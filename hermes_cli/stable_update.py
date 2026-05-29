@@ -96,7 +96,7 @@ def list_stable_tags(repo_dir: Path, pattern: str = DEFAULT_STABLE_TAG_PATTERN) 
 
 
 def resolve_commit(repo_dir: Path, ref: str) -> Optional[str]:
-    """Resolve a git ref/tag to a full commit hash, or None on failure."""
+    """Resolve a git ref to its peeled commit SHA."""
     try:
         result = _run_git(repo_dir, ["rev-parse", f"{ref}^{{commit}}"], timeout=5)
     except Exception:
@@ -218,12 +218,8 @@ def stable_update_status(
     if current_release_tag in tags:
         status["releases_behind"] = tags.index(current_release_tag)
 
-    exact_target = status["head"] == status["target_commit"]
-    carries_target = is_ancestor(repo_dir, target) if target else False
-    on_moving_main = status["current_branch"] in {"main", "master"}
-    # A custom overlay commit on top of a release remains release-current, but
-    # selecting the release track while sitting on moving main must still offer
-    # to pin the exact tag. This resolves both reviewer-reported edge cases.
-    status["up_to_date"] = exact_target or (carries_target and not on_moving_main)
+    # Release track means an exact, reproducible tag pin. Descendants of the tag
+    # include unreleased main and local overlays; neither is the selected build.
+    status["up_to_date"] = status["head"] == status["target_commit"]
     status["update_available"] = not status["up_to_date"]
     return status

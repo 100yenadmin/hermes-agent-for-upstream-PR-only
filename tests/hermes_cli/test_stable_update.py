@@ -81,7 +81,7 @@ def test_stable_updates_enabled_accepts_strategy_and_legacy_bool():
     assert configured_update_channel({"updates": {"channel": "fast-track"}}) == "main"
 
 
-def test_overlay_commit_on_latest_release_is_current(tmp_path):
+def test_overlay_commit_on_latest_release_is_not_exact_pin(tmp_path):
     from hermes_cli.stable_update import stable_update_status
 
     repo = tmp_path / "repo"
@@ -100,8 +100,8 @@ def test_overlay_commit_on_latest_release_is_current(tmp_path):
     assert status["current_branch"] == "local-overlay"
     assert status["current_release_tag"] == "v2026.5.16"
     assert status["releases_behind"] == 0
-    assert status["up_to_date"] is True
-    assert status["update_available"] is False
+    assert status["up_to_date"] is False
+    assert status["update_available"] is True
 
 
 def test_moving_main_after_latest_release_still_offers_release_pin(tmp_path):
