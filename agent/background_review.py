@@ -313,7 +313,9 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
 
 
 # Review prompts. AIAgent exposes them as class attributes (``_MEMORY_REVIEW_PROMPT`` etc.) so
-# per-agent overrides work; the text lives here.
+# per-agent overrides work; the text lives here. Users can override any of them via
+# ``agent.review_prompts.{memory,skill,combined}`` (or ``..._file``) in config.yaml — see
+# ``_resolve_review_prompt`` below for the full resolution chain.
 _MEMORY_REVIEW_PROMPT = (
     "Review the conversation above and consider saving to memory if appropriate.\n\n"
     "Focus on:\n"
@@ -1259,6 +1261,80 @@ _PROMPT_NAME_BY_SCOPE = {
     (True, True): "_COMBINED_REVIEW_PROMPT", (True, False): "_MEMORY_REVIEW_PROMPT",
     (False, True): "_SKILL_REVIEW_PROMPT", (False, False): "_SKILL_REVIEW_PROMPT",
 }
+
+
+# Mapping from config-side review-prompt key (``agent.review_prompts.*`` in
+# config.yaml) to the module-level constants and the matching agent-attribute
+# names. Centralising the mapping keeps ``_resolve_review_prompt`` tiny and
+# means adding a new review kind only needs one edit here.
+_REVIEW_PROMPT_BY_KIND: Dict[str, str] = {
+    "memory": "_MEMORY_REVIEW_PROMPT",
+    "skill": "_SKILL_REVIEW_PROMPT",
+    "combined": "_COMBINED_REVIEW_PROMPT",
+}
+
+
+def _resolve_review_prompt(agent: Any, kind: str) -> str:
+    """Pick the review prompt to send to the forked review agent.
+
+    Resolution order (first hit wins):
+
+      1. ``agent.<attr>`` — a per-instance override set by tests or by a
+         subclass. Wins on any non-empty value. Back-compat path with
+         the existing ``getattr(agent, "_MEMORY_REVIEW_PROMPT", ...)``
+         fallback pattern.
+      2. ``agent.review_prompts.<kind>`` in ``config.yaml`` — the new
+         override slot. ``None`` / missing key → fall through. An empty
+         string (``""``) is treated as an explicit "this review kind is
+         off" signal: ``spawn_background_review_thread`` short-circuits
+         and the forked agent never spawns, saving the model call.
+      3. The module-level constant for that kind — the unchanged default.
+
+    Pure read against ``agent``. The config read is wrapped in a narrow
+    ``except (ImportError, OSError, ValueError)`` so a misconfigured
+    user gets a ``logger.warning`` line and falls through to the module
+    constant rather than crashing the review thread.
+    """
+    attr_name = _REVIEW_PROMPT_BY_KIND.get(kind)
+    if attr_name is None:
+        # Unknown kind — caller bug. Don't raise: a bad probe into the
+        # review API shouldn't kill the user's turn.
+        return _MEMORY_REVIEW_PROMPT
+    # 1. Per-instance override (test patches, agent subclassing).
+    try:
+        per_instance = getattr(agent, attr_name)
+    except AttributeError:
+        per_instance = None
+    if per_instance:
+        return per_instance
+    # 2. config.yaml override (None / missing = fall through). We narrow
+    # the except to the realistic failure modes a misconfigured user can
+    # hit (yaml parse error, missing file, bad JSON) — anything else is a
+    # bug we'd rather see than swallow.
+    cfg = None
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+    except (ImportError, OSError, ValueError) as exc:
+        # ImportError: hermes_cli.config unavailable in odd contexts.
+        # OSError: user config file unreadable.
+        # ValueError: yaml/json parse error in the user's config.
+        logger.warning(
+            "background_review: could not read config (%s); "
+            "falling back to module-level prompt constants",
+            exc,
+        )
+    if isinstance(cfg, dict):
+        agent_cfg = cfg.get("agent")
+        if isinstance(agent_cfg, dict):
+            rp_cfg = agent_cfg.get("review_prompts")
+            if isinstance(rp_cfg, dict):
+                override = rp_cfg.get(kind)
+                if override is not None:
+                    return override
+    # 3. Module-level constant — preserved verbatim so legacy callers
+    # that import ``AIAgent._SKILL_REVIEW_PROMPT`` see the same text.
+    return globals()[attr_name]
 
 
 def spawn_background_review_thread(
