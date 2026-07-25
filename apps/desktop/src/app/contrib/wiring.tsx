@@ -35,6 +35,7 @@ import { $billingSettingsRequest } from '@/store/billing-block'
 import { $desktopBoot } from '@/store/boot'
 import { requestVoiceConversationStart } from '@/store/composer'
 import { setCronFocusJobId } from '@/store/cron'
+import { $gatewayConnectionEpochs } from '@/store/gateway'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
 import { $previewTarget } from '@/store/preview'
 import {
@@ -164,6 +165,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const actionsRef = useRef<WiringActions | null>(null)
 
   const gatewayState = useStore($gatewayState)
+  const gatewayConnectionEpochs = useStore($gatewayConnectionEpochs)
   const activeSessionId = useStore($activeSessionId)
   const billingSettingsRequest = useStore($billingSettingsRequest)
   const currentCwd = useStore($currentCwd)
@@ -187,6 +189,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const messagingSessions = useStore($messagingSessions)
   const sessions = useStore($sessions)
   const activeGatewayProfile = useStore($activeGatewayProfile)
+  const gatewayConnectionEpoch = gatewayConnectionEpochs[normalizeProfileKey(activeGatewayProfile)] ?? 0
   const profileScope = useStore($profileScope)
   const boot = useStore($desktopBoot)
 
@@ -671,6 +674,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     creatingSessionRef,
     currentView,
     freshDraftReady,
+    gatewayConnectionEpoch,
     gatewayState,
     locationPathname: location.pathname,
     resumeSession,

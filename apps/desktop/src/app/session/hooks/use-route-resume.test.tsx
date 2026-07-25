@@ -313,31 +313,39 @@ describe('useRouteResume', () => {
 
   it('reconciles when a reconnect epoch advances even if React only renders open', () => {
     const resumeSession = vi.fn(async () => undefined)
+    const startFreshSessionDraft = vi.fn()
     const activeSessionIdRef: MutableRefObject<null | string> = { current: 'runtime-1' }
+    const creatingSessionRef = { current: false }
+    const runtimeIdByStoredSessionIdRef = { current: new Map([['session-1', 'runtime-1']]) }
     const selectedStoredSessionIdRef: MutableRefObject<null | string> = { current: 'session-1' }
     const common = {
       activeSessionId: 'runtime-1',
       activeSessionIdRef,
-      creatingSessionRef: { current: false },
+      creatingSessionRef,
       currentView: 'chat',
       freshDraftReady: false,
       gatewayState: 'open',
       locationPathname: '/session-1',
       resumeSession,
       routedSessionId: 'session-1',
-      runtimeIdByStoredSessionIdRef: { current: new Map([['session-1', 'runtime-1']]) },
+      runtimeIdByStoredSessionIdRef,
       selectedStoredSessionId: 'session-1',
       selectedStoredSessionIdRef,
-      startFreshSessionDraft: vi.fn()
+      startFreshSessionDraft
     } as const
 
     const { rerender } = render(<RouteResumeHarness {...common} gatewayConnectionEpoch={1} />)
 
     expect(resumeSession).not.toHaveBeenCalled()
+
+    // The renderer never observed closed/connecting, but the socket listener
+    // published a new generation when the replacement connection opened.
     rerender(<RouteResumeHarness {...common} gatewayConnectionEpoch={2} />)
+
     expect(resumeSession).toHaveBeenCalledTimes(1)
     expect(resumeSession).toHaveBeenCalledWith('session-1', true)
 
+    // Ordinary renders within the same connection generation are idempotent.
     rerender(<RouteResumeHarness {...common} gatewayConnectionEpoch={2} />)
     expect(resumeSession).toHaveBeenCalledTimes(1)
   })
