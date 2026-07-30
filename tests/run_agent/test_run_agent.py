@@ -2279,6 +2279,73 @@ class TestHandleMaxIterations:
             outcome="success",
         )
 
+    @pytest.mark.parametrize(
+        ("clock_values", "response_texts", "expired_dispatch_index"),
+        [
+            ([110.0, 160.001], ["Summary"], 0),
+            ([110.0, 110.0, 110.0, 160.001], ["", "Retry summary"], 1),
+        ],
+        ids=["primary", "retry"],
+    )
+    def test_codex_summary_revalidates_fast_cutoff_before_dispatch(
+        self, agent, clock_values, response_texts, expired_dispatch_index
+    ):
+        from agent.fast_mode import begin_fast_mode_turn
+
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "chatgpt.com"
+        agent.model = "gpt-5.5"
+        agent.service_tier = "auto"
+        agent.fast_auto_on_seconds = 60
+        agent._cached_system_prompt = "You are helpful."
+        begin_fast_mode_turn(agent, [], now=100.0)
+
+        built_kwargs = []
+        dispatched_kwargs = []
+        original_build = agent._build_api_kwargs
+
+        def capture_build(messages):
+            kwargs = original_build(messages)
+            built_kwargs.append(dict(kwargs))
+            return kwargs
+
+        pending_responses = iter(response_texts)
+
+        def capture_dispatch(kwargs):
+            dispatched_kwargs.append(dict(kwargs))
+            return SimpleNamespace(
+                status="completed",
+                output=[
+                    SimpleNamespace(
+                        type="message",
+                        status="completed",
+                        content=[
+                            SimpleNamespace(
+                                type="output_text", text=next(pending_responses)
+                            )
+                        ],
+                    )
+                ],
+            )
+
+        with (
+            patch.object(agent, "_build_api_kwargs", side_effect=capture_build),
+            patch.object(agent, "_run_codex_stream", side_effect=capture_dispatch),
+            patch("agent.fast_mode.time.monotonic", side_effect=clock_values),
+        ):
+            result = agent._handle_max_iterations(
+                [{"role": "user", "content": "do stuff"}], 1
+            )
+
+        assert result == response_texts[-1]
+        assert built_kwargs[expired_dispatch_index]["service_tier"] == "priority"
+        assert "service_tier" not in dispatched_kwargs[expired_dispatch_index]
+        for kwargs in dispatched_kwargs[:expired_dispatch_index]:
+            assert kwargs["service_tier"] == "priority"
+
     def test_api_failure_returns_error(self, agent):
         agent.client.chat.completions.create.side_effect = Exception("API down")
         agent._cached_system_prompt = "You are helpful."
@@ -5712,5 +5779,4 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
-
 
