@@ -16,6 +16,29 @@ from typing import Any, Optional
 DEFAULT_STABLE_TAG_PATTERN = "v20*"
 DEFAULT_STABLE_TAG_REMOTE = "origin"
 STABLE_TAG_STRATEGIES = {"stable-tags", "stable_tags", "stable-tag", "tags"}
+UPDATE_CHANNELS = {"main", "release"}
+
+
+def normalize_update_channel(value: Any, *, default: str = "main") -> str:
+    """Normalize a user-facing update channel to ``main`` or ``release``."""
+    normalized_default = default if default in UPDATE_CHANNELS else "main"
+    raw = str(value or "").strip().lower()
+    if raw in {"release", *STABLE_TAG_STRATEGIES}:
+        return "release"
+    if raw in {"main", "branch", "fast", "fast-track", "fast_track"}:
+        return "main"
+    return normalized_default
+
+
+def configured_update_channel(config: dict[str, Any] | None, *, default: str = "main") -> str:
+    """Return the canonical update channel from an effective config mapping."""
+    updates = config.get("updates", {}) if isinstance(config, dict) else {}
+    if not isinstance(updates, dict):
+        return normalize_update_channel(None, default=default)
+    return normalize_update_channel(
+        updates.get("channel") or updates.get("check_strategy") or updates.get("strategy"),
+        default=default,
+    )
 
 
 def stable_updates_enabled(config: dict[str, Any] | None) -> bool:
@@ -23,13 +46,7 @@ def stable_updates_enabled(config: dict[str, Any] | None) -> bool:
     updates = config.get("updates", {}) if isinstance(config, dict) else {}
     if not isinstance(updates, dict):
         return False
-    strategy = str(
-        updates.get("check_strategy")
-        or updates.get("strategy")
-        or updates.get("channel")
-        or ""
-    ).strip().lower()
-    return bool(updates.get("stable_tags")) or strategy in STABLE_TAG_STRATEGIES
+    return bool(updates.get("stable_tags")) or configured_update_channel(config) == "release"
 
 
 def stable_update_config(config: dict[str, Any] | None) -> dict[str, str]:
@@ -102,6 +119,39 @@ def exact_head_tag(repo_dir: Path) -> Optional[str]:
     return value or None
 
 
+def current_branch(repo_dir: Path) -> Optional[str]:
+    """Return the checked-out branch, or ``None`` for detached HEAD."""
+    try:
+        result = _run_git(repo_dir, ["symbolic-ref", "--quiet", "--short", "HEAD"], timeout=5)
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    value = (result.stdout or "").strip()
+    return value or None
+
+
+def is_ancestor(repo_dir: Path, ancestor: str, descendant: str = "HEAD") -> bool:
+    """Return whether *ancestor* is reachable from *descendant*."""
+    try:
+        result = _run_git(
+            repo_dir,
+            ["merge-base", "--is-ancestor", ancestor, descendant],
+            timeout=5,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
+def latest_reachable_tag(repo_dir: Path, tags: list[str]) -> Optional[str]:
+    """Return the newest candidate tag reachable from HEAD."""
+    for tag in tags:
+        if is_ancestor(repo_dir, tag):
+            return tag
+    return None
+
+
 def stable_update_status(
     repo_dir: Path,
     *,
@@ -122,12 +172,15 @@ def stable_update_status(
         "pattern": pattern,
         "remote": remote,
         "current_tag": None,
+        "current_release_tag": None,
+        "current_branch": None,
         "head": None,
         "latest_tag": None,
         "target_tag": target_tag,
         "target_commit": None,
         "up_to_date": None,
         "update_available": False,
+        "releases_behind": None,
         "fetch_ok": None,
         "fetch_error": None,
         "error": None,
@@ -152,6 +205,7 @@ def stable_update_status(
     status["latest_tag"] = latest_tag
     status["target_tag"] = target
     status["current_tag"] = exact_head_tag(repo_dir)
+    status["current_branch"] = current_branch(repo_dir)
     status["head"] = resolve_commit(repo_dir, "HEAD")
     status["target_commit"] = resolve_commit(repo_dir, target) if target else None
 
@@ -159,6 +213,17 @@ def stable_update_status(
         status["error"] = "could-not-resolve-ref"
         return status
 
-    status["up_to_date"] = status["head"] == status["target_commit"]
+    current_release_tag = latest_reachable_tag(repo_dir, tags)
+    status["current_release_tag"] = current_release_tag
+    if current_release_tag in tags:
+        status["releases_behind"] = tags.index(current_release_tag)
+
+    exact_target = status["head"] == status["target_commit"]
+    carries_target = is_ancestor(repo_dir, target) if target else False
+    on_moving_main = status["current_branch"] in {"main", "master"}
+    # A custom overlay commit on top of a release remains release-current, but
+    # selecting the release track while sitting on moving main must still offer
+    # to pin the exact tag. This resolves both reviewer-reported edge cases.
+    status["up_to_date"] = exact_target or (carries_target and not on_moving_main)
     status["update_available"] = not status["up_to_date"]
     return status
