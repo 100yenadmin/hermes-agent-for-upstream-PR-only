@@ -1047,6 +1047,16 @@ class TestCmdUpdateRelease:
     requested release is already installed.
     """
 
+    @pytest.fixture(autouse=True)
+    def _published_github_releases(self, monkeypatch):
+        def resolve(requested_tag=None):
+            tag = requested_tag or "v2026.5.29"
+            if not tag.startswith("v2026."):
+                return None, f"Official release tag '{tag}' not found."
+            return tag, None
+
+        monkeypatch.setattr("hermes_cli.stable_update.resolve_published_release_tag", resolve)
+
     def _release_side_effect(
         self,
         *,
@@ -1061,19 +1071,20 @@ class TestCmdUpdateRelease:
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
 
+            if "ls-remote --tags" in joined:
+                refs = [
+                    f"{target_sha}\trefs/tags/{latest_tag}",
+                    f"{'c' * 40}\trefs/tags/v2026.5.28",
+                ]
+                if requested_tag_exists:
+                    refs.append(f"{target_sha}\trefs/tags/v2026.5.7")
+                return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(refs) + "\n", stderr="")
+
+            if "fetch --quiet --no-tags" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
             if "rev-parse" in joined and "--abbrev-ref" in joined:
                 return subprocess.CompletedProcess(cmd, 0, stdout=f"{current_branch}\n", stderr="")
-
-            # _tag_exists probe
-            if "rev-parse" in joined and "--verify" in joined and "refs/tags/" in joined:
-                rc = 0 if requested_tag_exists else 1
-                return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="")
-
-            # _latest_release_tag
-            if "tag" in joined and "--list" in joined:
-                return subprocess.CompletedProcess(
-                    cmd, 0, stdout=f"{latest_tag}\nv2026.5.28\n", stderr=""
-                )
 
             if "describe" in joined and "--exact-match" in joined:
                 return subprocess.CompletedProcess(
@@ -1091,11 +1102,11 @@ class TestCmdUpdateRelease:
                     stderr="",
                 )
 
-            if "rev-parse" in joined and "HEAD^{commit}" in joined:
-                return subprocess.CompletedProcess(cmd, 0, stdout=f"{head_sha}\n", stderr="")
-
-            if "rev-parse" in joined and "^{commit}" in joined:
+            if "rev-parse" in joined and cmd[-1] == "FETCH_HEAD^{commit}":
                 return subprocess.CompletedProcess(cmd, 0, stdout=f"{target_sha}\n", stderr="")
+
+            if "rev-parse" in joined and cmd[-1] == "HEAD^{commit}":
+                return subprocess.CompletedProcess(cmd, 0, stdout=f"{head_sha}\n", stderr="")
 
             if "merge-base" in joined and "--is-ancestor" in joined:
                 return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -1103,6 +1114,43 @@ class TestCmdUpdateRelease:
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         return side_effect
+
+    @patch("hermes_cli.config.detect_install_method", return_value="git")
+    @patch("hermes_cli.stable_update.resolve_commit", return_value="a" * 40)
+    @patch("hermes_cli.stable_update.resolve_official_release")
+    @patch("subprocess.run")
+    def test_release_check_uses_official_release_not_origin_tags(
+        self, mock_run, mock_resolve_release, _mock_resolve_commit, _mock_method, capsys
+    ):
+        mock_resolve_release.return_value = {
+            "tag": "v2026.5.29",
+            "commit": "b" * 40,
+            "error": None,
+        }
+
+        cmd_update(SimpleNamespace(check=True, release="latest", branch=None, release_commit=None))
+
+        mock_resolve_release.assert_called_once_with(PROJECT_ROOT, requested_tag=None)
+        mock_run.assert_not_called()
+        out = capsys.readouterr().out
+        assert "official GitHub Releases" in out
+        assert "Release update available: v2026.5.29" in out
+
+    @patch("hermes_cli.config.detect_install_method", return_value="git")
+    @patch("hermes_cli.stable_update.resolve_official_release")
+    def test_release_check_fails_closed_for_unpublished_tag(self, mock_resolve_release, _mock_method, capsys):
+        mock_resolve_release.return_value = {
+            "tag": "v2026.5.27",
+            "commit": None,
+            "error": "Official release tag 'v2026.5.27' not found.",
+        }
+
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_update(SimpleNamespace(check=True, release="v2026.5.27", branch=None, release_commit=None))
+
+        assert exc_info.value.code == 1
+        mock_resolve_release.assert_called_once_with(PROJECT_ROOT, requested_tag="v2026.5.27")
+        assert "Official release tag 'v2026.5.27' not found" in capsys.readouterr().out
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -1131,6 +1179,46 @@ class TestCmdUpdateRelease:
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
         assert any(f"checkout --detach {'b' * 40}" in c for c in commands), commands
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_release_commit_guard_accepts_the_checked_target(self, mock_run, _which, capsys):
+        mock_run.side_effect = self._release_side_effect(
+            current_branch="main", requested_tag_exists=True, head_equals_target=False
+        )
+
+        cmd_update(SimpleNamespace(release="v2026.5.7", release_commit="b" * 40))
+
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        assert any(f"checkout --detach {'b' * 40}" in c for c in commands), commands
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_release_commit_guard_rejects_a_moved_tag_before_checkout(self, mock_run, _which, capsys):
+        mock_run.side_effect = self._release_side_effect(
+            current_branch="main", requested_tag_exists=True, head_equals_target=False
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_update(SimpleNamespace(release="v2026.5.7", release_commit="c" * 40))
+
+        assert exc.value.code == 1
+        assert "no longer resolves to the checked commit" in capsys.readouterr().out
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        assert not any("checkout --detach" in c for c in commands), commands
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_release_commit_guard_rejects_invalid_sha(self, mock_run, _which, capsys):
+        mock_run.side_effect = self._release_side_effect()
+
+        with pytest.raises(SystemExit) as exc:
+            cmd_update(SimpleNamespace(release="v2026.5.7", release_commit="not-a-sha"))
+
+        assert exc.value.code == 1
+        assert "full 40-character Git commit SHA" in capsys.readouterr().out
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        assert not any("checkout --detach" in c for c in commands), commands
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -1164,6 +1252,12 @@ class TestCmdUpdateRelease:
             cmd_update(SimpleNamespace(release="latest", branch="main"))
         assert exc.value.code == 1
         assert "mutually exclusive" in capsys.readouterr().out
+
+    def test_release_commit_requires_release(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cmd_update(SimpleNamespace(release=None, release_commit="b" * 40))
+        assert exc.value.code == 1
+        assert "requires --release" in capsys.readouterr().out
 
 
 def test_is_termux_env_true_for_termux_prefix():

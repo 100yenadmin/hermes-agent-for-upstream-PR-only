@@ -9,12 +9,20 @@ script on installations that opt into the stable-tag channel.
 
 from __future__ import annotations
 
+import json
+import re
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Optional
 
 DEFAULT_STABLE_TAG_PATTERN = "v20*"
-DEFAULT_STABLE_TAG_REMOTE = "origin"
+OFFICIAL_RELEASE_REPOSITORY = "https://github.com/NousResearch/hermes-agent.git"
+OFFICIAL_RELEASES_API = "https://api.github.com/repos/NousResearch/hermes-agent/releases"
+DEFAULT_STABLE_TAG_REMOTE = OFFICIAL_RELEASE_REPOSITORY
+OFFICIAL_RELEASE_TAG_RE = re.compile(r"^v(20\d{2})\.(\d{1,2})\.(\d{1,2})(?:\.(\d+))?$")
 STABLE_TAG_STRATEGIES = {"stable-tags", "stable_tags", "stable-tag", "tags"}
 UPDATE_CHANNELS = {"main", "release"}
 
@@ -105,6 +113,161 @@ def resolve_commit(repo_dir: Path, ref: str) -> Optional[str]:
         return None
     value = (result.stdout or "").strip()
     return value or None
+
+
+def parse_official_release_refs(output: str) -> dict[str, str]:
+    """Return strict official release tags mapped to their peeled commit SHA."""
+    direct: dict[str, str] = {}
+    peeled: dict[str, str] = {}
+
+    for line in output.splitlines():
+        parts = line.strip().split()
+        if len(parts) != 2:
+            continue
+        sha, ref = parts
+        match = re.fullmatch(
+            r"refs/tags/(v20\d{2}\.\d{1,2}\.\d{1,2}(?:\.\d+)?)(\^\{\})?",
+            ref,
+        )
+        if not match or len(sha) != 40 or any(c not in "0123456789abcdefABCDEF" for c in sha):
+            continue
+        tag = match.group(1)
+        (peeled if match.group(2) else direct)[tag] = sha.lower()
+
+    return {tag: peeled.get(tag, sha) for tag, sha in direct.items()}
+
+
+def resolve_published_release_tag(
+    requested_tag: str | None = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve a published GitHub Release to its strict date tag."""
+    if requested_tag is not None and not OFFICIAL_RELEASE_TAG_RE.fullmatch(requested_tag):
+        return None, f"Official release tag '{requested_tag}' not found."
+
+    endpoint = (
+        f"{OFFICIAL_RELEASES_API}/tags/{urllib.parse.quote(requested_tag, safe='')}"
+        if requested_tag
+        else f"{OFFICIAL_RELEASES_API}/latest"
+    )
+    request = urllib.request.Request(
+        endpoint,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "hermes-agent-updater",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404 and requested_tag:
+            return None, f"Official release tag '{requested_tag}' not found."
+        return None, f"Could not read official GitHub releases (HTTP {exc.code})."
+    except Exception as exc:
+        return None, str(exc)
+
+    tag = str(payload.get("tag_name") or "") if isinstance(payload, dict) else ""
+    is_draft = bool(payload.get("draft")) if isinstance(payload, dict) else True
+    if (
+        not OFFICIAL_RELEASE_TAG_RE.fullmatch(tag)
+        or is_draft
+        or (requested_tag is not None and tag != requested_tag)
+    ):
+        label = requested_tag or tag or "latest"
+        return None, f"Official release tag '{label}' not found."
+    return tag, None
+
+
+def _official_tag_commit(repo_dir: Path, tag: str) -> tuple[Optional[str], Optional[str]]:
+    """Resolve one published release tag from the official repository."""
+    try:
+        result = _run_git(
+            repo_dir,
+            [
+                "ls-remote",
+                "--tags",
+                OFFICIAL_RELEASE_REPOSITORY,
+                f"refs/tags/{tag}",
+                f"refs/tags/{tag}^{{}}",
+            ],
+            timeout=30,
+        )
+    except Exception as exc:
+        return None, str(exc)
+    if result.returncode != 0:
+        return None, (result.stderr or "Could not read the official release tag.").strip()
+
+    refs = parse_official_release_refs(result.stdout or "")
+    commit = refs.get(tag)
+    return commit, None if commit else f"Official release tag '{tag}' was not found in the official repository."
+
+
+def official_release_status(repo_dir: Path) -> dict[str, Any]:
+    """Return exact-pin status against the latest published GitHub Release."""
+    latest_tag, error = resolve_published_release_tag()
+    target_commit = None
+    if not error and latest_tag:
+        target_commit, error = _official_tag_commit(Path(repo_dir), latest_tag)
+    status: dict[str, Any] = {
+        "mode": "official-releases",
+        "current_release_tag": None,
+        "head": resolve_commit(Path(repo_dir), "HEAD"),
+        "latest_tag": None,
+        "target_tag": None,
+        "target_commit": None,
+        "up_to_date": None,
+        "update_available": False,
+        "releases_behind": None,
+        "error": error,
+    }
+    if error or not latest_tag or not target_commit or not status["head"]:
+        status["error"] = error or "could-not-resolve-head"
+        return status
+
+    status["latest_tag"] = latest_tag
+    status["target_tag"] = latest_tag
+    status["target_commit"] = target_commit
+    if status["head"] == target_commit:
+        status["current_release_tag"] = latest_tag
+        status["releases_behind"] = 0
+    status["up_to_date"] = status["head"] == target_commit
+    status["update_available"] = not status["up_to_date"]
+    return status
+
+
+def resolve_official_release(repo_dir: Path, requested_tag: str | None = None) -> dict[str, Any]:
+    """Fetch and verify one published GitHub Release from the official repo."""
+    tag, error = resolve_published_release_tag(requested_tag)
+    if error or not tag:
+        return {"tag": requested_tag, "commit": None, "error": error or "No official release found."}
+
+    expected_commit, error = _official_tag_commit(Path(repo_dir), tag)
+    if error or not expected_commit:
+        return {"tag": tag, "commit": None, "error": error}
+    try:
+        fetched = _run_git(
+            Path(repo_dir),
+            ["fetch", "--quiet", "--no-tags", OFFICIAL_RELEASE_REPOSITORY, f"refs/tags/{tag}"],
+            timeout=30,
+        )
+    except Exception as exc:
+        return {"tag": tag, "commit": None, "error": str(exc)}
+    if fetched.returncode != 0:
+        return {
+            "tag": tag,
+            "commit": None,
+            "error": (fetched.stderr or f"Could not fetch official release {tag}.").strip(),
+        }
+
+    fetched_commit = resolve_commit(Path(repo_dir), "FETCH_HEAD")
+    if fetched_commit != expected_commit:
+        return {
+            "tag": tag,
+            "commit": fetched_commit,
+            "error": f"Official release {tag} did not resolve to its advertised commit.",
+        }
+    return {"tag": tag, "commit": expected_commit, "error": None}
 
 
 def exact_head_tag(repo_dir: Path) -> Optional[str]:
