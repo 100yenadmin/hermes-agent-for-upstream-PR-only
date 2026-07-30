@@ -5068,6 +5068,203 @@ def _make_tc_delta(index=0, tc_id=None, name=None, arguments=None):
 class TestStreamingApiCall:
     """Tests for _streaming_api_call — voice TTS streaming pipeline."""
 
+    def test_managed_stream_revalidates_after_relay_delay(self, agent, monkeypatch):
+        """Relay may finalize kwargs after the turn cutoff has expired."""
+        from agent import relay_llm
+        from agent.fast_mode import begin_fast_mode_turn
+
+        agent.provider = "openai-api"
+        agent.api_mode = "chat_completions"
+        agent.base_url = "https://api.openai.com/v1"
+        agent.model = "gpt-5.4"
+        agent.service_tier = "auto"
+        agent.fast_auto_on_seconds = 60
+        agent.request_overrides = {}
+        begin_fast_mode_turn(agent, [], now=100.0)
+
+        clock = {"now": 110.0}
+        monkeypatch.setattr(
+            "agent.fast_mode.time.monotonic", lambda: clock["now"]
+        )
+        real_stream = relay_llm.stream
+
+        def delayed_stream(request, stream_factory, **kwargs):
+            def delayed_factory(final_kwargs):
+                clock["now"] = 160.001
+                return stream_factory(final_kwargs)
+
+            return real_stream(request, delayed_factory, **kwargs)
+
+        monkeypatch.setattr(relay_llm, "stream", delayed_stream)
+        agent.client.chat.completions.create.return_value = iter(
+            [_make_chunk(content="ok"), _make_chunk(finish_reason="stop")]
+        )
+
+        with patch.object(
+            agent, "_create_request_openai_client", return_value=agent.client
+        ):
+            response = agent._interruptible_streaming_api_call(
+                {
+                    "messages": [],
+                    "model": "gpt-5.4",
+                    "service_tier": "priority",
+                }
+            )
+
+        assert response.choices[0].message.content == "ok"
+        dispatched = agent.client.chat.completions.create.call_args.kwargs
+        assert "service_tier" not in dispatched
+
+    def test_managed_anthropic_stream_revalidates_after_relay_delay(
+        self, agent, monkeypatch
+    ):
+        from agent import relay_llm
+        from agent.fast_mode import begin_fast_mode_turn
+
+        agent.provider = "anthropic"
+        agent.api_mode = "anthropic_messages"
+        agent.base_url = "https://api.anthropic.com/v1"
+        agent._anthropic_base_url = agent.base_url
+        agent._is_anthropic_oauth = False
+        agent._oauth_1m_beta_disabled = False
+        agent.model = "claude-opus-4-6"
+        agent.service_tier = "auto"
+        agent.fast_auto_on_seconds = 60
+        agent.request_overrides = {}
+        begin_fast_mode_turn(agent, [], now=100.0)
+
+        clock = {"now": 110.0}
+        monkeypatch.setattr(
+            "agent.fast_mode.time.monotonic", lambda: clock["now"]
+        )
+        captured = {}
+
+        class RawStream:
+            response = None
+
+            def get_final_message(self):
+                return SimpleNamespace(
+                    content=[SimpleNamespace(type="text", text="ok")],
+                    stop_reason="end_turn",
+                )
+
+        raw_stream = RawStream()
+
+        class Manager:
+            def __enter__(self):
+                return raw_stream
+
+            def __exit__(self, *_args):
+                return None
+
+        request_client = SimpleNamespace(
+            messages=SimpleNamespace(
+                stream=lambda **kwargs: captured.update(kwargs) or Manager()
+            )
+        )
+
+        class ManagedStream:
+            final_response = None
+            output_modified = False
+
+            def __iter__(self):
+                return iter(())
+
+            def close(self):
+                return None
+
+        def delayed_stream(request, stream_factory, **kwargs):
+            clock["now"] = 160.001
+            opened = stream_factory(request)
+            kwargs["on_stream_created"](opened)
+            return ManagedStream()
+
+        monkeypatch.setattr(relay_llm, "stream", delayed_stream)
+        with patch.object(
+            agent,
+            "_create_request_anthropic_client",
+            return_value=request_client,
+        ):
+            response = agent._interruptible_streaming_api_call(
+                {
+                    "model": "claude-opus-4-6",
+                    "messages": [],
+                    "extra_body": {"speed": "fast"},
+                    "extra_headers": {
+                        "anthropic-beta": "fast-mode-2026-02-01"
+                    },
+                }
+            )
+
+        assert response.content[0].text == "ok"
+        assert "speed" not in captured
+        assert "fast-mode-2026-02-01" not in captured.get(
+            "extra_headers", {}
+        ).get("anthropic-beta", "")
+
+    def test_managed_bedrock_stream_revalidates_after_relay_delay(
+        self, agent, monkeypatch
+    ):
+        from agent import relay_llm
+        from agent.fast_mode import begin_fast_mode_turn
+
+        agent.provider = "bedrock"
+        agent.api_mode = "bedrock_converse"
+        agent.base_url = "https://bedrock-runtime.us-east-1.amazonaws.com"
+        agent.model = "anthropic/claude-opus-4.6"
+        agent.service_tier = "auto"
+        agent.fast_auto_on_seconds = 60
+        agent.request_overrides = {}
+        begin_fast_mode_turn(agent, [], now=100.0)
+
+        clock = {"now": 110.0}
+        monkeypatch.setattr(
+            "agent.fast_mode.time.monotonic", lambda: clock["now"]
+        )
+        captured = {}
+
+        class BedrockClient:
+            def converse_stream(self, **kwargs):
+                captured.update(kwargs)
+                return {"stream": []}
+
+        class ManagedStream:
+            final_response = "final"
+
+            def __iter__(self):
+                return iter(())
+
+            def close(self):
+                return None
+
+        def delayed_stream(request, stream_factory, **_kwargs):
+            clock["now"] = 160.001
+            stream_factory(request)
+            return ManagedStream()
+
+        monkeypatch.setattr(relay_llm, "stream", delayed_stream)
+        monkeypatch.setattr(
+            "agent.bedrock_adapter._get_bedrock_runtime_client",
+            lambda _region: BedrockClient(),
+        )
+        monkeypatch.setattr(
+            "agent.bedrock_adapter.stream_converse_with_callbacks",
+            lambda *_args, **_kwargs: "streamed",
+        )
+
+        response = agent._interruptible_streaming_api_call(
+            {
+                "__bedrock_region__": "us-east-1",
+                "__bedrock_converse__": True,
+                "modelId": "anthropic.claude-opus-4-6",
+                "speed": "fast",
+            }
+        )
+
+        assert response == "final"
+        assert "speed" not in captured
+        assert "service_tier" not in captured
+
     def test_content_assembly(self, agent):
         chunks = [
             _make_chunk(content="Hel"),
@@ -5779,4 +5976,3 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
-

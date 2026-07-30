@@ -2581,7 +2581,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 writer_token = {"value": None}
 
                 def _open_bedrock_stream(next_api_kwargs: dict[str, Any]):
-                    final_kwargs = dict(next_api_kwargs)
+                    final_kwargs = revalidate_fast_mode_request(
+                        agent, next_api_kwargs
+                    )
                     region = final_kwargs.pop("__bedrock_region__", "us-east-1")
                     final_kwargs.pop("__bedrock_converse__", None)
                     client = _get_bedrock_runtime_client(region)
@@ -3047,8 +3049,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         attempt_request_client = {"value": None}
 
         def _open_stream(next_api_kwargs: dict[str, Any]):
+            final_kwargs = revalidate_fast_mode_request(agent, next_api_kwargs)
             stream_kwargs = {
-                **next_api_kwargs,
+                **final_kwargs,
                 "stream": True,
                 "timeout": _httpx.Timeout(
                     connect=_conn_cap,
@@ -3548,7 +3551,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         accumulator = relay_llm.AnthropicStreamAccumulator()
 
         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
-            final_kwargs = dict(next_api_kwargs)
+            final_kwargs = revalidate_fast_mode_request(agent, next_api_kwargs)
             sanitize_anthropic_kwargs(
                 final_kwargs,
                 log_prefix=getattr(agent, "log_prefix", ""),

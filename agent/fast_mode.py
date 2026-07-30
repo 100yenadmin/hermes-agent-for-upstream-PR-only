@@ -96,7 +96,15 @@ def effective_request_overrides(
     if max(0.0, current - float(started_at)) <= cutoff:
         from hermes_cli.models import resolve_fast_mode_overrides
 
-        fast_overrides = resolve_fast_mode_overrides(getattr(agent, "model", None))
+        fast_overrides = resolve_fast_mode_overrides(
+            getattr(agent, "model", None),
+            provider=getattr(agent, "provider", None),
+            api_mode=getattr(agent, "api_mode", None),
+            base_url=(
+                getattr(agent, "_anthropic_base_url", None)
+                or getattr(agent, "base_url", None)
+            ),
+        )
         if fast_overrides:
             overrides.update(fast_overrides)
     return overrides

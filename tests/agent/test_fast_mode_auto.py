@@ -15,6 +15,9 @@ from agent.fast_mode import (
 def _agent(model="gpt-5.4", **overrides):
     values = {
         "model": model,
+        "provider": "openai-api",
+        "api_mode": "chat_completions",
+        "base_url": "https://api.openai.com/v1",
         "service_tier": "auto",
         "fast_auto_on_seconds": 60,
         "request_overrides": {"unrelated": "preserved"},
@@ -93,6 +96,49 @@ def test_unsupported_model_never_adds_fast_metadata():
     agent = _agent(model="openrouter/some-unsupported-model")
     begin_fast_mode_turn(agent, now=10.0)
     assert effective_request_overrides(agent, now=10.0) == {"unrelated": "preserved"}
+
+
+@pytest.mark.parametrize(
+    ("provider", "base_url"),
+    [
+        ("custom", "https://proxy.example/v1"),
+        ("openai-api", "https://api.openai.com.attacker.test/v1"),
+        ("openai-api", "https://proxy.example/api.openai.com/v1"),
+    ],
+)
+def test_dynamic_openai_priority_requires_native_runtime_identity(
+    provider, base_url
+):
+    agent = _agent(provider=provider, base_url=base_url)
+    begin_fast_mode_turn(agent, now=10.0)
+
+    assert effective_request_overrides(agent, now=10.0) == {
+        "unrelated": "preserved"
+    }
+
+
+def test_dynamic_openai_priority_remains_enabled_on_native_endpoint():
+    agent = _agent()
+    begin_fast_mode_turn(agent, now=10.0)
+
+    assert effective_request_overrides(agent, now=10.0) == {
+        "service_tier": "priority",
+        "unrelated": "preserved",
+    }
+
+
+def test_dynamic_anthropic_metadata_is_not_emitted_for_bedrock():
+    agent = _agent(
+        model="anthropic/claude-opus-4.6",
+        provider="bedrock",
+        api_mode="bedrock_converse",
+        base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+    )
+    begin_fast_mode_turn(agent, now=10.0)
+
+    assert effective_request_overrides(agent, now=10.0) == {
+        "unrelated": "preserved"
+    }
 
 
 def test_dispatch_revalidation_preserves_middleware_fields(monkeypatch):
@@ -179,6 +225,32 @@ def test_dispatch_revalidation_preserves_anthropic_metadata(monkeypatch):
     assert dispatched["extra_headers"] == {
         "anthropic-beta": "plugin-feature",
         "x-plugin": "preserved",
+    }
+
+
+def test_dispatch_revalidation_strips_fast_metadata_from_bedrock(monkeypatch):
+    agent = _agent(
+        model="anthropic/claude-opus-4.6",
+        provider="bedrock",
+        api_mode="bedrock_converse",
+        base_url="https://bedrock-runtime.us-east-1.amazonaws.com",
+    )
+    begin_fast_mode_turn(agent, [], now=100.0)
+    monkeypatch.setattr("agent.fast_mode.time.monotonic", lambda: 160.001)
+
+    dispatched = revalidate_fast_mode_request(
+        agent,
+        {
+            "modelId": "anthropic.claude-opus-4-6",
+            "speed": "fast",
+            "service_tier": "priority",
+            "inferenceConfig": {"maxTokens": 100},
+        },
+    )
+
+    assert dispatched == {
+        "modelId": "anthropic.claude-opus-4-6",
+        "inferenceConfig": {"maxTokens": 100},
     }
 
 
