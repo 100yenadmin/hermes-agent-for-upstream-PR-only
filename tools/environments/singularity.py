@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from profile_runtime_context import terminal_getenv
 from hermes_constants import get_hermes_home
 from tools.environments.base import (
     BaseEnvironment,
@@ -70,7 +71,7 @@ def _save_snapshots(data: dict) -> None:
 
 
 def _get_scratch_dir() -> Path:
-    custom_scratch = os.getenv("TERMINAL_SCRATCH_DIR")
+    custom_scratch = terminal_getenv("TERMINAL_SCRATCH_DIR")
     if custom_scratch:
         scratch_path = Path(custom_scratch)
         scratch_path.mkdir(parents=True, exist_ok=True)

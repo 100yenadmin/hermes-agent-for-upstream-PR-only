@@ -27,6 +27,8 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+from profile_runtime_context import terminal_getenv
 from typing import Any, Optional, Union
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
@@ -3009,7 +3011,7 @@ class GatewaySlashCommandsMixin:
             max_file_size_mb=cp_kwargs["checkpoint_max_file_size_mb"],
         )
 
-        cwd = os.getenv("TERMINAL_CWD", str(Path.home()))
+        cwd = terminal_getenv("TERMINAL_CWD", str(Path.home()))
         arg = event.get_command_args().strip()
 
         if not arg:
@@ -3068,7 +3070,7 @@ class GatewaySlashCommandsMixin:
             elif low == "session":
                 mode = "session"
 
-        cwd = os.getenv("TERMINAL_CWD", str(Path.home()))
+        cwd = terminal_getenv("TERMINAL_CWD", str(Path.home()))
 
         if mode == "session":
             return await self._gateway_session_diff(cwd, stat_only)

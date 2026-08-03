@@ -10,6 +10,20 @@ class TestExpandEnvVars:
             mp.setenv("MY_KEY", "secret123")
             assert _expand_env_vars("${MY_KEY}") == "secret123"
 
+    def test_custom_resolver_is_used_recursively(self, monkeypatch):
+        monkeypatch.setenv("PROFILE_ONLY", "launch-profile")
+        scoped = {"PROFILE_ONLY": "routed-profile", "EMPTY": ""}
+
+        assert _expand_env_vars(
+            {"a": "${PROFILE_ONLY}", "b": ["${env:EMPTY}"]},
+            scoped.get,
+        ) == {"a": "routed-profile", "b": [""]}
+
+    def test_custom_resolver_does_not_fall_through_to_process_env(self, monkeypatch):
+        monkeypatch.setenv("PROFILE_ONLY", "launch-profile")
+
+        assert _expand_env_vars("${PROFILE_ONLY}", {}.get) == "${PROFILE_ONLY}"
+
 
 
 

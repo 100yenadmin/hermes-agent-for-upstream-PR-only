@@ -1834,6 +1834,7 @@ def _profile_runtime_scope(profile_home: "Path"):
     returns an isolated dict — which is what keeps subprocesses (MCP, kanban)
     from inheriting cross-profile secrets.
     """
+    from profile_runtime_context import use_profile_runtime_context
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     from agent.secret_scope import (
         build_profile_secret_scope,
@@ -1843,12 +1844,17 @@ def _profile_runtime_scope(profile_home: "Path"):
     from hermes_cli.env_loader import hydrate_profile_secret_sources
 
     home_token = set_hermes_home_override(str(profile_home))
-    hydrate_profile_secret_sources(Path(profile_home))
-    secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+    secret_token = None
     try:
-        yield
+        hydrate_profile_secret_sources(Path(profile_home))
+        secret_token = set_secret_scope(
+            build_profile_secret_scope(Path(profile_home))
+        )
+        with use_profile_runtime_context(profile_home):
+            yield
     finally:
-        reset_secret_scope(secret_token)
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
         reset_hermes_home_override(home_token)
 
 
@@ -6176,7 +6182,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Docker, so users commonly need a dedicated export mount such as
         `host-dir:/output`.
         """
-        if os.getenv("TERMINAL_ENV", "").strip().lower() != "docker":
+        from profile_runtime_context import terminal_getenv
+
+        if (terminal_getenv("TERMINAL_ENV") or "").strip().lower() != "docker":
             return
 
         connected = self.config.get_connected_platforms()
@@ -6184,7 +6192,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not messaging_platforms:
             return
 
-        raw_volumes = os.getenv("TERMINAL_DOCKER_VOLUMES", "").strip()
+        raw_volumes = (terminal_getenv("TERMINAL_DOCKER_VOLUMES") or "").strip()
         volumes: List[str] = []
         if raw_volumes:
             try:
@@ -15955,7 +15963,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from agent.context_references import preprocess_context_references_async
                 from agent.model_metadata import get_model_context_length_async
 
-                _msg_cwd = os.environ.get("TERMINAL_CWD", os.path.expanduser("~"))
+                from profile_runtime_context import terminal_getenv
+
+                _msg_cwd = terminal_getenv("TERMINAL_CWD", os.path.expanduser("~"))
                 _msg_config_ctx = None
                 _msg_cfg = None
                 _msg_model_cfg = {}
@@ -17605,6 +17615,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # text, so we fire a separate trailing send below.
             _footer_line = ""
             try:
+                from profile_runtime_context import terminal_getenv
                 from gateway.runtime_footer import build_footer_line as _bfl
                 _footer_line = _bfl(
                     user_config=_load_gateway_config(),
@@ -17612,7 +17623,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     model=agent_result.get("model"),
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
-                    cwd=os.environ.get("TERMINAL_CWD", ""),
+                    cwd=terminal_getenv("TERMINAL_CWD", ""),
                     turn_seconds=_turn_seconds,
                 )
             except Exception as _footer_err:

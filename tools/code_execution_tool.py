@@ -48,6 +48,7 @@ import uuid
 _IS_WINDOWS = platform.system() == "Windows"
 from typing import Any, Dict, List, Optional, Tuple
 
+from profile_runtime_context import terminal_getenv
 from tools.thread_context import propagate_context_to_thread
 
 # Availability gate.  On Windows we fall back to loopback TCP for the
@@ -296,6 +297,21 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
             scrubbed = scrub_kanban_env(scrubbed)
     except Exception:
         pass
+    from profile_runtime_context import overlay_terminal_env, terminal_scope_active
+
+    safe_terminal_names = (
+        "TERMINAL_ENV",
+        "TERMINAL_CWD",
+        "TERMINAL_TIMEOUT",
+        "TERMINAL_MAX_FOREGROUND_TIMEOUT",
+        "TERMINAL_HOME_MODE",
+        "TERMINAL_SCRATCH_DIR",
+    )
+    if terminal_scope_active():
+        for name in list(scrubbed):
+            if name.startswith("TERMINAL_"):
+                scrubbed.pop(name, None)
+    overlay_terminal_env(scrubbed, names=safe_terminal_names)
     return scrubbed
 
 
@@ -1481,6 +1497,7 @@ def execute_code(
         child_env.pop("HERMES_TIMEZONE", None)
 
         from hermes_constants import apply_subprocess_home_env
+
         apply_subprocess_home_env(child_env)
 
         # Resolve interpreter + CWD based on execute_code mode.
@@ -1936,7 +1953,7 @@ def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:
             session_cwd = None
         if session_cwd and os.path.isdir(session_cwd):
             return session_cwd
-    raw = os.environ.get("TERMINAL_CWD", "").strip()
+    raw = (terminal_getenv("TERMINAL_CWD") or "").strip()
     if raw:
         expanded = os.path.expanduser(raw)
         if os.path.isdir(expanded):

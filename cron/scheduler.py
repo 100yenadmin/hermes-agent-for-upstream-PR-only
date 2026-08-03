@@ -1034,16 +1034,37 @@ def _resolve_home_env_var(platform_name: str) -> str:
     return _plugin_cron_env_var(name)
 
 
+_CRON_PROCESS_FALLBACK_ENV = {
+    "HERMES_CRON_SCRIPT_TIMEOUT",
+    "HERMES_CRON_SESSION_DB_TIMEOUT",
+    "HERMES_CRON_TIMEOUT",
+    "HERMES_CRON_MAX_PARALLEL",
+}
+
+
+def _cron_env_get(name: str) -> str:
+    from agent.secret_scope import current_secret_scope
+
+    scope = current_secret_scope()
+    if scope is not None:
+        scoped_value = scope.get(name)
+        if scoped_value is not None:
+            return scoped_value or ""
+        if name not in _CRON_PROCESS_FALLBACK_ENV:
+            return ""
+    return os.getenv(name, "")
+
+
 def _get_home_target_chat_id(platform_name: str) -> str:
     """Return the configured home target chat/room ID for a delivery platform."""
     env_var = _resolve_home_env_var(platform_name)
     if not env_var:
         return ""
-    value = os.getenv(env_var, "")
+    value = _cron_env_get(env_var)
     if not value:
         legacy = _LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
         if legacy:
-            value = os.getenv(legacy, "")
+            value = _cron_env_get(legacy)
     return value
 
 
@@ -1062,14 +1083,14 @@ def _get_home_target_thread_id(platform_name: str) -> Optional[str]:
     if not env_var:
         return None
     if platform_name.lower() == "telegram":
-        cron_thread = os.getenv("TELEGRAM_CRON_THREAD_ID", "").strip()
+        cron_thread = _cron_env_get("TELEGRAM_CRON_THREAD_ID").strip()
         if cron_thread:
             return cron_thread
-    value = os.getenv(f"{env_var}_THREAD_ID", "").strip()
+    value = _cron_env_get(f"{env_var}_THREAD_ID").strip()
     if not value:
         legacy = _LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
         if legacy:
-            value = os.getenv(f"{legacy}_THREAD_ID", "").strip()
+            value = _cron_env_get(f"{legacy}_THREAD_ID").strip()
     return value or None
 
 
@@ -2120,7 +2141,7 @@ def _get_script_timeout() -> int:
         except Exception:
             logger.warning("Invalid patched _SCRIPT_TIMEOUT=%r; using env/config/default", _SCRIPT_TIMEOUT)
 
-    env_value = os.getenv("HERMES_CRON_SCRIPT_TIMEOUT", "").strip()
+    env_value = _cron_env_get("HERMES_CRON_SCRIPT_TIMEOUT").strip()
     if env_value:
         try:
             timeout = int(float(env_value))
@@ -2915,7 +2936,7 @@ def run_job(
         # Resolve timeout: env override → config.yaml → default 10s.
         # Mirrors the script_timeout_seconds resolution pattern.
         _session_db_timeout: float | None = None
-        _raw_env_timeout = os.getenv("HERMES_CRON_SESSION_DB_TIMEOUT", "").strip()
+        _raw_env_timeout = _cron_env_get("HERMES_CRON_SESSION_DB_TIMEOUT").strip()
         if _raw_env_timeout:
             try:
                 _session_db_timeout = float(_raw_env_timeout)
@@ -3085,42 +3106,33 @@ def run_job(
         _VAR_MAP[_var_name].set("")
 
     # Per-job working directory — _SESSION_CWD was already set via
-    # set_session_vars(cwd=...) above. Here we only handle the
-    # process-global TERMINAL_CWD env var, which is serialized by
-    # _terminal_cwd_lock to avoid leaking into concurrent jobs.
-    #
-    # os.environ["TERMINAL_CWD"] is process-global, so this override is
-    # serialized by _terminal_cwd_lock (acquired just below): a workdir job
-    # holds it as a writer for its whole run, excluding every other job, while
-    # workdir-less jobs hold it as readers and stay parallel with each other.
-    # The sequential pool only keeps workdir jobs from overlapping EACH OTHER;
-    # the lock is what additionally keeps a concurrently-firing workdir-less
-    # parallel-pool job from observing this override and running its shell /
-    # file / code-exec commands in the wrong directory.  For workdir-less jobs
-    # we leave TERMINAL_CWD untouched — preserves the original behaviour
-    # (skip_context_files=True, tools use whatever cwd the scheduler has).
-    #
-    # The critical path (resolve_context_cwd / build_context_files_prompt)
-    # checks _SESSION_CWD first, so gateway sessions with no override see
-    # their own cwd, not the cron's workdir (#69396).
+    # set_session_vars(cwd=...) above. In a multiplexed profile runtime, keep the
+    # terminal override context-local. Legacy single-profile cron retains the
+    # process-global TERMINAL_CWD bridge and readers-writer lock unchanged.
+    from profile_runtime_context import (
+        reset_terminal_env_overrides,
+        set_terminal_env_overrides,
+        terminal_scope_active,
+    )
 
-    # Snapshot the current env value BEFORE acquiring the lock so the finally
-    # below can always restore it, even if an exception fires before we set the
-    # override inside the try.  This read can't leak the lock (it precedes the
-    # acquire) and is a no-op for workdir-less jobs (they never mutate the env).
-    _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
+    _scoped_terminal_runtime = terminal_scope_active()
+    _prior_terminal_cwd = (
+        "_SCOPED_"
+        if _scoped_terminal_runtime
+        else os.environ.get("TERMINAL_CWD", "_UNSET_")
+    )
+    _terminal_cwd_override_token = None
 
-    _holds_cwd_write = _job_workdir is not None
-    if _holds_cwd_write:
-        _terminal_cwd_lock.acquire_write()
-    else:
-        _terminal_cwd_lock.acquire_read()
+    _holds_cwd_lock = not _scoped_terminal_runtime
+    _holds_cwd_write = _holds_cwd_lock and _job_workdir is not None
+    if _holds_cwd_lock:
+        if _holds_cwd_write:
+            _terminal_cwd_lock.acquire_write()
+        else:
+            _terminal_cwd_lock.acquire_read()
 
-    # Everything after the acquire MUST live inside this try, so the finally
-    # below always releases the lock even if the env override or any later
-    # statement raises.  A leaked writer would deadlock the whole scheduler
-    # (every future job blocks on acquire_*); a leaked reader blocks all
-    # future writers.  Acquire itself can't leak (it either blocks or returns).
+    # Everything after a legacy lock acquire MUST live inside this try so the
+    # finally below always releases it. Scoped jobs own only a ContextVar token.
     _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
     _cron_session_token = None
     try:
@@ -3130,27 +3142,32 @@ def run_job(
         # cron entrypoints and tests.
         _cron_session_token = _cron_session_var.set("1")
         if _job_workdir:
-            os.environ["TERMINAL_CWD"] = _job_workdir
+            if _scoped_terminal_runtime:
+                _terminal_cwd_override_token, _ = set_terminal_env_overrides(
+                    {"TERMINAL_CWD": _job_workdir}
+                )
+            else:
+                os.environ["TERMINAL_CWD"] = _job_workdir
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
 
-        # Re-read .env and config.yaml fresh every run so provider/key
-        # changes take effect without a gateway restart. Route through
-        # load_hermes_dotenv (not a bare load_dotenv) and reset the secret-
-        # source cache first: startup already applied external secrets and
-        # recorded this HERMES_HOME in _APPLIED_HOMES, so a naive reload would
-        # re-apply only the .env placeholder and never re-resolve a Bitwarden/
-        # BSM-backed secret — leaving cron jobs 401'ing on the placeholder
-        # (#33465). Clearing the cache forces the re-pull; the resolved secret
-        # overrides the placeholder only when secrets.bitwarden.override_existing
-        # is set (mirrors startup), and the Bitwarden value-cache keeps the
-        # forced re-pull off the network. load_hermes_dotenv also handles the
-        # utf-8/latin-1 encoding fallback internally.
-        from hermes_cli.env_loader import (
-            load_hermes_dotenv,
-            reset_secret_source_cache,
-        )
-        reset_secret_source_cache()
-        load_hermes_dotenv(hermes_home=_get_hermes_home())
+        # Re-read .env and config.yaml fresh every ordinary single-profile run
+        # so provider/key changes take effect without a gateway restart. A
+        # multiplexed run already has fresh routed secret and terminal scopes
+        # installed by run_one_job(); reloading here would mutate process-global
+        # os.environ with one profile and race concurrent jobs.
+        if not terminal_scope_active():
+            # Route through load_hermes_dotenv (not a bare load_dotenv) and reset
+            # the secret-source cache first. Startup already applied external
+            # secrets and recorded this HERMES_HOME in _APPLIED_HOMES, so a naive
+            # reload would re-apply only the .env placeholder and never re-resolve
+            # a Bitwarden/BSM-backed secret (#33465).
+            from hermes_cli.env_loader import (
+                load_hermes_dotenv,
+                reset_secret_source_cache,
+            )
+
+            reset_secret_source_cache()
+            load_hermes_dotenv(hermes_home=_get_hermes_home())
 
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
@@ -3168,7 +3185,7 @@ def run_job(
         # re-read from storage every tick so a ``cronjob action=update
         # model=...`` after a failed run takes effect on the next tick — there
         # is no in-memory cache.
-        model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+        model = job.get("model") or _cron_env_get("HERMES_MODEL") or ""
 
         # cron.model / cron.model_provider: a deliberate cron-fleet default
         # so unattended jobs stop shadowing chat `/model` switches. When an
@@ -3254,7 +3271,7 @@ def run_job(
         prefill_messages = None
         agent_cfg = _cfg.get("agent", {}) if isinstance(_cfg.get("agent", {}), dict) else {}
         prefill_file = (
-            os.getenv("HERMES_PREFILL_MESSAGES_FILE", "")
+            _cron_env_get("HERMES_PREFILL_MESSAGES_FILE")
             or _cfg.get("prefill_messages_file", "")
             or agent_cfg.get("prefill_messages_file", "")
         )
@@ -3528,7 +3545,7 @@ def run_job(
         #
         # Uses the agent's built-in activity tracker (updated by
         # _touch_activity() on every tool call, API call, and stream delta).
-        _raw_cron_timeout = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
+        _raw_cron_timeout = _cron_env_get("HERMES_CRON_TIMEOUT").strip()
         if _raw_cron_timeout:
             try:
                 _cron_timeout = float(_raw_cron_timeout)
@@ -3757,20 +3774,19 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
-        # Restore TERMINAL_CWD to whatever it was before this job ran.  We
-        # only ever mutate it when the job has a workdir; see the setup block
-        # at the top of run_job for the serialization guarantee.
-        if _job_workdir:
+        if _terminal_cwd_override_token is not None:
+            reset_terminal_env_overrides(_terminal_cwd_override_token)
+        elif _job_workdir:
+            # Legacy single-profile bridge only.
             if _prior_terminal_cwd == "_UNSET_":
                 os.environ.pop("TERMINAL_CWD", None)
             else:
                 os.environ["TERMINAL_CWD"] = _prior_terminal_cwd
-        # Release the cwd lock now that the env is restored, so a waiting
-        # workdir job (or queued reader) can proceed without seeing the override.
-        if _holds_cwd_write:
-            _terminal_cwd_lock.release_write()
-        else:
-            _terminal_cwd_lock.release_read()
+        if _holds_cwd_lock:
+            if _holds_cwd_write:
+                _terminal_cwd_lock.release_write()
+            else:
+                _terminal_cwd_lock.release_read()
         # Clean up ContextVar session/delivery state for this job.
         # clear_session_vars also clears _SESSION_CWD internally, so no
         # separate clear_session_cwd() call is needed.
@@ -3938,14 +3954,22 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # resolve_runtime_provider() raised UnscopedSecretError before model
         # selection, breaking every cron job. Mirrors the per-turn pattern in
         # gateway/run.py (_profile_runtime_scope).
+        from contextlib import nullcontext
+        from profile_runtime_context import use_profile_runtime_context
         from agent.secret_scope import (
             build_profile_secret_scope,
+            is_multiplex_active,
             reset_secret_scope,
             set_secret_scope,
         )
 
+        _profile_home = _get_hermes_home()
+        if is_multiplex_active():
+            from hermes_cli.env_loader import refresh_profile_secret_sources
+
+            refresh_profile_secret_sources(_profile_home)
         _scope_token = set_secret_scope(
-            build_profile_secret_scope(_get_hermes_home())
+            build_profile_secret_scope(_profile_home)
         )
         # Defer the cron agent's async-resource teardown until AFTER delivery.
         # run_job normally closes the agent (and reaps stale async clients) in
@@ -3956,18 +3980,22 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         try:
-            success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
+            _runtime_scope = (
+                use_profile_runtime_context(_profile_home)
+                if is_multiplex_active()
+                else nullcontext()
             )
-        except BaseException:
-            # run_job's finally still hands back the agent when it raises; tear
-            # it down here so a failed run never leaks its async resources
-            # (#10200), then re-raise into the outer handler. BaseException
-            # (not just Exception) so a KeyboardInterrupt/SystemExit mid-run
-            # still triggers teardown before propagating.
-            for _deferred_agent in _deferred_agents:
-                _teardown_cron_agent(_deferred_agent, job["id"])
-            raise
+            with _runtime_scope:
+                try:
+                    success, output, final_response, error = run_job(
+                        job, defer_agent_teardown=_deferred_agents
+                    )
+                except BaseException:
+                    # run_job's finally still hands back the agent when it raises;
+                    # tear it down before leaving the profile cache scope.
+                    for _deferred_agent in _deferred_agents:
+                        _teardown_cron_agent(_deferred_agent, job["id"])
+                    raise
         finally:
             reset_secret_scope(_scope_token)
 
@@ -3978,7 +4006,15 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # deferred agent is still torn down. Otherwise the outer `except` would
         # swallow the error and leak the agent's subprocesses/clients (#10200).
         delivery_error = None
+        _delivery_scope = None
+        _delivery_secret_token = None
         try:
+            if is_multiplex_active():
+                _delivery_secret_token = set_secret_scope(
+                    build_profile_secret_scope(_profile_home)
+                )
+                _delivery_scope = use_profile_runtime_context(_profile_home)
+                _delivery_scope.__enter__()
             output_file = save_job_output(job["id"], output)
             if verbose:
                 logger.info("Output saved to: %s", output_file)
@@ -4027,11 +4063,14 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
         finally:
-            # Tear down the deferred agent(s) now that save + delivery have run
-            # (or raised). Must happen on every path so cron agents never leak
-            # their subprocesses/clients (#10200).
-            for _deferred_agent in _deferred_agents:
-                _teardown_cron_agent(_deferred_agent, job["id"])
+            try:
+                for _deferred_agent in _deferred_agents:
+                    _teardown_cron_agent(_deferred_agent, job["id"])
+            finally:
+                if _delivery_scope is not None:
+                    _delivery_scope.__exit__(None, None, None)
+                if _delivery_secret_token is not None:
+                    reset_secret_scope(_delivery_secret_token)
 
         # Treat empty final_response as a soft failure so last_status
         # is not "ok" — the agent ran but produced nothing useful.
@@ -4189,7 +4228,7 @@ def tick(
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
         _max_workers: Optional[int] = None
         try:
-            _env_par = os.getenv("HERMES_CRON_MAX_PARALLEL", "").strip()
+            _env_par = _cron_env_get("HERMES_CRON_MAX_PARALLEL").strip()
             if _env_par:
                 _max_workers = int(_env_par) or None
         except (ValueError, TypeError):
@@ -4219,12 +4258,13 @@ def tick(
             body."""
             return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
 
-        # Partition due jobs: those with a per-job workdir mutate
-        # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
-        # they queue on the single-thread sequential pool to run one at a time.
-        # That alone only keeps workdir jobs from overlapping EACH OTHER;
-        # run_job's _terminal_cwd_lock is what additionally stops a concurrently
-        # firing workdir-less parallel-pool job from observing the override.
+        # Partition due jobs conservatively: legacy single-profile workdir jobs
+        # mutate process-global TERMINAL_CWD, while multiplexed jobs use a
+        # ContextVar override. Keeping one partition preserves legacy ordering
+        # without coupling tick() to the runtime-scope implementation.
+        # That alone only keeps legacy workdir jobs from overlapping each other;
+        # the unscoped run_job lock additionally stops a concurrent workdir-less
+        # job from observing the process-global override.
         sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
         parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
 

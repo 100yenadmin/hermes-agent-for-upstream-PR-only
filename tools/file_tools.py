@@ -11,6 +11,11 @@ import threading
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
+from profile_runtime_context import (
+    current_profile_cache_key,
+    profile_scoped_key,
+    terminal_getenv,
+)
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
     ShellFileOperations,
@@ -58,30 +63,32 @@ def _expand_tilde(path: str) -> str:
 # Configurable via config.yaml:  file_read_max_chars: 200000
 # ---------------------------------------------------------------------------
 _DEFAULT_MAX_READ_CHARS = 100_000
-_max_read_chars_cached: int | None = None
+_max_read_chars_cached: dict[str, int] | None = {}
 
 
 def _get_max_read_chars() -> int:
     """Return the configured max characters per file read.
 
-    Reads ``file_read_max_chars`` from config.yaml on first call, caches
-    the result for the lifetime of the process.  Falls back to the
-    built-in default if the config is missing or invalid.
+    Reads ``file_read_max_chars`` from config.yaml on first call per profile.
+    Falls back to the built-in default if the config is missing or invalid.
     """
     global _max_read_chars_cached
-    if _max_read_chars_cached is not None:
-        return _max_read_chars_cached
+    if _max_read_chars_cached is None:
+        _max_read_chars_cached = {}
+    cache_key = current_profile_cache_key() or "process"
+    if cache_key in _max_read_chars_cached:
+        return _max_read_chars_cached[cache_key]
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
         val = cfg.get("file_read_max_chars")
         if isinstance(val, (int, float)) and val > 0:
-            _max_read_chars_cached = int(val)
-            return _max_read_chars_cached
+            _max_read_chars_cached[cache_key] = int(val)
+            return _max_read_chars_cached[cache_key]
     except Exception:
         pass
-    _max_read_chars_cached = _DEFAULT_MAX_READ_CHARS
-    return _max_read_chars_cached
+    _max_read_chars_cached[cache_key] = _DEFAULT_MAX_READ_CHARS
+    return _max_read_chars_cached[cache_key]
 
 
 def _truncate_to_char_budget(content: str, max_chars: int) -> tuple[str, int, bool]:
@@ -180,9 +187,10 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
         try:
             container_key = _resolve_container_task_id(task_id)
         except Exception:
-            container_key = task_id
+            container_key = profile_scoped_key(task_id)
+        raw_key = profile_scoped_key(task_id)
         with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
+            env = _active_environments.get(container_key) or _active_environments.get(raw_key)
         if env is not None:
             name = env.__class__.__name__.lower()
             if "local" in name:
@@ -198,9 +206,9 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
             if "daytona" in name:
                 return "daytona"
         cfg = _get_env_config()
-        return str(cfg.get("env_type") or os.getenv("TERMINAL_ENV") or "local").lower()
+        return str(cfg.get("env_type") or terminal_getenv("TERMINAL_ENV") or "local").lower()
     except Exception:
-        return str(os.getenv("TERMINAL_ENV") or "local").lower()
+        return str(terminal_getenv("TERMINAL_ENV") or "local").lower()
 
 
 def _uses_container_paths(task_id: str = "default") -> bool:
@@ -247,7 +255,7 @@ def _configured_terminal_cwd() -> str | None:
     relative to, which is exactly the ambiguity that misroutes worktree edits.
     Only an absolute, sentinel-free value is honored.
     """
-    return _sentinel_free_abs_cwd(os.environ.get("TERMINAL_CWD"))
+    return _sentinel_free_abs_cwd(terminal_getenv("TERMINAL_CWD"))
 
 
 def _registered_task_cwd_override(task_id: str = "default") -> str | None:
@@ -713,12 +721,13 @@ def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | Non
         )
 
         container_key = _resolve_container_task_id(task_id)
+        raw_key = profile_scoped_key(task_id)
     except Exception:
         return None
 
     try:
         with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
+            env = _active_environments.get(container_key) or _active_environments.get(raw_key)
 
         if env is not None:
             if env.__class__.__name__ == "DockerEnvironment" and bool(
@@ -835,10 +844,16 @@ _patch_failure_lock = threading.Lock()
 _patch_failure_tracker: dict = {}  # {task_id: {resolved_path: count}}
 
 
+def _tracker_key(task_id: str | None) -> str:
+    """Return the profile-qualified key for file-tool in-memory state."""
+
+    return profile_scoped_key(task_id or "default")
+
+
 def _record_patch_failure(task_id: str, resolved_path: str) -> int:
     """Increment and return the consecutive-failure count for this path."""
     with _patch_failure_lock:
-        task_failures = _patch_failure_tracker.setdefault(task_id, {})
+        task_failures = _patch_failure_tracker.setdefault(_tracker_key(task_id), {})
         # Cap dict size per task to avoid unbounded growth in long sessions
         # where the agent fails on many distinct files.  64 distinct
         # failing files per task is generous; older entries get evicted.
@@ -857,7 +872,7 @@ def _reset_patch_failures(task_id: str, resolved_paths: list) -> None:
     if not resolved_paths:
         return
     with _patch_failure_lock:
-        task_failures = _patch_failure_tracker.get(task_id)
+        task_failures = _patch_failure_tracker.get(_tracker_key(task_id))
         if not task_failures:
             return
         for rp in resolved_paths:
@@ -957,7 +972,7 @@ def _check_not_found_cache(op: str, resolved_str: str, task_id: str) -> str | No
     import os as _os
     import time
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
+        task_data = _read_tracker.get(_tracker_key(task_id))
         if not task_data:
             return None
         nf = task_data.get("not_found")
@@ -983,7 +998,7 @@ def _check_not_found_cache(op: str, resolved_str: str, task_id: str) -> str | No
     # task's read/search bookkeeping.
     if _os.path.exists(resolved_str):
         with _read_tracker_lock:
-            task_data = _read_tracker.get(task_id)
+            task_data = _read_tracker.get(_tracker_key(task_id))
             nf = task_data.get("not_found") if task_data else None
             if nf:
                 nf.pop((op, resolved_str), None)
@@ -995,7 +1010,7 @@ def _record_not_found(op: str, resolved_str: str, task_id: str, error_json: str)
     """Cache a not-found error so the next *op* call for *resolved_str* skips I/O."""
     import time
     with _read_tracker_lock:
-        task_data = _read_tracker.setdefault(task_id, {
+        task_data = _read_tracker.setdefault(_tracker_key(task_id), {
             "last_key": None, "consecutive": 0,
             "read_history": set(), "dedup": {},
             "dedup_hits": {}, "read_timestamps": {},
@@ -1373,7 +1388,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         resolved_str = str(_resolved)
         dedup_key = (resolved_str, offset, limit)
         with _read_tracker_lock:
-            task_data = _read_tracker.setdefault(task_id, {
+            task_data = _read_tracker.setdefault(_tracker_key(task_id), {
                 "last_key": None, "consecutive": 0,
                 "read_history": set(), "dedup": {},
                 "dedup_hits": {}, "read_timestamps": {},
@@ -1586,7 +1601,7 @@ def reset_file_dedup(task_id: str = None):
     """
     with _read_tracker_lock:
         if task_id:
-            task_data = _read_tracker.get(task_id)
+            task_data = _read_tracker.get(_tracker_key(task_id))
             if task_data:
                 if "dedup" in task_data:
                     task_data["dedup"].clear()
@@ -1610,7 +1625,7 @@ def notify_other_tool_call(task_id: str = "default"):
     resets and the next read is treated as fresh.
     """
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
+        task_data = _read_tracker.get(_tracker_key(task_id))
         if task_data:
             task_data["last_key"] = None
             task_data["consecutive"] = 0
@@ -1647,7 +1662,7 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
     except (OSError, ValueError):
         return
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
+        task_data = _read_tracker.get(_tracker_key(task_id))
         if task_data is None:
             return
         dedup = task_data.get("dedup")
@@ -1683,7 +1698,7 @@ def _update_read_timestamp(filepath: str, task_id: str) -> None:
     except (OSError, ValueError):
         return
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
+        task_data = _read_tracker.get(_tracker_key(task_id))
         if task_data is not None:
             task_data.setdefault("read_timestamps", {})[resolved] = current_mtime
             _cap_read_tracker_data(task_data)
@@ -1701,7 +1716,7 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
     except (OSError, ValueError):
         return None
     with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
+        task_data = _read_tracker.get(_tracker_key(task_id))
         if not task_data:
             return None
         read_mtime = task_data.get("read_timestamps", {}).get(resolved)
@@ -2060,7 +2075,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             offset,
         )
         with _read_tracker_lock:
-            task_data = _read_tracker.setdefault(task_id, {
+            task_data = _read_tracker.setdefault(_tracker_key(task_id), {
                 "last_key": None, "consecutive": 0, "read_history": set(),
             })
             if task_data["last_key"] == search_key:

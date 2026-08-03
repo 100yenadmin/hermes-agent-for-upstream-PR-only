@@ -687,30 +687,34 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
 
 
 def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path):
-    """Agent construction must install the selected profile's secret scope.
-
-    Without it, get_secret() falls through to process os.environ, so a session
-    "switched" to profile X resolves credentials from the LAUNCH profile's
-    .env (#67605 item 2).
-    """
+    """Agent construction installs the selected profile's secret/runtime scope."""
     import threading
 
     from agent.secret_scope import current_secret_scope
+    from profile_runtime_context import current_profile_runtime_context, terminal_getenv
 
     profile_home = tmp_path / "profiles" / "grace"
     profile_home.mkdir(parents=True)
     (profile_home / ".env").write_text(
         "PROXMOX_TOKEN=grace-secret\n", encoding="utf-8"
     )
+    (profile_home / "config.yaml").write_text(
+        "terminal:\n  backend: docker\n  timeout: 17\n",
+        encoding="utf-8",
+    )
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default"))
 
     scopes = []
+    runtime_contexts = []
     built = threading.Event()
 
     def _fake_make_agent(*args, **kwargs):
         scope = current_secret_scope()
         scopes.append(dict(scope) if scope else None)
+        runtime_contexts.append(
+            (current_profile_runtime_context(), terminal_getenv("TERMINAL_ENV"))
+        )
         built.set()
         return type("Agent", (), {"model": "test"})()
 
@@ -735,10 +739,13 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     try:
         server._start_agent_build(sid, session)
         assert built.wait(timeout=2)
+        assert ready.wait(timeout=2)
     finally:
         server._sessions.pop(sid, None)
 
     assert scopes == [{"PROXMOX_TOKEN": "grace-secret"}]
+    assert runtime_contexts[0][0] is not None
+    assert runtime_contexts[0][1] == "docker"
 
 
 def test_profile_configured_cwd_reads_target_profile(tmp_path):
@@ -747,6 +754,38 @@ def test_profile_configured_cwd_reads_target_profile(tmp_path):
     project.mkdir()
     home = _write_profile_cfg(tmp_path / "home", str(project))
     assert server._profile_configured_cwd(home) == str(project)
+
+
+def test_profile_configured_cwd_expands_target_profile_env(monkeypatch, tmp_path):
+    project = tmp_path / "profile-project"
+    project.mkdir()
+    home = tmp_path / "profile-home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "terminal:\n  cwd: ${env:PROFILE_CWD}\n",
+        encoding="utf-8",
+    )
+    (home / ".env").write_text(
+        f"PROFILE_CWD={project}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PROFILE_CWD", str(tmp_path / "launch-project"))
+
+    assert server._profile_configured_cwd(home) == str(project)
+    assert os.environ["PROFILE_CWD"] == str(tmp_path / "launch-project")
+
+
+def test_launch_configured_cwd_expands_process_env(monkeypatch, tmp_path):
+    project = tmp_path / "launch-project"
+    project.mkdir()
+    monkeypatch.setenv("LAUNCH_CWD", str(project))
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"terminal": {"cwd": "${env:LAUNCH_CWD}"}},
+    )
+
+    assert server._launch_configured_cwd() == str(project)
 
 
 def test_profile_configured_cwd_skips_placeholders_and_missing(tmp_path):
@@ -816,6 +855,44 @@ def test_default_session_cwd_prefers_launch_config(monkeypatch, tmp_path):
     # No launch config → fall back to the process env var.
     monkeypatch.setattr(server, "_load_cfg", lambda: {})
     assert server._default_session_cwd() == str(stale)
+
+
+def test_profile_config_set_cwd_does_not_mutate_launch_env(monkeypatch, tmp_path):
+    import yaml
+
+    profile_home = tmp_path / "profile-home"
+    profile_home.mkdir()
+    (profile_home / "config.yaml").write_text(
+        "terminal:\n  backend: local\n",
+        encoding="utf-8",
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("TERMINAL_CWD", "/launch-cwd")
+    sid = "profile-config-set"
+    server._sessions[sid] = {
+        "session_key": "profile-config-set-key",
+        "profile_home": str(profile_home),
+    }
+    try:
+        response = server.handle_request(
+            {
+                "id": "cfg-1",
+                "method": "config.set",
+                "params": {
+                    "session_id": sid,
+                    "key": "terminal.cwd",
+                    "value": str(workspace),
+                },
+            }
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert "result" in response
+    assert os.environ["TERMINAL_CWD"] == "/launch-cwd"
+    saved = yaml.safe_load((profile_home / "config.yaml").read_text())
+    assert saved["terminal"]["cwd"] == str(workspace)
 
 
 def test_completion_cwd_explicit_cwd_wins_over_profile(monkeypatch, tmp_path):

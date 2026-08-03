@@ -40,6 +40,7 @@ import subprocess
 import threading
 import time
 import uuid
+from contextvars import copy_context
 
 _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
@@ -47,6 +48,7 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from profile_runtime_context import terminal_getenv
 from hermes_cli.config import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -54,6 +56,14 @@ logger = logging.getLogger(__name__)
 
 # Checkpoint file for crash recovery (gateway only)
 CHECKPOINT_PATH = get_hermes_home() / "processes.json"
+
+
+def _checkpoint_path():
+    """Return the routed profile's checkpoint path when scoped."""
+
+    from profile_runtime_context import terminal_scope_active
+
+    return get_hermes_home() / "processes.json" if terminal_scope_active() else CHECKPOINT_PATH
 
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
@@ -162,6 +172,7 @@ class ProcessRegistry:
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
+        self._recovered_checkpoint_paths: set[str] = set()
 
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
@@ -746,9 +757,10 @@ class ProcessRegistry:
                 session._pty = pty_proc
 
                 # PTY reader thread
+                reader_context = copy_context()
                 reader = threading.Thread(
-                    target=self._pty_reader_loop,
-                    args=(session,),
+                    target=reader_context.run,
+                    args=(self._pty_reader_loop, session),
                     daemon=True,
                     name=f"proc-pty-reader-{session.id}",
                 )
@@ -798,9 +810,10 @@ class ProcessRegistry:
 
         try:
             # Start output reader thread
+            reader_context = copy_context()
             reader = threading.Thread(
-                target=self._reader_loop,
-                args=(session,),
+                target=reader_context.run,
+                args=(self._reader_loop, session),
                 daemon=True,
                 name=f"proc-reader-{session.id}",
             )
@@ -916,9 +929,10 @@ class ProcessRegistry:
 
         if not session.exited:
             # Start a poller thread that periodically reads the log file
+            reader_context = copy_context()
             reader = threading.Thread(
-                target=self._env_poller_loop,
-                args=(session, env, log_path, pid_path, exit_path),
+                target=reader_context.run,
+                args=(self._env_poller_loop, session, env, log_path, pid_path, exit_path),
                 daemon=True,
                 name=f"proc-poller-{session.id}",
             )
@@ -1534,7 +1548,7 @@ class ProcessRegistry:
         from tools.interrupt import is_interrupted as _is_interrupted
 
         try:
-            default_timeout = int(os.getenv("TERMINAL_TIMEOUT", "180"))
+            default_timeout = int(terminal_getenv("TERMINAL_TIMEOUT", "180"))
         except (ValueError, TypeError):
             default_timeout = 180
         max_timeout = default_timeout
@@ -2059,6 +2073,8 @@ class ProcessRegistry:
             with self._lock:
                 entries = []
                 for s in self._running.values():
+                    if not _process_visible_to_active_profile(s):
+                        continue
                     if not s.exited:
                         # Lazily backfill the kernel start time for host PIDs so
                         # recovery after restart can detect PID recycling even
@@ -2088,7 +2104,7 @@ class ProcessRegistry:
             
             # Atomic write to avoid corruption on crash
             from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, entries)
+            atomic_json_write(_checkpoint_path(), entries)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
@@ -2098,11 +2114,17 @@ class ProcessRegistry:
 
         Returns the number of processes recovered as detached.
         """
-        if not CHECKPOINT_PATH.exists():
+        checkpoint_path = _checkpoint_path()
+        checkpoint_key = str(checkpoint_path.resolve())
+        with self._lock:
+            if checkpoint_key in self._recovered_checkpoint_paths:
+                return 0
+            self._recovered_checkpoint_paths.add(checkpoint_key)
+        if not checkpoint_path.exists():
             return 0
 
         try:
-            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+            entries = json.loads(checkpoint_path.read_text(encoding="utf-8"))
         except Exception:
             return 0
 
@@ -2477,6 +2499,20 @@ def _redact_process_result(result: dict) -> dict:
     return result
 
 
+def _process_visible_to_active_profile(session: ProcessSession | None) -> bool:
+    """Keep process discovery/control inside the active routed profile."""
+
+    if session is None:
+        return False
+    from profile_runtime_context import current_profile_cache_key
+
+    profile_key = current_profile_cache_key()
+    task_id = str(session.task_id or "")
+    if profile_key is None:
+        return not task_id.startswith("profile:")
+    return task_id.startswith(f"profile:{profile_key}:")
+
+
 def _handle_process(args, **kw):
     task_id = kw.get("task_id")
     action = args.get("action", "")
@@ -2492,13 +2528,20 @@ def _handle_process(args, **kw):
             session_key = get_current_session_key(default="") or ""
         except Exception:
             session_key = ""
-        return json.dumps(
-            {"processes": process_registry.list_sessions(task_id=task_id, session_key=session_key or None)},
-            ensure_ascii=False,
+        processes = process_registry.list_sessions(
+            task_id=task_id, session_key=session_key or None
         )
+        processes = [
+            item
+            for item in processes
+            if _process_visible_to_active_profile(process_registry.get(item.get("id", "")))
+        ]
+        return json.dumps({"processes": processes}, ensure_ascii=False)
     elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
         if not session_id:
             return tool_error(f"session_id is required for {action}")
+        if not _process_visible_to_active_profile(process_registry.get(session_id)):
+            return tool_error(f"No process with ID {session_id}")
         if action == "poll":
             return json.dumps(_redact_process_result(process_registry.poll(session_id)), ensure_ascii=False)
         elif action == "log":

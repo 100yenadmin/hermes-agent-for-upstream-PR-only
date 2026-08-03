@@ -16,6 +16,8 @@ from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Any
 
+from profile_runtime_context import terminal_getenv
+
 logger = logging.getLogger(__name__)
 
 _UNSET: Any = object()
@@ -64,7 +66,7 @@ def resolve_agent_cwd() -> Path:
         if p.is_dir():
             return p
         logger.warning("configured working directory does not exist: %s", override)
-    raw = os.environ.get("TERMINAL_CWD", "").strip()
+    raw = (terminal_getenv("TERMINAL_CWD") or "").strip()
     if raw:
         p = Path(raw).expanduser()
         if p.is_dir():
@@ -90,7 +92,7 @@ def resolve_context_cwd() -> Path | None:
         else:
             return p
         return None
-    raw = os.environ.get("TERMINAL_CWD", "").strip()
+    raw = (terminal_getenv("TERMINAL_CWD") or "").strip()
     if raw:
         p = Path(raw).expanduser()
         if not p.is_dir():

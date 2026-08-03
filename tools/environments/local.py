@@ -395,13 +395,19 @@ def _is_hermes_internal_secret(key: str) -> bool:
 
 
 def _inject_context_hermes_home(env: dict) -> None:
-    """Bridge the context-local Hermes home override into subprocess env."""
+    """Bridge context-local profile settings into a subprocess env."""
     try:
         from hermes_constants import get_hermes_home_override
 
         value = get_hermes_home_override()
         if value:
             env["HERMES_HOME"] = value
+    except Exception:
+        pass
+    try:
+        from profile_runtime_context import overlay_terminal_env
+
+        overlay_terminal_env(env)
     except Exception:
         pass
 

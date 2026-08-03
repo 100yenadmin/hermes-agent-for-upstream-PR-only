@@ -185,6 +185,19 @@ def hydrate_profile_secret_sources(
         return _hydrate_profile_secret_sources(Path(hermes_home))
 
 
+def refresh_profile_secret_sources(
+    hermes_home: str | os.PathLike,
+) -> dict[str, str]:
+    """Atomically invalidate and rehydrate one profile's source snapshot."""
+
+    home = Path(hermes_home)
+    home_key = str(home.resolve())
+    with _SECRET_SOURCE_CACHE_LOCK:
+        _APPLIED_HOMES.discard(home_key)
+        _SECRET_SOURCE_VALUES_BY_HOME.pop(home_key, None)
+        return _hydrate_profile_secret_sources(home)
+
+
 def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
     """Locked implementation for :func:`hydrate_profile_secret_sources`."""
     home_key = str(home.resolve())
@@ -238,19 +251,25 @@ def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
     return dict(values)
 
 
-def reset_secret_source_cache() -> None:
-    """Forget which HERMES_HOME paths have already had external secrets applied.
+def reset_secret_source_cache(
+    hermes_home: str | os.PathLike | None = None,
+) -> None:
+    """Forget cached external-secret state globally or for one home.
 
-    The first call to ``_apply_external_secret_sources(home_path)`` in a
-    process pulls from Bitwarden (or other configured backend), records the
-    applied keys in ``_SECRET_SOURCES``, and remembers ``home_path`` so
-    subsequent calls in the same process are no-ops.  Call this to force the
-    next call to re-pull — useful for tests, and for long-running processes
-    that want to refresh after a config change.
+    With no argument, preserve the historical clear-all behavior. Passing a
+    home invalidates only that routed profile so multiplex cron can refresh its
+    external sources without discarding concurrent profiles' snapshots.
     """
-    _APPLIED_HOMES.clear()
-    _SECRET_SOURCES.clear()
-    _SECRET_SOURCE_VALUES_BY_HOME.clear()
+    with _SECRET_SOURCE_CACHE_LOCK:
+        if hermes_home is None:
+            _APPLIED_HOMES.clear()
+            _SECRET_SOURCES.clear()
+            _SECRET_SOURCE_VALUES_BY_HOME.clear()
+            return
+
+        home_key = str(Path(hermes_home).resolve())
+        _APPLIED_HOMES.discard(home_key)
+        _SECRET_SOURCE_VALUES_BY_HOME.pop(home_key, None)
 
 
 def format_secret_source_suffix(env_var: str) -> str:

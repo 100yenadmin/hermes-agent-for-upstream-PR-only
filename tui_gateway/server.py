@@ -32,6 +32,11 @@ from hermes_constants import (
     set_hermes_home_override,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
+from profile_runtime_context import (
+    terminal_getenv,
+    terminal_scope_active,
+    use_profile_runtime_context,
+)
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
@@ -1401,24 +1406,31 @@ def _profile_home(profile: str | None) -> Path | None:
 
 
 def _profile_scoped(handler):
-    """Bind ``params['profile']``'s HERMES_HOME around a pet RPC handler.
-
-    Pets are per-profile: ``display.pet.*`` lives in the profile's config.yaml and
-    sprites install under its ``pets/`` dir (both resolve via ``get_hermes_home``).
-    The desktop sends ``profile`` on pet calls so config + pets dir resolve to the
-    focused profile even in app-global remote mode, where one backend serves every
-    profile. No-op for the launch profile (own-profile backends already resolve it).
-    """
+    """Bind a request's profile home, secrets, and terminal runtime."""
 
     def wrapper(rid, params):
-        home = _profile_home(params.get("profile") if isinstance(params, dict) else None)
+        params = params if isinstance(params, dict) else {}
+        home = _profile_home(params.get("profile"))
+        if home is None:
+            session = _sessions.get(params.get("session_id") or "")
+            profile_home = session.get("profile_home") if session else None
+            home = Path(profile_home) if profile_home else None
         if home is None:
             return handler(rid, params)
-        token = set_hermes_home_override(home)
+
+        from hermes_cli.env_loader import hydrate_profile_secret_sources
+
+        home_token = set_hermes_home_override(str(home))
+        secret_token = None
         try:
-            return handler(rid, params)
+            hydrate_profile_secret_sources(home)
+            secret_token = set_secret_scope(build_profile_secret_scope(home))
+            with use_profile_runtime_context(home):
+                return handler(rid, params)
         finally:
-            reset_hermes_home_override(token)
+            if secret_token is not None:
+                reset_secret_scope(secret_token)
+            reset_hermes_home_override(home_token)
 
     return wrapper
 
@@ -1459,19 +1471,19 @@ def _profile_configured_cwd(profile_home: Path | None) -> str | None:
     if profile_home is None:
         return None
     try:
+        from agent.secret_scope import build_profile_secret_scope
         from hermes_cli.config import _expand_env_vars, read_user_config_raw
 
         p = Path(profile_home) / "config.yaml"
         if not p.exists():
             return None
-        # Behavioral read of a NON-launch profile's config: load_config()
-        # would resolve the ACTIVE profile's path, so read this profile's
-        # file directly, then apply the same read-side pipeline as
-        # _load_cfg (managed overlay + ${VAR} expansion). Fail-open.
-        data = _apply_managed(read_user_config_raw(p))
-        expanded = _expand_env_vars(data)
-        if isinstance(expanded, dict):
-            data = expanded
+        # Behavioral read of a NON-launch profile's config: expand user refs
+        # through THAT profile's secret scope, then apply managed policy (whose
+        # refs deliberately use process env). Fail-open for completion/CWD UI.
+        raw = read_user_config_raw(p)
+        profile_secrets = build_profile_secret_scope(Path(profile_home))
+        expanded = _expand_env_vars(raw, getenv=profile_secrets.get)
+        data = _apply_managed(expanded if isinstance(expanded, dict) else raw)
         return _configured_cwd_from_cfg(data)
     except Exception:
         return None
@@ -1489,7 +1501,10 @@ def _launch_configured_cwd() -> str | None:
     new in-memory TUI sessions too.
     """
     try:
-        return _configured_cwd_from_cfg(_load_cfg())
+        from hermes_cli.config import _expand_env_vars
+
+        expanded = _expand_env_vars(_load_cfg(), getenv=os.environ.get)
+        return _configured_cwd_from_cfg(expanded if isinstance(expanded, dict) else {})
     except Exception:
         return None
 
@@ -1502,7 +1517,7 @@ def _default_session_cwd() -> str:
     than ``os.getcwd()`` when the in-memory gateway's process env has no bridged
     ``TERMINAL_CWD``.
     """
-    return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
+    return _launch_configured_cwd() or terminal_getenv("TERMINAL_CWD") or os.getcwd()
 
 
 def write_json(obj: dict) -> bool:
@@ -2105,6 +2120,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
         notify_registered = False
         home_token = None
         secret_token = None
+        runtime_scope = None
         profile_home = current.get("profile_home")
         try:
             tokens = _set_session_context(key)
@@ -2114,12 +2130,13 @@ def _start_agent_build(sid: str, session: dict) -> None:
             session_db = None
             if profile_home:
                 home_token = set_hermes_home_override(profile_home)
-                try:
-                    from agent.secret_scope import build_profile_secret_scope, set_secret_scope
+                from agent.secret_scope import build_profile_secret_scope, set_secret_scope
+                from hermes_cli.env_loader import hydrate_profile_secret_sources
 
-                    secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
-                except Exception:
-                    pass
+                hydrate_profile_secret_sources(Path(profile_home))
+                secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+                runtime_scope = use_profile_runtime_context(profile_home)
+                runtime_scope.__enter__()
                 try:
                     from hermes_state import SessionDB
 
@@ -2238,6 +2255,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
             current["agent_error"] = str(e)
             _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
+            if runtime_scope is not None:
+                try:
+                    runtime_scope.__exit__(None, None, None)
+                except Exception:
+                    pass
             if home_token is not None:
                 reset_hermes_home_override(home_token)
             if secret_token is not None:
@@ -2309,7 +2331,7 @@ def _completion_cwd(params: dict | None = None) -> str:
         # TERMINAL_CWD. Read the launch profile's config.yaml directly so a
         # configured terminal.cwd wins over a stale process env / launch dir.
         or _launch_configured_cwd()
-        or os.environ.get("TERMINAL_CWD")
+        or terminal_getenv("TERMINAL_CWD")
         or os.getcwd()
     )
     try:
@@ -2334,7 +2356,7 @@ def _terminal_task_cwd(session: dict | None) -> str:
     resolution path is taken even when the dashboard entrypoint did not call
     ``apply_terminal_config_to_env`` on its own ``os.environ``.
     """
-    backend = (os.environ.get("TERMINAL_ENV") or "").strip().lower()
+    backend = (terminal_getenv("TERMINAL_ENV") or "").strip().lower()
     if not backend or backend == "local":
         # Fall back to config when TERMINAL_ENV is unset (dashboard/TUI process
         # never calls apply_terminal_config_to_env on os.environ).
@@ -2348,7 +2370,7 @@ def _terminal_task_cwd(session: dict | None) -> str:
             pass
 
     if backend and backend != "local":
-        raw = os.environ.get("TERMINAL_CWD", "").strip()
+        raw = (terminal_getenv("TERMINAL_CWD") or "").strip()
         if not raw:
             try:
                 terminal_cfg = _load_cfg().get("terminal", {})
@@ -2440,7 +2462,7 @@ def _heal_dead_cwd(cwd: str) -> str:
 
 
 def _is_local_terminal_backend() -> bool:
-    backend = (os.environ.get("TERMINAL_ENV") or "").strip().lower()
+    backend = (terminal_getenv("TERMINAL_ENV") or "").strip().lower()
     return not backend or backend == "local"
 
 
@@ -3007,7 +3029,9 @@ def _save_cfg(cfg: dict):
 
     from hermes_cli.config import atomic_config_write
 
-    path = _hermes_home / "config.yaml"
+    override = get_hermes_home_override()
+    home = Path(override) if isinstance(override, str) and override else _hermes_home
+    path = home / "config.yaml"
     atomic_config_write(path, cfg)
     with _cfg_lock:
         _cfg_cache = copy.deepcopy(cfg)
@@ -9376,6 +9400,7 @@ def _run_prompt_submit(
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         secret_token = None
+        runtime_scope = None
         goal_followup = None  # set by the post-turn goal hook below
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
@@ -9410,7 +9435,12 @@ def _run_prompt_submit(
             _profile_home_str = session.get("profile_home")
             if _profile_home_str:
                 home_token = set_hermes_home_override(_profile_home_str)
+                from hermes_cli.env_loader import hydrate_profile_secret_sources
+
+                hydrate_profile_secret_sources(Path(_profile_home_str))
                 secret_token = set_secret_scope(build_profile_secret_scope(Path(_profile_home_str)))
+                runtime_scope = use_profile_runtime_context(_profile_home_str)
+                runtime_scope.__enter__()
             # The sudo password callback is thread-local (tools.terminal_tool
             # _callback_tls), so wiring it on the build thread doesn't reach this
             # turn thread — terminal sudo prompts would fall through to /dev/tty
@@ -10070,6 +10100,11 @@ def _run_prompt_submit(
                     reset_current_session_key(approval_token)
             except Exception:
                 pass
+            if runtime_scope is not None:
+                try:
+                    runtime_scope.__exit__(None, None, None)
+                except Exception:
+                    pass
             if home_token is not None:
                 reset_hermes_home_override(home_token)
             if secret_token is not None:
@@ -10466,6 +10501,7 @@ def _respond(rid, params, key, *, allow_expired=False):
 # opt/model-resolution-core PR touches its body; move it to methods_config.py
 # in a follow-up once that PR lands.
 @method("config.set")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
     session = _sessions.get(params.get("session_id", ""))
@@ -11112,7 +11148,8 @@ def _(rid, params: dict) -> dict:
         if not os.path.isdir(cwd):
             return _err(rid, 4002, f"working directory does not exist: {raw}")
         _write_config_key("terminal.cwd", cwd)
-        os.environ["TERMINAL_CWD"] = cwd
+        if not terminal_scope_active():
+            os.environ["TERMINAL_CWD"] = cwd
         return _ok(
             rid,
             {"key": "terminal.cwd", "value": cwd, "cwd": cwd, "branch": _git_branch_for_cwd(cwd)},

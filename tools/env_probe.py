@@ -35,9 +35,12 @@ import shutil
 import subprocess
 import tempfile
 import threading
+from contextvars import copy_context
+from dataclasses import dataclass, field
 from typing import Optional
 
 from hermes_cli._subprocess_compat import windows_hide_flags
+from profile_runtime_context import current_profile_cache_key, terminal_getenv
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +71,18 @@ _PROBE_WAIT_TIMEOUT = 10.0
 # stop paying it too — they just peek at the event.  If the stuck worker
 # ever finishes, the published line resumes appearing in new prompts.
 _WAIT_ALREADY_TIMED_OUT = False
+
+
+@dataclass
+class _ProfileProbeState:
+    line: Optional[str] = None
+    done: threading.Event = field(default_factory=threading.Event)
+    thread: Optional[threading.Thread] = None
+    generation: int = 0
+    wait_timed_out: bool = False
+
+
+_PROFILE_PROBE_STATES: dict[str, _ProfileProbeState] = {}
 
 # Remote backends — keep in sync with agent/prompt_builder.py:_REMOTE_TERMINAL_BACKENDS.
 # Duplicated rather than imported to avoid a circular import (prompt_builder
@@ -194,7 +209,7 @@ def _build_probe_line() -> str:
     """
     # Bail out if a remote terminal backend is configured; the host's
     # Python state isn't where the agent's tools run.
-    backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
+    backend = (terminal_getenv("TERMINAL_ENV") or "local").strip().lower()
     if backend in _REMOTE_BACKENDS:
         return ""
 
@@ -268,6 +283,66 @@ def _build_probe_line() -> str:
     return "Python toolchain: " + ", ".join(bits) + "."
 
 
+def _profile_probe_worker(profile_key: str, generation: int) -> None:
+    try:
+        line = _build_probe_line()
+    except Exception as exc:
+        logger.debug("env_probe failed for profile %s: %s", profile_key, exc)
+        line = ""
+    with _CACHE_LOCK:
+        state = _PROFILE_PROBE_STATES.get(profile_key)
+        if state is None or generation != state.generation:
+            return
+        state.line = line
+        state.done.set()
+
+
+def _ensure_profile_probe_started(profile_key: str, state: _ProfileProbeState) -> None:
+    with _CACHE_LOCK:
+        if state.done.is_set():
+            return
+        if state.thread is not None and state.thread.is_alive():
+            return
+        context = copy_context()
+        state.thread = threading.Thread(
+            target=lambda: context.run(
+                _profile_probe_worker,
+                profile_key,
+                state.generation,
+            ),
+            name=f"env-probe-{profile_key}",
+            daemon=True,
+        )
+        state.thread.start()
+
+
+def _get_profile_probe_line(profile_key: str, *, force_refresh: bool) -> str:
+    with _CACHE_LOCK:
+        state = _PROFILE_PROBE_STATES.setdefault(profile_key, _ProfileProbeState())
+        if force_refresh:
+            state.line = None
+            state.done.clear()
+            state.thread = None
+            state.generation += 1
+            state.wait_timed_out = False
+        if state.done.is_set():
+            return state.line or ""
+
+    _ensure_profile_probe_started(profile_key, state)
+    wait_timeout = 0.05 if state.wait_timed_out else _PROBE_WAIT_TIMEOUT
+    if not state.done.wait(timeout=wait_timeout):
+        if not state.wait_timed_out:
+            state.wait_timed_out = True
+            logger.warning(
+                "env_probe for profile %s did not finish within %.0fs; "
+                "building without the Python toolchain line",
+                profile_key,
+                _PROBE_WAIT_TIMEOUT,
+            )
+        return ""
+    return state.line or ""
+
+
 def get_environment_probe_line(*, force_refresh: bool = False) -> str:
     """Return the cached probe line (building it on first call).
 
@@ -284,6 +359,10 @@ def get_environment_probe_line(*, force_refresh: bool = False) -> str:
 
     ``force_refresh`` is for tests; real callers should never need it.
     """
+    profile_key = current_profile_cache_key()
+    if profile_key:
+        return _get_profile_probe_line(profile_key, force_refresh=force_refresh)
+
     global _CACHED_LINE, _PROBE_THREAD, _PROBE_GEN, _WAIT_ALREADY_TIMED_OUT
     if force_refresh:
         with _CACHE_LOCK:
@@ -356,6 +435,15 @@ def warm_environment_probe_async() -> None:
     completion event instead of recomputing.  Called from agent init
     (all platforms); safe to call from anywhere.
     """
+    profile_key = current_profile_cache_key()
+    if profile_key:
+        with _CACHE_LOCK:
+            state = _PROFILE_PROBE_STATES.setdefault(
+                profile_key,
+                _ProfileProbeState(),
+            )
+        _ensure_profile_probe_started(profile_key, state)
+        return
     _ensure_probe_started()
 
 
@@ -363,6 +451,7 @@ def _reset_cache_for_tests() -> None:
     """Test helper — clear the cache between probe scenarios."""
     global _CACHED_LINE, _PROBE_THREAD, _PROBE_GEN, _WAIT_ALREADY_TIMED_OUT
     with _CACHE_LOCK:
+        _PROFILE_PROBE_STATES.clear()
         _CACHED_LINE = None
         _PROBE_DONE.clear()
         _PROBE_THREAD = None

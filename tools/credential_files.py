@@ -27,6 +27,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Dict, List, Optional
 from hermes_cli.config import cfg_get
+from profile_runtime_context import terminal_getenv
 
 try:  # pragma: no cover - exercised via the fail-closed test below
     from agent.file_safety import get_read_block_error
@@ -50,8 +51,9 @@ def _get_registered() -> Dict[str, str]:
         return val
 
 
-# Cache for config-based file list (loaded once per process).
-_config_files: List[Dict[str, str]] | None = None
+# Cache for config-based file lists, partitioned by resolved HERMES_HOME.
+# ``None`` remains a supported test/reset sentinel.
+_config_files: dict[str, List[Dict[str, str]]] | None = {}
 
 
 def _resolve_hermes_home() -> Path:
@@ -174,16 +176,21 @@ def register_credential_files(
 
 
 def _load_config_files() -> List[Dict[str, str]]:
-    """Load ``terminal.credential_files`` from config.yaml (cached)."""
+    """Load ``terminal.credential_files`` from the active profile (cached)."""
     global _config_files
-    if _config_files is not None:
-        return _config_files
+    if _config_files is None:
+        _config_files = {}
+
+    hermes_home = _resolve_hermes_home()
+    home_key = str(hermes_home.resolve())
+    if home_key in _config_files:
+        return _config_files[home_key]
 
     result: List[Dict[str, str]] = []
     try:
-        from hermes_cli.config import read_raw_config
-        hermes_home = _resolve_hermes_home()
-        cfg = read_raw_config()
+        from hermes_cli.config import read_user_config_raw
+
+        cfg = read_user_config_raw(hermes_home / "config.yaml")
         cred_files = cfg_get(cfg, "terminal", "credential_files")
         if isinstance(cred_files, list):
             from tools.path_security import validate_within_dir
@@ -214,8 +221,8 @@ def _load_config_files() -> List[Dict[str, str]]:
     except Exception as e:
         logger.warning("Could not read terminal.credential_files from config: %s", e)
 
-    _config_files = result
-    return _config_files
+    _config_files[home_key] = result
+    return _config_files[home_key]
 
 
 def get_credential_file_mounts() -> List[Dict[str, str]]:
@@ -462,7 +469,7 @@ def from_agent_visible_cache_path(
     auto-mounted cache directory — the caller then treats a still-container
     path as "no host file" and falls back to an in-container read.
     """
-    if os.environ.get("TERMINAL_ENV", "local") != "docker":
+    if terminal_getenv("TERMINAL_ENV", "local") != "docker":
         return container_path
 
     path = Path(container_path)
@@ -489,7 +496,7 @@ def to_agent_visible_cache_path(
     # (Modal, Daytona, Vercel) use different mount semantics and will be
     # addressed separately if needed.  Backend is identified by TERMINAL_ENV
     # (same env var tools/terminal_tool.py reads in _get_environment_config).
-    if os.environ.get("TERMINAL_ENV", "local") != "docker":
+    if terminal_getenv("TERMINAL_ENV", "local") != "docker":
         return host_path
 
     mapped = map_cache_path_to_container(host_path, container_base=container_base)

@@ -28,6 +28,8 @@ import threading
 import uuid
 from typing import Any, Dict, Optional
 
+from profile_runtime_context import terminal_getenv
+
 # fal_client is imported lazily — see _load_fal_client(). Pulling it
 # eagerly added ~64 ms to every CLI cold start because
 # discover_builtin_tools() imports this module unconditionally during
@@ -768,7 +770,7 @@ def _agent_cache_base_for_env(env: Any) -> str | None:
     # Hermes cache roots can be translated without side effects. SSH can still
     # use a shell-visible tilde path; its first environment sync will upload
     # the cache file before the first command runs.
-    backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
+    backend = (terminal_getenv("TERMINAL_ENV") or "local").strip().lower()
     if backend in {"docker", "singularity", "modal"}:
         return "/root/.hermes"
     if backend == "ssh":

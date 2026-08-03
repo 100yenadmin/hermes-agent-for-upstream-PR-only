@@ -657,7 +657,9 @@ def _begin_tool_execution(
         try:
             command = function_args.get("command", "")
             if _is_destructive_command(command):
-                cwd = function_args.get("workdir") or os.getenv(
+                from profile_runtime_context import terminal_getenv
+
+                cwd = function_args.get("workdir") or terminal_getenv(
                     "TERMINAL_CWD", os.getcwd()
                 )
                 agent._checkpoint_mgr.ensure_checkpoint(

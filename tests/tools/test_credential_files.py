@@ -572,3 +572,34 @@ class TestMasterCredentialStoresAreNeverMountable:
             assert cf.get_credential_file_mounts() == []
         rec = next(r for r in caplog.records if "read guard raised" in r.message)
         assert rec.exc_info is not None, "traceback must be attached (logger.exception)"
+
+
+def test_config_cache_is_partitioned_by_profile_home(tmp_path):
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+    from tools.credential_files import _load_config_files
+
+    homes = []
+    for name in ("a", "b"):
+        home = tmp_path / name
+        home.mkdir()
+        token = home / f"{name}.token"
+        token.write_text(name, encoding="utf-8")
+        (home / "config.yaml").write_text(
+            f"terminal:\n  credential_files:\n    - {name}.token\n",
+            encoding="utf-8",
+        )
+        homes.append((home, token))
+
+    loaded = []
+    for home, _token in homes:
+        scope = set_hermes_home_override(str(home))
+        try:
+            loaded.append(_load_config_files())
+        finally:
+            reset_hermes_home_override(scope)
+
+    assert loaded[0][0]["host_path"] == str(homes[0][1])
+    assert loaded[1][0]["host_path"] == str(homes[1][1])

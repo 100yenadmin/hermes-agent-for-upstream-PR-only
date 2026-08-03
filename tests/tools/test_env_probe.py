@@ -317,3 +317,31 @@ class TestRunBoundedByTimeout:
         assert elapsed < 3.0, f"_run blocked on grandchild for {elapsed:.1f}s"
         assert rc == 0, f"expected clean exit, got rc={rc} err={err!r}"
         assert out == "ok"
+
+
+def test_profile_probe_cache_and_worker_context_are_partitioned(tmp_path, monkeypatch):
+    from profile_runtime_context import terminal_getenv, use_profile_runtime_context
+
+    profiles = []
+    for name, backend in (("a", "docker"), ("b", "local")):
+        home = tmp_path / name
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            f"terminal:\n  backend: {backend}\n",
+            encoding="utf-8",
+        )
+        profiles.append((home, backend))
+
+    monkeypatch.setattr(
+        env_probe,
+        "_build_probe_line",
+        lambda: terminal_getenv("TERMINAL_ENV", "missing"),
+    )
+
+    env_probe._reset_cache_for_tests()
+    for home, backend in profiles:
+        with use_profile_runtime_context(home):
+            assert env_probe.get_environment_probe_line(force_refresh=True) == backend
+            assert env_probe.get_environment_probe_line() == backend
+
+    assert len(env_probe._PROFILE_PROBE_STATES) == 2

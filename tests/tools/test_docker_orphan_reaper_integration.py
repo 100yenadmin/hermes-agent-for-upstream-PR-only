@@ -14,6 +14,7 @@ import os
 from unittest.mock import patch
 
 import tools.terminal_tool as terminal_tool
+from profile_runtime_context import use_profile_runtime_context
 
 
 def _reset_reaper_gate():
@@ -42,6 +43,33 @@ def test_maybe_reap_runs_once_per_process(monkeypatch):
     assert call_count["reap"] == 1, (
         f"reaper must run exactly once per process; got {call_count['reap']} calls"
     )
+
+
+def test_maybe_reap_runs_once_per_routed_profile(tmp_path):
+    terminal_tool._docker_orphan_reaper_profile_keys.clear()
+    profile_a = tmp_path / "a"
+    profile_b = tmp_path / "b"
+    for profile in (profile_a, profile_b):
+        profile.mkdir()
+        (profile / "config.yaml").write_text(
+            "terminal:\n  backend: docker\n",
+            encoding="utf-8",
+        )
+
+    calls = []
+
+    def _fake_reap(**kwargs):
+        calls.append(kwargs)
+        return 0
+
+    with patch("tools.environments.docker.reap_orphan_containers", _fake_reap):
+        with use_profile_runtime_context(profile_a):
+            terminal_tool._maybe_reap_docker_orphans({"docker_orphan_reaper": True})
+            terminal_tool._maybe_reap_docker_orphans({"docker_orphan_reaper": True})
+        with use_profile_runtime_context(profile_b):
+            terminal_tool._maybe_reap_docker_orphans({"docker_orphan_reaper": True})
+
+    assert len(calls) == 2
 
 
 def test_maybe_reap_passes_current_profile_as_filter(monkeypatch):

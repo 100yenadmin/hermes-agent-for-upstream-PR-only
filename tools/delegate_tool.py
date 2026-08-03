@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from toolsets import TOOLSETS
+from profile_runtime_context import terminal_getenv
 from agent.interrupt_compat import request_hard_interrupt
 
 # Sentinel value used by the runtime provider system for providers that are
@@ -872,7 +873,7 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     guessing `/workspace/...` for local repo tasks.
     """
     candidates = [
-        os.getenv("TERMINAL_CWD"),
+        terminal_getenv("TERMINAL_CWD"),
         getattr(
             getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
         ),

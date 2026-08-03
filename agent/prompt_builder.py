@@ -17,6 +17,7 @@ from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
 from typing import Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
+from profile_runtime_context import terminal_getenv
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS,
     ORG_ACTIVE_MARKER,
@@ -1027,7 +1028,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
     per process. Used only for non-local backends where the agent's tools
     operate on a different machine than the host Hermes runs on.
     """
-    cwd_hint = os.getenv("TERMINAL_CWD", "")
+    cwd_hint = terminal_getenv("TERMINAL_CWD", "")
     cache_key = (env_type, cwd_hint)
     cached = _BACKEND_PROBE_CACHE.get(cache_key)
     if cached is not None:
@@ -1173,7 +1174,7 @@ def build_environment_hints() -> str:
 
     hints: list[str] = []
 
-    backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
+    backend = (terminal_getenv("TERMINAL_ENV") or "local").strip().lower()
     is_remote_backend = backend in _REMOTE_TERMINAL_BACKENDS
 
     if not is_remote_backend:

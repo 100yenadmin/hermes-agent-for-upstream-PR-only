@@ -50,6 +50,12 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 from utils import env_var_enabled
+from profile_runtime_context import (
+    current_profile_cache_key,
+    profile_scoped_key,
+    terminal_getenv as _terminal_getenv,
+    terminal_scope_active,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +129,37 @@ DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env(
     float,
     "number",
 )
+
+
+def _safe_parse_runtime_env(name: str, default: Any, converter, type_label: str):
+    """Parse a profile-aware terminal setting without freezing it at import."""
+
+    raw = _terminal_getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return converter(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid value for %s: %r (expected %s). Falling back to %r.",
+            name,
+            raw,
+            type_label,
+            default,
+        )
+        return default
+
+
+def _foreground_max_timeout() -> int:
+    return _safe_parse_runtime_env(
+        "TERMINAL_MAX_FOREGROUND_TIMEOUT", 600, int, "integer"
+    )
+
+
+def _disk_warning_threshold_gb() -> float:
+    return _safe_parse_runtime_env(
+        "TERMINAL_DISK_WARNING_GB", 500.0, float, "number"
+    )
 _VERCEL_SANDBOX_DEFAULT_CWD = "/vercel/sandbox"
 _SUPPORTED_VERCEL_RUNTIMES = ("node24", "node22", "python3.13")
 
@@ -191,7 +228,7 @@ def _check_vercel_sandbox_requirements(config: dict[str, Any]) -> bool:
 
 # Cache for disk usage warning to avoid full rglob scan on every call.
 # The check is advisory-only — staleness for up to 5 minutes is acceptable.
-_disk_usage_cache: dict = {"timestamp": 0.0, "result": False}
+_disk_usage_cache: dict[str, dict[str, Any]] = {}
 _DISK_USAGE_CACHE_TTL = 300.0  # seconds
 
 
@@ -205,8 +242,15 @@ def _check_disk_usage_warning():
     """
     import time as _time_mod
     now = _time_mod.monotonic()
-    if now - _disk_usage_cache["timestamp"] < _DISK_USAGE_CACHE_TTL:
-        return _disk_usage_cache["result"]
+    cache_key = current_profile_cache_key() or "process"
+    threshold = _disk_warning_threshold_gb()
+    cache = _disk_usage_cache.get(cache_key)
+    if (
+        cache
+        and cache.get("threshold") == threshold
+        and now - cache["timestamp"] < _DISK_USAGE_CACHE_TTL
+    ):
+        return cache["result"]
     try:
         scratch_dir = _get_scratch_dir()
 
@@ -223,12 +267,15 @@ def _check_disk_usage_warning():
         
         total_gb = total_bytes / (1024 ** 3)
         
-        exceeded = total_gb > DISK_USAGE_WARNING_THRESHOLD_GB
+        exceeded = total_gb > threshold
         if exceeded:
             logger.warning("Disk usage (%.1fGB) exceeds threshold (%.0fGB). Consider running cleanup_all_environments().",
-                           total_gb, DISK_USAGE_WARNING_THRESHOLD_GB)
-        _disk_usage_cache["timestamp"] = _time_mod.monotonic()
-        _disk_usage_cache["result"] = exceeded
+                           total_gb, threshold)
+        _disk_usage_cache[cache_key] = {
+            "timestamp": _time_mod.monotonic(),
+            "result": exceeded,
+            "threshold": threshold,
+        }
         return exceeded
     except Exception as e:
         logger.debug("Disk usage warning check failed: %s", e, exc_info=True)
@@ -783,7 +830,7 @@ def _sudo_nopasswd_works() -> bool:
     cache) so an expired sudo timestamp cannot make a later command silently
     block waiting for a password.
     """
-    terminal_env = os.getenv("TERMINAL_ENV", "local").strip().lower() or "local"
+    terminal_env = _terminal_getenv("TERMINAL_ENV", "local").strip().lower() or "local"
     if terminal_env != "local":
         return False
 
@@ -1086,15 +1133,16 @@ _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
 _cleanup_thread = None
 _cleanup_running = False
 
-# Once-per-process guard for the docker orphan reaper (issue #20561).
-# Set when _maybe_reap_docker_orphans first runs; concurrent _create_environment
-# calls for parallel subagents won't re-trigger the sweep.
+# Legacy once-per-process guard plus routed-profile guards for the docker orphan
+# reaper (issue #20561). Parallel calls within one profile never re-trigger it;
+# a different routed profile gets its own conservative sweep.
 _docker_orphan_reaper_ran = False
+_docker_orphan_reaper_profile_keys: set[str] = set()
 _docker_orphan_reaper_lock = threading.Lock()
 
 
 def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
-    """Run the docker orphan reaper once per process, if enabled.
+    """Run the docker orphan reaper once per process/profile, if enabled.
 
     Sweeps long-Exited containers labeled ``hermes-agent=1`` for the current
     profile that match the issue #20561 leak class — containers left behind
@@ -1109,21 +1157,33 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
       operator opted out — usually because they're running multiple
       Hermes processes in the same profile and don't trust the
       conservative defaults).
-    * ``_docker_orphan_reaper_ran`` flag — sweep runs once per Python
-      interpreter, not on every subagent / RL-rollout / parallel
-      ``terminal()`` call.
+    * guard state — unscoped execution sweeps once per interpreter; routed
+      execution sweeps once per profile, never per subagent / rollout / call.
     """
     global _docker_orphan_reaper_ran
     if not container_config.get("docker_orphan_reaper", True):
         return
+    profile_key = current_profile_cache_key()
     # Cheap double-checked-locking: read without the lock, take the lock
     # only on first run, recheck inside.
-    if _docker_orphan_reaper_ran:
+    if (
+        profile_key in _docker_orphan_reaper_profile_keys
+        if profile_key is not None
+        else _docker_orphan_reaper_ran
+    ):
         return
     with _docker_orphan_reaper_lock:
-        if _docker_orphan_reaper_ran:
+        already_ran = (
+            profile_key in _docker_orphan_reaper_profile_keys
+            if profile_key is not None
+            else _docker_orphan_reaper_ran
+        )
+        if already_ran:
             return
-        _docker_orphan_reaper_ran = True
+        if profile_key is None:
+            _docker_orphan_reaper_ran = True
+        else:
+            _docker_orphan_reaper_profile_keys.add(profile_key)
 
     # 2 × lifetime_seconds gives sibling Hermes processes a generous grace
     # window. Floor at 60s so an operator with TERMINAL_LIFETIME_SECONDS=0
@@ -1131,7 +1191,7 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
     # ``container_config`` only carries container_* keys, so read
     # lifetime_seconds from the env var the rest of the module uses.
     try:
-        lifetime = int(os.getenv("TERMINAL_LIFETIME_SECONDS", "300"))
+        lifetime = int(_terminal_getenv("TERMINAL_LIFETIME_SECONDS", "300"))
     except (TypeError, ValueError):
         lifetime = 300
     lifetime = max(60, lifetime)
@@ -1197,7 +1257,7 @@ def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
     """
     if not isinstance(cwd, str) or not cwd.strip():
         return
-    key = str(session_key or "default")
+    key = profile_scoped_key(str(session_key or "default"))
     with _session_cwd_lock:
         if _session_cwd.get(key) != cwd:
             _session_cwd[key] = cwd
@@ -1210,7 +1270,7 @@ def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
     means (config default, TERMINAL_CWD seed, process cwd). ``None``/empty
     keys read the ``"default"`` record.
     """
-    key = str(session_key or "default")
+    key = profile_scoped_key(str(session_key or "default"))
     with _session_cwd_lock:
         return _session_cwd.get(key)
 
@@ -1218,7 +1278,7 @@ def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
 def clear_session_cwd(session_key: str) -> None:
     """Drop a session's cwd record (session teardown)."""
     with _session_cwd_lock:
-        _session_cwd.pop(session_key, None)
+        _session_cwd.pop(profile_scoped_key(session_key), None)
 
 
 def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
@@ -1237,7 +1297,8 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         task_id: The rollout's unique task identifier
         overrides: Dict of config keys to override
     """
-    _task_env_overrides[task_id] = overrides
+    scoped_task_id = profile_scoped_key(task_id)
+    _task_env_overrides[scoped_task_id] = overrides
 
     # If a live environment already exists for this task, a freshly registered
     # ``cwd`` override (e.g. the ACP client switching the editor's project root
@@ -1256,7 +1317,7 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         # updates the originating session's env.
         container_id = _resolve_container_task_id(task_id)
         with _env_lock:
-            env = _active_environments.get(task_id) or _active_environments.get(container_id)
+            env = _active_environments.get(scoped_task_id) or _active_environments.get(container_id)
         if env is not None and getattr(env, "cwd", None) is not None:
             env.cwd = new_cwd
 
@@ -1267,7 +1328,7 @@ def clear_task_env_overrides(task_id: str):
 
     Called during cleanup to avoid stale entries accumulating.
     """
-    _task_env_overrides.pop(task_id, None)
+    _task_env_overrides.pop(profile_scoped_key(task_id), None)
     clear_session_cwd(task_id)
 
 
@@ -1299,11 +1360,12 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         "docker_image", "modal_image", "singularity_image",
         "daytona_image", "env_type",
     })
-    if task_id and task_id in _task_env_overrides:
-        overrides = _task_env_overrides[task_id]
+    scoped_task_id = profile_scoped_key(task_id) if task_id else None
+    if scoped_task_id and scoped_task_id in _task_env_overrides:
+        overrides = _task_env_overrides[scoped_task_id]
         if set(overrides.keys()) & _ISOLATION_KEYS:
-            return task_id
-    return "default"
+            return scoped_task_id
+    return profile_scoped_key("default")
 
 
 def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
@@ -1318,10 +1380,10 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
     the originating session's override is silently dropped. This is the single
     source of that lookup so the terminal and file layers can't drift apart.
     """
-    raw = task_id or "default"
+    raw = profile_scoped_key(task_id or "default")
     return (
         _task_env_overrides.get(raw)
-        or _task_env_overrides.get(_resolve_container_task_id(raw))
+        or _task_env_overrides.get(_resolve_container_task_id(task_id))
         or {}
     )
 
@@ -1334,7 +1396,7 @@ def _parse_env_var(name: str, default: str, converter: Any = int, type_label: st
     Without this wrapper, a single malformed env var (e.g. TERMINAL_TIMEOUT=5m)
     causes an unhandled ValueError that kills every terminal command.
     """
-    raw = os.getenv(name, default)
+    raw = _terminal_getenv(name, default)
     try:
         return converter(raw)
     except (ValueError, json.JSONDecodeError):
@@ -1355,7 +1417,7 @@ def _safe_getcwd() -> str:
     try:
         return os.getcwd()
     except FileNotFoundError:
-        return os.getenv("TERMINAL_CWD") or os.path.expanduser("~")
+        return _terminal_getenv("TERMINAL_CWD") or os.path.expanduser("~")
 
 
 # Path prefixes that identify a *host* working directory which cannot exist
@@ -1431,6 +1493,8 @@ def _ensure_terminal_env_bridged() -> None:
     keep working unchanged.
     """
     global _terminal_config_bridge_attempted
+    if terminal_scope_active():
+        return
     if _terminal_config_bridge_attempted:
         return
     _terminal_config_bridge_attempted = True
@@ -1463,9 +1527,9 @@ def _get_env_config() -> Dict[str, Any]:
     # Default image with Python and Node.js for maximum compatibility
     default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
     _ensure_terminal_env_bridged()
-    env_type = os.getenv("TERMINAL_ENV", "local")
+    env_type = _terminal_getenv("TERMINAL_ENV", "local")
     
-    mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
+    mount_docker_cwd = _terminal_getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
     container_backend = env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}
     docker_backend = env_type == "docker"
 
@@ -1487,7 +1551,7 @@ def _get_env_config() -> Dict[str, Any]:
         docker_volumes = _parse_env_var("TERMINAL_DOCKER_VOLUMES", "[]", json.loads, "valid JSON")
         docker_env = _parse_env_var("TERMINAL_DOCKER_ENV", "{}", json.loads, "valid JSON")
         docker_extra_args = _parse_env_var("TERMINAL_DOCKER_EXTRA_ARGS", "[]", json.loads, "valid JSON")
-        docker_shm_size = os.getenv("TERMINAL_DOCKER_SHM_SIZE", "1g")
+        docker_shm_size = _terminal_getenv("TERMINAL_DOCKER_SHM_SIZE", "1g")
     else:
         docker_forward_env = []
         docker_volumes = []
@@ -1511,12 +1575,12 @@ def _get_env_config() -> Dict[str, Any]:
     # If Docker cwd passthrough is explicitly enabled, remap the host path to
     # /workspace and track the original host path separately. Otherwise keep the
     # normal sandbox behavior and discard host paths.
-    cwd = os.getenv("TERMINAL_CWD", default_cwd)
+    cwd = _terminal_getenv("TERMINAL_CWD", default_cwd)
     if cwd and not _is_ssh_remote_tilde_cwd(env_type, cwd):
         cwd = os.path.expanduser(cwd)
     host_cwd = None
     if env_type == "docker" and mount_docker_cwd:
-        docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
+        docker_cwd_source = _terminal_getenv("TERMINAL_CWD") or _safe_getcwd()
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
             any(candidate.startswith(p) for p in _HOST_CWD_PREFIXES)
@@ -1534,41 +1598,41 @@ def _get_env_config() -> Dict[str, Any]:
 
     return {
         "env_type": env_type,
-        "modal_mode": coerce_modal_mode(os.getenv("TERMINAL_MODAL_MODE", "auto")),
-        "docker_image": os.getenv("TERMINAL_DOCKER_IMAGE", default_image),
+        "modal_mode": coerce_modal_mode(_terminal_getenv("TERMINAL_MODAL_MODE", "auto")),
+        "docker_image": _terminal_getenv("TERMINAL_DOCKER_IMAGE", default_image),
         "docker_forward_env": docker_forward_env,
-        "singularity_image": os.getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
-        "modal_image": os.getenv("TERMINAL_MODAL_IMAGE", default_image),
-        "daytona_image": os.getenv("TERMINAL_DAYTONA_IMAGE", default_image),
-        "vercel_runtime": os.getenv("TERMINAL_VERCEL_RUNTIME", "").strip(),
+        "singularity_image": _terminal_getenv("TERMINAL_SINGULARITY_IMAGE", f"docker://{default_image}"),
+        "modal_image": _terminal_getenv("TERMINAL_MODAL_IMAGE", default_image),
+        "daytona_image": _terminal_getenv("TERMINAL_DAYTONA_IMAGE", default_image),
+        "vercel_runtime": _terminal_getenv("TERMINAL_VERCEL_RUNTIME", "").strip(),
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
         # SSH-specific config
-        "ssh_host": os.getenv("TERMINAL_SSH_HOST", ""),
-        "ssh_user": os.getenv("TERMINAL_SSH_USER", ""),
+        "ssh_host": _terminal_getenv("TERMINAL_SSH_HOST", ""),
+        "ssh_user": _terminal_getenv("TERMINAL_SSH_USER", ""),
         "ssh_port": _parse_env_var("TERMINAL_SSH_PORT", "22"),
-        "ssh_key": os.getenv("TERMINAL_SSH_KEY", ""),
+        "ssh_key": _terminal_getenv("TERMINAL_SSH_KEY", ""),
         # Persistent shell: SSH defaults to the config-level persistent_shell
         # setting (true by default for non-local backends); local is always opt-in.
         # Per-backend env vars override if explicitly set.
-        "ssh_persistent": os.getenv(
+        "ssh_persistent": _terminal_getenv(
             "TERMINAL_SSH_PERSISTENT",
-            os.getenv("TERMINAL_PERSISTENT_SHELL", "true"),
+            _terminal_getenv("TERMINAL_PERSISTENT_SHELL", "true"),
         ).lower() in {"true", "1", "yes"},
-        "local_persistent": os.getenv("TERMINAL_LOCAL_PERSISTENT", "false").lower() in {"true", "1", "yes"},
+        "local_persistent": _terminal_getenv("TERMINAL_LOCAL_PERSISTENT", "false").lower() in {"true", "1", "yes"},
         # Container resource config (applies to docker, singularity, modal,
         # daytona, and vercel_sandbox -- ignored for local/ssh)
         "container_cpu": container_cpu,
         "container_memory": container_memory,     # MB (default 5GB)
         "container_disk": container_disk,        # MB (default 50GB)
-        "container_persistent": os.getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"},
+        "container_persistent": _terminal_getenv("TERMINAL_CONTAINER_PERSISTENT", "true").lower() in {"true", "1", "yes"},
         "docker_volumes": docker_volumes,
         "docker_env": docker_env,
-        "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
-        "docker_network": os.getenv("TERMINAL_DOCKER_NETWORK", "true").lower() in {"true", "1", "yes"},
+        "docker_run_as_host_user": _terminal_getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
+        "docker_network": _terminal_getenv("TERMINAL_DOCKER_NETWORK", "true").lower() in {"true", "1", "yes"},
         "docker_extra_args": docker_extra_args,
         "docker_shm_size": docker_shm_size,
         # Cross-process container reuse (issue #20561).  The docs claim
@@ -1577,14 +1641,14 @@ def _get_env_config() -> Dict[str, Any]:
         # attaching to it instead of always starting a fresh one.  Set to
         # ``false`` for hard per-process isolation (no reuse, container is
         # removed on exit).
-        "docker_persist_across_processes": os.getenv(
+        "docker_persist_across_processes": _terminal_getenv(
             "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES", "true"
         ).lower() in {"true", "1", "yes"},
         # Startup orphan reaper for hermes-tagged containers left behind by
         # crashed / SIGKILL'd previous processes that bypassed atexit.
         # Conservative: only sweeps Exited containers older than 2× the
         # idle-reap window AND scoped to the current profile. Issue #20561.
-        "docker_orphan_reaper": os.getenv(
+        "docker_orphan_reaper": _terminal_getenv(
             "TERMINAL_DOCKER_ORPHAN_REAPER", "true"
         ).lower() in {"true", "1", "yes"},
     }
@@ -1870,7 +1934,10 @@ def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
     lookup = _resolve_container_task_id(task_id)
     with _env_lock:
-        return _active_environments.get(lookup) or _active_environments.get(task_id)
+        env = _active_environments.get(lookup)
+        if env is not None or current_profile_cache_key() is not None:
+            return env
+        return _active_environments.get(task_id)
 
 
 def is_persistent_env(task_id: str) -> bool:
@@ -1944,18 +2011,28 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     # actual (potentially slow) env.cleanup() call to outside the lock
     # so other tool calls aren't blocked.
     env = None
+    resolved_key = (
+        task_id
+        if task_id.startswith("profile:")
+        else _resolve_container_task_id(task_id)
+    )
     with _env_lock:
-        env = _active_environments.pop(task_id, None)
-        _last_activity.pop(task_id, None)
+        cache_key = (
+            task_id
+            if current_profile_cache_key() is None and task_id in _active_environments
+            else resolved_key
+        )
+        env = _active_environments.pop(cache_key, None)
+        _last_activity.pop(cache_key, None)
 
     # Clean up per-task creation lock
     with _creation_locks_lock:
-        _creation_locks.pop(task_id, None)
+        _creation_locks.pop(cache_key, None)
 
     # Invalidate stale file_ops cache entry
     try:
         from tools.file_tools import clear_file_ops_cache
-        clear_file_ops_cache(task_id)
+        clear_file_ops_cache(cache_key)
     except ImportError:
         pass
 
@@ -2353,11 +2430,12 @@ def terminal_tool(
         effective_timeout = timeout or default_timeout
 
         # Reject foreground commands where the model explicitly requests
-        # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
-        if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:
+        # a timeout above the routed profile's cap — nudge it toward background.
+        foreground_max_timeout = _foreground_max_timeout()
+        if not background and timeout and timeout > foreground_max_timeout:
             return tool_error(
                 f"Foreground timeout {timeout}s exceeds the maximum of "
-                f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true with "
+                f"{foreground_max_timeout}s. Use background=true with "
                 f"notify_on_complete=true for long-running commands."
             )
 
@@ -2387,9 +2465,14 @@ def terminal_tool(
             # with a CWD-only override collapse to "default" for container
             # sharing, yet an env may already be cached under the originating
             # task_id; honor it instead of spawning a duplicate.
+            raw_cache_key = profile_scoped_key(task_id) if task_id else None
             _existing_key = (
                 effective_task_id if effective_task_id in _active_environments
-                else (task_id if task_id and task_id in _active_environments else None)
+                else (
+                    raw_cache_key
+                    if raw_cache_key and raw_cache_key in _active_environments
+                    else None
+                )
             )
             if _existing_key is not None:
                 _last_activity[_existing_key] = time.time()
@@ -2410,7 +2493,11 @@ def terminal_tool(
                 with _env_lock:
                     _existing_key = (
                         effective_task_id if effective_task_id in _active_environments
-                        else (task_id if task_id and task_id in _active_environments else None)
+                        else (
+                            raw_cache_key
+                            if raw_cache_key and raw_cache_key in _active_environments
+                            else None
+                        )
                     )
                     if _existing_key is not None:
                         _last_activity[_existing_key] = time.time()
@@ -3317,18 +3404,18 @@ if __name__ == "__main__":
     default_img = "nikolaik/python-nodejs:python3.11-nodejs20"
     print(
         "  TERMINAL_ENV: "
-        f"{os.getenv('TERMINAL_ENV', 'local')} "
+        f"{_terminal_getenv('TERMINAL_ENV', 'local')} "
         "(local/docker/singularity/modal/daytona/vercel_sandbox/ssh)"
     )
-    print(f"  TERMINAL_DOCKER_IMAGE: {os.getenv('TERMINAL_DOCKER_IMAGE', default_img)}")
-    print(f"  TERMINAL_SINGULARITY_IMAGE: {os.getenv('TERMINAL_SINGULARITY_IMAGE', f'docker://{default_img}')}")
-    print(f"  TERMINAL_MODAL_IMAGE: {os.getenv('TERMINAL_MODAL_IMAGE', default_img)}")
-    print(f"  TERMINAL_DAYTONA_IMAGE: {os.getenv('TERMINAL_DAYTONA_IMAGE', default_img)}")
-    print(f"  TERMINAL_CWD: {os.getenv('TERMINAL_CWD', _safe_getcwd())}")
+    print(f"  TERMINAL_DOCKER_IMAGE: {_terminal_getenv('TERMINAL_DOCKER_IMAGE', default_img)}")
+    print(f"  TERMINAL_SINGULARITY_IMAGE: {_terminal_getenv('TERMINAL_SINGULARITY_IMAGE', f'docker://{default_img}')}")
+    print(f"  TERMINAL_MODAL_IMAGE: {_terminal_getenv('TERMINAL_MODAL_IMAGE', default_img)}")
+    print(f"  TERMINAL_DAYTONA_IMAGE: {_terminal_getenv('TERMINAL_DAYTONA_IMAGE', default_img)}")
+    print(f"  TERMINAL_CWD: {_terminal_getenv('TERMINAL_CWD', _safe_getcwd())}")
     from hermes_constants import display_hermes_home as _dhh
-    print(f"  TERMINAL_SANDBOX_DIR: {os.getenv('TERMINAL_SANDBOX_DIR', f'{_dhh()}/sandboxes')}")
-    print(f"  TERMINAL_TIMEOUT: {os.getenv('TERMINAL_TIMEOUT', '60')}")
-    print(f"  TERMINAL_LIFETIME_SECONDS: {os.getenv('TERMINAL_LIFETIME_SECONDS', '300')}")
+    print(f"  TERMINAL_SANDBOX_DIR: {_terminal_getenv('TERMINAL_SANDBOX_DIR', f'{_dhh()}/sandboxes')}")
+    print(f"  TERMINAL_TIMEOUT: {_terminal_getenv('TERMINAL_TIMEOUT', '60')}")
+    print(f"  TERMINAL_LIFETIME_SECONDS: {_terminal_getenv('TERMINAL_LIFETIME_SECONDS', '300')}")
 
 
 # ---------------------------------------------------------------------------

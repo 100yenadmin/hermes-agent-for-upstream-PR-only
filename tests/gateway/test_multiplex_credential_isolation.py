@@ -5,6 +5,7 @@ interpolation) rather than mocking it, proving the property that matters: two
 profiles with different keys never see each other's, and an unscoped read in
 multiplex mode fails closed instead of leaking.
 """
+import os
 import pytest
 
 from pathlib import Path
@@ -87,6 +88,55 @@ class TestProfilePathResolutionUnderMultiplexScope:
         assert a_seen == prof_a / "skills"
         assert b_seen == prof_b / "skills"
 
+    def test_terminal_config_and_cache_key_follow_multiplex_scope(self, tmp_path):
+        from profile_runtime_context import current_profile_runtime_context
+        from gateway.run import _profile_runtime_scope
+        from tools.terminal_tool import _get_env_config, _resolve_container_task_id
+
+        prof_a, prof_b = self._profiles(tmp_path)
+        (prof_a / "config.yaml").write_text(
+            "terminal:\n  backend: docker\n  timeout: 11\n",
+            encoding="utf-8",
+        )
+        (prof_b / "config.yaml").write_text(
+            "terminal:\n  backend: local\n  timeout: 22\n",
+            encoding="utf-8",
+        )
+
+        with _profile_runtime_scope(prof_a):
+            a_config = _get_env_config()
+            a_key = _resolve_container_task_id(None)
+        with _profile_runtime_scope(prof_b):
+            b_config = _get_env_config()
+            b_key = _resolve_container_task_id(None)
+
+        assert a_config["env_type"] == "docker"
+        assert a_config["timeout"] == 11
+        assert b_config["env_type"] == "local"
+        assert b_config["timeout"] == 22
+        assert a_key != b_key
+        assert current_profile_runtime_context() is None
+
+    def test_terminal_config_ref_uses_routed_profile_dotenv(self, tmp_path, monkeypatch):
+        from gateway.run import _profile_runtime_scope
+        from tools.terminal_tool import _get_env_config
+
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        (profile / ".env").write_text(
+            "PROFILE_TERMINAL_BACKEND=docker\n",
+            encoding="utf-8",
+        )
+        (profile / "config.yaml").write_text(
+            "terminal:\n  backend: ${env:PROFILE_TERMINAL_BACKEND}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("PROFILE_TERMINAL_BACKEND", "local")
+
+        with _profile_runtime_scope(profile):
+            assert _get_env_config()["env_type"] == "docker"
+        assert os.environ["PROFILE_TERMINAL_BACKEND"] == "local"
+
 
 def test_cold_profile_hydrates_external_source_without_global_env(
     tmp_path, monkeypatch
@@ -164,5 +214,41 @@ def test_cold_profile_hydrates_external_source_without_global_env(
     assert calls["count"] == 1
     assert "TEST_PROVIDER_API_KEY" not in os.environ
     assert "EXPLICIT_API_KEY" not in os.environ
+
+
+@pytest.mark.parametrize("failure_site", ["hydrate", "build"])
+def test_profile_runtime_scope_resets_home_when_setup_raises(
+    tmp_path, monkeypatch, failure_site
+):
+    from profile_runtime_context import current_profile_runtime_context
+    from gateway.run import _profile_runtime_scope
+    from hermes_constants import get_hermes_home
+    from hermes_cli import env_loader
+
+    profile = tmp_path / failure_site
+    profile.mkdir()
+    before = get_hermes_home()
+
+    if failure_site == "hydrate":
+        monkeypatch.setattr(
+            env_loader,
+            "hydrate_profile_secret_sources",
+            lambda _home: (_ for _ in ()).throw(RuntimeError("hydrate failed")),
+        )
+    else:
+        monkeypatch.setattr(env_loader, "hydrate_profile_secret_sources", lambda _home: {})
+        monkeypatch.setattr(
+            ss,
+            "build_profile_secret_scope",
+            lambda _home: (_ for _ in ()).throw(RuntimeError("build failed")),
+        )
+
+    with pytest.raises(RuntimeError):
+        with _profile_runtime_scope(profile):
+            pass
+
+    assert get_hermes_home() == before
+    assert ss.current_secret_scope() is None
+    assert current_profile_runtime_context() is None
 
 

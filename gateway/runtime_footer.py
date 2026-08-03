@@ -138,7 +138,9 @@ def format_runtime_footer(
             if turn_seconds is not None and turn_seconds >= 0:
                 parts.append(_format_latency(turn_seconds))
         elif field == "cwd":
-            rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
+            from profile_runtime_context import terminal_getenv
+
+            rel = _home_relative_cwd(cwd or terminal_getenv("TERMINAL_CWD", ""))
             if rel:
                 parts.append(rel)
         # Unknown field names are silently ignored.

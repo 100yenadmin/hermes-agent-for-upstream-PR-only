@@ -33,6 +33,7 @@ from urllib.parse import parse_qs, urlparse, urlunparse
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
+from profile_runtime_context import terminal_getenv
 from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -2622,7 +2623,7 @@ def init_agent(
             _ra().logger.debug("Context engine on_session_start: %s", _ce_err)
 
     agent._subdirectory_hints = SubdirectoryHintTracker(
-        working_dir=os.getenv("TERMINAL_CWD") or None,
+        working_dir=terminal_getenv("TERMINAL_CWD") or None,
     )
     agent._user_turn_count = 0
     # Copilot x-initiator flag: first API call of a user turn sends "user" (#3040).

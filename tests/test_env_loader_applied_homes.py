@@ -133,3 +133,29 @@ def test_success_marks_applied_and_second_call_noop(tmp_path, monkeypatch):
     env_loader._apply_external_secret_sources(home)
     assert calls["n"] == 1
     monkeypatch.delenv("KEY_OK_40597", raising=False)
+
+
+def test_refresh_one_home_preserves_other_profile_snapshot(tmp_path, monkeypatch):
+    home_a = tmp_path / "a"
+    home_b = tmp_path / "b"
+    home_a.mkdir()
+    home_b.mkdir()
+    key_a = str(home_a.resolve())
+    key_b = str(home_b.resolve())
+    env_loader._APPLIED_HOMES.update({key_a, key_b})
+    env_loader._SECRET_SOURCE_VALUES_BY_HOME[key_a] = {"A_KEY": "old"}
+    env_loader._SECRET_SOURCE_VALUES_BY_HOME[key_b] = {"B_KEY": "keep"}
+
+    def fake_hydrate(home):
+        assert str(home.resolve()) == key_a
+        assert key_a not in env_loader._APPLIED_HOMES
+        assert key_b in env_loader._APPLIED_HOMES
+        env_loader._APPLIED_HOMES.add(key_a)
+        env_loader._SECRET_SOURCE_VALUES_BY_HOME[key_a] = {"A_KEY": "fresh"}
+        return {"A_KEY": "fresh"}
+
+    monkeypatch.setattr(env_loader, "_hydrate_profile_secret_sources", fake_hydrate)
+
+    assert env_loader.refresh_profile_secret_sources(home_a) == {"A_KEY": "fresh"}
+    assert env_loader._SECRET_SOURCE_VALUES_BY_HOME[key_a] == {"A_KEY": "fresh"}
+    assert env_loader._SECRET_SOURCE_VALUES_BY_HOME[key_b] == {"B_KEY": "keep"}

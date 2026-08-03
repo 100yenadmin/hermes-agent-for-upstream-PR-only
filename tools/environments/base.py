@@ -25,6 +25,7 @@ from typing import IO, Callable, Iterable, Protocol
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.interrupt import is_interrupted
+from profile_runtime_context import terminal_getenv
 
 logger = logging.getLogger(__name__)
 
@@ -252,7 +253,7 @@ def get_sandbox_dir() -> Path:
 
     Configurable via TERMINAL_SANDBOX_DIR. Defaults to {HERMES_HOME}/sandboxes/.
     """
-    custom = os.getenv("TERMINAL_SANDBOX_DIR")
+    custom = terminal_getenv("TERMINAL_SANDBOX_DIR")
     if custom:
         p = Path(custom)
     else:

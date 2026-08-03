@@ -163,6 +163,7 @@ class TestRunJobTerminalCwd:
         import os
         import sys
         import cron.scheduler as sched
+        from profile_runtime_context import terminal_getenv
 
         class FakeAgent:
             def __init__(self, **kwargs):
@@ -171,9 +172,15 @@ class TestRunJobTerminalCwd:
                 observed["terminal_cwd_during_init"] = os.environ.get(
                     "TERMINAL_CWD", "_UNSET_"
                 )
+                observed["effective_cwd_during_init"] = terminal_getenv(
+                    "TERMINAL_CWD", "_UNSET_"
+                )
 
             def run_conversation(self, *_a, **_kw):
                 observed["terminal_cwd_during_run"] = os.environ.get(
+                    "TERMINAL_CWD", "_UNSET_"
+                )
+                observed["effective_cwd_during_run"] = terminal_getenv(
                     "TERMINAL_CWD", "_UNSET_"
                 )
                 return {"final_response": "done", "messages": []}
@@ -211,6 +218,14 @@ class TestRunJobTerminalCwd:
         # has TERMINAL_CWD set (common on dev boxes).  Stub it out.
         import dotenv
         monkeypatch.setattr(dotenv, "load_dotenv", lambda *_a, **_kw: True)
+        import hermes_cli.env_loader as env_loader
+        monkeypatch.setattr(
+            env_loader,
+            "load_hermes_dotenv",
+            lambda *_a, **_kw: observed.__setitem__(
+                "dotenv_loads", observed.get("dotenv_loads", 0) + 1
+            ) or True,
+        )
 
 
     def test_no_workdir_leaves_terminal_cwd_untouched(self, monkeypatch):
@@ -248,6 +263,50 @@ class TestRunJobTerminalCwd:
         assert observed["load_soul_identity"] is True
         # TERMINAL_CWD saw the same value during init as it had before.
         assert observed["terminal_cwd_during_init"] == before
+        assert observed["dotenv_loads"] == 1
         # And after run_job completes, it's still the sentinel (nothing
         # overwrote or cleared it).
         assert os.environ["TERMINAL_CWD"] == before
+
+    def test_multiplex_workdir_is_context_local(self, tmp_path, monkeypatch):
+        import os
+        import cron.scheduler as sched
+        from profile_runtime_context import use_profile_runtime_context
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        profile_home = tmp_path / "profile"
+        profile_home.mkdir()
+        (profile_home / "config.yaml").write_text(
+            "terminal:\n  backend: local\n  cwd: /profile-base\n",
+            encoding="utf-8",
+        )
+        workdir = tmp_path / "job-workdir"
+        workdir.mkdir()
+        monkeypatch.setenv("TERMINAL_CWD", "/launch-cwd")
+
+        observed: dict = {}
+        self._install_stubs(monkeypatch, observed)
+        job = {
+            "id": "scoped",
+            "name": "scoped-wd-job",
+            "workdir": str(workdir),
+            "schedule_display": "manual",
+        }
+
+        home_token = set_hermes_home_override(str(profile_home))
+        try:
+            with use_profile_runtime_context(profile_home):
+                success, *_ = sched.run_job(job)
+        finally:
+            reset_hermes_home_override(home_token)
+
+        assert success is True
+        assert observed["terminal_cwd_during_init"] == "/launch-cwd"
+        assert observed["terminal_cwd_during_run"] == "/launch-cwd"
+        assert observed["effective_cwd_during_init"] == str(workdir)
+        assert observed["effective_cwd_during_run"] == str(workdir)
+        assert observed.get("dotenv_loads", 0) == 0
+        assert os.environ["TERMINAL_CWD"] == "/launch-cwd"
