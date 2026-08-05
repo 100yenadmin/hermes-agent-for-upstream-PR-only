@@ -274,19 +274,28 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
 
 
 def test_compute_host_explicit_images_do_not_clear_later_attachment(monkeypatch):
+    captured = {}
+
     class _Supervisor:
-        def submit_turn(self, _frame, *, on_complete=None):
+        def submit_turn(self, frame, *, on_complete=None):
+            captured["frame"] = frame
             session["attached_images"].append("/tmp/c.png")
 
     session = _session(attached_images=[])
     monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
 
     response = server._submit_prompt_to_compute_host(
-        "r1", "sid", session, "B", image_paths=["/tmp/b.png"]
+        "r1",
+        "sid",
+        session,
+        "B",
+        image_paths=["/tmp/b.png"],
+        attachment_session_keys=["pre-compression-key"],
     )
 
     assert response["result"]["status"] == "streaming"
     assert session["attached_images"] == ["/tmp/c.png"]
+    assert captured["frame"]["attachment_session_keys"] == ["pre-compression-key"]
 
 
 def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monkeypatch):
@@ -7864,9 +7873,113 @@ def test_prompt_submit_expands_context_refs(monkeypatch, tmp_path):
     )
 
     assert captured["prompt"] == "expanded prompt"
-    assert captured["context_kwargs"]["additional_allowed_roots"] == (
-        server._profile_desktop_attachment_dir(session, create=False),
+    current_root = server._profile_desktop_attachment_dir(session, create=False)
+    assert captured["context_kwargs"]["additional_allowed_roots"] == (current_root,)
+
+    server._run_prompt_submit(
+        "2",
+        "sid",
+        session,
+        "@file:/queued/attachment.txt",
+        attachment_session_keys=["pre-compression-key"],
     )
+
+    assert captured["context_kwargs"]["additional_allowed_roots"] == (
+        current_root,
+        server._profile_desktop_attachment_dir(
+            session, create=False, session_key="pre-compression-key"
+        ),
+    )
+
+
+def test_queued_file_ref_expands_after_session_key_rotation(monkeypatch, tmp_path):
+    captured = {}
+
+    class _Agent:
+        model = "test/model"
+        base_url = ""
+        api_key = ""
+        provider = ""
+
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+            captured["prompt"] = prompt
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile_home = tmp_path / "profile-home"
+    session = _session(
+        agent=_Agent(),
+        cwd=str(workspace),
+        profile_home=str(profile_home),
+        session_key="after-compression",
+    )
+    old_root = server._profile_desktop_attachment_dir(
+        session, create=True, session_key="before-compression"
+    )
+    attached = old_root / "queued.txt"
+    attached.write_text("queued attachment survived compression", encoding="utf-8")
+
+    from agent import model_metadata
+
+    monkeypatch.setattr(
+        model_metadata, "get_model_context_length", lambda *args, **kwargs: 100000
+    )
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+
+    server._run_prompt_submit(
+        "1",
+        "sid",
+        session,
+        f"@file:{attached}",
+        attachment_session_keys=["before-compression"],
+    )
+
+    assert "queued attachment survived compression" in captured["prompt"]
+
+
+def test_queued_file_refs_retain_pre_compression_session_keys(monkeypatch):
+    session = _session(running=True, session_key="before-compression")
+    transport = object()
+    server._enqueue_prompt(session, "@file:/old/one.txt", transport)
+    session["session_key"] = "during-compression"
+    server._enqueue_prompt(session, "@file:/old/two.txt", transport)
+
+    queued = session["queued_prompt"]
+    assert queued["attachment_session_keys"] == [
+        "before-compression",
+        "during-compression",
+    ]
+
+    captured = {}
+
+    def capture_run(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    session["session_key"] = "after-compression"
+    session["running"] = False
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+    monkeypatch.setattr(server, "_run_prompt_submit", capture_run)
+
+    assert server._drain_queued_prompt("1", "sid", session)
+    assert captured["kwargs"]["attachment_session_keys"] == [
+        "before-compression",
+        "during-compression",
+    ]
 
 
 def test_image_attach_appends_local_image(monkeypatch):

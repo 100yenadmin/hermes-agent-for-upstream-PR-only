@@ -1635,6 +1635,7 @@ def _compute_host_turn_frame(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    attachment_session_keys: list[str] | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -1661,6 +1662,7 @@ def _compute_host_turn_frame(
         "source": _session_source(session),
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
+        "attachment_session_keys": list(attachment_session_keys or []),
     }
 
 
@@ -1738,6 +1740,7 @@ def _submit_prompt_to_compute_host(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    attachment_session_keys: list[str] | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -1747,6 +1750,7 @@ def _submit_prompt_to_compute_host(
         text,
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
+        attachment_session_keys=attachment_session_keys,
     )
 
     def _complete(done: dict) -> None:
@@ -7327,6 +7331,10 @@ def _enqueue_prompt(
     """
     image_paths = list(image_paths or [])
     queued = {"text": text, "transport": transport}
+    if isinstance(text, str) and "@file:" in text:
+        attachment_session_key = str(session.get("session_key") or "").strip()
+        if attachment_session_key:
+            queued["attachment_session_keys"] = [attachment_session_key]
     if image_paths:
         queued["image_paths"] = image_paths
     existing = session.get("queued_prompt")
@@ -7340,6 +7348,10 @@ def _enqueue_prompt(
     ):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
+        existing_keys = existing.setdefault("attachment_session_keys", [])
+        for attachment_session_key in queued.get("attachment_session_keys", []):
+            if attachment_session_key not in existing_keys:
+                existing_keys.append(attachment_session_key)
         return
     if existing:
         session.setdefault("queued_prompts", []).append(queued)
@@ -7501,10 +7513,16 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    attachment_session_keys=queued.get("attachment_session_keys"),
                 )
             else:
                 resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    queued_prompt_generation=queue_generation,
+                    attachment_session_keys=queued.get("attachment_session_keys"),
                 )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
@@ -7522,6 +7540,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    attachment_session_keys=queued.get("attachment_session_keys"),
                 )
             else:
                 _run_prompt_submit(
@@ -7530,6 +7549,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
+                    attachment_session_keys=queued.get("attachment_session_keys"),
                 )
     except Exception as exc:
         print(
@@ -9349,6 +9369,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    attachment_session_keys: list[str] | None = None,
 ) -> None:
     with session["history_lock"]:
         if (
@@ -9460,13 +9481,22 @@ def _run_prompt_submit(
                         agent, "_config_context_length", None
                     ),
                 )
+                attachment_roots = [
+                    _profile_desktop_attachment_dir(session, create=False)
+                ]
+                for attachment_session_key in attachment_session_keys or []:
+                    queued_root = _profile_desktop_attachment_dir(
+                        session,
+                        create=False,
+                        session_key=attachment_session_key,
+                    )
+                    if queued_root not in attachment_roots:
+                        attachment_roots.append(queued_root)
                 ctx = preprocess_context_references(
                     prompt,
                     cwd=cwd,
                     allowed_root=cwd,
-                    additional_allowed_roots=(
-                        _profile_desktop_attachment_dir(session, create=False),
-                    ),
+                    additional_allowed_roots=tuple(attachment_roots),
                     context_length=ctx_len,
                 )
                 if ctx.blocked:
@@ -10346,11 +10376,18 @@ def _desktop_attachment_dir(session: dict) -> Path:
     return root
 
 
-def _profile_desktop_attachment_dir(session: dict, *, create: bool = True) -> Path:
-    """Return this session's profile-owned attachment fallback directory."""
+def _profile_desktop_attachment_dir(
+    session: dict,
+    *,
+    create: bool = True,
+    session_key: str | None = None,
+) -> Path:
+    """Return a profile-owned attachment fallback directory for a session key."""
     profile_home = session.get("profile_home")
     base = Path(profile_home) if profile_home else Path(_hermes_home)
-    session_key = str(session.get("session_key") or session.get("_sid") or "").strip()
+    session_key = str(
+        session_key if session_key is not None else session.get("session_key") or ""
+    ).strip()
     if not session_key:
         raise ValueError("session identity unavailable for attachment staging")
     profile_root = base.resolve()
