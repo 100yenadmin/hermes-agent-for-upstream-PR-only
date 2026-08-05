@@ -7967,7 +7967,13 @@ def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp
 @pytest.mark.parametrize(
     "staging_error",
     [
-        pytest.param(PermissionError("workspace staging denied"), id="permission-denied"),
+        pytest.param(PermissionError("workspace staging denied"), id="permission-no-errno"),
+        pytest.param(
+            PermissionError(errno.EACCES, "permission denied"), id="permission-eacces"
+        ),
+        pytest.param(
+            PermissionError(errno.EPERM, "operation not permitted"), id="permission-eperm"
+        ),
         pytest.param(OSError(errno.EROFS, "read-only filesystem"), id="read-only-filesystem"),
     ],
 )
@@ -8013,6 +8019,9 @@ def test_file_attach_falls_back_to_profile_home_when_workspace_staging_is_unwrit
         assert resp["result"]["ref_text"] == f"@file:{stored}"
         assert stored.read_text(encoding="utf-8") == "hello world"
         assert not (workspace / ".hermes" / "desktop-attachments").exists()
+        if os.name != "nt":
+            assert stored.stat().st_mode & 0o777 == 0o600
+            assert fallback_root.stat().st_mode & 0o777 == 0o700
 
         from agent.context_references import preprocess_context_references
 
@@ -8029,18 +8038,27 @@ def test_file_attach_falls_back_to_profile_home_when_workspace_staging_is_unwrit
         server._sessions.pop("sid", None)
 
 
-def test_file_attach_does_not_fallback_for_unrelated_staging_os_error(monkeypatch, tmp_path):
+def test_file_attach_rejects_profile_cache_symlink_escape(monkeypatch, tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     profile_home = tmp_path / "profile-home"
-    profile_home.mkdir()
+    cache_root = profile_home / "cache"
+    cache_root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    attachment_link = cache_root / "desktop-attachments"
+    try:
+        attachment_link.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
     fake_cli = types.ModuleType("cli")
     fake_cli._detect_file_drop = lambda raw: None
     fake_cli._split_path_input = lambda raw: (raw, "")
     fake_cli._resolve_attachment_path = lambda raw: None
 
     def fail_workspace_staging(_session):
-        raise OSError(errno.ENOSPC, "no space left on device")
+        raise PermissionError("workspace staging denied")
 
     monkeypatch.setattr(server, "_desktop_attachment_dir", fail_workspace_staging)
     server._sessions["sid"] = _session(
@@ -8063,7 +8081,109 @@ def test_file_attach_does_not_fallback_for_unrelated_staging_os_error(monkeypatc
         )
 
         assert "error" in resp
-        assert resp["error"]["message"] == "[Errno 28] no space left on device"
+        assert "escaped the active profile home" in resp["error"]["message"]
+        assert list(outside.rglob("*")) == []
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.parametrize(
+    "staging_error",
+    [
+        pytest.param(OSError(errno.ENOSPC, "no space left on device"), id="disk-full"),
+        pytest.param(OSError(errno.EIO, "input/output error"), id="io-error"),
+        pytest.param(OSError(errno.ENOTDIR, "not a directory"), id="not-a-directory"),
+    ],
+)
+def test_file_attach_does_not_fallback_for_unrelated_staging_os_error(
+    monkeypatch, tmp_path, staging_error
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile_home = tmp_path / "profile-home"
+    profile_home.mkdir()
+    fake_cli = types.ModuleType("cli")
+    fake_cli._detect_file_drop = lambda raw: None
+    fake_cli._split_path_input = lambda raw: (raw, "")
+    fake_cli._resolve_attachment_path = lambda raw: None
+
+    def fail_workspace_staging(_session):
+        raise staging_error
+
+    monkeypatch.setattr(server, "_desktop_attachment_dir", fail_workspace_staging)
+    server._sessions["sid"] = _session(
+        cwd=str(workspace), profile_home=str(profile_home)
+    )
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "path": "/Users/alice/Downloads/report.txt",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,aGVsbG8gd29ybGQ=",
+                },
+            }
+        )
+
+        assert "error" in resp
+        assert resp["error"]["message"] == str(staging_error)
+        assert not (profile_home / "cache" / "desktop-attachments").exists()
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_file_attach_does_not_fallback_for_source_read_permission_error(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile_home = tmp_path / "profile-home"
+    profile_home.mkdir()
+    source = tmp_path / "outside.txt"
+    source.write_text("unreadable source", encoding="utf-8")
+    fake_cli = types.ModuleType("cli")
+    fake_cli._detect_file_drop = lambda raw: None
+    fake_cli._split_path_input = lambda raw: (raw, "")
+    fake_cli._resolve_attachment_path = lambda raw: source
+
+    original_read_bytes = Path.read_bytes
+
+    def deny_source_read(path):
+        if path.resolve() == source.resolve():
+            raise PermissionError(errno.EACCES, "source read denied")
+        return original_read_bytes(path)
+
+    fallback_calls = []
+    original_fallback_dir = server._profile_desktop_attachment_dir
+
+    def track_fallback(*args, **kwargs):
+        fallback_calls.append(True)
+        return original_fallback_dir(*args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", deny_source_read)
+    monkeypatch.setattr(server, "_profile_desktop_attachment_dir", track_fallback)
+    server._sessions["sid"] = _session(
+        cwd=str(workspace), profile_home=str(profile_home)
+    )
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {"session_id": "sid", "path": str(source)},
+            }
+        )
+
+        assert "error" in resp
+        assert "source read denied" in resp["error"]["message"]
+        assert fallback_calls == []
         assert not (profile_home / "cache" / "desktop-attachments").exists()
     finally:
         server._sessions.pop("sid", None)

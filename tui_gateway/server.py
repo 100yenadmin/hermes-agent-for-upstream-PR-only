@@ -10353,11 +10353,24 @@ def _profile_desktop_attachment_dir(session: dict, *, create: bool = True) -> Pa
     session_key = str(session.get("session_key") or session.get("_sid") or "").strip()
     if not session_key:
         raise ValueError("session identity unavailable for attachment staging")
+    profile_root = base.resolve()
     scope = hashlib.sha256(session_key.encode("utf-8")).hexdigest()
-    root = base.resolve() / "cache" / "desktop-attachments" / scope
+    root = profile_root / "cache" / "desktop-attachments" / scope
+    resolved_root = root.resolve()
+    try:
+        resolved_root.relative_to(profile_root)
+    except ValueError as exc:
+        raise PermissionError("attachment fallback escaped the active profile home") from exc
     if create:
-        root.mkdir(parents=True, exist_ok=True)
-    return root
+        resolved_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        resolved_root = resolved_root.resolve()
+        try:
+            resolved_root.relative_to(profile_root)
+        except ValueError as exc:
+            raise PermissionError("attachment fallback escaped the active profile home") from exc
+    if create and os.name != "nt":
+        resolved_root.chmod(0o700)
+    return resolved_root
 
 
 def _is_readonly_attachment_staging_error(exc: OSError) -> bool:
@@ -10374,18 +10387,29 @@ def _sanitize_attachment_name(name: str) -> str:
     return candidate or "attachment"
 
 
-def _unique_attachment_path(root: Path, filename: str) -> Path:
-    candidate = root / filename
-    if not candidate.exists():
-        return candidate
+def _write_unique_attachment(
+    root: Path, filename: str, payload: bytes, *, mode: int = 0o600
+) -> Path:
+    """Create an attachment without following or replacing a raced path."""
     stem = Path(filename).stem or "attachment"
     suffix = Path(filename).suffix
-    counter = 2
+    counter = 1
     while True:
-        next_candidate = root / f"{stem}-{counter}{suffix}"
-        if not next_candidate.exists():
-            return next_candidate
-        counter += 1
+        candidate = root / (filename if counter == 1 else f"{stem}-{counter}{suffix}")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(candidate, flags, mode)
+        except FileExistsError:
+            counter += 1
+            continue
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+        except Exception:
+            with contextlib.suppress(OSError):
+                candidate.unlink()
+            raise
+        return candidate
 
 
 def _resolve_gateway_attachment_path(raw: str) -> Path | None:
@@ -10470,14 +10494,14 @@ def _stage_session_file_attachment(
     safe_filename = _sanitize_attachment_name(filename)
     try:
         upload_dir = _desktop_attachment_dir(session)
-        target = _unique_attachment_path(upload_dir, safe_filename)
-        target.write_bytes(payload)
+        target = _write_unique_attachment(
+            upload_dir, safe_filename, payload, mode=0o666
+        )
     except OSError as exc:
         if not _is_readonly_attachment_staging_error(exc):
             raise
         upload_dir = _profile_desktop_attachment_dir(session)
-        target = _unique_attachment_path(upload_dir, safe_filename)
-        target.write_bytes(payload)
+        target = _write_unique_attachment(upload_dir, safe_filename, payload)
     return target.resolve(), True
 
 
