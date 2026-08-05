@@ -3,6 +3,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import errno
 import hashlib
 import inspect
 import json
@@ -9463,6 +9464,9 @@ def _run_prompt_submit(
                     prompt,
                     cwd=cwd,
                     allowed_root=cwd,
+                    additional_allowed_roots=(
+                        _profile_desktop_attachment_dir(session, create=False),
+                    ),
                     context_length=ctx_len,
                 )
                 if ctx.blocked:
@@ -10342,6 +10346,25 @@ def _desktop_attachment_dir(session: dict) -> Path:
     return root
 
 
+def _profile_desktop_attachment_dir(session: dict, *, create: bool = True) -> Path:
+    """Return this session's profile-owned attachment fallback directory."""
+    profile_home = session.get("profile_home")
+    base = Path(profile_home) if profile_home else Path(_hermes_home)
+    session_key = str(session.get("session_key") or session.get("_sid") or "").strip()
+    if not session_key:
+        raise ValueError("session identity unavailable for attachment staging")
+    scope = hashlib.sha256(session_key.encode("utf-8")).hexdigest()
+    root = base.resolve() / "cache" / "desktop-attachments" / scope
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _is_readonly_attachment_staging_error(exc: OSError) -> bool:
+    """Classify only permission/read-only errors as workspace fallback triggers."""
+    return isinstance(exc, PermissionError) or exc.errno == errno.EROFS
+
+
 def _sanitize_attachment_name(name: str) -> str:
     import re as _re
 
@@ -10422,6 +10445,11 @@ def _stage_session_file_attachment(
          path on the CLIENT's disk) — decode the uploaded ``data_url`` bytes and
          write them into ``.hermes/desktop-attachments/``.
 
+    If workspace-local staging is denied or the filesystem is read-only, the
+    attachment is instead written under the active profile's HERMES_HOME. The
+    resulting reference is absolute so it remains resolvable outside the
+    workspace.
+
     Returns ``(stored_path, uploaded)``.
     """
     workspace = Path(_session_cwd(session)).resolve()
@@ -10439,9 +10467,17 @@ def _stage_session_file_attachment(
         payload = _decode_attachment_data_url(data_url)
         filename = _sanitize_attachment_name(name or Path(str(raw_path or "")).name)
 
-    upload_dir = _desktop_attachment_dir(session)
-    target = _unique_attachment_path(upload_dir, _sanitize_attachment_name(filename))
-    target.write_bytes(payload)
+    safe_filename = _sanitize_attachment_name(filename)
+    try:
+        upload_dir = _desktop_attachment_dir(session)
+        target = _unique_attachment_path(upload_dir, safe_filename)
+        target.write_bytes(payload)
+    except OSError as exc:
+        if not _is_readonly_attachment_staging_error(exc):
+            raise
+        upload_dir = _profile_desktop_attachment_dir(session)
+        target = _unique_attachment_path(upload_dir, safe_filename)
+        target.write_bytes(payload)
     return target.resolve(), True
 
 

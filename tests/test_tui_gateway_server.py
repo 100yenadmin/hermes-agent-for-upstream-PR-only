@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import subprocess
@@ -7807,7 +7808,7 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
     assert captured["session_key"] == "session-key"
 
 
-def test_prompt_submit_expands_context_refs(monkeypatch):
+def test_prompt_submit_expands_context_refs(monkeypatch, tmp_path):
     captured = {}
 
     class _Agent:
@@ -7830,19 +7831,23 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
             self._target()
 
     fake_ctx = types.ModuleType("agent.context_references")
-    fake_ctx.preprocess_context_references = (
-        lambda message, **kwargs: types.SimpleNamespace(
+
+    def preprocess_context_references(message, **kwargs):
+        captured["context_kwargs"] = kwargs
+        return types.SimpleNamespace(
             blocked=False,
             message="expanded prompt",
             warnings=[],
             references=[],
             injected_tokens=0,
         )
-    )
+
+    fake_ctx.preprocess_context_references = preprocess_context_references
     fake_meta = types.ModuleType("agent.model_metadata")
     fake_meta.get_model_context_length = lambda *args, **kwargs: 100000
 
-    server._sessions["sid"] = _session(agent=_Agent())
+    session = _session(agent=_Agent(), profile_home=str(tmp_path / "profile-home"))
+    server._sessions["sid"] = session
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
@@ -7859,6 +7864,9 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
     )
 
     assert captured["prompt"] == "expanded prompt"
+    assert captured["context_kwargs"]["additional_allowed_roots"] == (
+        server._profile_desktop_attachment_dir(session, create=False),
+    )
 
 
 def test_image_attach_appends_local_image(monkeypatch):
@@ -7952,6 +7960,111 @@ def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp
         assert resp["result"]["path"] == str(stored)
         assert resp["result"]["ref_text"] == "@file:.hermes/desktop-attachments/report.txt"
         assert stored.read_text(encoding="utf-8") == "hello world"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.parametrize(
+    "staging_error",
+    [
+        pytest.param(PermissionError("workspace staging denied"), id="permission-denied"),
+        pytest.param(OSError(errno.EROFS, "read-only filesystem"), id="read-only-filesystem"),
+    ],
+)
+def test_file_attach_falls_back_to_profile_home_when_workspace_staging_is_unwritable(
+    monkeypatch, tmp_path, staging_error
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile_home = tmp_path / "profile-home"
+    profile_home.mkdir()
+    fake_cli = types.ModuleType("cli")
+    fake_cli._detect_file_drop = lambda raw: None
+    fake_cli._split_path_input = lambda raw: (raw, "")
+    fake_cli._resolve_attachment_path = lambda raw: None
+
+    def fail_workspace_staging(_session):
+        raise staging_error
+
+    monkeypatch.setattr(server, "_desktop_attachment_dir", fail_workspace_staging)
+    session = _session(cwd=str(workspace), profile_home=str(profile_home))
+    server._sessions["sid"] = session
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "path": "/Users/alice/Downloads/report.txt",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,aGVsbG8gd29ybGQ=",
+                },
+            }
+        )
+
+        fallback_root = server._profile_desktop_attachment_dir(session, create=False)
+        stored = fallback_root / "report.txt"
+        assert resp["result"]["attached"] is True
+        assert resp["result"]["uploaded"] is True
+        assert resp["result"]["path"] == str(stored)
+        assert resp["result"]["ref_text"] == f"@file:{stored}"
+        assert stored.read_text(encoding="utf-8") == "hello world"
+        assert not (workspace / ".hermes" / "desktop-attachments").exists()
+
+        from agent.context_references import preprocess_context_references
+
+        expanded = preprocess_context_references(
+            resp["result"]["ref_text"],
+            cwd=workspace,
+            allowed_root=workspace,
+            additional_allowed_roots=(fallback_root,),
+            context_length=100_000,
+        )
+        assert not expanded.blocked
+        assert "hello world" in expanded.message
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_file_attach_does_not_fallback_for_unrelated_staging_os_error(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile_home = tmp_path / "profile-home"
+    profile_home.mkdir()
+    fake_cli = types.ModuleType("cli")
+    fake_cli._detect_file_drop = lambda raw: None
+    fake_cli._split_path_input = lambda raw: (raw, "")
+    fake_cli._resolve_attachment_path = lambda raw: None
+
+    def fail_workspace_staging(_session):
+        raise OSError(errno.ENOSPC, "no space left on device")
+
+    monkeypatch.setattr(server, "_desktop_attachment_dir", fail_workspace_staging)
+    server._sessions["sid"] = _session(
+        cwd=str(workspace), profile_home=str(profile_home)
+    )
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "path": "/Users/alice/Downloads/report.txt",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,aGVsbG8gd29ybGQ=",
+                },
+            }
+        )
+
+        assert "error" in resp
+        assert resp["error"]["message"] == "[Errno 28] no space left on device"
+        assert not (profile_home / "cache" / "desktop-attachments").exists()
     finally:
         server._sessions.pop("sid", None)
 
