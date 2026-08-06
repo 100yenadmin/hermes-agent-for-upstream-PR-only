@@ -926,6 +926,15 @@ class GatewayConfig:
     # gateway behaves exactly as before — single HERMES_HOME, no profile stamping.
     multiplex_profiles: bool = False
 
+    # Fail startup when a multiplexed profile does not come online (opt-in;
+    # default off preserves today's log-and-continue behavior). Adapter
+    # creation/connection failures on non-port-binding platforms (Mattermost,
+    # Telegram) are only logged, so a consolidated gateway can start "healthy"
+    # with one profile silently offline — nobody notices until that employee's
+    # agent stops answering. Deployments that put every profile in one process
+    # turn this on so the failure is loud at boot instead of silent.
+    require_all_profiles_connected: bool = False
+
     # Opt-in systemd event-loop watchdog. Zero preserves Type=simple and
     # disables sd_notify at runtime.
     systemd_watchdog_seconds: int = 0
@@ -1070,6 +1079,7 @@ class GatewayConfig:
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
+            "require_all_profiles_connected": self.require_all_profiles_connected,
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "loop_watchdog": self.loop_watchdog,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
@@ -1133,6 +1143,7 @@ class GatewayConfig:
         group_sessions_per_user = data.get("group_sessions_per_user")
         thread_sessions_per_user = data.get("thread_sessions_per_user")
         multiplex_profiles = data.get("multiplex_profiles")
+        require_all_profiles_connected = data.get("require_all_profiles_connected")
         nested_gateway = data.get("gateway") if isinstance(data.get("gateway"), dict) else {}
         if "systemd_watchdog_seconds" in data:
             systemd_watchdog_raw = data.get("systemd_watchdog_seconds")
@@ -1152,6 +1163,12 @@ class GatewayConfig:
             # Also honor gateway.multiplex_profiles written by
             # ``hermes config set gateway.multiplex_profiles true``.
             multiplex_profiles = nested_gateway.get("multiplex_profiles")
+        if require_all_profiles_connected is None and isinstance(nested_gateway, dict):
+            # Also honor gateway.require_all_profiles_connected written by
+            # ``hermes config set gateway.require_all_profiles_connected true``.
+            require_all_profiles_connected = nested_gateway.get(
+                "require_all_profiles_connected"
+            )
         # Operator override: GATEWAY_MULTIPLEX_PROFILES wins over config.yaml when
         # set to a recognized value. Hosted deployments (Nous Portal / Fly) stamp
         # it on the container so the single multiplexed gateway — which the
@@ -1207,6 +1224,9 @@ class GatewayConfig:
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
+            require_all_profiles_connected=_coerce_bool(
+                require_all_profiles_connected, False
+            ),
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             loop_watchdog=loop_watchdog,
             max_concurrent_sessions=max_concurrent_sessions,
@@ -1350,6 +1370,13 @@ def load_gateway_config() -> GatewayConfig:
             if "multiplex_profiles" in yaml_cfg:
                 gw_data["multiplex_profiles"] = yaml_cfg["multiplex_profiles"]
 
+            # All-profiles-connected startup assertion: same top-level /
+            # nested-gateway parity as multiplex_profiles above.
+            if "require_all_profiles_connected" in yaml_cfg:
+                gw_data["require_all_profiles_connected"] = yaml_cfg[
+                    "require_all_profiles_connected"
+                ]
+
             # Profile-based routing rules: accept either top-level
             # ``profile_routes`` or the nested ``gateway.profile_routes`` form
             # (matching the multiplex_profiles parity above).
@@ -1363,6 +1390,15 @@ def load_gateway_config() -> GatewayConfig:
                 if "multiplex_profiles" in gateway_section and "multiplex_profiles" not in gw_data:
                     # gateway.multiplex_profiles written by `hermes config set gateway.multiplex_profiles true`
                     gw_data["multiplex_profiles"] = gateway_section["multiplex_profiles"]
+                if (
+                    "require_all_profiles_connected" in gateway_section
+                    and "require_all_profiles_connected" not in gw_data
+                ):
+                    # gateway.require_all_profiles_connected written by
+                    # `hermes config set gateway.require_all_profiles_connected true`
+                    gw_data["require_all_profiles_connected"] = gateway_section[
+                        "require_all_profiles_connected"
+                    ]
                 if "max_concurrent_sessions" in gateway_section:
                     gw_data["max_concurrent_sessions"] = gateway_section["max_concurrent_sessions"]
                 if "systemd_watchdog_seconds" in gateway_section:
