@@ -2042,18 +2042,63 @@ class PluginManager:
 
 
 # ---------------------------------------------------------------------------
-# Module-level singleton & convenience functions
+# Profile-scoped manager cache & convenience functions
 # ---------------------------------------------------------------------------
 
+#: Explicit pin. ``None`` means "no pin"; tests (and ``tests/conftest.py``'s
+#: isolation fixture) assign directly here, and a non-``None`` value wins over
+#: the cache below. Production code never assigns it.
 _plugin_manager: Optional[PluginManager] = None
+
+#: One manager per profile home. A single-profile process only ever creates one
+#: entry, so its lifecycle is identical to the old module-level singleton.
+_plugin_managers: Dict[str, PluginManager] = {}
+_plugin_manager_lock = threading.Lock()
+
+
+def _plugin_manager_scope_key() -> str:
+    """Identify the profile a PluginManager belongs to.
+
+    ``get_hermes_home()`` follows the context-local override installed by
+    ``gateway/run.py::_profile_runtime_scope``, so this is the same seam the
+    rest of the per-profile config/skills/memory resolution already uses — the
+    key changes exactly when the routed profile changes.
+    """
+    try:
+        return str(get_hermes_home())
+    except Exception:  # pragma: no cover — get_hermes_home() is total in practice
+        logger.debug("Could not resolve plugin manager scope key", exc_info=True)
+        return ""
 
 
 def get_plugin_manager() -> PluginManager:
-    """Return (and lazily create) the global PluginManager singleton."""
-    global _plugin_manager
-    if _plugin_manager is None:
-        _plugin_manager = PluginManager()
-    return _plugin_manager
+    """Return (and lazily create) the PluginManager for the active profile.
+
+    A multiplexed gateway routes each inbound message to a different profile,
+    and each profile has its own ``plugins/`` directory plus its own
+    ``plugins.disabled``/``plugins.enabled`` config. A single process-global
+    manager meant the first profile to trip discovery latched ``_discovered``
+    for every profile routed afterwards, so a secondary profile's plugins never
+    loaded — ``discover_plugins()`` returned early on the first profile's
+    already-populated registry. Keying the cache by home gives each profile its
+    own registry and its own discovery sweep.
+    """
+    pinned = _plugin_manager
+    if pinned is not None:
+        return pinned
+    key = _plugin_manager_scope_key()
+    with _plugin_manager_lock:
+        manager = _plugin_managers.get(key)
+        if manager is None:
+            manager = PluginManager()
+            _plugin_managers[key] = manager
+        return manager
+
+
+def reset_plugin_managers() -> None:
+    """Drop every cached per-profile manager (test/reload seam)."""
+    with _plugin_manager_lock:
+        _plugin_managers.clear()
 
 
 def discover_plugins(force: bool = False) -> None:
