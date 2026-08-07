@@ -30,10 +30,21 @@ _principal: ContextVar[ManagedProfilePrincipal | None] = ContextVar(
     "evaos_managed_profile_principal",
     default=None,
 )
+_effective_profile: ContextVar[str | None] = ContextVar(
+    "evaos_managed_effective_profile",
+    default=None,
+)
 
 
 def current_principal() -> ManagedProfilePrincipal | None:
     return _principal.get()
+
+
+def current_effective_profile() -> str | None:
+    principal = current_principal()
+    if principal is None:
+        return None
+    return _effective_profile.get() or principal.primary_profile
 
 
 def principal_from_headers(headers: Mapping[str, str]) -> ManagedProfilePrincipal | None:
@@ -93,14 +104,24 @@ def filter_profile_names(names: Iterable[str]) -> set[str]:
 
 
 @contextmanager
-def managed_profile_context(principal: ManagedProfilePrincipal | None):
+def managed_profile_context(
+    principal: ManagedProfilePrincipal | None,
+    *,
+    effective_profile: str | None = None,
+):
     token = _principal.set(principal)
     home_token = None
+    effective_token = None
     if principal is not None:
         from hermes_cli import profiles as profiles_mod
         from hermes_constants import set_hermes_home_override
 
-        profile_home = profiles_mod._get_profiles_root() / principal.primary_profile
+        selected = effective_profile or principal.primary_profile
+        if selected not in principal.allowed_profiles:
+            _principal.reset(token)
+            raise PermissionError("profile is not authorized")
+        effective_token = _effective_profile.set(selected)
+        profile_home = profiles_mod._get_profiles_root() / selected
         home_token = set_hermes_home_override(str(profile_home))
     try:
         yield principal
@@ -109,5 +130,6 @@ def managed_profile_context(principal: ManagedProfilePrincipal | None):
             from hermes_constants import reset_hermes_home_override
 
             reset_hermes_home_override(home_token)
+        if effective_token is not None:
+            _effective_profile.reset(effective_token)
         _principal.reset(token)
-

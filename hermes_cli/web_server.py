@@ -15934,14 +15934,14 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    with managed_profile_context(principal):
-        try:
+    try:
+        with managed_profile_context(principal):
             requested_profile = (ws.query_params.get("profile") or "").strip()
-            if requested_profile:
-                require_profile(requested_profile)
-        except PermissionError:
-            await ws.close(code=4403)
-            return
+            effective_profile = require_profile(requested_profile)
+    except PermissionError:
+        await ws.close(code=4403)
+        return
+    with managed_profile_context(principal, effective_profile=effective_profile):
         await handle_ws(ws)
 
 

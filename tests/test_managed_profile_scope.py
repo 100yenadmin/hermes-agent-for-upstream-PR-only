@@ -4,6 +4,7 @@ import pytest
 
 from hermes_cli import profiles
 from hermes_cli.profile_scope import (
+    current_effective_profile,
     managed_profile_context,
     principal_from_headers,
     require_profile,
@@ -30,11 +31,15 @@ def test_managed_scope_defaults_to_primary_and_rejects_other_profile(monkeypatch
 
     with managed_profile_context(_principal()):
         assert require_profile(None) == "jane"
+        assert current_effective_profile() == "jane"
         assert profiles.get_profile_dir("default") == profiles_root / "jane"
         assert profiles.get_profile_dir("louis") == profiles_root / "louis"
         assert profiles.profile_exists("other") is False
         with pytest.raises(PermissionError):
             profiles.get_profile_dir("other")
+
+    with managed_profile_context(_principal(), effective_profile="louis"):
+        assert current_effective_profile() == "louis"
 
 
 def test_managed_profile_header_rejects_primary_outside_allowlist():
@@ -46,4 +51,3 @@ def test_managed_profile_header_rejects_primary_outside_allowlist():
                 "x-evaos-principal-user": "user-1",
             }
         )
-

@@ -12276,15 +12276,15 @@ def test_managed_session_registry_hides_and_refuses_other_profile(monkeypatch, t
     )
     principal = principal_from_headers(
         {
-            "x-evaos-allowed-profiles": "jane",
+            "x-evaos-allowed-profiles": "jane,louis",
             "x-evaos-primary-profile": "jane",
-            "x-evaos-profile-admin": "0",
+            "x-evaos-profile-admin": "1",
             "x-evaos-principal-user": "user-1",
             "x-evaos-session-id": "session-1",
         }
     )
     try:
-        with managed_profile_context(principal):
+        with managed_profile_context(principal, effective_profile="jane"):
             listed = server.handle_request(
                 {
                     "id": "list",

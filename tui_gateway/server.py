@@ -7833,16 +7833,19 @@ def _session_lookup_key(session: dict, *, fallback: str = "") -> str:
 
 def _managed_session_is_authorized(session: dict) -> bool:
     """Fail closed when a managed caller targets another profile's live chat."""
-    from hermes_cli.profile_scope import current_principal
+    from hermes_cli.profile_scope import current_effective_profile, current_principal
 
     principal = current_principal()
     if principal is None:
         return True
+    effective_profile = current_effective_profile()
+    if not effective_profile:
+        return False
     raw_home = str(session.get("profile_home") or "").strip()
     if not raw_home:
         return False
     profile_name = Path(raw_home).name
-    if profile_name not in principal.allowed_profiles:
+    if profile_name != effective_profile:
         return False
     try:
         from hermes_cli import profiles as profiles_mod
