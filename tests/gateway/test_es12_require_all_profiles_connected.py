@@ -18,18 +18,24 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from gateway.run import GatewayRunner, ProfileConnectivityError
+from gateway.run import GatewayRunner, Platform, ProfileConnectivityError
 
 
-def _bare_runner(require_all: bool, multiplex: bool = True):
+def _bare_runner(require_all: bool, multiplex: bool = True, active_online: bool = True):
     runner = object.__new__(GatewayRunner)
     runner.config = MagicMock(
         multiplex_profiles=multiplex,
         require_all_profiles_connected=require_all,
     )
-    runner.adapters = {}
+    # ``self.adapters`` is the ACTIVE profile's map, filled by the primary
+    # startup loop that these tests stub out. The assertion covers the active
+    # profile too, so a healthy primary must be modelled explicitly — an empty
+    # map means "the active profile connected nothing", which is an outage.
+    runner.adapters = {"mattermost": MagicMock()} if active_online else {}
+    runner._failed_platforms = {}
     runner._profile_adapters = {}
     runner._profile_startup_failures = {}
+    runner._profile_relay_served = set()
     runner.pairing_store = MagicMock()
     runner.pairing_stores = {}
     runner._adapter_credential_fingerprint = lambda adapter: None
@@ -196,3 +202,104 @@ def test_no_secondary_profiles_is_healthy(tmp_path):
     connected = _run(runner, tmp_path, profiles=["main"])
 
     assert connected == 0
+
+
+def test_active_profile_with_no_adapters_raises(tmp_path):
+    """The active profile is covered too, not just the secondaries.
+
+    "Healthy gateway, one employee unreachable" is exactly as invisible when
+    the unreachable employee is on the ACTIVE profile, and on a consolidated
+    host the active profile is an employee like any other.
+    """
+    runner = _bare_runner(require_all=True, active_online=False)
+
+    with pytest.raises(ProfileConnectivityError) as exc:
+        _run(
+            runner,
+            tmp_path,
+            profiles=["main", "woody"],
+            connected_profiles=("woody",),
+        )
+
+    message = str(exc.value)
+    assert "main" in message
+    assert "no platform adapter connected" in message
+    assert "woody" not in message
+
+
+def test_active_profile_queued_for_reconnect_raises(tmp_path):
+    """A retryable primary failure is still an offline profile under the flag.
+
+    The primary startup loop parks a failed platform in ``_failed_platforms``
+    and keeps going. That is the right default, but it is the precise case the
+    flag exists to make fatal on a consolidated host.
+    """
+    runner = _bare_runner(require_all=True)
+    runner._failed_platforms = {Platform.TELEGRAM: {"attempts": 0}}
+
+    with pytest.raises(ProfileConnectivityError) as exc:
+        _run(
+            runner,
+            tmp_path,
+            profiles=["main", "woody"],
+            connected_profiles=("woody",),
+        )
+
+    message = str(exc.value)
+    assert "main" in message
+    assert "telegram" in message
+    assert "queued for background reconnection" in message
+
+
+def test_relay_only_secondary_is_not_offline(tmp_path):
+    """A profile served solely through the shared Relay must not abort startup.
+
+    Multiplex mode skips a secondary's Relay adapter by design — the active
+    profile owns the single connection and inbound turns are routed by the
+    connector-stamped ``source.profile``. Such a profile therefore ends
+    startup with an empty adapter map on purpose, which the assertion must not
+    read as an outage.
+    """
+    runner = _bare_runner(require_all=True)
+    runner._profile_adapters = {"woody": {}}
+    runner._profile_relay_served = {"woody"}
+
+    # No exception: the empty map is the designed outcome for this profile.
+    runner._assert_all_profiles_connected(["woody"], "main")
+
+
+def test_relay_only_secondary_with_a_real_failure_still_raises(tmp_path):
+    """The Relay exemption only covers the empty-map rule, not real failures."""
+    runner = _bare_runner(require_all=True)
+    runner._profile_adapters = {"woody": {}}
+    runner._profile_relay_served = {"woody"}
+    runner._record_profile_startup_failure("woody", "telegram", "failed to connect")
+
+    with pytest.raises(ProfileConnectivityError) as exc:
+        runner._assert_all_profiles_connected(["woody"], "main")
+
+    assert "woody" in str(exc.value)
+    assert "failed to connect" in str(exc.value)
+
+
+def test_start_one_profile_adapters_records_the_relay_skip(tmp_path):
+    """The exemption is driven by the real skip site, not only by the fixture.
+
+    Guards the seam between ``_start_one_profile_adapters`` (which decides to
+    skip Relay) and the assertion (which must know it did).
+    """
+    runner = _bare_runner(require_all=True)
+    profile_cfg = MagicMock()
+    profile_cfg.platforms = {Platform.RELAY: MagicMock(enabled=True, extra={})}
+
+    with patch("gateway.config.load_gateway_config", return_value=profile_cfg), patch(
+        "gateway.run._own_policy_open_startup_violation", return_value=None
+    ):
+        connected = asyncio.run(
+            runner._start_one_profile_adapters(
+                "woody", tmp_path / ".hermes" / "profiles" / "woody", {}
+            )
+        )
+
+    assert connected == 0
+    assert "woody" in runner._profile_relay_served
