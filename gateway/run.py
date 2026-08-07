@@ -44,7 +44,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
+from typing import Awaitable, Callable, Dict, Optional, Any, List, Set, Tuple, Union, cast
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
@@ -5814,6 +5814,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # startup. Populated alongside _profile_adapters and consumed by
         # _assert_all_profiles_connected(); empty unless something failed.
         self._profile_startup_failures: Dict[str, List[str]] = {}
+        # Profiles whose only ingress is the shared Relay connection, which is
+        # skipped by design in multiplex mode (the active profile owns it).
+        # They legitimately finish startup with an empty adapter map, so
+        # _assert_all_profiles_connected() must not read that as offline.
+        self._profile_relay_served: Set[str] = set()
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -13173,7 +13178,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     profile_name, "*", f"profile startup raised {e}"
                 )
 
-        self._assert_all_profiles_connected(served_secondaries)
+        self._assert_all_profiles_connected(served_secondaries, active)
 
         # Record served profiles in runtime status for `hermes status`.
         try:
@@ -13197,7 +13202,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return connected
 
-    def _assert_all_profiles_connected(self, served_secondaries: "List[str]") -> None:
+    def _assert_all_profiles_connected(
+        self, served_secondaries: "List[str]", active: str = ""
+    ) -> None:
         """Refuse to finish startup with a served profile offline.
 
         No-op unless ``gateway.require_all_profiles_connected`` is set. The
@@ -13208,9 +13215,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         employee complains.
 
         A profile fails the check when it recorded any adapter failure *or*
-        ended startup with zero connected adapters. Only the secondary profiles
-        are covered — the active profile's adapters come up in the primary
-        startup loop, which has its own retryable/non-retryable error handling.
+        ended startup with zero connected adapters.
+
+        The *active* profile is covered too when its name is passed. Its
+        adapters come up in the primary startup loop rather than here, so its
+        state is read from ``self.adapters`` (what connected) and
+        ``self._failed_platforms`` (what was queued for retry) instead of the
+        secondary bookkeeping. Leaving it out meant a consolidated host could
+        pass this gate with the employee on the active profile offline, which
+        is the exact failure the flag exists to prevent.
+
+        A profile served only through the shared Relay ingress is exempt from
+        the zero-adapters rule: multiplex mode skips its Relay adapter by
+        design (see ``_start_one_profile_adapters``), so an empty map is the
+        expected outcome, not an outage.
         """
         # Only a literal True arms this. Unlike every other gateway flag, this
         # one's effect is to ABORT startup, so it must not be armable by a
@@ -13223,23 +13241,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         recorded = getattr(self, "_profile_startup_failures", None) or {}
+        relay_served = getattr(self, "_profile_relay_served", None) or set()
+        no_adapter_reason = (
+            "no platform adapter connected (check that this profile's "
+            "config.yaml enables at least one platform and that its "
+            "credentials are present in its profile .env)"
+        )
         offline: Dict[str, List[str]] = {}
         for profile_name in served_secondaries:
             reasons = list(recorded.get(profile_name, ()))
-            if not self._profile_adapters.get(profile_name):
-                reasons.append(
-                    "no platform adapter connected (check that this profile's "
-                    "config.yaml enables at least one platform and that its "
-                    "credentials are present in its profile .env)"
-                )
+            if (
+                not self._profile_adapters.get(profile_name)
+                and profile_name not in relay_served
+            ):
+                reasons.append(no_adapter_reason)
             if reasons:
                 offline[profile_name] = reasons
 
+        checked = list(served_secondaries)
+        if active:
+            checked.append(active)
+            active_reasons = [
+                f"{platform.value}: queued for background reconnection"
+                for platform in getattr(self, "_failed_platforms", {})
+            ]
+            if not self.adapters and active not in relay_served:
+                active_reasons.append(no_adapter_reason)
+            if active_reasons:
+                offline[active] = active_reasons
+
         if not offline:
             logger.info(
-                "[MULTIPLEX] require_all_profiles_connected: all %d secondary "
+                "[MULTIPLEX] require_all_profiles_connected: all %d served "
                 "profile(s) connected",
-                len(served_secondaries),
+                len(checked),
             )
             return
 
@@ -13248,7 +13283,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         raise ProfileConnectivityError(
             f"gateway.require_all_profiles_connected is on and "
-            f"{len(offline)} of {len(served_secondaries)} served profile(s) did "
+            f"{len(offline)} of {len(checked)} served profile(s) did "
             f"not come online: {detail}. Fix the profile(s) or turn the flag off."
         )
 
@@ -13316,6 +13351,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 getattr(self.config, "multiplex_profiles", False)
                 and platform is Platform.RELAY
             ):
+                # Note the skip: a profile served ONLY through Relay ends this
+                # loop with zero adapters by design, and the connectivity
+                # assertion must tell that apart from "everything failed".
+                self._profile_relay_served.add(profile_name)
                 continue
             try:
                 with _profile_runtime_scope(profile_home):
