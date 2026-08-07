@@ -89,7 +89,7 @@ def require_profile(name: str | None, *, allow_selectors: Iterable[str] = ()) ->
     if requested in set(allow_selectors):
         return requested
     if requested in {"", "default", "current"}:
-        return principal.primary_profile
+        return current_effective_profile() or principal.primary_profile
     if requested not in principal.allowed_profiles:
         raise PermissionError("profile is not authorized")
     return requested

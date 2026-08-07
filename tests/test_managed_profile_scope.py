@@ -40,6 +40,7 @@ def test_managed_scope_defaults_to_primary_and_rejects_other_profile(monkeypatch
 
     with managed_profile_context(_principal(), effective_profile="louis"):
         assert current_effective_profile() == "louis"
+        assert require_profile(None) == "louis"
 
 
 def test_managed_profile_header_rejects_primary_outside_allowlist():
