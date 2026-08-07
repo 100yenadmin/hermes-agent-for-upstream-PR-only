@@ -781,6 +781,7 @@ def _(rid, params: dict) -> dict:
         _session_live_item(sid, session, current)
         for sid, session in snapshot
         if not session.get("_finalized")
+        and _managed_session_is_authorized(session)
     ]
     return _ok(rid, {"sessions": rows})
 

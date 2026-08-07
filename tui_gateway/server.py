@@ -1364,7 +1364,10 @@ def _response_profile_name(profile: str | None = None) -> str:
     Prefer the RPC's requested profile when it is a real non-launch profile;
     otherwise the process launch profile.
     """
-    name = (profile or "").strip()
+    from hermes_cli.profile_scope import current_principal, require_profile
+
+    principal = current_principal()
+    name = require_profile(profile) if principal is not None else (profile or "").strip()
     if name and _profile_home(name) is not None:
         return name
     return _current_profile_name()
@@ -1385,7 +1388,10 @@ def _db_unavailable_error(rid, *, code: int):
 # launch profile (unchanged for single-profile and per-profile-remote setups).
 def _profile_home(profile: str | None) -> Path | None:
     """Resolve a named profile's home on THIS host, or None for the launch profile."""
-    name = (profile or "").strip()
+    from hermes_cli.profile_scope import current_principal, require_profile
+
+    principal = current_principal()
+    name = require_profile(profile) if principal is not None else (profile or "").strip()
     if not name:
         return None
     try:
@@ -2271,7 +2277,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
 def _sess_nowait(params, rid):
     s = _sessions.get(params.get("session_id") or "")
-    return (s, None) if s else (None, _err(rid, 4001, "session not found"))
+    return (
+        (s, None)
+        if s and _managed_session_is_authorized(s)
+        else (None, _err(rid, 4001, "session not found"))
+    )
 
 
 def _sess(params, rid):
@@ -7821,9 +7831,36 @@ def _session_lookup_key(session: dict, *, fallback: str = "") -> str:
     )
 
 
+def _managed_session_is_authorized(session: dict) -> bool:
+    """Fail closed when a managed caller targets another profile's live chat."""
+    from hermes_cli.profile_scope import current_effective_profile, current_principal
+
+    principal = current_principal()
+    if principal is None:
+        return True
+    effective_profile = current_effective_profile()
+    if not effective_profile:
+        return False
+    raw_home = str(session.get("profile_home") or "").strip()
+    if not raw_home:
+        return False
+    profile_name = Path(raw_home).name
+    if profile_name != effective_profile:
+        return False
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        expected = Path(profiles_mod.get_profile_dir(profile_name)).resolve()
+        return Path(raw_home).resolve() == expected
+    except (OSError, PermissionError, ValueError):
+        return False
+
+
 def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
     for sid, session in list(_sessions.items()):
         if session.get("_finalized"):
+            continue
+        if not _managed_session_is_authorized(session):
             continue
         if _session_lookup_key(session, fallback=sid) == session_key:
             return sid, session
