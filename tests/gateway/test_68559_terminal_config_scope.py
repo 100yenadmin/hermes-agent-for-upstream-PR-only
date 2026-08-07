@@ -127,6 +127,68 @@ def test_routed_local_profile_does_not_inherit_docker_settings(tmp_path, monkeyp
     assert routed_config["docker_network"] is True
 
 
+def test_routed_profiles_do_not_share_cached_terminal_environment(tmp_path, monkeypatch):
+    """Multiplexed profiles with different backends need distinct cache entries."""
+    from agent.secret_scope import is_multiplex_active, set_multiplex_active
+    from gateway.run import _profile_runtime_scope
+    from tools import file_tools, terminal_tool
+
+    local_home, docker_home = _gateway_and_routed_homes(
+        tmp_path,
+        {"backend": "local"},
+        {"backend": "docker", "docker_image": "routed-image"},
+    )
+    created = []
+
+    class _FakeEnvironment:
+        def __init__(self, env_type):
+            self.env_type = env_type
+            self.cwd = str(tmp_path)
+
+        def execute(self, *args, **kwargs):
+            return {"output": self.env_type, "exit_code": 0}
+
+    def _fake_create_environment(env_type, *args, **kwargs):
+        created.append(env_type)
+        return _FakeEnvironment(env_type)
+
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+    monkeypatch.setattr(file_tools, "_file_ops_cache", {})
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda *args, **kwargs: {"approved": True},
+    )
+    monkeypatch.setattr(
+        terminal_tool,
+        "_create_environment",
+        _fake_create_environment,
+    )
+
+    was_multiplexing = is_multiplex_active()
+    set_multiplex_active(True)
+    try:
+        with _profile_runtime_scope(local_home):
+            local_result = json.loads(terminal_tool.terminal_tool("pwd"))
+            local_file_ops = file_tools._get_file_ops()
+        with _profile_runtime_scope(docker_home):
+            docker_result = json.loads(terminal_tool.terminal_tool("pwd"))
+            docker_file_ops = file_tools._get_file_ops()
+    finally:
+        set_multiplex_active(was_multiplexing)
+
+    assert created == ["local", "docker"]
+    assert local_result["output"] == "local"
+    assert docker_result["output"] == "docker"
+    assert local_file_ops.env.env_type == "local"
+    assert docker_file_ops.env.env_type == "docker"
+    assert len(terminal_tool._active_environments) == 2
+    assert len(file_tools._file_ops_cache) == 2
+
+
 def test_single_profile_path_still_uses_process_environment(tmp_path, monkeypatch):
     from tools import terminal_tool
 

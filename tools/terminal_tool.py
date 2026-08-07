@@ -33,6 +33,7 @@ Usage:
     result = terminal_tool("python server.py", background=True)
 """
 
+import hashlib
 import importlib.util
 import json
 import logging
@@ -1295,16 +1296,34 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     tracking) are *not* isolation signals — they should not cause each
     session to spin up its own container.  Only overrides containing
     backend-specific image keys or ``env_type`` trigger isolation.
+
+    A multiplex gateway additionally scopes the key by the canonical profile
+    home and resolved backend. This preserves parent/subagent sharing within
+    one profile without letting another profile reuse the cached environment.
     """
     _ISOLATION_KEYS = frozenset({
         "docker_image", "modal_image", "singularity_image",
         "daytona_image", "env_type",
     })
+    resolved_task_id = "default"
     if task_id and task_id in _task_env_overrides:
         overrides = _task_env_overrides[task_id]
         if set(overrides.keys()) & _ISOLATION_KEYS:
-            return task_id
-    return "default"
+            resolved_task_id = task_id
+
+    from agent.secret_scope import is_multiplex_active
+
+    if not is_multiplex_active():
+        return resolved_task_id
+
+    from hermes_constants import get_hermes_home
+
+    profile_home = str(Path(get_hermes_home()).expanduser().resolve())
+    env_type = str(_get_terminal_env("TERMINAL_ENV", "local")).strip().lower() or "local"
+    scope_digest = hashlib.sha256(
+        f"{profile_home}\0{env_type}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"{resolved_task_id}-{env_type}-{scope_digest}"
 
 
 def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:

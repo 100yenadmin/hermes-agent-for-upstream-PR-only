@@ -163,12 +163,13 @@ class ToolEntry:
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
-        "max_result_size_chars", "dynamic_schema_overrides",
+        "max_result_size_chars", "dynamic_schema_overrides", "registration_home",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 registration_home=""):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -187,6 +188,14 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self.registration_home = registration_home
+
+
+def _current_registration_home() -> str:
+    """Return the canonical Hermes home owning a tool registration."""
+    from hermes_constants import get_hermes_home
+
+    return str(Path(get_hermes_home()).expanduser().resolve())
 
 
 # ---------------------------------------------------------------------------
@@ -539,10 +548,31 @@ class ToolRegistry:
         replace an existing built-in tool implementation (e.g. swap the
         default browser tool for a headed-Chrome CDP backend). Without it,
         registrations that would shadow an existing tool from a different
-        toolset are rejected to prevent accidental overwrites.
+        toolset are rejected to prevent accidental overwrites. While multiplex
+        mode is active, re-registration from a different Hermes home is
+        rejected so profile discovery cannot silently replace another
+        profile's handler.
         """
         with self._lock:
+            registration_home = _current_registration_home()
             existing = self._tools.get(name)
+            from agent.secret_scope import is_multiplex_active
+
+            if (
+                existing
+                and is_multiplex_active()
+                and existing.registration_home != registration_home
+            ):
+                logger.error(
+                    "Tool registration REJECTED: %r from different Hermes home "
+                    "%r would replace the registration owned by %r.",
+                    name, registration_home, existing.registration_home,
+                )
+                raise PermissionError(
+                    f"Tool {name!r} from different Hermes home "
+                    f"{registration_home!r} cannot replace the registration "
+                    f"owned by {existing.registration_home!r}."
+                )
             if existing and existing.toolset != toolset:
                 if override:
                     _owner = self._plugin_owner_of(handler)
@@ -591,6 +621,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                registration_home=registration_home,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
