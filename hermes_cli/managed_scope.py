@@ -66,6 +66,12 @@ def get_managed_dir() -> Optional[Path]:
     if override:
         p = Path(override)
         return p if p.is_dir() else None
+    profile_root = os.environ.get("EVAOS_HERMES_MANAGED_PROFILE_ROOT", "").strip()
+    if profile_root:
+        from hermes_constants import get_hermes_home
+
+        profile_dir = Path(profile_root) / get_hermes_home().name
+        return profile_dir if profile_dir.is_dir() else None
     if _under_pytest():
         return None
     return _DEFAULT_MANAGED_DIR if _DEFAULT_MANAGED_DIR.is_dir() else None
