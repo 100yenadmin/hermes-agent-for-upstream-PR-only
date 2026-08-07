@@ -2986,7 +2986,6 @@ def _run_approval_gate(
     autoapprove_log_prefix: str,
     fail_closed_when_no_human: bool = False,
     no_human_block_message: str = "",
-    plugin_metadata: Optional[dict] = None,
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -3023,13 +3022,6 @@ def _run_approval_gate(
             plugin-flagged action never runs ungated without a human.
         no_human_block_message: Message returned when
             ``fail_closed_when_no_human`` blocks.
-        plugin_metadata: Optional already-scrubbed dict of extra fields a
-            plugin ``pre_tool_call`` directive carried (see
-            ``hermes_cli.plugins._scrub_pre_tool_call_metadata``). Attached to
-            the approval payload the gateway/API transports emit, under
-            ``plugin_metadata``, so a session-event consumer can see the
-            target of the gated call. Purely descriptive — it is never read
-            back here and takes no part in the decision.
 
     Returns:
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
@@ -3114,8 +3106,6 @@ def _run_approval_gate(
                 "allow_permanent": True,
                 "allow_session": True,
             }
-            if plugin_metadata:
-                approval_data["plugin_metadata"] = plugin_metadata
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface="gateway"
             )
@@ -3163,14 +3153,11 @@ def _run_approval_gate(
 
         # No notify callback (e.g. API server without an attached chat):
         # queue for /approve /deny review, agent sees approval_required.
-        pending_payload = {
+        submit_pending(session_key, {
             "command": display_target,
             "pattern_key": pattern_key,
             "description": description,
-        }
-        if plugin_metadata:
-            pending_payload["plugin_metadata"] = plugin_metadata
-        submit_pending(session_key, pending_payload)
+        })
         return {
             "approved": False,
             "pattern_key": pattern_key,
@@ -3315,7 +3302,6 @@ def request_tool_approval(
     *,
     rule_key: str = "",
     approval_callback=None,
-    plugin_metadata: Optional[dict] = None,
 ) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
@@ -3343,14 +3329,6 @@ def request_tool_approval(
             on the same tool).
         approval_callback: Optional CLI callback for interactive prompts
             (same contract as ``check_dangerous_command``).
-        plugin_metadata: Optional scrubbed dict of the directive's extra
-            fields (tool_name, app_slug, the contract-declared target props,
-            …). Forwarded verbatim onto the approval payload the gateway and
-            API transports emit, under ``plugin_metadata``, so a consumer of
-            the session event stream can see WHICH send/write is pending
-            rather than only that one is. It never influences the decision:
-            the prompt, the allowlist grain, and every branch below key off
-            ``pattern_key``/``description`` exactly as before.
 
     Returns:
         ``{"approved": True, "message": None}`` when allowed, or
@@ -3402,7 +3380,6 @@ def request_tool_approval(
             "but no interactive user or gateway is present to approve it. "
             "A plugin flagged this action for human confirmation."
         ),
-        plugin_metadata=plugin_metadata if isinstance(plugin_metadata, dict) else None,
     )
 
 
