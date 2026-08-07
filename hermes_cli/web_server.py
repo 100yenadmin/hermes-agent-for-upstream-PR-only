@@ -685,6 +685,59 @@ async def _token_auth_seam(request: Request, call_next):
     return await token_auth_middleware(request, call_next)
 
 
+_MANAGED_NON_ADMIN_BLOCKED_PREFIXES = (
+    "/api/console",
+    "/api/pty",
+    "/api/fs/",
+    "/api/process",
+    "/api/ssh/",
+    "/api/system",
+    "/api/terminal",
+    "/api/shell",
+    "/api/update",
+)
+
+
+@app.middleware("http")
+async def evaos_managed_profile_scope_middleware(request: Request, call_next):
+    """Bind VM-proxy-authenticated evaOS profile authority to this request."""
+    from hermes_cli.profile_scope import (
+        managed_profile_context,
+        principal_from_headers,
+        require_profile,
+    )
+
+    try:
+        principal = principal_from_headers(request.headers)
+    except ValueError:
+        return JSONResponse({"detail": "invalid managed profile scope"}, status_code=403)
+    if principal is None:
+        return await call_next(request)
+
+    with managed_profile_context(principal):
+        try:
+            requested_profile = (request.query_params.get("profile") or "").strip()
+            if requested_profile:
+                require_profile(requested_profile, allow_selectors={"all"})
+            profile_route = re.match(r"^/api/profiles/([^/]+)", request.url.path)
+            if profile_route and profile_route.group(1) not in {"active", "sessions"}:
+                require_profile(profile_route.group(1))
+        except PermissionError:
+            return JSONResponse({"detail": "profile is not authorized"}, status_code=403)
+
+        if not principal.admin:
+            path = request.url.path
+            manages_profiles = (
+                path == "/api/profiles" and request.method != "GET"
+            ) or (
+                path.startswith("/api/profiles/") and request.method not in {"GET", "HEAD"}
+            )
+            if manages_profiles or path.startswith(_MANAGED_NON_ADMIN_BLOCKED_PREFIXES):
+                return JSONResponse({"detail": "administrator access required"}, status_code=403)
+
+        return await call_next(request)
+
+
 # ---------------------------------------------------------------------------
 # Dashboard component health — in-process error/self-test counters that feed
 # the ``components`` dict on ``/api/status``.  That endpoint is in
@@ -15823,8 +15876,27 @@ async def gateway_ws(ws: WebSocket) -> None:
         return
 
     from tui_gateway.ws import handle_ws
+    from hermes_cli.profile_scope import (
+        managed_profile_context,
+        principal_from_headers,
+        require_profile,
+    )
 
-    await handle_ws(ws)
+    try:
+        principal = principal_from_headers(ws.headers)
+    except ValueError:
+        await ws.close(code=4403)
+        return
+
+    with managed_profile_context(principal):
+        try:
+            requested_profile = (ws.query_params.get("profile") or "").strip()
+            if requested_profile:
+                require_profile(requested_profile)
+        except PermissionError:
+            await ws.close(code=4403)
+            return
+        await handle_ws(ws)
 
 
 # ---------------------------------------------------------------------------

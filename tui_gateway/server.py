@@ -1364,7 +1364,10 @@ def _response_profile_name(profile: str | None = None) -> str:
     Prefer the RPC's requested profile when it is a real non-launch profile;
     otherwise the process launch profile.
     """
-    name = (profile or "").strip()
+    from hermes_cli.profile_scope import current_principal, require_profile
+
+    principal = current_principal()
+    name = require_profile(profile) if principal is not None else (profile or "").strip()
     if name and _profile_home(name) is not None:
         return name
     return _current_profile_name()
@@ -1385,7 +1388,10 @@ def _db_unavailable_error(rid, *, code: int):
 # launch profile (unchanged for single-profile and per-profile-remote setups).
 def _profile_home(profile: str | None) -> Path | None:
     """Resolve a named profile's home on THIS host, or None for the launch profile."""
-    name = (profile or "").strip()
+    from hermes_cli.profile_scope import current_principal, require_profile
+
+    principal = current_principal()
+    name = require_profile(profile) if principal is not None else (profile or "").strip()
     if not name:
         return None
     try:
