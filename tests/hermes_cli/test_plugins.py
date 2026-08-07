@@ -1,5 +1,6 @@
 """Tests for the Hermes plugin system (hermes_cli.plugins)."""
 
+import json
 import logging
 import sys
 import types
@@ -442,6 +443,137 @@ class TestResolvePreToolBlock:
         monkeypatch.setattr("tools.approval.request_tool_approval", _boom)
         msg = resolve_pre_tool_block("terminal", {})
         assert msg is not None and "gate failed" in msg  # fail-closed
+
+
+class TestPreToolCallDirectiveMetadata:
+    """Extra keys on an ``approve`` directive reach the approval gate as
+    ``plugin_metadata`` — the payload session-event consumers read to see
+    WHAT is pending, not just that something is."""
+
+    @staticmethod
+    def _capture_gate(monkeypatch, seen):
+        def _approve(tool_name, reason, **kwargs):
+            seen["kwargs"] = kwargs
+            return {"approved": True, "message": None}
+
+        monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
+
+    @staticmethod
+    def _directive(monkeypatch, directive):
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [directive],
+        )
+
+    def test_extra_directive_keys_forwarded_verbatim(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        seen = {}
+        self._directive(monkeypatch, {
+            "action": "approve",
+            "message": "outbound send",
+            "rule_key": "pipedream:send",
+            "tool_name": "pipedream_run_action",
+            "app_slug": "mattermost",
+            "arguments": {"channel": "town-square", "text": "canary"},
+        })
+        self._capture_gate(monkeypatch, seen)
+
+        assert resolve_pre_tool_block("pipedream_run_action", {}) is None
+        assert seen["kwargs"]["plugin_metadata"] == {
+            "tool_name": "pipedream_run_action",
+            "app_slug": "mattermost",
+            "arguments": {"channel": "town-square", "text": "canary"},
+        }
+
+    def test_no_extra_keys_forwards_none(self, monkeypatch):
+        """A directive carrying only the consumed keys adds nothing — the
+        approval event stays byte-identical to today's."""
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        seen = {}
+        self._directive(monkeypatch, {
+            "action": "approve",
+            "message": "why",
+            "rule_key": "write_file:ssh",
+        })
+        self._capture_gate(monkeypatch, seen)
+
+        assert resolve_pre_tool_block("write_file", {}) is None
+        assert seen["kwargs"]["plugin_metadata"] is None
+
+    def test_block_directive_carries_no_metadata(self, monkeypatch):
+        """``block`` never reaches the gate, so it never grows metadata."""
+        from hermes_cli.plugins import _get_pre_tool_call_directive_details
+
+        self._directive(monkeypatch, {
+            "action": "block",
+            "message": "nope",
+            "app_slug": "mattermost",
+        })
+        details = _get_pre_tool_call_directive_details("terminal", {})
+        assert details.action == "block"
+        assert details.metadata is None
+
+    def test_oversized_metadata_truncates(self, monkeypatch):
+        from hermes_cli.plugins import (
+            _DIRECTIVE_METADATA_MAX_BYTES,
+            _get_pre_tool_call_directive_details,
+        )
+
+        self._directive(monkeypatch, {
+            "action": "approve",
+            "message": "outbound send",
+            "app_slug": "mattermost",
+            "blob": "x" * (_DIRECTIVE_METADATA_MAX_BYTES * 2),
+        })
+        metadata = _get_pre_tool_call_directive_details("terminal", {}).metadata
+
+        assert metadata is not None
+        assert metadata["_truncated"] is True
+        # The small key survives; the one that blew the budget is gone.
+        assert metadata["app_slug"] == "mattermost"
+        assert "blob" not in metadata
+        assert len(json.dumps(metadata).encode("utf-8")) <= _DIRECTIVE_METADATA_MAX_BYTES
+
+    def test_unserialisable_metadata_degrades_to_omission(self, monkeypatch):
+        """A value JSON cannot carry is dropped, not raised — decoration on
+        an approval event must never break the gate."""
+        from hermes_cli.plugins import _get_pre_tool_call_directive_details
+
+        self._directive(monkeypatch, {
+            "action": "approve",
+            "message": "outbound send",
+            "handle": object(),
+        })
+        assert _get_pre_tool_call_directive_details("terminal", {}).metadata is None
+
+    def test_metadata_does_not_change_the_decision(self, monkeypatch):
+        """Same directive with and without extra keys → same gate verdict,
+        same rule_key, same block message on denial."""
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        seen = {}
+
+        def _deny(tool_name, reason, **kwargs):
+            seen.setdefault("rule_keys", []).append(kwargs.get("rule_key"))
+            return {"approved": False, "message": "BLOCKED: denied by user"}
+
+        monkeypatch.setattr("tools.approval.request_tool_approval", _deny)
+
+        self._directive(monkeypatch, {
+            "action": "approve", "message": "why", "rule_key": "pipedream:send",
+        })
+        plain = resolve_pre_tool_block("pipedream_run_action", {})
+
+        self._directive(monkeypatch, {
+            "action": "approve", "message": "why", "rule_key": "pipedream:send",
+            "app_slug": "mattermost", "arguments": {"channel": "town-square"},
+        })
+        decorated = resolve_pre_tool_block("pipedream_run_action", {})
+
+        assert plain == decorated == "BLOCKED: denied by user"
+        assert seen["rule_keys"] == ["pipedream:send", "pipedream:send"]
 
 
 class TestGetPreVerifyContinueMessage:

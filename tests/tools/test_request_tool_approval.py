@@ -119,6 +119,114 @@ class TestRequestToolApproval:
         assert res["approved"] is False
         assert "no interactive user or gateway" in res["message"].lower()
 
+    def test_plugin_metadata_reaches_the_gateway_approval_event(self, monkeypatch):
+        """``plugin_metadata`` rides the SAME approval payload the gateway
+        notify callback emits (tui_gateway ``approval.request`` on /api/ws,
+        the API server's SSE event), so a session-event consumer can see the
+        target of the gated call — not just that a gate fired."""
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+
+        captured = {}
+        monkeypatch.setitem(approval._gateway_notify_cbs, "test-session", lambda d: None)
+        monkeypatch.setattr(
+            approval, "_await_gateway_decision",
+            lambda sk, cb, data, surface="gateway": (
+                captured.update(data), {"resolved": True, "choice": "once"}
+            )[1],
+        )
+
+        metadata = {
+            "tool_name": "pipedream_run_action",
+            "app_slug": "mattermost",
+            "arguments": {"channel": "town-square"},
+        }
+        res = approval.request_tool_approval(
+            "pipedream_run_action", "outbound send",
+            rule_key="pipedream:send", plugin_metadata=metadata,
+        )
+
+        assert res["approved"] is True
+        assert captured["plugin_metadata"] == metadata
+        # The pre-existing fields are untouched.
+        assert captured["pattern_key"] == "plugin_rule:pipedream:send"
+        assert captured["description"] == "outbound send"
+
+    def test_absent_plugin_metadata_leaves_the_event_unchanged(self, monkeypatch):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+
+        captured = {}
+        monkeypatch.setitem(approval._gateway_notify_cbs, "test-session", lambda d: None)
+        monkeypatch.setattr(
+            approval, "_await_gateway_decision",
+            lambda sk, cb, data, surface="gateway": (
+                captured.update(data), {"resolved": True, "choice": "once"}
+            )[1],
+        )
+
+        approval.request_tool_approval("terminal", "smtp send")
+
+        assert "plugin_metadata" not in captured
+
+    def test_plugin_metadata_reaches_the_pending_queue(self, monkeypatch):
+        """No notify callback (API server with no attached chat) → the
+        metadata rides submit_pending instead, same key."""
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        approval._gateway_notify_cbs.pop("test-session", None)
+
+        pending = {}
+        monkeypatch.setattr(
+            approval, "submit_pending",
+            lambda sk, payload: pending.update(payload),
+        )
+
+        res = approval.request_tool_approval(
+            "pipedream_run_action", "outbound send",
+            plugin_metadata={"app_slug": "mattermost"},
+        )
+
+        assert res["status"] == "approval_required"
+        assert pending["plugin_metadata"] == {"app_slug": "mattermost"}
+
+    def test_plugin_metadata_does_not_change_the_decision(self, monkeypatch):
+        """Metadata is decoration: the deny verdict, message, and pattern_key
+        are identical with and without it."""
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        monkeypatch.setattr(approval, "prompt_dangerous_approval", lambda *a, **k: "deny")
+
+        plain = request_tool_approval("terminal", "outbound send", rule_key="x")
+        decorated = request_tool_approval(
+            "terminal", "outbound send", rule_key="x",
+            plugin_metadata={"app_slug": "mattermost"},
+        )
+
+        assert plain == decorated
+
+    def test_malformed_plugin_metadata_is_ignored(self, monkeypatch):
+        """A non-dict slipping through (an out-of-tree caller) is dropped
+        rather than poisoning the event or blocking the gate."""
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+
+        captured = {}
+        monkeypatch.setitem(approval._gateway_notify_cbs, "test-session", lambda d: None)
+        monkeypatch.setattr(
+            approval, "_await_gateway_decision",
+            lambda sk, cb, data, surface="gateway": (
+                captured.update(data), {"resolved": True, "choice": "once"}
+            )[1],
+        )
+
+        res = approval.request_tool_approval(
+            "terminal", "outbound send", plugin_metadata="not-a-dict",
+        )
+
+        assert res["approved"] is True
+        assert "plugin_metadata" not in captured
+
     def test_yolo_session_bypasses_gate(self, monkeypatch):
         """A --yolo session skips the plugin approval gate (parity with the
         dangerous-command path, via the shared _run_approval_gate)."""

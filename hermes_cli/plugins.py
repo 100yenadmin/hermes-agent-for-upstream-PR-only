@@ -37,6 +37,7 @@ import asyncio
 import importlib.metadata
 import importlib.util
 import inspect
+import json
 import logging
 import os
 import sys
@@ -2148,6 +2149,105 @@ class _PreToolCallDirective:
     action: Optional[str] = None
     message: Optional[str] = None
     rule_key: Optional[str] = None
+    # Every OTHER key the plugin put on an ``approve`` directive (tool_name,
+    # app_slug, the contract-declared target props, …), forwarded to the
+    # approval event so session-API consumers can see WHAT is being gated.
+    # ``None`` when the directive carried nothing beyond action/message/rule_key.
+    metadata: Optional[Dict[str, Any]] = None
+
+
+# Directive keys the host consumes itself; everything else becomes metadata.
+_DIRECTIVE_RESERVED_KEYS = frozenset({"action", "message", "rule_key"})
+# Ceiling for the forwarded metadata blob (JSON bytes). Approval events fan
+# out to every attached transport (websocket, SSE, chat embeds), so a plugin
+# that stuffs a whole tool payload in there must not be able to wedge them.
+_DIRECTIVE_METADATA_MAX_BYTES = 4096
+# Marker set when the ceiling forced keys to be dropped.
+_DIRECTIVE_METADATA_TRUNCATED_KEY = "_truncated"
+
+
+def _json_len(value: Any) -> int:
+    """Encoded size of ``value`` in UTF-8 JSON bytes."""
+    return len(json.dumps(value, separators=(",", ":")).encode("utf-8"))
+
+
+def _scrub_pre_tool_call_metadata(
+    result: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Extract the directive's extra keys for the approval event.
+
+    Shallow-copies every key beyond ``action``/``message``/``rule_key`` and
+    bounds the result to ``_DIRECTIVE_METADATA_MAX_BYTES``; when the blob is
+    over budget the keys that fit are kept and ``_truncated: True`` is set so
+    the consumer can tell the payload is partial.
+
+    Fail-safe by construction: anything unusable (non-string keys, values that
+    do not survive JSON, a serializer blowing up) degrades to omission. This
+    is decoration on an approval event — it must never affect the gate
+    decision, so every failure path returns ``None`` rather than raising.
+
+    Strings are passed through the shared redaction seam first: a directive
+    is free-form plugin data heading for the same egress surfaces as the
+    approval ``command``/``description`` fields, which redact for the same
+    reason (#48456).
+    """
+    try:
+        from agent.redact import redact_sensitive_text
+
+        extras = {
+            key: _redact_metadata_value(value, redact_sensitive_text)
+            for key, value in result.items()
+            if isinstance(key, str)
+            and key not in _DIRECTIVE_RESERVED_KEYS
+            and key != _DIRECTIVE_METADATA_TRUNCATED_KEY
+        }
+        if not extras:
+            return None
+        # Drop values JSON cannot carry rather than losing the whole blob.
+        extras = {k: v for k, v in extras.items() if _is_json_safe(v)}
+        if not extras:
+            return None
+        if _json_len(extras) <= _DIRECTIVE_METADATA_MAX_BYTES:
+            return extras
+        bounded: Dict[str, Any] = {_DIRECTIVE_METADATA_TRUNCATED_KEY: True}
+        for key, value in extras.items():
+            candidate = dict(bounded)
+            candidate[key] = value
+            if _json_len(candidate) <= _DIRECTIVE_METADATA_MAX_BYTES:
+                bounded = candidate
+        return bounded
+    except Exception:
+        logger.debug("pre_tool_call directive metadata dropped", exc_info=True)
+        return None
+
+
+def _is_json_safe(value: Any) -> bool:
+    try:
+        json.dumps(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _redact_metadata_value(value: Any, redact, _depth: int = 0) -> Any:
+    """Redact credential-shaped strings anywhere in a directive value.
+
+    Depth-bounded so a self-referential structure cannot spin here; below the
+    bound the value is passed through untouched (it is then subject to the
+    JSON-safety and size checks like anything else).
+    """
+    if _depth > 4:
+        return value
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {
+            k: _redact_metadata_value(v, redact, _depth + 1)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_metadata_value(v, redact, _depth + 1) for v in value]
+    return value
 
 
 def set_thread_tool_whitelist(
@@ -2194,6 +2294,11 @@ def _get_pre_tool_call_directive_details(
       :func:`tools.approval.request_tool_approval`).
     - ``rule_key`` is optional and only honored for ``approve`` directives. It
       lets plugins choose the allowlist grain for `[a]lways` approvals.
+    - Any OTHER key on an ``approve`` directive (``tool_name``, ``app_slug``,
+      the contract-declared target props, …) is carried through to the
+      approval event under ``plugin_metadata`` so session-API consumers can
+      see what is being gated, not just that something is. It is decoration
+      only — never an input to the approval decision.
 
     The first valid directive wins. Invalid or irrelevant hook return values
     are silently ignored so existing observer-only hooks are unaffected.
@@ -2234,7 +2339,15 @@ def _get_pre_tool_call_directive_details(
         rule_key = rule_key.strip() if isinstance(rule_key, str) else None
         if not rule_key:
             rule_key = None
-        return _PreToolCallDirective(action=action, message=message, rule_key=rule_key)
+        metadata = (
+            _scrub_pre_tool_call_metadata(result) if action == "approve" else None
+        )
+        return _PreToolCallDirective(
+            action=action,
+            message=message,
+            rule_key=rule_key,
+            metadata=metadata,
+        )
 
     return _PreToolCallDirective()
 
@@ -2327,6 +2440,7 @@ def resolve_pre_tool_block(
                 tool_name,
                 details.message or "",
                 rule_key=details.rule_key or tool_name,
+                plugin_metadata=details.metadata,
             )
         except Exception:
             # Fail-closed: if the gate itself errors, block rather than
