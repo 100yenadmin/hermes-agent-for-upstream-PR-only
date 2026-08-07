@@ -70,6 +70,23 @@ def test_console_ws_rejects_missing_or_bad_token(console_client):
     assert exc.value.code == 4401
 
 
+def test_console_ws_denies_managed_non_admin_before_accept(console_client):
+    headers = {
+        "x-evaos-allowed-profiles": "jane",
+        "x-evaos-primary-profile": "jane",
+        "x-evaos-profile-admin": "0",
+        "x-evaos-principal-user": "user-1",
+        "x-evaos-session-id": "session-1",
+    }
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with console_client.websocket_connect(
+            _url(profile="jane"),
+            headers=headers,
+        ):
+            pass
+    assert exc.value.code == 4403
+
+
 def test_console_ws_cancel_returns_to_prompt(console_client, monkeypatch):
     from hermes_cli.console_engine import ConsoleResult, HermesConsoleEngine
 

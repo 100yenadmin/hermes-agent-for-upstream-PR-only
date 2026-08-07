@@ -3474,6 +3474,24 @@ class TestPtyWebSocket:
         q = {"token": tok, **params}
         return f"/api/pty?{urlencode(q)}"
 
+    def test_managed_non_admin_cannot_open_pty(self):
+        from starlette.websockets import WebSocketDisconnect
+
+        headers = {
+            "x-evaos-allowed-profiles": "jane",
+            "x-evaos-primary-profile": "jane",
+            "x-evaos-profile-admin": "0",
+            "x-evaos-principal-user": "user-1",
+            "x-evaos-session-id": "session-1",
+        }
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with self.client.websocket_connect(
+                self._url(profile="louis"),
+                headers=headers,
+            ):
+                pass
+        assert exc.value.code == 4403
+
 
 
     def test_tui_python_command_uses_child_path(self, tmp_path):
