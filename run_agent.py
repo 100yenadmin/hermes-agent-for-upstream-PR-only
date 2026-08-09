@@ -470,6 +470,7 @@ class AIAgent:
         clarify_callback: callable = None,
         read_terminal_callback: callable = None,
         read_preview_callback: callable = None,
+        read_window_below_callback: callable = None,
         step_callback: callable = None,
         stream_delta_callback: callable = None,
         interim_assistant_callback: callable = None,
@@ -556,6 +557,7 @@ class AIAgent:
             clarify_callback=clarify_callback,
             read_terminal_callback=read_terminal_callback,
             read_preview_callback=read_preview_callback,
+            read_window_below_callback=read_window_below_callback,
             step_callback=step_callback,
             stream_delta_callback=stream_delta_callback,
             interim_assistant_callback=interim_assistant_callback,
@@ -2302,6 +2304,13 @@ class AIAgent:
             # Force a full re-scan on the next flush: an exception mid-loop
             # leaves messages with mixed dispositions.
             self._db_flush_scan_prefix = None
+            # This is the one place the underlying SQLite error is visible
+            # before it is swallowed into a bare ``False`` — classify it here
+            # so the turn-end explanation can distinguish lock contention
+            # ("storage was busy, send it again") from disk-full/read-only.
+            from hermes_state import classify_persistence_error
+
+            self._last_persistence_error_cause = classify_persistence_error(e)
             logger.warning("Session DB append_message failed: %s", e)
             return False
 
@@ -2520,10 +2529,37 @@ class AIAgent:
         """Extract a human-readable one-liner from an API error.
 
         Handles Cloudflare HTML error pages (502, 503, etc.) by pulling the
-        <title> tag instead of dumping raw HTML.  Falls back to a truncated
-        str(error) for everything else.
+        <title> tag instead of dumping raw HTML. Network/DNS failures are
+        translated into an offline hint, including when an SDK wraps the
+        original OS error. Falls back to a truncated str(error) otherwise.
         """
         raw = str(error)
+
+        # Linux, macOS, and Windows use different low-level messages when DNS
+        # cannot resolve the provider while the device is offline. SDKs often
+        # wrap that OSError in a generic "Connection error", so inspect the
+        # exception chain before showing the top-level message to the user.
+        network_resolution_markers = (
+            "temporary failure in name resolution",
+            "name or service not known",
+            "nodename nor servname provided, or not known",
+            "getaddrinfo failed",
+            "no address associated with hostname",
+            "network is unreachable",
+        )
+        current: Optional[BaseException] = error
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if any(
+                marker in str(current).lower()
+                for marker in network_resolution_markers
+            ):
+                return (
+                    "Hermes can't reach the model provider. You may be offline. "
+                    "Check your internet connection and try again."
+                )
+            current = current.__cause__ or current.__context__
 
         if (
             isinstance(error, ValueError)
@@ -3588,7 +3624,9 @@ class AIAgent:
         return True  # safe default: explainer on
 
     @staticmethod
-    def _format_turn_completion_explanation(turn_exit_reason: str) -> str:
+    def _format_turn_completion_explanation(
+        turn_exit_reason: str, persistence_cause: Optional[str] = None
+    ) -> str:
         """Render a user-facing explanation for an abnormal turn ending.
 
         Maps the internal ``turn_exit_reason`` to a short, actionable
@@ -3596,6 +3634,13 @@ class AIAgent:
         content after retries, a partial/truncated stream, a still-pending
         tool result, or an iteration/budget limit) is never silent from
         the UI's perspective — the symptom users report in #34452.
+
+        ``persistence_cause`` refines the ``session_persistence_failed``
+        wording (see ``classify_persistence_error``): lock contention gets
+        "storage was busy, send it again" instead of the disk-space advice,
+        which was a misdiagnosis for that failure mode. It is optional and
+        ignored for every other reason, so one-argument callers keep the
+        exact behavior they had before.
 
         Returns an empty string for reasons that are NOT abnormal (e.g.
         a normal ``text_response(...)`` exit), so callers can concatenate
@@ -3677,12 +3722,30 @@ class AIAgent:
                 "let it summarize."
             )
         if reason == "session_persistence_failed":
+            cause = persistence_cause or "unknown"
+            if cause == "locked":
+                return (
+                    prefix
+                    + "the turn was stopped because session storage was busy "
+                    "(another Hermes process was writing to the state "
+                    "database). Your message should already be saved — "
+                    "please send it again in a moment."
+                )
+            if cause == "disk":
+                return (
+                    prefix
+                    + "the turn was stopped because session storage could not "
+                    "be written (the transcript would have been lost on "
+                    "restart). This is often a full disk — free some space "
+                    "(or fix state.db permissions), then send your message "
+                    "again."
+                )
             return (
                 prefix
                 + "the turn was stopped because session storage could not be "
                 "written (the transcript would have been lost on restart). "
-                "This is often a full disk — free some space (or fix state.db "
-                "permissions), then send your message again."
+                "Check the state database health (`hermes doctor`), then "
+                "send your message again."
             )
         # Unknown/diagnostic-only reasons (e.g. "unknown", guardrail_halt
         # which already surfaces its own message) — don't second-guess.
