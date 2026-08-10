@@ -18,6 +18,7 @@ interface HarnessProps {
   creatingSessionRef: MutableRefObject<boolean>
   currentView: string
   freshDraftReady: boolean
+  gatewayConnectionEpoch?: number
   gatewayState: string
   locationPathname: string
   resumeSession: (sessionId: string, focus: boolean) => Promise<unknown>
@@ -30,8 +31,13 @@ interface HarnessProps {
   startFreshSessionDraft: (focus: boolean) => unknown
 }
 
-function RouteResumeHarness({ resumeFailedSessionId = null, resumeExhaustedSessionId = null, ...props }: HarnessProps) {
-  useRouteResume({ ...props, resumeExhaustedSessionId, resumeFailedSessionId })
+function RouteResumeHarness({
+  gatewayConnectionEpoch = 0,
+  resumeFailedSessionId = null,
+  resumeExhaustedSessionId = null,
+  ...props
+}: HarnessProps) {
+  useRouteResume({ ...props, gatewayConnectionEpoch, resumeExhaustedSessionId, resumeFailedSessionId })
 
   return null
 }
@@ -303,6 +309,37 @@ describe('useRouteResume', () => {
 
     expect(resumeSession).toHaveBeenCalledTimes(1)
     expect(resumeSession).toHaveBeenCalledWith('session-1', true)
+  })
+
+  it('reconciles when a reconnect epoch advances even if React only renders open', () => {
+    const resumeSession = vi.fn(async () => undefined)
+    const activeSessionIdRef: MutableRefObject<null | string> = { current: 'runtime-1' }
+    const selectedStoredSessionIdRef: MutableRefObject<null | string> = { current: 'session-1' }
+    const common = {
+      activeSessionId: 'runtime-1',
+      activeSessionIdRef,
+      creatingSessionRef: { current: false },
+      currentView: 'chat',
+      freshDraftReady: false,
+      gatewayState: 'open',
+      locationPathname: '/session-1',
+      resumeSession,
+      routedSessionId: 'session-1',
+      runtimeIdByStoredSessionIdRef: { current: new Map([['session-1', 'runtime-1']]) },
+      selectedStoredSessionId: 'session-1',
+      selectedStoredSessionIdRef,
+      startFreshSessionDraft: vi.fn()
+    } as const
+
+    const { rerender } = render(<RouteResumeHarness {...common} gatewayConnectionEpoch={1} />)
+
+    expect(resumeSession).not.toHaveBeenCalled()
+    rerender(<RouteResumeHarness {...common} gatewayConnectionEpoch={2} />)
+    expect(resumeSession).toHaveBeenCalledTimes(1)
+    expect(resumeSession).toHaveBeenCalledWith('session-1', true)
+
+    rerender(<RouteResumeHarness {...common} gatewayConnectionEpoch={2} />)
+    expect(resumeSession).toHaveBeenCalledTimes(1)
   })
 })
 
