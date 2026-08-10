@@ -318,6 +318,7 @@ describe('useRouteResume', () => {
     const creatingSessionRef = { current: false }
     const runtimeIdByStoredSessionIdRef = { current: new Map([['session-1', 'runtime-1']]) }
     const selectedStoredSessionIdRef: MutableRefObject<null | string> = { current: 'session-1' }
+
     const common = {
       activeSessionId: 'runtime-1',
       activeSessionIdRef,

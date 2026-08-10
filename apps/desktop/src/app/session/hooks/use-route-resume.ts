@@ -115,11 +115,13 @@ export function useRouteResume({
     // already open is not mistaken for "became open" and does not double-resume with the
     // pathname-driven initial resume below.
     const gatewayBecameOpen = seenGatewayStateRef.current && !wasGatewayOpenRef.current && gatewayOpen
+
     // React can batch a fast closed -> connecting -> open cycle and render only
     // the final "open" state. The socket listener's monotonic epoch still
     // exposes that real reconnect.
     const gatewayConnectionAdvanced =
       lastGatewayConnectionEpochRef.current !== null && gatewayConnectionEpoch > lastGatewayConnectionEpochRef.current
+
     const gatewayReopened = gatewayBecameOpen || gatewayConnectionAdvanced
     lastPathnameRef.current = locationPathname
     lastGatewayConnectionEpochRef.current = gatewayConnectionEpoch

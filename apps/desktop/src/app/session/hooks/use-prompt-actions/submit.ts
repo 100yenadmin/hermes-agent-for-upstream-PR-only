@@ -2,7 +2,7 @@ import { type MutableRefObject, useCallback } from 'react'
 
 import { PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import type { Translations } from '@/i18n'
-import { type ChatMessage, textPart } from '@/lib/chat-messages'
+import { type ChatMessage, chatMessageText, textPart, toChatMessages } from '@/lib/chat-messages'
 import { optimisticAttachmentRef } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { setMutableRef } from '@/lib/mutable-ref'
@@ -14,8 +14,11 @@ import {
 } from '@/lib/voice-playback'
 import {
   $composerAttachments,
+  $composerDraft,
+  addComposerAttachment,
   clearComposerAttachments,
   type ComposerAttachment,
+  setComposerDraft,
   terminalContextBlocksFromDraft
 } from '@/store/composer'
 import { $hudMode } from '@/store/hud'
@@ -31,6 +34,7 @@ import {
   touchSessionActivity
 } from '@/store/session'
 import { $sessionStates } from '@/store/session-states'
+import type { SessionResumeResponse } from '@/types/hermes'
 
 import type { ClientSessionState } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
@@ -41,6 +45,7 @@ import {
   _submitInFlight,
   type GatewayRequest,
   inlineErrorMessage,
+  isPromptDeliveryUnconfirmedError,
   isProviderSetupError,
   isSessionBusyError,
   isTargetSessionBusy,
@@ -82,6 +87,11 @@ interface SubmitPromptDeps {
     setMessages: (updater: (current: ChatMessage[]) => ChatMessage[]) => void
   }
 }
+
+type SessionActivationRecovery = Pick<
+  SessionResumeResponse,
+  'inflight' | 'messages' | 'running' | 'session_id' | 'session_key' | 'status'
+>
 
 // Stable identity — a fresh default object per render would churn the
 // useCallback below on every render.
@@ -658,17 +668,115 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
                   setActiveSessionId(recoveredId)
                 }
               }
-            },
-            // A starved backend loop (#55578 symptom d) rejects the submit even
-            // though the stored session is fine — recover it like a dead id
-            // instead of erroring out and losing the session binding.
-            { alsoTimeout: true }
+            }
           )
         } catch (firstErr) {
           if (firstErr instanceof SessionRecoveryAborted) {
             console.warn('[submit-drift-abort]', firstErr.reason, { phase: 'post-resume-retry' })
 
             return abortForSessionSwitch(sessionId)
+          }
+
+          if (isPromptDeliveryUnconfirmedError(firstErr)) {
+            let activated: SessionActivationRecovery | null = null
+
+            try {
+              activated = await requestGateway<SessionActivationRecovery>('session.activate', {
+                session_id: sessionId
+              })
+            } catch {
+              // A replacement gateway process may have lost the volatile id.
+              // Resume the durable route once, then activate the fresh binding.
+              const recoverStoredSessionId =
+                targetStoredSessionId ?? selectedStoredSessionIdRef.current ?? startingStoredSessionId
+
+              if (recoverStoredSessionId) {
+                try {
+                  await resumeStoredSession(recoverStoredSessionId)
+                  const recoveredId = activeSessionIdRef.current
+
+                  if (recoveredId) {
+                    sessionId = recoveredId
+                    activated = await requestGateway<SessionActivationRecovery>('session.activate', {
+                      session_id: recoveredId
+                    })
+                  }
+                } catch {
+                  activated = null
+                }
+              }
+            }
+
+            const canonicalMessages = activated?.messages ? toChatMessages(activated.messages) : []
+            const expectedVisible = bubbleText.trim()
+            const expectedWire = text.trim()
+
+            const acceptedUser = canonicalMessages.some(message => {
+              if (message.role !== 'user' || message.id === optimisticId) {
+                return false
+              }
+
+              const persisted = chatMessageText(message).trim()
+
+              return (
+                persisted === expectedVisible ||
+                persisted === expectedWire ||
+                (expectedVisible.length > 0 && persisted.endsWith(expectedVisible))
+              )
+            })
+
+            const accepted = Boolean(activated?.running || activated?.inflight?.user || acceptedUser)
+
+            if (accepted && activated) {
+              sessionId = activated.session_id || sessionId
+              updateSessionState(
+                sessionId,
+                state => ({
+                  ...state,
+                  messages: canonicalMessages,
+                  busy: Boolean(activated.running),
+                  awaitingResponse: Boolean(activated.running),
+                  pendingBranchGroup: null,
+                  sawAssistantPayload: canonicalMessages.some(message => message.role === 'assistant'),
+                  streamId: null
+                }),
+                targetStoredSessionId
+              )
+
+              if (targetIsCurrentView()) {
+                scope.setBusy(Boolean(activated.running))
+                scope.setAwaitingResponse(Boolean(activated.running))
+              }
+
+              if (usingComposerAttachments) {
+                scope.clearAttachments()
+              }
+
+              releaseSubmitLock()
+
+              return true
+            }
+
+            dropOptimistic(sessionId)
+            releaseBusy()
+
+            if (targetIsCurrentView() && scope === MAIN_SUBMIT_SCOPE) {
+              if (!$composerDraft.get().trim()) {
+                setComposerDraft(rawText)
+              }
+
+              const presentAttachmentIds = new Set($composerAttachments.get().map(attachment => attachment.id))
+
+              for (const attachment of attachments) {
+                if (!presentAttachmentIds.has(attachment.id)) {
+                  addComposerAttachment(attachment)
+                }
+              }
+
+              notifyError(new Error(copy.deliveryNotConfirmed), copy.promptFailed)
+            }
+
+            return false
           }
 
           submitErr = firstErr

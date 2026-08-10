@@ -1580,6 +1580,7 @@ def _emit(event: str, sid: str, payload: dict | None = None):
 # is how such events reach WS clients at all. See _broadcast_global_event.
 _live_transports: set[Transport] = set()
 _live_transports_lock = threading.Lock()
+_TRANSPORT_OWNERSHIP_LIVE_S = 60.0
 
 
 def register_live_transport(transport: Transport | None) -> None:
@@ -1594,6 +1595,44 @@ def unregister_live_transport(transport: Transport | None) -> None:
     """Stop tracking a transport (call on disconnect). Idempotent."""
     with _live_transports_lock:
         _live_transports.discard(transport)
+
+
+def _transport_is_recently_live(transport: Transport | None) -> bool:
+    """Whether a transport still owns a session stream.
+
+    WebSocket transports publish their last inbound activity. A transport that
+    is closed, unregistered, detached, or beyond the heartbeat recovery window
+    no longer blocks a reconnecting renderer from reclaiming the stream.
+    """
+    if transport is None or transport is _detached_ws_transport:
+        return False
+    if bool(getattr(transport, "closed", False)):
+        return False
+
+    last_inbound = getattr(transport, "last_inbound_at", None)
+    if isinstance(last_inbound, (int, float)):
+        with _live_transports_lock:
+            registered = transport in _live_transports
+        return registered and (time.monotonic() - float(last_inbound)) <= _TRANSPORT_OWNERSHIP_LIVE_S
+
+    # Stdio and test transports have no application heartbeat. Preserve their
+    # historical behavior; the conflict contract is for competing WS clients.
+    return False
+
+
+def _bind_session_transport(session: dict, candidate: Transport | None) -> bool:
+    """Atomically rebind a session unless another recently-live WS owns it."""
+    if candidate is None:
+        return True
+
+    with session["history_lock"]:
+        current = session.get("transport")
+        if current is candidate:
+            return True
+        if _transport_is_recently_live(current):
+            return False
+        session["transport"] = candidate
+        return True
 
 
 def _broadcast_global_event(event: str, payload: dict | None = None) -> None:
@@ -8201,12 +8240,12 @@ def _live_session_payload(
     transport: Transport | None = None,
     omit_messages: bool = False,
 ) -> dict:
+    if transport is not None:
+        _bind_session_transport(session, transport)
     with session["history_lock"]:
         _reconcile_finished_run_thread(session)
         if cols is not None:
             session["cols"] = cols
-        if transport is not None:
-            session["transport"] = transport
         if touch:
             session["last_active"] = time.time()
         in_memory_history = list(session.get("display_history_prefix") or []) + list(

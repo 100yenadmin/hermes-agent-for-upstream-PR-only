@@ -7,6 +7,19 @@ import { $gateway, ensureActiveGatewayOpen, isActivePrimary } from '@/store/gate
 import { $activeGatewayProfile } from '@/store/profile'
 import { $gatewayState, setConnection } from '@/store/session'
 
+export interface GatewayReconnectPolicy {
+  /**
+   * Whether a request may be sent again after reconnect. Non-idempotent calls
+   * such as prompt.submit must opt out because a closed socket cannot prove
+   * whether the backend accepted the first frame.
+   */
+  replayOnReconnect?: boolean
+}
+
+export function requestMayReplayAfterReconnect(method: string, policy: GatewayReconnectPolicy = {}): boolean {
+  return policy.replayOnReconnect ?? method !== 'prompt.submit'
+}
+
 export function useGatewayRequest() {
   const gatewayState = useStore($gatewayState)
   // Reactive companion to `gatewayRef`. The ref exists so `requestGateway`
@@ -52,7 +65,7 @@ export function useGatewayRequest() {
       return null
     }
 
-    if (gatewayStateRef.current === 'open') {
+    if (gatewayStateRef.current === 'open' && existing.connectionState === 'open') {
       return existing
     }
 
@@ -104,7 +117,13 @@ export function useGatewayRequest() {
   }, [])
 
   const requestGateway = useCallback(
-    async <T>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number, signal?: AbortSignal) => {
+    async <T>(
+      method: string,
+      params: Record<string, unknown> = {},
+      timeoutMs?: number,
+      signal?: AbortSignal,
+      reconnectPolicy: GatewayReconnectPolicy = {}
+    ) => {
       const gateway = gatewayRef.current
 
       if (!gateway) {
@@ -115,9 +134,17 @@ export function useGatewayRequest() {
         return await gateway.request<T>(method, params, timeoutMs, signal)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
+        const ambiguousPromptTimeout = method === 'prompt.submit' && /request timed out/i.test(message)
 
-        if (!/not connected|connection closed/i.test(message)) {
+        if (
+          !ambiguousPromptTimeout &&
+          !/not connected|connection closed|heartbeat acknowledgement timed out/i.test(message)
+        ) {
           throw error
+        }
+
+        if (ambiguousPromptTimeout) {
+          gateway.invalidate('prompt.submit delivery timed out')
         }
 
         // Primary keeps the OAuth-aware reconnect (remote gateways re-mint a
@@ -136,6 +163,12 @@ export function useGatewayRequest() {
           }
 
           throw error
+        }
+
+        const replayOnReconnect = requestMayReplayAfterReconnect(method, reconnectPolicy)
+
+        if (!replayOnReconnect) {
+          throw new Error(`delivery not confirmed after reconnect: ${method}`)
         }
 
         return recovered.request<T>(method, params, timeoutMs, signal)

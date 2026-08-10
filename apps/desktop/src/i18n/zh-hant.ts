@@ -2623,6 +2623,7 @@ export const zhHant = defineLocale({
     sessionUnavailable: '工作階段不可用',
     createSessionFailed: '無法建立新工作階段',
     promptFailed: '提示詞傳送失敗',
+    deliveryNotConfirmed: '無法確認訊息是否送達。訊息已還原，請準備好後重試。',
     providerCredentialRequired: '傳送第一則訊息前請先新增提供方憑證。',
     emptySlashCommand: '空的斜線指令',
     desktopCommands: '桌面端指令',

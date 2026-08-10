@@ -186,6 +186,10 @@ export class GatewayClient extends EventEmitter {
         clearTimeout(this.readyTimer)
         this.readyTimer = null
       }
+
+      if (ev.payload?.heartbeat && this.ws?.readyState === WS_OPEN) {
+        this.startHeartbeat(this.ws)
+      }
     }
 
     if (this.subscribed) {
@@ -575,7 +579,6 @@ export class GatewayClient extends EventEmitter {
 
             this.lastActivityAt = Date.now()
             this.clearReconnect()
-            this.startHeartbeat(ws)
             this.connectSidecarMirror()
           },
           { once: true }

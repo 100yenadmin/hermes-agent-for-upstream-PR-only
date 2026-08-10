@@ -1,6 +1,5 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
-
 import { JsonRpcGatewayClient } from '@hermes/shared'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 interface ListenerEntry {
   callback: (event: any) => void
@@ -71,6 +70,7 @@ describe('JsonRpcGatewayClient heartbeat recovery', () => {
     const socket = new FakeSocket()
     const states: string[] = []
     const events: string[] = []
+
     const client = new JsonRpcGatewayClient({
       heartbeatDeadlineMs: 45,
       heartbeatIntervalMs: 15,
@@ -107,6 +107,7 @@ describe('JsonRpcGatewayClient heartbeat recovery', () => {
     vi.useFakeTimers()
     vi.stubGlobal('WebSocket', { OPEN: FakeSocket.OPEN })
     const socket = new FakeSocket()
+
     const client = new JsonRpcGatewayClient({
       heartbeatDeadlineMs: 45,
       heartbeatIntervalMs: 15,

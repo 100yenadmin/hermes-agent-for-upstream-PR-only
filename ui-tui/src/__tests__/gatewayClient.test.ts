@@ -504,6 +504,13 @@ describe('GatewayClient websocket attach mode', () => {
       const socket = FakeWebSocket.instances[0]!
 
       socket.open()
+      socket.message(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'event',
+          params: { type: 'gateway.ready', payload: { heartbeat: true } }
+        })
+      )
       await vi.advanceTimersByTimeAsync(WS_HEARTBEAT_INTERVAL_MS)
 
       const heartbeat = JSON.parse(socket.sent.at(-1) ?? '{}') as { id: string; method: string }
@@ -530,11 +537,45 @@ describe('GatewayClient websocket attach mode', () => {
       const first = FakeWebSocket.instances[0]!
 
       first.open()
+      first.message(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'event',
+          params: { type: 'gateway.ready', payload: { heartbeat: true } }
+        })
+      )
       await vi.advanceTimersByTimeAsync(WS_HEARTBEAT_INTERVAL_MS)
       expect(JSON.parse(first.sent.at(-1) ?? '{}')).toMatchObject({ method: 'gateway.ping' })
       await vi.advanceTimersByTimeAsync(WS_HEARTBEAT_DEAD_MS + WS_HEARTBEAT_INTERVAL_MS)
       await vi.advanceTimersByTimeAsync(RECONNECT_BASE_MS)
       expect(FakeWebSocket.instances.length).toBeGreaterThanOrEqual(2)
+    } finally {
+      gw.kill()
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not heartbeat an older backend that omits the capability', async () => {
+    vi.useFakeTimers()
+    process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
+    const gw = new GatewayClient()
+
+    try {
+      gw.start()
+      const socket = FakeWebSocket.instances[0]!
+
+      socket.open()
+      socket.message(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'event',
+          params: { type: 'gateway.ready', payload: {} }
+        })
+      )
+      await vi.advanceTimersByTimeAsync(WS_HEARTBEAT_DEAD_MS + WS_HEARTBEAT_INTERVAL_MS)
+      expect(socket.readyState).toBe(FakeWebSocket.OPEN)
+      expect(socket.sent).toEqual([])
+      expect(FakeWebSocket.instances).toHaveLength(1)
     } finally {
       gw.kill()
       vi.useRealTimers()

@@ -3146,29 +3146,28 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls).not.toContain('session.resume')
   })
 
-  it('recovers via session.resume when prompt.submit TIMES OUT and a stored session is selected (#55578)', async () => {
-    // A starved gateway loop rejects with "request timed out: prompt.submit".
-    // With a stored session selected, that must recover exactly like
-    // "session not found" — resume + retry — not surface an error that leaves
-    // activeSessionId null and lets the next send mint a new session.
+  it('reconciles an ambiguously accepted prompt without resubmitting it', async () => {
     const calls: { method: string; params?: Record<string, unknown> }[] = []
-    let submitAttempts = 0
+    let lastMessages: Array<{ role: string }> = []
 
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
       calls.push({ method, params })
 
       if (method === 'prompt.submit') {
-        submitAttempts += 1
-
-        if (submitAttempts === 1) {
-          throw new Error('request timed out: prompt.submit')
-        }
-
-        return {} as never
+        throw new Error('delivery not confirmed after reconnect: prompt.submit')
       }
 
-      if (method === 'session.resume') {
-        return { session_id: RECOVERED_SESSION_ID } as never
+      if (method === 'session.activate') {
+        return {
+          session_id: RUNTIME_SESSION_ID,
+          session_key: STORED_SESSION_ID,
+          messages: [
+            { content: 'message during replacement', role: 'user', row_id: 1 },
+            { content: 'persisted answer', role: 'assistant', row_id: 2 }
+          ],
+          running: false,
+          status: 'idle'
+        } as never
       }
 
       return {} as never
@@ -3178,25 +3177,19 @@ describe('usePromptActions sleep/wake session recovery', () => {
     await actRender(
       <Harness
         onReady={h => (handle = h)}
+        onSeedState={state => (lastMessages = state.messages as Array<{ role: string }>)}
         refreshSessions={async () => undefined}
         requestGateway={requestGateway}
         storedSessionId={STORED_SESSION_ID}
       />
     )
 
-    const ok = await handle!.submitText('message during starved loop')
+    const ok = await handle!.submitText('message during replacement')
 
     expect(ok).toBe(true)
-    expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
-    expect(calls[1]?.params).toEqual({
-      session_id: STORED_SESSION_ID,
-      source: 'desktop',
-      omit_messages: true
-    })
-    expect(calls[2]?.params).toEqual({
-      session_id: RECOVERED_SESSION_ID,
-      text: 'message during starved loop'
-    })
+    expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.activate'])
+    expect(calls.filter(c => c.method === 'prompt.submit')).toHaveLength(1)
+    expect(lastMessages.map(message => message.role)).toEqual(['user', 'assistant'])
   })
 
   it('resumes the SELECTED stored session instead of minting a new one when activeSessionId is null (#55578 split)', async () => {
@@ -3649,32 +3642,27 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
     expect(calls.some(c => c.method === 'prompt.submit')).toBe(true)
   })
 
-  it('aborts recovery submit when the user switches sessions during timeout resume', async () => {
+  it('never resubmits an ambiguous prompt when activation cannot prove acceptance', async () => {
     const calls: { method: string; params?: Record<string, unknown> }[] = []
-    let submitAttempts = 0
-
-    let releaseResume: () => void = () => {}
-
     const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: STORED_SESSION_A }
+    let lastMessages: Array<{ role: string }> = []
+    setComposerDraft('')
 
     const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
       calls.push({ method, params })
 
       if (method === 'prompt.submit') {
-        submitAttempts += 1
-
-        if (submitAttempts === 1) {
-          throw new Error('request timed out: prompt.submit')
-        }
+        throw new Error('delivery not confirmed after reconnect: prompt.submit')
       }
 
-      if (method === 'session.resume') {
-        await new Promise<void>(resolve => {
-          releaseResume = resolve
-        })
-        selectedStoredSessionIdRef.current = STORED_SESSION_B
-
-        return { session_id: RUNTIME_SESSION_B } as never
+      if (method === 'session.activate') {
+        return {
+          session_id: RUNTIME_SESSION_ID,
+          session_key: STORED_SESSION_A,
+          messages: [],
+          running: false,
+          status: 'idle'
+        } as never
       }
 
       return {} as never
@@ -3684,6 +3672,7 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
     render(
       <Harness
         onReady={h => (handle = h)}
+        onSeedState={state => (lastMessages = state.messages as Array<{ role: string }>)}
         refreshSessions={async () => undefined}
         requestGateway={requestGateway}
         selectedStoredSessionIdRef={selectedStoredSessionIdRef}
@@ -3692,16 +3681,11 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
     )
     await waitFor(() => expect(handle).not.toBeNull())
 
-    const submitting = handle!.submitText('message that must not land in session B')
-    await waitFor(() => expect(calls.some(c => c.method === 'session.resume')).toBe(true))
-    releaseResume()
-
-    expect(await submitting).toBe(false)
-    expect(submitAttempts).toBe(1)
+    expect(await handle!.submitText('message whose delivery is unknown')).toBe(false)
     expect(calls.filter(c => c.method === 'prompt.submit')).toHaveLength(1)
-    expect(calls.find(c => c.method === 'session.resume')?.params).toMatchObject({
-      session_id: STORED_SESSION_A
-    })
+    expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.activate'])
+    expect($composerDraft.get()).toBe('message whose delivery is unknown')
+    expect(lastMessages.some(message => message.role === 'user')).toBe(false)
   })
 
   it('submits the first prompt of a new chat — the create pipeline re-homing selection/route is not user drift', async () => {

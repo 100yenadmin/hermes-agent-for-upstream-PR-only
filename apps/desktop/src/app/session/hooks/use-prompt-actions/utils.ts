@@ -6,7 +6,13 @@ import { type CommandsCatalogLike, filterDesktopCommandsCatalog } from '@/lib/de
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import type { ComposerAttachment } from '@/store/composer'
 
-export type GatewayRequest = <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
+export type GatewayRequest = <T>(
+  method: string,
+  params?: Record<string, unknown>,
+  timeoutMs?: number,
+  signal?: AbortSignal,
+  reconnectPolicy?: { replayOnReconnect?: boolean }
+) => Promise<T>
 
 export function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
@@ -223,6 +229,12 @@ export function isGatewayTimeoutError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error)
 
   return /request timed out/i.test(message)
+}
+
+export function isPromptDeliveryUnconfirmedError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+
+  return /delivery not confirmed after reconnect:\s*prompt\.submit/i.test(message)
 }
 
 // The gateway refuses prompt.submit while a turn is running (4009 "session
