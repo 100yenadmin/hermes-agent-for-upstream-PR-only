@@ -1580,7 +1580,11 @@ def _emit(event: str, sid: str, payload: dict | None = None):
 # is how such events reach WS clients at all. See _broadcast_global_event.
 _live_transports: set[Transport] = set()
 _live_transports_lock = threading.Lock()
-_TRANSPORT_OWNERSHIP_LIVE_S = 60.0
+# Match the negotiated client heartbeat deadline. Once a silent transport has
+# missed 45 seconds of inbound activity, a replacement socket must be able to
+# activate immediately instead of waiting behind an owner the client already
+# declared dead.
+_TRANSPORT_OWNERSHIP_LIVE_S = 45.0
 
 
 def register_live_transport(transport: Transport | None) -> None:

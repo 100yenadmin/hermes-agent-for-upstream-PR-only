@@ -250,7 +250,7 @@ def test_expired_ws_transport_can_be_rebound():
         def close(self):
             self.closed = True
 
-    owner = FakeTransport(time.monotonic() - 61)
+    owner = FakeTransport(time.monotonic() - 46)
     contender = FakeTransport(time.monotonic())
     session = {
         "history_lock": threading.Lock(),
@@ -339,4 +339,3 @@ def test_ws_transport_preserves_cross_batch_order():
         assert entered == ["A1", "A2", "B1", "B2"]
 
     asyncio.run(scenario())
-
