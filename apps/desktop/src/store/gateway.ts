@@ -34,7 +34,7 @@ interface Secondary {
   offState: () => void
   reconnectTimer: ReturnType<typeof setTimeout> | null
   reconnectAttempt: number
-  reconnecting: boolean
+  reconnecting: Promise<void> | null
   // While true the entry auto-reconnects on drop; pruning flips it off so a
   // deliberate close doesn't trigger the backoff loop.
   wantOpen: boolean
@@ -214,24 +214,30 @@ function scheduleReconnect(entry: Secondary): void {
 }
 
 async function reconnectSecondary(entry: Secondary): Promise<void> {
-  if (entry.reconnecting || !entry.wantOpen || isOpen(entry.gateway)) {
+  if (entry.reconnecting) {
+    return entry.reconnecting
+  }
+
+  if (!entry.wantOpen || isOpen(entry.gateway)) {
     return
   }
 
-  entry.reconnecting = true
+  entry.reconnecting = (async () => {
+    try {
+      await openSecondary(entry)
+      entry.reconnectAttempt = 0
+    } catch {
+      // Transport failure → fall through to the backoff below.
+    } finally {
+      entry.reconnecting = null
 
-  try {
-    await openSecondary(entry)
-    entry.reconnectAttempt = 0
-  } catch {
-    // Transport failure → fall through to the backoff below.
-  } finally {
-    entry.reconnecting = false
-
-    if (entry.wantOpen && !isOpen(entry.gateway)) {
-      scheduleReconnect(entry)
+      if (entry.wantOpen && !isOpen(entry.gateway)) {
+        scheduleReconnect(entry)
+      }
     }
-  }
+  })()
+
+  return entry.reconnecting
 }
 
 function createSecondary(profile: string): Secondary {
@@ -244,7 +250,7 @@ function createSecondary(profile: string): Secondary {
     offState: () => {},
     reconnectTimer: null,
     reconnectAttempt: 0,
-    reconnecting: false,
+    reconnecting: null,
     wantOpen: true
   }
 

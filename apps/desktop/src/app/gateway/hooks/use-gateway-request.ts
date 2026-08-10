@@ -20,6 +20,49 @@ export function requestMayReplayAfterReconnect(method: string, policy: GatewayRe
   return policy.replayOnReconnect ?? method !== 'prompt.submit'
 }
 
+function waitForGatewayOpen(gateway: HermesGateway): Promise<void> {
+  if (gateway.connectionState === 'open') {
+    return Promise.resolve()
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false
+
+    let unsubscribe = () => {}
+
+    const finish = (error?: Error) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      unsubscribe()
+
+      if (error) {
+        reject(error)
+      } else {
+        resolve()
+      }
+    }
+
+    unsubscribe = gateway.onState(state => {
+      if (state === 'open') {
+        finish()
+      } else if (state === 'closed' || state === 'error') {
+        finish(new Error(`gateway reconnect ended in ${state}`))
+      }
+    })
+
+    const state = gateway.connectionState
+
+    if (state === 'open') {
+      finish()
+    } else if (state === 'closed' || state === 'error') {
+      finish(new Error(`gateway reconnect ended in ${state}`))
+    }
+  })
+}
+
 export function useGatewayRequest() {
   const gatewayState = useStore($gatewayState)
   // Reactive companion to `gatewayRef`. The ref exists so `requestGateway`
@@ -97,6 +140,7 @@ export function useGatewayRequest() {
         // actionable "sign in again" message.
         const wsUrl = await resolveGatewayWsUrl(desktop, conn)
         await existing.connect(wsUrl)
+        await waitForGatewayOpen(existing)
 
         return existing
       } catch (error) {

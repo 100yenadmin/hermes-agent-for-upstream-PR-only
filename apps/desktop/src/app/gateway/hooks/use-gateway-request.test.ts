@@ -101,4 +101,82 @@ describe('useGatewayRequest', () => {
       window.hermesDesktop = desktop
     }
   })
+
+  it('waits for an in-flight reconnect owner before reporting an ambiguous submit', async () => {
+    let connectionState = 'open'
+    let settled = false
+    const stateHandlers = new Set<(state: string) => void>()
+
+    const request = vi.fn(async () => {
+      throw new Error('request timed out after 30s: prompt.submit')
+    })
+
+    const invalidate = vi.fn(() => {
+      // The normal boot owner reacts first and starts the replacement socket.
+      connectionState = 'connecting'
+      setGatewayState('connecting')
+    })
+
+    // JsonRpcGatewayClient.connect() returns immediately when another owner is
+    // already connecting. requestGateway must still wait for the real open.
+    const connect = vi.fn(async () => undefined)
+
+    const gateway = {
+      connect,
+      invalidate,
+      onState: vi.fn((handler: (state: string) => void) => {
+        stateHandlers.add(handler)
+
+        return () => stateHandlers.delete(handler)
+      }),
+      request,
+      get connectionState() {
+        return connectionState
+      }
+    } as unknown as HermesGateway
+
+    const desktop = window.hermesDesktop
+
+    window.hermesDesktop = {
+      ...desktop,
+      getConnection: vi.fn(async () => ({
+        authMode: 'token',
+        baseUrl: 'http://gateway.test',
+        isFullscreen: false,
+        logs: [],
+        nativeOverlayWidth: 0,
+        token: 'test-token',
+        windowButtonPosition: null,
+        wsUrl: 'ws://gateway.test/api/ws'
+      }))
+    } as typeof window.hermesDesktop
+    setGatewayState('open')
+    $gateway.set(gateway)
+
+    try {
+      const { result } = renderHook(() => useGatewayRequest())
+      const recovery = result.current.requestGateway('prompt.submit', { text: 'one prompt' })
+
+      void recovery.then(
+        () => {
+          settled = true
+        },
+        () => {
+          settled = true
+        }
+      )
+
+      await vi.waitFor(() => expect(connect).toHaveBeenCalledTimes(1))
+      expect(settled).toBe(false)
+
+      connectionState = 'open'
+      setGatewayState('open')
+      stateHandlers.forEach(handler => handler('open'))
+
+      await expect(recovery).rejects.toThrow('delivery not confirmed after reconnect: prompt.submit')
+      expect(request).toHaveBeenCalledTimes(1)
+    } finally {
+      window.hermesDesktop = desktop
+    }
+  })
 })
