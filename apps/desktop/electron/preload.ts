@@ -54,6 +54,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     close: () => ipcRenderer.invoke('hermes:hud:close'),
     setIgnoreMouse: ignore => ipcRenderer.send('hermes:hud:ignore-mouse', ignore),
     moveBy: delta => ipcRenderer.send('hermes:hud:move-by', delta),
+    setBounds: bounds => ipcRenderer.send('hermes:hud:set-bounds', bounds),
     setVibrancy: on => ipcRenderer.invoke('hermes:hud:vibrancy', on),
     // The HUD tells main which session it is on; main hands that back to the
     // app window when the HUD closes, so the app can re-home onto it.
@@ -69,6 +70,16 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
       ipcRenderer.on('hermes:hud:changed', listener)
 
       return () => ipcRenderer.removeListener('hermes:hud:changed', listener)
+    },
+    // Linux only, and silent elsewhere: where the cursor is, in page
+    // coordinates, or null when it has left the window. Stands in for the
+    // mousemove that `setIgnoreMouseEvents(true, { forward: true })` delivers on
+    // macOS and Windows but not here.
+    onCursor: callback => {
+      const listener = (_event, point) => callback(point)
+      ipcRenderer.on('hermes:hud:cursor', listener)
+
+      return () => ipcRenderer.removeListener('hermes:hud:cursor', listener)
     }
   },
   // Quick Entry: the global-hotkey mini composer window. Main owns the OS
@@ -219,6 +230,8 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
       commitContext: repoPath => ipcRenderer.invoke('hermes:git:review:commitContext', repoPath),
       push: repoPath => ipcRenderer.invoke('hermes:git:review:push', repoPath),
       shipInfo: repoPath => ipcRenderer.invoke('hermes:git:review:shipInfo', repoPath),
+      prList: (repoPath, branches, numbers) =>
+        ipcRenderer.invoke('hermes:git:review:prList', repoPath, branches, numbers),
       createPr: repoPath => ipcRenderer.invoke('hermes:git:review:createPr', repoPath)
     }
   },
