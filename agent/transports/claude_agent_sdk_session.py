@@ -545,6 +545,14 @@ class ClaudeAgentSdkSession:
         resume_session_id: Optional[str] = None,
         on_stream_delta: Optional[Callable[[str], None]] = None,
         on_unsolicited_result: Optional[Callable[[list[str]], None]] = None,
+        # Hybrid MCP bridge (ported from PR #56413): when both `agent` and
+        # `tools` are provided, an in-process MCP server exposing the full
+        # Hermes tool registry (including proxified third-party MCPs) is
+        # added to `mcp_servers` alongside the stdio `hermes-tools` wrapper.
+        # None on either param disables the bridge — fcava's original
+        # behaviour (stdio-only wrapper) is preserved.
+        agent: Optional[Any] = None,
+        tools: Optional[List[dict]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._model = model
@@ -574,6 +582,9 @@ class ClaudeAgentSdkSession:
         # enter the projected transcript; the gateway's stream consumer
         # handles rate limiting and the already_sent final-send dedup.
         self._on_stream_delta = on_stream_delta
+        # Hybrid MCP bridge inputs (see param docstring above).
+        self._agent = agent
+        self._tools = tools
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
@@ -1374,7 +1385,42 @@ class ClaudeAgentSdkSession:
         """The ClaudeAgentOptions field dict — plain data so tests can assert
         on it without importing the SDK."""
         mcp_servers: dict[str, Any] = {}
-        if self._include_hermes_tools:
+        # Hybrid in-process MCP bridge (ported from PR #56413) — exposes the
+        # full Hermes tool registry, including proxified third-party MCP
+        # servers, which the stdio `hermes-tools` wrapper cannot reach
+        # because credentials live in the gateway process env and don't
+        # propagate to the subprocess. Only activated when the caller
+        # supplied both `agent` and `tools` (defaults preserve fcava's
+        # stdio-only behaviour).
+        hybrid_active = False
+        if self._agent is not None and self._tools:
+            try:
+                from agent.transports.hermes_hybrid_mcp import (
+                    HYBRID_SERVER,
+                    build_hybrid_mcp_server,
+                )
+
+                mcp_servers[HYBRID_SERVER] = build_hybrid_mcp_server(
+                    self._agent, self._tools
+                )
+                hybrid_active = True
+            except Exception as exc:  # noqa: BLE001
+                # Never break session start on hybrid bridge failure — the
+                # stdio wrapper still provides the curated tool set.
+                logger.warning(
+                    "hybrid MCP bridge failed to build (%s) — falling back "
+                    "to stdio hermes-tools only",
+                    exc,
+                )
+        # The stdio ``hermes-tools`` wrapper exposes ~25 curated tools that
+        # the hybrid bridge already re-exposes (as a strict subset of the
+        # full registry). Registering both concurrently sends Claude two
+        # copies of the same tools under different names
+        # (mcp__hermes-tools__web_search vs mcp__hermes-hybrid__web_search),
+        # bloats the tool block, and invalidates the Anthropic prompt cache
+        # prefix. Skip stdio when hybrid is active. (Hybrid failure above
+        # falls back to stdio via ``hybrid_active`` staying False.)
+        if self._include_hermes_tools and not hybrid_active:
             mcp_servers["hermes-tools"] = _build_hermes_tools_mcp_config(
                 hermes_session_id=self._hermes_session_id
             )

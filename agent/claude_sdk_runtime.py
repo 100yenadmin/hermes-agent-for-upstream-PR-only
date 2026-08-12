@@ -698,6 +698,13 @@ def run_claude_agent_sdk_turn(
             # None = no budget. Read per session creation so a config edit
             # applies on the next session, same as the append snapshot.
             max_budget_usd=_configured_max_budget_usd(),
+            # Hybrid MCP bridge inputs (ported from PR #56413). Passing the
+            # live agent + its OpenAI-format tool list activates an in-process
+            # MCP server that exposes the full Hermes tool registry — so
+            # proxified third-party MCP servers become reachable from inside
+            # the SDK loop, not just the ~25 curated stdio tools.
+            agent=agent,
+            tools=getattr(agent, "tools", None),
         )
         # The prologue persisted Hermes' native composed prompt — a prompt
         # this runtime never sends. Overwrite the snapshot with the
