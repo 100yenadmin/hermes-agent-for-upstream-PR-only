@@ -32,6 +32,38 @@ def _read_capped(path: str, cap: int = _APPEND_SOURCE_MAX_CHARS) -> str:
         return ""
 
 
+def _snapshot_agent_tools_with_mcp_refresh(agent) -> Optional[List[Dict[str, Any]]]:
+    """Return ``agent.tools`` after making sure late-registered MCP tools are
+    included. See ``tools/mcp_tool.py::refresh_agent_mcp_tools`` for context:
+    the agent snapshots its tool list once at build time and never re-reads
+    the registry, so MCP servers whose initial connect finishes AFTER that
+    snapshot (slow HTTP handshake, OAuth-gated servers, ``/reload-mcp``) are
+    invisible until the snapshot is rebuilt. ``turn_context.py`` already does
+    this between turns; we do it at session-creation time too so the hybrid
+    MCP bridge (which is built ONCE per session) doesn't freeze a stale
+    snapshot into the SDK's ``mcp_servers`` for the entire session.
+
+    Never raises; a refresh failure falls back to the raw snapshot.
+    """
+    try:
+        # Same import-cost gate as turn_context.py's between-turns refresh:
+        # ``tools.mcp_tool`` is heavy (~0.4s) and only worth importing when
+        # something else already did (which means MCPs may be registered).
+        import sys as _sys
+        if "tools.mcp_tool" in _sys.modules:
+            from tools.mcp_tool import (
+                has_registered_mcp_tools,
+                refresh_agent_mcp_tools,
+            )
+            if has_registered_mcp_tools() and not getattr(
+                agent, "_skip_mcp_refresh", False
+            ):
+                refresh_agent_mcp_tools(agent, quiet_mode=True)
+    except Exception:
+        logger.debug("MCP refresh before hybrid build failed", exc_info=True)
+    return getattr(agent, "tools", None)
+
+
 # Total append budget. Blocks are included whole, in priority order; a block
 # that does not fit is SKIPPED (never truncated mid-block) and later, smaller
 # blocks may still be included. Priority = assembly order below: soul,
@@ -703,8 +735,17 @@ def run_claude_agent_sdk_turn(
             # MCP server that exposes the full Hermes tool registry — so
             # proxified third-party MCP servers become reachable from inside
             # the SDK loop, not just the ~25 curated stdio tools.
+            #
+            # agent.tools is a snapshot taken at agent build time and never
+            # re-reads the registry (see tools/mcp_tool.py::refresh_agent_mcp_tools
+            # docstring). If an HTTP MCP finished connecting AFTER that snapshot
+            # (e.g. slow initial handshake, or /reload-mcp), its tools would be
+            # invisible to the hybrid bridge. Force a refresh here so the bridge
+            # sees the current registry — the same call turn_context.py does
+            # between turns, but pulled forward so it also applies to the
+            # session-creation build.
             agent=agent,
-            tools=getattr(agent, "tools", None),
+            tools=_snapshot_agent_tools_with_mcp_refresh(agent),
         )
         # The prologue persisted Hermes' native composed prompt — a prompt
         # this runtime never sends. Overwrite the snapshot with the
