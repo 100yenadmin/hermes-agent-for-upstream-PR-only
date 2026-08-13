@@ -20,7 +20,7 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from agent.transports.hermes_tool_exposure import (
     looks_like_tool_error,
@@ -29,13 +29,27 @@ from agent.transports.hermes_tool_exposure import (
 
 logger = logging.getLogger(__name__)
 
-# MCP server name used to expose Hermes tools in-process. Distinct from the
-# ``hermes-tools`` stdio subprocess so both can coexist during rollout — but
-# the caller can pass this into ``mcp_servers`` in place of the stdio entry.
+# MCP server name used to expose the "extras" bucket in-process (proxified
+# third-party MCPs + agent-level tools). Distinct from ``hermes-tools`` so
+# the legacy stdio-parity bucket keeps operator grants intact.
 HYBRID_SERVER = "hermes-hybrid"
 
+# MCP server name preserved for backward compatibility with operator grants
+# in ``~/.claude/settings.json`` that key on ``mcp__hermes-tools__<tool>``.
+# When the hybrid bridge is active, the tools listed in
+# ``HERMES_TOOLS_LEGACY_NAMES`` are exposed under this name so those grants
+# keep matching without a migration step.
+HERMES_TOOLS_SERVER = "hermes-tools"
 
-def build_hybrid_mcp_server(agent, tools: List[dict]) -> Any:
+
+def build_hybrid_mcp_server(
+    agent,
+    tools: List[dict],
+    *,
+    server_name: str = HYBRID_SERVER,
+    only_names: Optional[Iterable[str]] = None,
+    exclude_names: Optional[Iterable[str]] = None,
+) -> Any:
     """Build an in-process MCP server exposing Hermes tools to the SDK loop.
 
     Each Hermes tool becomes an ``@tool`` whose handler routes through Hermes'
@@ -44,6 +58,23 @@ def build_hybrid_mcp_server(agent, tools: List[dict]) -> Any:
     agent-level tools (todo/memory/clarify/delegate_task/read_terminal/
     session_search) with live agent state — then wraps the result in the
     ``<untrusted_tool_result>`` promptware defense used by the native path.
+
+    ``server_name`` sets the MCP server name Claude sees
+    (``mcp__<server_name>__<tool>``). The bridge uses two buckets — see the
+    call site in ``claude_agent_sdk_session.py`` — one under
+    ``hermes-tools`` (stdio-legacy names, keeps existing operator grants
+    intact) and one under ``hermes-hybrid`` (everything else).
+
+    ``only_names`` (optional) restricts the exposed tools to that set,
+    matched on the raw Hermes registry name (no ``mcp__`` prefix). Used to
+    partition the registry between the two buckets.
+
+    ``exclude_names`` (optional) drops the listed tools from this server.
+    Applied AFTER ``only_names``. Used to honour the operator's
+    ``agent.claude_agent_sdk.hybrid_mcp_bridge_exclude`` config: the stdio
+    wrapper's curation was a security choice, and this list lets an
+    operator keep the wide bridge for proxified MCPs without inheriting
+    high-blast tools (delegate_task, cron_*, read_terminal, terminal).
     """
     # Lazy imports so this module stays cheap to import at package load.
     import claude_agent_sdk as sdk
@@ -115,10 +146,18 @@ def build_hybrid_mcp_server(agent, tools: List[dict]) -> Any:
     # unresolvable strings that ``invoke_tool``'s registry lookup rejects
     # silently — every third-party MCP call would return an "unknown tool"
     # JSON error while the SDK reports success (is_error=True content).
+    only_set: Optional[set] = set(only_names) if only_names is not None else None
+    exclude_set: set = set(exclude_names or ())
+
     normalized_specs: List[Tuple[str, str, Dict[str, Any]]] = []
     for spec in tools or []:
         normalized = normalize_tool_spec(spec, strip_mcp_prefix=False)
         if normalized is None:
+            continue
+        name = normalized[0]
+        if only_set is not None and name not in only_set:
+            continue
+        if name in exclude_set:
             continue
         normalized_specs.append(normalized)
     normalized_specs.sort(key=lambda t: t[0])
@@ -135,5 +174,5 @@ def build_hybrid_mcp_server(agent, tools: List[dict]) -> Any:
         sdk_tools.append(decorated)
 
     return sdk.create_sdk_mcp_server(
-        name=HYBRID_SERVER, version="1.0.0", tools=sdk_tools
+        name=server_name, version="1.0.0", tools=sdk_tools
     )

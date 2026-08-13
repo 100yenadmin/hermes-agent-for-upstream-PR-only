@@ -42,6 +42,16 @@ from typing import Any, Dict, List, Optional, Tuple
 #   - todo / memory / delegate_task / session_search — ``_AGENT_LOOP_TOOLS``;
 #     they require live mid-loop agent state, which a stateless/out-of-process
 #     dispatcher cannot provide.
+# Tool names historically exposed under the ``hermes-tools`` MCP server (the
+# stdio subprocess wrapper). Consumed by the hybrid bridge to keep those
+# tools under the same server name for backward compatibility with operator
+# grants stored in ``~/.claude/settings.json`` (which key on
+# ``mcp__hermes-tools__<tool>``). Union of the stdio wrapper's
+# ``EXPOSED_TOOLS`` list plus the two agent-level tools it exposes through
+# dedicated stateless shims (``memory``, ``session_search``).
+HERMES_TOOLS_LEGACY_NAMES: "frozenset[str]" = frozenset()  # populated below
+
+
 CURATED_STATELESS_TOOLS: Tuple[str, ...] = (
     "web_search",
     "web_extract",
@@ -75,6 +85,22 @@ CURATED_STATELESS_TOOLS: Tuple[str, ...] = (
     "kanban_unblock",
     "kanban_link",
 )
+
+
+HERMES_TOOLS_LEGACY_NAMES = frozenset((
+    *CURATED_STATELESS_TOOLS,
+    # Stdio wrapper also ships these two under ``mcp__hermes-tools__*``
+    # via dedicated stateless shims (see ``hermes_tools_mcp_server.py``).
+    "memory",
+    "session_search",
+    # Present in the stdio wrapper's ``EXPOSED_TOOLS`` but not in the
+    # module-level ``CURATED_STATELESS_TOOLS`` — grants for these under
+    # ``mcp__hermes-tools__*`` would otherwise stop matching when the
+    # hybrid bridge takes over.
+    "kanban_request_review",
+    "kanban_request_changes",
+))
+
 
 _MCP_PREFIX = "mcp__"
 

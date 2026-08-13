@@ -51,6 +51,8 @@ All keys live under `agent.claude_agent_sdk` in `config.yaml` (see `cli-config.y
 | `append_file` | `""` | Operator persona/soul file appended to the system prompt. |
 | `permission_mode` | `""` | An SDK permission mode literal (`default`, `acceptEdits`, `plan`, `bypassPermissions`, `dontAsk`, `auto`). Empty keeps the `HERMES_TERMINAL_SECURITY_MODE` mapping. Set `default` to route SDK tool permissions through Hermes' approval flow. |
 | `max_budget_usd` | `null` | Per-query USD cap forwarded to the SDK; the turn ends with `error_max_budget_usd` when exceeded. `null` = no budget. |
+| `hybrid_mcp_bridge` | `false` | Opt in to the in-process MCP bridge that exposes the FULL Hermes tool registry (proxified third-party MCPs + agent-level tools) to the SDK loop. `false` (default) keeps the stdio `hermes-tools` wrapper only — byte-identical to the fcava-provider default. Off by default because the wide bridge exposes agent-level tools whose enablement is a security choice. |
+| `hybrid_mcp_bridge_exclude` | `[]` | Tool names to drop from the hybrid bridge (both `hermes-tools` and `hermes-hybrid` buckets). Ignored when `hybrid_mcp_bridge` is `false`. Use to keep the wide bridge for proxified MCPs without inheriting high-blast tools (`delegate_task`, `cron_*`, `read_terminal`, `terminal`). Match on the raw Hermes registry name (no `mcp__` prefix). |
 
 ### Permission posture, honestly
 
@@ -60,7 +62,7 @@ Ambient Claude settings are isolated: the runtime pins the SDK's `setting_source
 
 ## What Hermes still provides
 
-- **hermes-tools MCP server** — memory and `session_search` shims (plus the standard Hermes tool surface) are exposed into the SDK's loop over stdio.
+- **hermes-tools MCP server** — memory and `session_search` shims (plus the standard Hermes tool surface) are exposed into the SDK's loop over stdio. When `hybrid_mcp_bridge: true`, this becomes an in-process MCP server under the same name (`mcp__hermes-tools__*`) — operator grants stored in `~/.claude/settings.json` keep matching without a migration step. The extra tools the bridge unlocks (third-party MCPs + agent-level tools) land under a second server, `mcp__hermes-hybrid__*`.
 - **Transcripts and continuity** — the SDK's typed message stream is projected into Hermes' messages shape and persisted; across gateway restarts the runtime resumes the same SDK session, and a failed resume retries fresh with a bounded continuity digest.
 - **Interrupts** — `/stop` and new-message preemption route into the SDK's interrupt.
 

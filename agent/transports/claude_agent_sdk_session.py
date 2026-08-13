@@ -556,6 +556,27 @@ def _provider_flag(config_key: str, default: bool = False) -> bool:
     return bool(value)
 
 
+def _configured_hybrid_exclude() -> list:
+    """agent.claude_agent_sdk.hybrid_mcp_bridge_exclude from config.yaml.
+
+    Names to drop from the hybrid bridge (both buckets). Match on the raw
+    Hermes registry name, no ``mcp__`` prefix. Non-string entries are
+    dropped silently — a typo is a config error the operator will notice
+    when the tool doesn't disappear, not a reason to widen exposure.
+    """
+    raw = _provider_config().get("hybrid_mcp_bridge_exclude")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        name = entry.strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
 def _build_hermes_tools_mcp_config(
     hermes_session_id: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -1461,19 +1482,52 @@ class ClaudeAgentSdkSession:
         # full Hermes tool registry, including proxified third-party MCP
         # servers, which the stdio `hermes-tools` wrapper cannot reach
         # because credentials live in the gateway process env and don't
-        # propagate to the subprocess. Only activated when the caller
-        # supplied both `agent` and `tools` (defaults preserve fcava's
-        # stdio-only behaviour).
+        # propagate to the subprocess. Activation requires ALL of:
+        #   1. the operator opted in via
+        #      ``agent.claude_agent_sdk.hybrid_mcp_bridge: true``
+        #      (the runtime call site enforces this — it passes
+        #      ``agent=None, tools=None`` when the flag is off);
+        #   2. the caller supplied both ``agent`` and ``tools`` (session-
+        #      level belt-and-suspenders for the flag).
+        # The bridge splits into two in-process servers:
+        #   - ``hermes-tools`` — stdio-legacy names (see
+        #     ``HERMES_TOOLS_LEGACY_NAMES``). Preserves operator grants
+        #     stored in ``~/.claude/settings.json`` that key on
+        #     ``mcp__hermes-tools__<tool>``: a box on
+        #     ``permission_mode: default`` would otherwise face an
+        #     approval storm for tools it already granted.
+        #   - ``hermes-hybrid`` — everything else (proxified MCPs +
+        #     agent-level tools).
+        # The exclude list from config is applied to BOTH buckets so an
+        # operator can keep the wide bridge for proxified MCPs without
+        # inheriting a specific tool (delegate_task, cron_*, terminal, ...).
         hybrid_active = False
         if self._agent is not None and self._tools:
             try:
                 from agent.transports.hermes_hybrid_mcp import (
+                    HERMES_TOOLS_SERVER,
                     HYBRID_SERVER,
                     build_hybrid_mcp_server,
                 )
+                from agent.transports.hermes_tool_exposure import (
+                    HERMES_TOOLS_LEGACY_NAMES,
+                )
 
+                exclude_names = _configured_hybrid_exclude()
+                mcp_servers[HERMES_TOOLS_SERVER] = build_hybrid_mcp_server(
+                    self._agent,
+                    self._tools,
+                    server_name=HERMES_TOOLS_SERVER,
+                    only_names=HERMES_TOOLS_LEGACY_NAMES,
+                    exclude_names=exclude_names,
+                )
                 mcp_servers[HYBRID_SERVER] = build_hybrid_mcp_server(
-                    self._agent, self._tools
+                    self._agent,
+                    self._tools,
+                    server_name=HYBRID_SERVER,
+                    exclude_names=(
+                        list(exclude_names) + list(HERMES_TOOLS_LEGACY_NAMES)
+                    ),
                 )
                 hybrid_active = True
             except Exception as exc:  # noqa: BLE001
@@ -1485,12 +1539,10 @@ class ClaudeAgentSdkSession:
                     exc,
                 )
         # The stdio ``hermes-tools`` wrapper exposes ~25 curated tools that
-        # the hybrid bridge already re-exposes (as a strict subset of the
-        # full registry). Registering both concurrently sends Claude two
-        # copies of the same tools under different names
-        # (mcp__hermes-tools__web_search vs mcp__hermes-hybrid__web_search),
-        # bloats the tool block, and invalidates the Anthropic prompt cache
-        # prefix. Skip stdio when hybrid is active. (Hybrid failure above
+        # the hybrid bridge already re-exposes under the same server name
+        # (``hermes-tools``) when active — registering both concurrently
+        # would send Claude two copies of every curated tool under the same
+        # server. Skip stdio when hybrid is active. (Hybrid failure above
         # falls back to stdio via ``hybrid_active`` staying False.)
         if self._include_hermes_tools and not hybrid_active:
             mcp_servers["hermes-tools"] = _build_hermes_tools_mcp_config(

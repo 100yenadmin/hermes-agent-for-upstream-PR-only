@@ -32,6 +32,17 @@ def _read_capped(path: str, cap: int = _APPEND_SOURCE_MAX_CHARS) -> str:
         return ""
 
 
+def _hybrid_bridge_enabled() -> bool:
+    """agent.claude_agent_sdk.hybrid_mcp_bridge from config.yaml.
+
+    Off by default — the wide bridge exposes agent-level tools whose
+    enablement is a security choice. Operators opt in via config.
+    """
+    from agent.transports.claude_agent_sdk_session import _provider_flag
+
+    return _provider_flag("hybrid_mcp_bridge", default=False)
+
+
 def _snapshot_agent_tools_with_mcp_refresh(agent) -> Optional[List[Dict[str, Any]]]:
     """Return ``agent.tools`` after making sure late-registered MCP tools are
     included. See ``tools/mcp_tool.py::refresh_agent_mcp_tools`` for context:
@@ -736,6 +747,12 @@ def run_claude_agent_sdk_turn(
             # proxified third-party MCP servers become reachable from inside
             # the SDK loop, not just the ~25 curated stdio tools.
             #
+            # Off by default (agent.claude_agent_sdk.hybrid_mcp_bridge:
+            # false) so a green-field upgrade is byte-identical to fcava's
+            # stdio-only behaviour — the wide bridge exposes agent-level
+            # tools whose enablement is a security choice. Operators opt in
+            # explicitly.
+            #
             # agent.tools is a snapshot taken at agent build time and never
             # re-reads the registry (see tools/mcp_tool.py::refresh_agent_mcp_tools
             # docstring). If an HTTP MCP finished connecting AFTER that snapshot
@@ -744,8 +761,12 @@ def run_claude_agent_sdk_turn(
             # sees the current registry — the same call turn_context.py does
             # between turns, but pulled forward so it also applies to the
             # session-creation build.
-            agent=agent,
-            tools=_snapshot_agent_tools_with_mcp_refresh(agent),
+            agent=(agent if _hybrid_bridge_enabled() else None),
+            tools=(
+                _snapshot_agent_tools_with_mcp_refresh(agent)
+                if _hybrid_bridge_enabled()
+                else None
+            ),
         )
         # The prologue persisted Hermes' native composed prompt — a prompt
         # this runtime never sends. Overwrite the snapshot with the
