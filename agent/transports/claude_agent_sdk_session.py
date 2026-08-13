@@ -1645,7 +1645,12 @@ class ClaudeAgentSdkSession:
             # dead-ends with "The user did not answer the questions." The model
             # must ask in plain text (Telegram-compatible); full option-button
             # mapping is a later feature.
-            "disallowed_tools": ["AskUserQuestion"],
+            #
+            # Native Read duplicates the bounded Hermes MCP read_file surface,
+            # but turns ordinary inspection into approval-card noise. Keep the
+            # protected-path-aware MCP tool and disallow only the duplicate
+            # native tool; Bash and all write-capable native tools are unchanged.
+            "disallowed_tools": ["AskUserQuestion", "Read"],
         }
         if self._resume_session_id:
             fields["resume"] = self._resume_session_id

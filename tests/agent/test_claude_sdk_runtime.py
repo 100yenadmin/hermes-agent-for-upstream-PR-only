@@ -475,12 +475,18 @@ class TestSession:
         # approval posture. The empty list is the SDK's isolation mode.
         assert options["setting_sources"] == []
 
-    def test_askuserquestion_in_disallowed_tools(self):
-        # No answer channel for AskUserQuestion in hermes — the model must
-        # ask in plain text; the tool is removed from its context.
+    def test_native_read_is_disallowed_in_favor_of_bounded_mcp_read(self):
+        # The Claude SDK profile exposes protected-path-aware Hermes MCP
+        # read_file. Native Read duplicates it but causes an approval card for
+        # every normal inspection, so only that duplicate is removed. Bash and
+        # all native write tools remain available and approval-gated.
         session, _ = _make_session(script=[ResultMessage(result="ok")])
         fields = session.build_option_fields()
-        assert fields["disallowed_tools"] == ["AskUserQuestion"]
+        assert fields["disallowed_tools"] == ["AskUserQuestion", "Read"]
+        assert "Bash" not in fields["disallowed_tools"]
+        assert "Edit" not in fields["disallowed_tools"]
+        assert "Write" not in fields["disallowed_tools"]
+        assert "mcp__hermes-tools__read_file" not in fields["disallowed_tools"]
 
     def test_config_permission_mode_overrides_env_mapping(self, monkeypatch):
         # agent.claude_agent_sdk.permission_mode (an SDK literal) wins over
