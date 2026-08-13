@@ -227,6 +227,12 @@ DEFAULT_CONFIG = {
         # from gateway_timeout (which kills the turn) and
         # gateway_notify_interval ("still working" heartbeats). 0 = disable.
         "session_stall_timeout": 300,
+        # Long-lived reconnect-loop escalation (seconds). A platform that has
+        # been continuously failing/reconnecting for this long gets
+        # needs_attention flagged in gateway runtime status (visible in
+        # `hermes status` / fleet monitoring). Retries never stop — this is a
+        # signal, not a circuit breaker. 0 = disable.
+        "reconnect_attention_after": 7200,
         # Freshness window for the gateway auto-continue note (seconds).
         # After a gateway crash/restart/SIGTERM mid-run, the next user
         # message gets a "[System note: your previous turn was
@@ -2320,6 +2326,14 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Allow cron-spawned agents to use the cronjob toolset (create/edit/
+        # remove scheduled jobs from within a cron run — the "cron-librarian"
+        # pattern). Off by default: the cronjob toolset is policy-denied in
+        # cron context to prevent unattended scheduling loops. Jobs created
+        # this way are user-owned in the same flat jobs table as every other
+        # job. Interactive toolsets (messaging/clarify) stay denied in cron
+        # context regardless of this setting.
+        "allow_agent_scheduling": False,
         # Pre-dispatch configuration validation (T1-26): before constructing
         # any agent machinery for a job, verify the provider API key resolves
         # (unless a fallback chain is configured), attached skills are ready
@@ -2403,6 +2417,11 @@ DEFAULT_CONFIG = {
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.
         "output_retention": 50,
+        # Timeout (seconds) for a no-agent cron script. Also overridable via
+        # HERMES_CRON_SCRIPT_TIMEOUT. Keep this in sync with
+        # cron.scheduler._DEFAULT_SCRIPT_TIMEOUT so config set recognizes the
+        # same setting the scheduler reads.
+        "script_timeout_seconds": 3600,
         # Timeout (seconds) for SessionDB() init inside cron jobs.
         # SessionDB opens/migrates state.db synchronously and has no timeout
         # of its own against a wedged sqlite3.connect. An unbounded hang here

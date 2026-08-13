@@ -115,6 +115,7 @@ Every `ctx.*` API below is available inside a plugin's `register(ctx)` function.
 | Route human approval prompts | `ctx.register_approval_transport(name, present_fn)` — see [Approval transports](#approval-transports) |
 | Register a memory backend | Subclass `MemoryProvider` in `plugins/memory/<name>/__init__.py` — see [Memory Provider Plugins](/developer-guide/memory-provider-plugin) (uses a separate discovery system) |
 | Run a host-owned LLM call | `ctx.llm.complete(...)` / `ctx.llm.complete_structured(...)` — borrow the user's active model + auth for a one-shot completion with optional JSON schema validation. See [Plugin LLM Access](/developer-guide/plugin-llm-access) |
+| Call an MCP tool (capability-gated) | `ctx.call_mcp(server, tool, arguments, timeout=30)` — see [Calling MCP servers from plugins](#calling-mcp-servers-from-plugins) |
 | Register an inference backend (LLM provider) | `register_provider(ProviderProfile(...))` in `plugins/model-providers/<name>/__init__.py` — see [Model Provider Plugins](/developer-guide/model-provider-plugin) (uses a separate discovery system) |
 
 ## Plugin discovery
@@ -259,13 +260,13 @@ When you upgrade to a version of Hermes that has opt-in plugins (config schema v
 
 ## Available hooks
 
-Plugins can register the 24 lifecycle events currently accepted by `hermes_cli.plugins.VALID_HOOKS`. The **[Event Hooks catalog](/user-guide/features/hooks#shipped-plugin-hook-catalog)** is canonical for exact timing, return handling, payload fields, and privacy notes.
+Plugins can register the 26 lifecycle events currently accepted by `hermes_cli.plugins.VALID_HOOKS`. The **[Event Hooks catalog](/user-guide/features/hooks#shipped-plugin-hook-catalog)** is canonical for exact timing, return handling, payload fields, and privacy notes.
 
 | Descriptive category | Shipped hooks |
 |---|---|
 | **Directive/control** | `pre_tool_call`, `pre_llm_call`, `pre_verify`, `pre_gateway_dispatch` |
-| **Transform** | `transform_tool_result`, `transform_terminal_output`, `transform_llm_output` |
-| **Observer** | `post_tool_call`, `post_llm_call`, `pre_api_request`, `post_api_request`, `api_request_error`, `on_stream_start`, `on_stream_delta`, `on_stream_end`, `on_interim_message`, `on_session_start`, `on_session_end`, `on_session_finalize`, `on_session_reset`, `on_skill_lifecycle`, `subagent_start`, `subagent_stop`, `pre_approval_request`, `post_approval_response`, `kanban_task_claimed`, `kanban_task_completed`, `kanban_task_blocked` |
+| **Transform** | `transform_tool_result`, `transform_terminal_output`, `transform_llm_output`, `pre_transcription` |
+| **Observer** | `post_tool_call`, `post_llm_call`, `pre_api_request`, `post_api_request`, `api_request_error`, `on_stream_start`, `on_stream_delta`, `on_stream_end`, `on_interim_message`, `on_session_start`, `on_session_end`, `on_session_finalize`, `on_session_reset`, `on_skill_lifecycle`, `subagent_start`, `subagent_stop`, `pre_approval_request`, `post_approval_response`, `pre_command`, `kanban_task_claimed`, `kanban_task_completed`, `kanban_task_blocked` |
 
 These categories describe current behavior rather than defining future naming rules. Plugin middleware remains a separate registry/surface.
 ## Plugin types
@@ -336,7 +337,7 @@ hermes plugins install <name>                # install by index name (resolved t
 hermes plugins install user/repo             # install from Git, then prompt Enable? [y/N]
 hermes plugins install user/repo --enable    # install AND enable (no prompt)
 hermes plugins install user/repo --no-enable # install but leave disabled (no prompt)
-hermes plugins update my-plugin              # pull latest
+hermes plugins update my-plugin              # pull latest (local edits are autostashed and re-applied)
 hermes plugins remove my-plugin              # uninstall
 hermes plugins enable my-plugin              # add to allow-list
 hermes plugins disable my-plugin             # remove from allow-list + add to disabled
@@ -390,6 +391,7 @@ working but are **deprecated** in favor of the consent flow:
 | `llm.agent_id_override` | `llm.allow_agent_id_override` |
 | `llm.profile_override` | `llm.allow_profile_override` |
 | `llm.task_override` | `llm.allow_task_override` |
+| `gateway.platform_actions` | `allow_platform_actions` |
 
 A gate is open when *either* the capability is granted *or* the legacy key is
 set — existing configs keep working unchanged.
@@ -400,6 +402,53 @@ regular in-process Python: a malicious plugin can ignore every gate here.
 Granting a capability is a statement of trust in the plugin author — it is
 not a code audit, and Hermes has not reviewed the plugin's code. Only install
 plugins from sources you trust.
+:::
+
+### Platform actions
+
+`ctx.platform_actions` gives a plugin a minimal, capability-gated verb set for
+acting on connected chat platforms through the live gateway adapter registry —
+the sanctioned alternative to monkeypatching an adapter. **It is off by
+default**: every call re-checks the `gateway.platform_actions` capability
+(legacy key `plugins.entries.<id>.allow_platform_actions`), and an ungranted
+call returns a structured error instead of acting.
+
+v1 verbs (both `async`, both return a plain dict, and neither ever raises into
+hook dispatch):
+
+```python
+result = await ctx.platform_actions.add_reaction(
+    platform="telegram", chat_id="-100123", message_id="456", emoji="👍",
+)
+result = await ctx.platform_actions.set_thread_title(
+    platform="discord", chat_id="123", thread_id="456", title="New title",
+)
+if not result["ok"]:
+    print(result["error"], result.get("detail"))
+```
+
+Success is `{"ok": True, "action": <verb>}`. Failures are
+`{"ok": False, "error": <code>, "detail": <str>}` with stable error codes:
+`capability_not_granted`, `invalid_argument`, `gateway_unavailable`,
+`unknown_platform`, `adapter_not_registered`, `adapter_disconnected`,
+`unsupported_platform_action`, `action_failed`. Actions validate that the
+target adapter exists and is connected before acting; a disconnected or
+missing adapter degrades to a structured error, never an exception.
+
+Platforms supported in v1: Telegram and Discord. Telegram's `add_reaction`
+*sets* the bot's reaction (the Bot API replaces a previous bot reaction rather
+than stacking). Every action — allowed or denied — is written to the log with
+the plugin id, verb, platform, and outcome.
+
+:::warning Security note
+Platform actions are a **messaging-as-the-bot power**: a granted plugin can
+react and rename threads in any chat the gateway bot can reach, not just the
+chat that triggered the hook. Grant `gateway.platform_actions` only to plugins
+you trust, and prefer plugins that document exactly which actions they take.
+Raw platform SDK payload/handle access is deliberately **not** part of this
+surface — per the #64176 round-2 design correction it requires its own
+capability (`gateway.raw_events`) with a "no stability guarantee" label and a
+separate design, and has not shipped.
 :::
 
 ### Discovering community plugins
@@ -470,6 +519,73 @@ consent/review flow (plugins install disabled by default, enabling is an
 explicit step, and tool-override rights require a separate grant). Review a
 plugin's source before enabling it.
 :::
+
+### Plugin packs
+
+A **plugin pack** is a declarative, shareable YAML file (`hermes-pack.yaml`)
+that pins a set of plugins — like sharing a modpack. Installing a pack fans
+out to ordinary pinned installs; nothing new exists at runtime.
+
+```yaml
+name: voice-assistant-pack
+description: STT + streaming TTS + approval relay
+author: hyper
+version: 1.0.0
+plugins:
+  - name: hermes-media-studio            # bare community-index name…
+    ref: e8d59971d2b7901405b39dac7b03bdd616272d0d
+  - repo: owner/approval-relay           # …or explicit owner/repo (or git URL)
+    ref: 8f3c2d1a9b4e5f6071829304a5b6c7d8e9f00112
+    subdir: plugins/relay                # optional monorepo path
+config:                                  # optional, non-secret seeds only
+  hermes-media-studio:
+    default_model: flux-3
+skills: []                               # declared list only (not auto-installed yet)
+```
+
+```bash
+hermes plugins pack show ./hermes-pack.yaml     # dry-run review
+hermes plugins pack install ./hermes-pack.yaml  # review → confirm → install
+hermes plugins pack export > hermes-pack.yaml   # snapshot the current install
+hermes plugins pack export --enabled-only       # only plugins.enabled
+```
+
+**Supply-chain posture.** Every entry's `ref` must be an exact 40-character
+commit SHA — tags and branch names are rejected with an error naming the
+entry, the same rule as the community index. Pack installs ride the exact
+same pinned install path as `hermes plugins install --ref <sha>` and record
+the same provenance in `plugins/.install-metadata.json`, so two installs of
+the same pack resolve identically. Packs build on the
+[manifest v2 fields](/developer-guide/plugins) (`manifest_version`,
+`api_version`, `requires_plugins`) — each plugin's own manifest still
+validates through the normal install path.
+
+**Consent is never bulk-granted.** `pack install` shows a mandatory review
+screen (every plugin, source, pinned ref, and the capabilities it declares),
+then asks **one** confirmation for the pack contents. After that, each
+plugin's declared capabilities go through the standard per-plugin
+capability-consent prompt — identical to a single `hermes plugins install`.
+There is no `--yes`, and non-interactive sessions cannot install packs.
+
+**Secrets never travel in packs.** `config:` seeds are limited to
+non-secret `plugins.entries.<id>` keys — secret-shaped key names
+(`*token*`, `*key*`, `*password*`, …), capability grants, and the deprecated
+`allow_*` trust gates are rejected on install and stripped on export.
+Plugins that need secrets declare them in their own `requires_env`, which
+prompts during install as usual. Existing user values in
+`plugins.entries.<id>` always win over pack seeds.
+
+**Partial failure.** Each plugin installs independently; failures are
+reported per plugin, the rest continue, and the command exits non-zero if
+any plugin failed.
+
+**Export caveats.** `pack export` only includes plugins with known Git
+provenance (installed via `hermes plugins install`). Local-only plugins are
+listed as warning comments in the emitted YAML, not as installable entries.
+
+The `skills:` list is parsed and displayed at install time but not yet
+auto-installed — install those manually for now (`hermes skills`). Wiring
+skill-hub ids into pack install is a documented follow-up seam.
 
 ### Interactive UI
 
@@ -571,6 +687,47 @@ Only grant gateway injection to plugins you trust. Hermes checks this host API p
 
 :::note
 This plugin API does not expose a public HTTP endpoint or CLI command for external processes. The plugin must already know the target gateway `session_key`, for example from its own trusted configuration or previously retained session state.
+:::
+
+## Calling MCP servers from plugins
+
+`ctx.call_mcp()` lets a plugin call a tool on one of the user's configured MCP servers — synchronously, from any hook or tool handler — routing through Hermes' existing native MCP client (same connections, trust-tier gates, circuit breaker, and reconnect logic as model-invoked MCP tools; never a parallel client).
+
+```python
+result = ctx.call_mcp(
+    "knowledge_rag",            # server name from mcp.servers
+    "query_knowledge",          # tool on that server
+    {"query": "deploy runbook"},
+    timeout=30,                 # seconds; clamped to 1–600
+)
+if result["ok"]:
+    print(result["result"])
+else:
+    print("MCP error:", result["error"])
+```
+
+**Signature:** `ctx.call_mcp(server: str, tool: str, arguments: dict | None = None, timeout: float = 30) -> dict`
+
+Returns a stable envelope: `{"ok": True, "result": ...}` (plus `structuredContent` when the server provides it) or `{"ok": False, "error": "..."}`. Results over ~64 KB are truncated and flagged with `"truncated": True`.
+
+### Security: default-off, per-server allowlist
+
+A plugin has **no MCP access by default**. The operator must grant each server explicitly in `config.yaml`:
+
+```yaml
+plugins:
+  entries:
+    my-plugin:
+      mcp_allowlist: ["knowledge_rag", "github"]
+```
+
+- Calling a server not in the list raises `PermissionError` naming the exact config key to set.
+- The grant is per-server and per-plugin — never ambient authority over every configured server, and `"*"` wildcards are not honored.
+- Every call has an enforced timeout (default 30 s) so a hung MCP server cannot stall the hook or tool pipeline that invoked it.
+- MCP servers return untrusted content. Treat `result` as data, not instructions — don't feed it into privileged decisions (approvals, command execution) without validation.
+
+:::warning
+Granting `mcp_allowlist` gives the plugin the same access to that MCP server as the model has — including any write-capable tools the server exposes (subject to the server's `trust` tier gates). Grant only servers the plugin genuinely needs.
 :::
 
 See the **[full guide](/developer-guide/plugins)** for handler contracts, schema format, hook behavior, error handling, and common mistakes.
