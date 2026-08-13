@@ -301,6 +301,78 @@ def _swallow_interrupt_result(future: Any) -> None:
         logger.debug("SDK interrupt control request failed", exc_info=True)
 
 
+def _http_mcp_entries_from_config() -> dict[str, dict]:
+    """Return third-party HTTP MCPs discovered in Hermes' merged config, in
+    the McpHttpServerConfig shape the SDK wants ({"type": "http", "url": ...}).
+
+    Reads (in order, later overrides earlier) ``$HERMES_HOME/config.yaml``
+    then ``$HERMES_HOME/profiles/<profile>/config.yaml`` and pulls every
+    ``mcp_servers.<name>`` entry that carries a ``url:`` field (i.e. HTTP
+    MCPs). ``${...}`` env placeholders in the URL are resolved against the
+    gateway process env. Entries without a URL (stdio subprocess, in-process)
+    are ignored. Returns ``{}`` on any read/parse failure — the caller keeps
+    working with just the hybrid + stdio wrapper.
+
+    Rationale: HTTP MCPs registered in Hermes end up in the registry under a
+    toolset ``mcp-<name>`` that isn't included in the agent's default enabled
+    toolsets, so ``get_tool_definitions()`` returns them behind tool_search's
+    tier-2 deferral — the hybrid bridge (which snapshots ``agent.tools`` at
+    session build) never sees them. Exposing them straight to the SDK client
+    bypasses the whole toolset-filter path.
+    """
+    import os as _os
+    import re as _re
+    try:
+        import yaml as _yaml  # type: ignore
+    except Exception:
+        return {}
+
+    home = _os.environ.get("HERMES_HOME") or _os.path.expanduser("~/.hermes")
+    profile = _os.environ.get("HERMES_PROFILE") or "default"
+    paths = [
+        _os.path.join(home, "config.yaml"),
+        _os.path.join(home, "profiles", profile, "config.yaml"),
+    ]
+
+    merged: dict[str, Any] = {}
+    for p in paths:
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                data = _yaml.safe_load(fh) or {}
+            block = (data.get("mcp_servers") or {}) if isinstance(data, dict) else {}
+            if isinstance(block, dict):
+                merged.update(block)
+        except FileNotFoundError:
+            continue
+        except Exception:
+            logger.debug("failed to read %s for HTTP MCP discovery", p, exc_info=True)
+            continue
+
+    _env_re = _re.compile(r"\$\{([A-Z0-9_]+)\}")
+
+    def _resolve_env(s: str) -> str:
+        return _env_re.sub(lambda m: _os.environ.get(m.group(1), ""), s)
+
+    out: dict[str, dict] = {}
+    for name, cfg in merged.items():
+        if not isinstance(cfg, dict):
+            continue
+        url = cfg.get("url")
+        if not isinstance(url, str) or not url.strip():
+            continue
+        resolved = _resolve_env(url).strip()
+        if not resolved:
+            continue
+        entry: dict[str, Any] = {"type": "http", "url": resolved}
+        headers = cfg.get("headers")
+        if isinstance(headers, dict) and headers:
+            entry["headers"] = {
+                str(k): _resolve_env(str(v)) for k, v in headers.items()
+            }
+        out[name] = entry
+    return out
+
+
 # Substrings in SDK/CLI errors that signal broken subscription credentials.
 # Conservative on purpose — mirrors codex's _OAUTH_REFRESH_FAILURE_HINTS
 # contract: every needle is a phrase, never a bare token. Bare "401" matched
@@ -1424,6 +1496,20 @@ class ClaudeAgentSdkSession:
             mcp_servers["hermes-tools"] = _build_hermes_tools_mcp_config(
                 hermes_session_id=self._hermes_session_id
             )
+
+        # Third-party HTTP MCPs configured in Hermes (config.yaml
+        # mcp_servers.<name>.url) are NOT reachable via the hybrid bridge:
+        # get_tool_definitions() returns only the tools registered under a
+        # toolset already enabled on the agent, and the ``mcp-<name>``
+        # toolsets these HTTP servers register under aren't in the agent's
+        # enabled_toolsets by default. Instead of chasing that path, we
+        # expose them directly to the SDK — the SDK's own MCP client
+        # connects to each HTTP endpoint natively (McpHttpServerConfig)
+        # and surfaces the tools as ``mcp__<name>__<tool>`` verbatim.
+        for entry_name, entry_cfg in _http_mcp_entries_from_config().items():
+            if entry_name in mcp_servers:
+                continue
+            mcp_servers[entry_name] = entry_cfg
 
         system_prompt: Any = {"type": "preset", "preset": "claude_code"}
         if self._system_prompt_append:
