@@ -447,7 +447,12 @@ class TestSession:
         assert options["system_prompt"]["preset"] == "claude_code"
         assert "hermes-tools" in options["mcp_servers"]
         mcp = options["mcp_servers"]["hermes-tools"]
-        assert mcp["args"] == ["-m", "agent.transports.hermes_tools_mcp_server"]
+        assert mcp["args"] == [
+            "-m",
+            "agent.transports.hermes_tools_mcp_server",
+            "--profile",
+            "claude-agent-sdk",
+        ]
         # Hard rule: a metered key never reaches any child of this runtime.
         assert "ANTHROPIC_API_KEY" not in (mcp.get("env") or {})
         assert options["permission_mode"] in {
@@ -2254,6 +2259,8 @@ class TestSystemPromptAppend:
         assert "skill_manage" not in out
         tools = captured.get("available_tools") or set()
         assert "memory" in tools and "session_search" in tools
+        assert {"read_file", "search_files"} <= tools
+        assert not tools & {"terminal", "shell", "write_file", "patch", "process"}
         assert set(EXPOSED_TOOLS) <= tools
 
     def test_root_files_are_not_read(self, tmp_path, monkeypatch):

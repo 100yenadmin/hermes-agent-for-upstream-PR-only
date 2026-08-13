@@ -601,7 +601,12 @@ def _build_hermes_tools_mcp_config(
     return {
         "type": "stdio",
         "command": sys.executable,
-        "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
+        "args": [
+            "-m",
+            "agent.transports.hermes_tools_mcp_server",
+            "--profile",
+            "claude-agent-sdk",
+        ],
         "env": env,
     }
 

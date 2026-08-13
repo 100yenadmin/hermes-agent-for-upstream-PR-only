@@ -274,9 +274,9 @@ def build_system_prompt_append(
     # in the MCP child's env and cannot be evaluated here.
     try:
         from agent import prompt_builder
-        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+        from agent.transports.hermes_tools_mcp_server import exposed_tools_for_profile
 
-        advertised = set(EXPOSED_TOOLS) | {"session_search"}
+        advertised = set(exposed_tools_for_profile("claude-agent-sdk")) | {"session_search"}
         if memory_tool_exposed:
             advertised.add("memory")
         index = prompt_builder.build_skills_system_prompt(
