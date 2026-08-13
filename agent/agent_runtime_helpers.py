@@ -2825,6 +2825,18 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if not isinstance(function_args, dict):
         function_args = {}
 
+    # Snapshot turn/request ids ONCE at entry. invoke_tool is dispatched via
+    # asyncio.to_thread from the claude-agent-sdk hybrid bridge, so it can
+    # be executing concurrently with a Hermes-native turn on the same agent
+    # (the native loop mutates ``_current_turn_id`` / ``_current_api_request_id``
+    # between turns). Reading them per middleware call site would leak the
+    # native turn's ids into this SDK-turn's middleware trace attribution
+    # if the mutation lands mid-invocation. Snapshotting fixes attribution
+    # to the ids observed at dispatch.
+    _snapshot_turn_id = getattr(agent, "_current_turn_id", "") or ""
+    _snapshot_api_request_id = getattr(agent, "_current_api_request_id", "") or ""
+    _snapshot_session_id = getattr(agent, "session_id", "") or ""
+
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
         from hermes_cli.middleware import apply_tool_request_middleware
@@ -2834,10 +2846,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 function_name,
                 function_args,
                 task_id=effective_task_id or "",
-                session_id=getattr(agent, "session_id", "") or "",
+                session_id=_snapshot_session_id,
                 tool_call_id=tool_call_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                turn_id=_snapshot_turn_id,
+                api_request_id=_snapshot_api_request_id,
             )
             function_args = _tool_request_mw.payload
             _tool_middleware_trace = _tool_request_mw.trace
@@ -2853,10 +2865,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 function_name,
                 function_args,
                 task_id=effective_task_id or "",
-                session_id=getattr(agent, "session_id", "") or "",
+                session_id=_snapshot_session_id,
                 tool_call_id=tool_call_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                turn_id=_snapshot_turn_id,
+                api_request_id=_snapshot_api_request_id,
                 middleware_trace=list(_tool_middleware_trace),
             )
         except Exception:
@@ -2870,10 +2882,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 function_args=function_args,
                 result=result,
                 task_id=effective_task_id or "",
-                session_id=getattr(agent, "session_id", "") or "",
+                session_id=_snapshot_session_id,
                 tool_call_id=tool_call_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                turn_id=_snapshot_turn_id,
+                api_request_id=_snapshot_api_request_id,
                 status="blocked",
                 error_type="plugin_block",
                 error_message=block_message,
@@ -2894,10 +2906,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 function_args=hook_args,
                 result=result,
                 task_id=effective_task_id or "",
-                session_id=getattr(agent, "session_id", "") or "",
+                session_id=_snapshot_session_id,
                 tool_call_id=tool_call_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                turn_id=_snapshot_turn_id,
+                api_request_id=_snapshot_api_request_id,
                 duration_ms=int((time.monotonic() - tool_start_time) * 1000),
                 middleware_trace=list(_tool_middleware_trace),
             )
@@ -2933,7 +2945,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     window=next_args.get("window", 5),
                     sort=next_args.get("sort"),
                     db=session_db,
-                    current_session_id=agent.session_id,
+                    current_session_id=_snapshot_session_id,
                 ),
                 next_args,
             )
@@ -3016,9 +3028,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         def _execute(next_args: dict) -> Any:
             dispatch_kwargs = dict(
                 tool_call_id=tool_call_id,
-                session_id=agent.session_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                session_id=_snapshot_session_id,
+                turn_id=_snapshot_turn_id,
+                api_request_id=_snapshot_api_request_id,
                 enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                 skip_pre_tool_call_hook=True,
                 skip_tool_request_middleware=True,
@@ -3046,10 +3058,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
         original_args=function_args,
         task_id=effective_task_id or "",
-        session_id=getattr(agent, "session_id", "") or "",
+        session_id=_snapshot_session_id,
         tool_call_id=tool_call_id or "",
-        turn_id=getattr(agent, "_current_turn_id", "") or "",
-        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+        turn_id=_snapshot_turn_id,
+        api_request_id=_snapshot_api_request_id,
     )
 
 
