@@ -2108,6 +2108,15 @@ class TestSystemPromptAppend:
         assert expected_memory in out
         assert expected_user in out
 
+    def test_mcp_inspection_preference_is_in_effective_sdk_prompt(self, tmp_path, monkeypatch):
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        self._home(tmp_path, monkeypatch)
+        out = build_system_prompt_append() or ""
+        assert "prefer the Hermes MCP `read_file` and `search_files` tools before Bash" in out
+        assert "database client, process/service state, network operation" in out
+        assert "Bash remains subject to normal approval" in out
+
     def test_memory_guidance_present_skill_sentence_stripped(self, tmp_path, monkeypatch):
         # MEMORY_GUIDANCE ships verbatim EXCEPT its one sentence instructing
         # the skill tool (skill_manage is not exposed — checklist #3:
@@ -2524,6 +2533,40 @@ def _plant_claude_agent_sdk_stand_in(monkeypatch) -> None:
 # no Telegram prompt ever reached the operator, though the gateway registers
 # a notify channel around every turn. The bridge routes SDK permission
 # requests onto that same tools.approval queue.
+
+
+class TestSdkBoundedMcpInspectionPermissions:
+    """Only fixed Hermes MCP file inspection tools bypass SDK prompting."""
+
+    @pytest.mark.parametrize("tool_name", [
+        "mcp__hermes-tools__read_file",
+        "mcp__hermes-tools__search_files",
+    ])
+    def test_bounded_inspection_mcp_tools_are_auto_allowed(self, tool_name):
+        calls = []
+        session, _ = _make_session(
+            approval_callback=lambda *a, **k: calls.append((a, k)) or "once",
+            permission_mode="default",
+        )
+        result = asyncio.run(session._make_can_use_tool()(tool_name, {}, None))
+        assert type(result).__name__ == "PermissionResultAllow"
+        assert calls == []
+
+    @pytest.mark.parametrize("tool_name", [
+        "mcp__hermes-tools__write_file",
+        "mcp__hermes-tools__read_file_evil",
+        "mcp__other-server__read_file",
+        "Bash",
+    ])
+    def test_non_bounded_tools_still_use_approval_bridge(self, tool_name):
+        calls = []
+        session, _ = _make_session(
+            approval_callback=lambda *a, **k: calls.append((a, k)) or "once",
+            permission_mode="default",
+        )
+        result = asyncio.run(session._make_can_use_tool()(tool_name, {"command": "ls"}, None))
+        assert type(result).__name__ == "PermissionResultAllow"
+        assert len(calls) == 1
 
 
 class TestGatewayApprovalBridge:

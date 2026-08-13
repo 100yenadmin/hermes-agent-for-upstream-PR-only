@@ -110,6 +110,21 @@ _MEMORY_TOOL_DISAMBIGUATION = (
     "keeping goes through the memory tool."
 )
 
+# The SDK profile exposes only these bounded native Hermes inspection tools
+# for filesystem work. Prefer them before Bash: they retain protected-path
+# checks and need no approval round-trip. This grants no additional permission:
+# database, process, service, network, and other shell-only work stays gated.
+_MCP_INSPECTION_PREFERENCE = (
+    "## SDK inspection tools\n"
+    "For routine filesystem inspection, prefer the Hermes MCP `read_file` "
+    "and `search_files` tools before Bash. Use `read_file` for known file "
+    "contents and `search_files` to locate files or search their contents. "
+    "They enforce Hermes protected-path rules. Use Bash only when the task "
+    "genuinely requires a shell-only capability (for example a database "
+    "client, process/service state, network operation, or an unavailable "
+    "tool); Bash remains subject to normal approval."
+)
+
 # Observed live twice: models write "topic word word word" discovery queries;
 # FTS5 ANDs the terms and returns nothing for content that matches one
 # distinctive term. Appended after the verbatim native guidance.
@@ -266,6 +281,10 @@ def build_system_prompt_append(
         blocks.append(SESSION_SEARCH_GUIDANCE + "\n" + _SEARCH_QUERY_ADDENDUM)
     except Exception:  # pragma: no cover
         logger.debug("session_search guidance unavailable", exc_info=True)
+
+    # SDK-specific capability preference follows general memory/search guidance
+    # and stays small enough that it cannot crowd out the skills index.
+    blocks.append(_MCP_INSPECTION_PREFERENCE)
 
     # Skills index for the read-side tools, filtered to the honest
     # MCP-exposed surface. `memory` joins only when the shim is actually

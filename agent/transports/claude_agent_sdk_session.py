@@ -99,6 +99,15 @@ def _configured_permission_mode() -> Optional[str]:
 # claude-agent-sdk 0.2.120 SettingSource type).
 _SDK_SETTING_SOURCES = ("user", "project", "local")
 
+# These are the only two filesystem-capable tools exposed by the fixed
+# ``claude-agent-sdk`` Hermes MCP profile. Their handlers retain the native
+# file safety/read-block checks; an exact identity check avoids treating a
+# generic MCP prefix or a lookalike server/tool as trusted.
+_SDK_AUTO_ALLOWED_MCP_INSPECTION_TOOLS = frozenset({
+    "mcp__hermes-tools__read_file",
+    "mcp__hermes-tools__search_files",
+})
+
 
 def _configured_setting_sources() -> list:
     """agent.claude_agent_sdk.setting_sources from config.yaml, validated.
@@ -1715,6 +1724,8 @@ class ClaudeAgentSdkSession:
         PermissionResultAllow: Any,
         PermissionResultDeny: Any,
     ) -> Any:
+        if tool_name in _SDK_AUTO_ALLOWED_MCP_INSPECTION_TOOLS:
+            return PermissionResultAllow()
         try:
             kwargs: dict = {"allow_permanent": False}
             # tool_use_id correlation (P2.a): the SDK guarantees a
