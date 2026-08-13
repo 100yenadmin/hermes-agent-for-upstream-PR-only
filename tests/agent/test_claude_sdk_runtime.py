@@ -44,8 +44,18 @@ def _isolate_provider_config(monkeypatch):
     `load_config_readonly` themselves (the last patch wins).
     """
     import hermes_cli.config as cfg
+    from gateway.session_context import reset_session_vars
+    from tools.terminal_tool import set_approval_callback
 
+    # Tests in this module create gateway-shaped contextvars and CLI callbacks.
+    # Reset both around every case so a later bare-CLI assertion cannot inherit
+    # state from a prior test in the same process.
+    reset_session_vars()
+    set_approval_callback(None)
     monkeypatch.setattr(cfg, "load_config_readonly", lambda *a, **k: {}, raising=False)
+    yield
+    set_approval_callback(None)
+    reset_session_vars()
 
 
 # ---------- SDK stand-in types (duck-typed by class NAME) ----------
