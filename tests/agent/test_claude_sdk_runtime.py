@@ -3301,8 +3301,8 @@ class TestGatewayApprovalBridge:
         agent._touch_activity.assert_called_once_with("executing tool: Bash")
         assert seen_progress == [("tool.started", "Bash", "sqlite3 …", {"command": "sqlite3"})]
 
-    def test_sdk_tool_result_updates_live_iteration_counter(self, monkeypatch):
-        """Heartbeat iteration count advances before the SDK turn completes."""
+    def test_sdk_tool_result_updates_isolated_live_iteration_counter(self, monkeypatch):
+        """SDK result advances its guarded visibility count, not native state."""
         import agent.transports.claude_agent_sdk_session as session_mod
 
         captured = {}
@@ -3320,13 +3320,61 @@ class TestGatewayApprovalBridge:
         monkeypatch.setattr(session_mod, "ClaudeAgentSdkSession", _CapturingSession)
         agent = _make_agent()
         agent._claude_sdk_session = None
+        agent._current_turn_id = "turn-one"
         agent._api_call_count = 0
         run_claude_agent_sdk_turn(
             agent, user_message="hi", original_user_message="hi",
             messages=[{"role": "user", "content": "hi"}], effective_task_id="task-1",
         )
         captured["on_tool_iteration"]()
-        assert agent._api_call_count == 1
+        assert agent._sdk_visibility_iteration_count == 1
+        assert agent._api_call_count == 0
+
+    def test_late_sdk_callback_is_fenced_after_turn_replacement(self, monkeypatch):
+        import agent.transports.claude_agent_sdk_session as session_mod
+
+        captured = {}
+        class _CapturingSession:
+            def __init__(self, **kwargs): captured.update(kwargs)
+            def run_turn(self, user_input): return _make_turn(projected_messages=[], final_text="ok")
+            def close(self): pass
+        monkeypatch.setattr(session_mod, "ClaudeAgentSdkSession", _CapturingSession)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        agent._current_turn_id = "turn-one"
+        run_claude_agent_sdk_turn(agent, user_message="one", original_user_message="one", messages=[{"role": "user", "content": "one"}], effective_task_id="one")
+        stale = captured["on_tool_iteration"]
+        agent._current_turn_id = "turn-two"
+        run_claude_agent_sdk_turn(agent, user_message="two", original_user_message="two", messages=[{"role": "user", "content": "two"}], effective_task_id="two")
+        stale()
+        assert agent._sdk_visibility_iteration_count == 0
+
+    def test_sdk_interim_relay_scrubs_redacts_and_deduplicates(self, monkeypatch):
+        import agent.transports.claude_agent_sdk_session as session_mod
+
+        captured = {}
+        class _CapturingSession:
+            def __init__(self, **kwargs): captured.update(kwargs)
+            def run_turn(self, user_input): return _make_turn(projected_messages=[], final_text="ok")
+            def close(self): pass
+        monkeypatch.setattr(session_mod, "ClaudeAgentSdkSession", _CapturingSession)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        agent._current_turn_id = "turn-one"
+        agent._strip_think_blocks.side_effect = lambda text: text.replace("<think>private</think>", "")
+        agent._delivered_interim_texts = set()
+        agent._interim_text_was_delivered.side_effect = lambda text: text in agent._delivered_interim_texts
+        agent._record_delivered_interim_text.side_effect = lambda text: agent._delivered_interim_texts.add(text)
+        delivered = []
+        agent.interim_assistant_callback = lambda text, **kw: delivered.append((text, kw))
+        run_claude_agent_sdk_turn(agent, user_message="one", original_user_message="one", messages=[{"role": "user", "content": "one"}], effective_task_id="one")
+        relay = captured["on_interim_assistant"]
+        relay("<think>private</think> Checking token sk-ant-12345678901234567890")
+        relay("<think>private</think> Checking token sk-ant-12345678901234567890")
+        assert len(delivered) == 1
+        assert "private" not in delivered[0][0]
+        assert "12345678901234567890" not in delivered[0][0]
+        assert delivered[0][1] == {"already_streamed": False}
 
     def test_create_session_without_gateway_context_keeps_none(self, monkeypatch):
         # CLI/bare-process posture unchanged: no context → callback stays None.

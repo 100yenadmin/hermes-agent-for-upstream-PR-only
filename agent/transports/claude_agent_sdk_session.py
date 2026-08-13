@@ -686,6 +686,7 @@ class ClaudeAgentSdkSession:
         # Display-only partial-text consumer (W4 streaming). Deltas never
         # enter the projected transcript; the gateway's stream consumer
         # handles rate limiting and the already_sent final-send dedup.
+        self._turn_callback_lock = threading.RLock()
         self._on_stream_delta = on_stream_delta
         # Hybrid MCP bridge inputs (see param docstring above).
         self._agent = agent
@@ -693,9 +694,10 @@ class ClaudeAgentSdkSession:
         # Completed assistant prose that accompanies a tool call is a true
         # interim status, not final-answer text. It follows the gateway's
         # existing commentary callback so platforms can render it separately.
+        # These callbacks are refreshed before EVERY run_turn: a session may
+        # safely span several Hermes turns, while visibility must stay scoped
+        # to the current one.
         self._on_interim_assistant = on_interim_assistant
-        # SDK tool loops are internal to one outer Hermes turn. Surface each
-        # resolved tool iteration live so the shared heartbeat counter moves.
         self._on_tool_iteration = on_tool_iteration
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -727,6 +729,17 @@ class ClaudeAgentSdkSession:
         self._on_unsolicited_result = on_unsolicited_result
         self._unsolicited_text: list[str] = []
         self._unsolicited_delivered: set[str] = set()
+
+    def set_turn_visibility_callbacks(
+        self,
+        *,
+        on_interim_assistant: Optional[Callable[[str], None]],
+        on_tool_iteration: Optional[Callable[[], None]],
+    ) -> None:
+        """Atomically install current-turn, runtime-owned visibility hooks."""
+        with self._turn_callback_lock:
+            self._on_interim_assistant = on_interim_assistant
+            self._on_tool_iteration = on_tool_iteration
 
     # ---------- lifecycle ----------
 
@@ -1496,7 +1509,11 @@ class ClaudeAgentSdkSession:
 
     def _notify_interim_assistant(self, message: Any) -> None:
         """Relay completed tool-adjacent assistant prose as commentary."""
-        if self._on_interim_assistant is None:
+        if getattr(message, "parent_tool_use_id", None):
+            return
+        with self._turn_callback_lock:
+            callback = self._on_interim_assistant
+        if callback is None:
             return
         if type(message).__name__ != "AssistantMessage":
             return
@@ -1511,7 +1528,7 @@ class ClaudeAgentSdkSession:
         if not text:
             return
         try:
-            self._on_interim_assistant(text)
+            callback(text)
         except Exception:  # pragma: no cover - display callback
             logger.debug("interim assistant callback raised", exc_info=True)
 

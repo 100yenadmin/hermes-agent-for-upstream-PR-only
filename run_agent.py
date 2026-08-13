@@ -4116,13 +4116,23 @@ class AIAgent:
         provenance = getattr(self, "_last_activity_provenance", None)
         if provenance is None:
             provenance = ActivityProvenance.UNKNOWN
+        sdk_visibility_count = int(getattr(self, "_sdk_visibility_iteration_count", 0) or 0)
+        sdk_visibility_lock = getattr(self, "_sdk_visibility_lock", None)
+        if sdk_visibility_lock is not None:
+            with sdk_visibility_lock:
+                sdk_visibility_count = int(
+                    getattr(self, "_sdk_visibility_iteration_count", 0) or 0
+                )
         return build_activity_snapshot(
             last_activity_at=getattr(self, "_last_activity_ts", None),
             last_activity_description=getattr(self, "_last_activity_desc", None) or "",
             last_activity_provenance=provenance,
             extra={
             "current_tool": self._current_tool,
-            "api_call_count": self._api_call_count,
+            "api_call_count": max(
+                int(getattr(self, "_api_call_count", 0) or 0),
+                sdk_visibility_count,
+            ),
             "max_iterations": self.max_iterations,
             "budget_used": self.iteration_budget.used,
             "budget_max": self.iteration_budget.max_total,
