@@ -1599,6 +1599,39 @@ class TestStreaming:
         assert [m["role"] for m in turn.projected_messages] == ["assistant"]
         assert turn.final_text == "Hello"
 
+    def test_tool_adjacent_assistant_text_reaches_interim_callback_once(self):
+        commentary = []
+        script = [
+            AssistantMessage(content=[
+                TextBlock("I will inspect the project first."),
+                ToolUseBlock(id="t1", name="Bash", input={"command": "pwd"}),
+            ]),
+            UserMessage(content=[ToolResultBlock(tool_use_id="t1", content="/tmp")]),
+            ResultMessage(result="Final answer"),
+        ]
+        session, _ = _make_session(script=script, on_interim_assistant=commentary.append)
+        try:
+            turn = session.run_turn("inspect")
+        finally:
+            session.close()
+        assert commentary == ["I will inspect the project first."]
+        assert turn.final_text == "Final answer"
+
+    def test_tool_iteration_callback_runs_before_turn_returns(self):
+        iterations = []
+        script = [
+            AssistantMessage(content=[ToolUseBlock(id="t1", name="Bash", input={"command": "pwd"})]),
+            UserMessage(content=[ToolResultBlock(tool_use_id="t1", content="/tmp")]),
+            ResultMessage(result="Final answer"),
+        ]
+        session, _ = _make_session(script=script, on_tool_iteration=lambda: iterations.append(True))
+        try:
+            turn = session.run_turn("inspect")
+        finally:
+            session.close()
+        assert iterations == [True]
+        assert turn.tool_iterations == 1
+
     def test_subagent_deltas_are_not_forwarded(self):
         got = []
         script = [
@@ -2119,6 +2152,8 @@ class TestSystemPromptAppend:
 
         self._home(tmp_path, monkeypatch)
         out = build_system_prompt_append() or ""
+        assert "For multi-step tool work, provide a brief user-facing status" in out
+        assert "never reveal private reasoning" in out
         assert "prefer the Hermes MCP `read_file` and `search_files` tools before Bash" in out
         assert "database client, process/service state, network operation" in out
         assert "Bash remains subject to normal approval" in out
@@ -3265,6 +3300,33 @@ class TestGatewayApprovalBridge:
         assert agent._current_tool == "Bash"
         agent._touch_activity.assert_called_once_with("executing tool: Bash")
         assert seen_progress == [("tool.started", "Bash", "sqlite3 …", {"command": "sqlite3"})]
+
+    def test_sdk_tool_result_updates_live_iteration_counter(self, monkeypatch):
+        """Heartbeat iteration count advances before the SDK turn completes."""
+        import agent.transports.claude_agent_sdk_session as session_mod
+
+        captured = {}
+
+        class _CapturingSession:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run_turn(self, user_input):
+                return _make_turn(projected_messages=[], final_text="ok")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(session_mod, "ClaudeAgentSdkSession", _CapturingSession)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        agent._api_call_count = 0
+        run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="task-1",
+        )
+        captured["on_tool_iteration"]()
+        assert agent._api_call_count == 1
 
     def test_create_session_without_gateway_context_keeps_none(self, monkeypatch):
         # CLI/bare-process posture unchanged: no context → callback stays None.

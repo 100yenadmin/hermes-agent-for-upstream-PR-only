@@ -647,6 +647,8 @@ class ClaudeAgentSdkSession:
         hermes_session_id: Optional[str] = None,
         resume_session_id: Optional[str] = None,
         on_stream_delta: Optional[Callable[[str], None]] = None,
+        on_interim_assistant: Optional[Callable[[str], None]] = None,
+        on_tool_iteration: Optional[Callable[[], None]] = None,
         on_unsolicited_result: Optional[Callable[[list[str]], None]] = None,
         # Hybrid MCP bridge (ported from PR #56413): when both `agent` and
         # `tools` are provided, an in-process MCP server exposing the full
@@ -688,6 +690,13 @@ class ClaudeAgentSdkSession:
         # Hybrid MCP bridge inputs (see param docstring above).
         self._agent = agent
         self._tools = tools
+        # Completed assistant prose that accompanies a tool call is a true
+        # interim status, not final-answer text. It follows the gateway's
+        # existing commentary callback so platforms can render it separately.
+        self._on_interim_assistant = on_interim_assistant
+        # SDK tool loops are internal to one outer Hermes turn. Surface each
+        # resolved tool iteration live so the shared heartbeat counter moves.
+        self._on_tool_iteration = on_tool_iteration
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
@@ -1164,6 +1173,7 @@ class ClaudeAgentSdkSession:
                     continue
                 if not interrupted:
                     self._notify_tool_started(message)
+                    self._notify_interim_assistant(message)
                 projection = projector.project(message)
                 if watch is not None:
                     # Outstanding-tool evidence: ToolUseBlocks issue, tool
@@ -1200,6 +1210,7 @@ class ClaudeAgentSdkSession:
                         out["messages"].extend(projection.messages)
                     if projection.is_tool_iteration:
                         out["tool_iterations"] += 1
+                        self._notify_tool_iteration()
                     if projection.final_text is not None:
                         out["final_text"] = projection.final_text
                 if projection.is_result:
@@ -1482,6 +1493,35 @@ class ClaudeAgentSdkSession:
             self._on_stream_delta(text)
         except Exception:  # pragma: no cover - display callback
             logger.debug("stream delta callback raised", exc_info=True)
+
+    def _notify_interim_assistant(self, message: Any) -> None:
+        """Relay completed tool-adjacent assistant prose as commentary."""
+        if self._on_interim_assistant is None:
+            return
+        if type(message).__name__ != "AssistantMessage":
+            return
+        blocks = list(getattr(message, "content", None) or [])
+        if not any(type(block).__name__ == "ToolUseBlock" for block in blocks):
+            return
+        text = "\n".join(
+            str(getattr(block, "text", "") or "")
+            for block in blocks
+            if type(block).__name__ == "TextBlock" and getattr(block, "text", "")
+        ).strip()
+        if not text:
+            return
+        try:
+            self._on_interim_assistant(text)
+        except Exception:  # pragma: no cover - display callback
+            logger.debug("interim assistant callback raised", exc_info=True)
+
+    def _notify_tool_iteration(self) -> None:
+        if self._on_tool_iteration is None:
+            return
+        try:
+            self._on_tool_iteration()
+        except Exception:  # pragma: no cover - display callback
+            logger.debug("tool-iteration callback raised", exc_info=True)
 
     def _notify_tool_started(self, message: Any) -> None:
         """Bridge ToolUseBlocks to Hermes tool-progress (gateway breadcrumbs),

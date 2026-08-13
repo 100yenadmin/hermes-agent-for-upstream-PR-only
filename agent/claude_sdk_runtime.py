@@ -115,9 +115,11 @@ _MEMORY_TOOL_DISAMBIGUATION = (
 # checks and need no approval round-trip. This grants no additional permission:
 # database, process, service, network, and other shell-only work stays gated.
 _MCP_INSPECTION_PREFERENCE = (
-    "## SDK inspection tools\n"
-    "For routine filesystem inspection, prefer the Hermes MCP `read_file` "
-    "and `search_files` tools before Bash. Use `read_file` for known file "
+    "## SDK inspection, status, and operational-record tools\n"
+    "For multi-step tool work, provide a brief user-facing status before a "
+    "distinct tool phase when useful. Keep it concise and factual; never "
+    "reveal private reasoning. For routine filesystem inspection, prefer the "
+    "Hermes MCP `read_file` and `search_files` tools before Bash. Use `read_file` "
     "contents and `search_files` to locate files or search their contents. "
     "They enforce Hermes protected-path rules. Use Bash only when the task "
     "genuinely requires a shell-only capability (for example a database "
@@ -660,6 +662,25 @@ def run_claude_agent_sdk_turn(
                     "claude-sdk tool-progress callback raised", exc_info=True
                 )
 
+        def _on_tool_iteration() -> None:
+            # The SDK runs its internal tool loop beneath one outer Hermes
+            # turn. Advance the shared live counter immediately so the gateway
+            # heartbeat reflects resolved SDK iterations before final return.
+            agent._api_call_count = getattr(agent, "_api_call_count", 0) + 1
+            try:
+                agent._touch_activity("completed SDK tool iteration")
+            except Exception:
+                logger.debug("claude-sdk iteration activity update failed", exc_info=True)
+
+        def _relay_interim_assistant(text: str) -> None:
+            callback = getattr(agent, "interim_assistant_callback", None)
+            if callback is None:
+                return
+            try:
+                callback(text, already_streamed=False)
+            except Exception:
+                logger.debug("interim assistant relay raised", exc_info=True)
+
         def _relay_stream_delta(text: str) -> None:
             # Late-bound: the gateway assigns stream_delta_callback per turn
             # AFTER the session exists (and clears it between turns).
@@ -765,6 +786,8 @@ def run_claude_agent_sdk_turn(
             hermes_session_id=getattr(agent, "session_id", None),
             resume_session_id=resume_id,
             on_stream_delta=_relay_stream_delta,
+            on_interim_assistant=_relay_interim_assistant,
+            on_tool_iteration=_on_tool_iteration,
             on_unsolicited_result=on_unsolicited_result,
             # Operator budget cap (agent.claude_agent_sdk.max_budget_usd);
             # None = no budget. Read per session creation so a config edit
