@@ -655,7 +655,7 @@ class ClaudeAgentSdkSession:
             or _configured_permission_mode()
             or _HERMES_TO_SDK_PERMISSION_MODE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
-                "acceptEdits",
+                "default",
             )
         )
         self._system_prompt_append = system_prompt_append

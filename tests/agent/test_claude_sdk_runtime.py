@@ -522,6 +522,12 @@ class TestSession:
         session, _ = _make_session(script=[ResultMessage(result="ok")])
         assert session.build_option_fields()["permission_mode"] == "default"
 
+    def test_unknown_terminal_security_mode_falls_back_to_default(self, monkeypatch):
+        """Unknown terminal modes must retain the approval-bridge posture."""
+        monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "unexpected-mode")
+        session, _ = _make_session(script=[ResultMessage(result="ok")])
+        assert session.build_option_fields()["permission_mode"] == "default"
+
     def test_empty_config_permission_mode_keeps_env_mapping(self, monkeypatch):
         # "" (the canonical default) = current behavior: the
         # HERMES_TERMINAL_SECURITY_MODE mapping stands.
