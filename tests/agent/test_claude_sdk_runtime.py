@@ -455,9 +455,11 @@ class TestSession:
         ]
         # Hard rule: a metered key never reaches any child of this runtime.
         assert "ANTHROPIC_API_KEY" not in (mcp.get("env") or {})
-        assert options["permission_mode"] in {
-            "acceptEdits", "default", "bypassPermissions",
-        }
+        # Agent SDK defaults fail closed to `default`: this is the only mode
+        # that installs Hermes' approval bridge, so falling through to the
+        # terminal "auto" mapping (`acceptEdits`) silently removes the bridge
+        # and makes otherwise-bounded MCP tools impossible to approve.
+        assert options["permission_mode"] == "default"
         # Explicit SDK isolation: None would load ALL of ~/.claude and
         # .claude/settings*, letting ambient settings shadow the gateway's
         # approval posture. The empty list is the SDK's isolation mode.
@@ -494,8 +496,8 @@ class TestSession:
         assert explicit.build_option_fields()["permission_mode"] == "default"
 
     def test_invalid_config_permission_mode_falls_back(self, monkeypatch):
-        # A typo must never silently change the posture — the env mapping
-        # stands (default env → acceptEdits).
+        # A typo must never silently loosen the posture — it falls back to the
+        # SDK's safe default, which retains the Hermes approval bridge.
         import hermes_cli.config as cfg
 
         monkeypatch.delenv("HERMES_TERMINAL_SECURITY_MODE", raising=False)
@@ -508,7 +510,7 @@ class TestSession:
             raising=False,
         )
         session, _ = _make_session(script=[ResultMessage(result="ok")])
-        assert session.build_option_fields()["permission_mode"] == "acceptEdits"
+        assert session.build_option_fields()["permission_mode"] == "default"
 
     def test_empty_config_permission_mode_keeps_env_mapping(self, monkeypatch):
         # "" (the canonical default) = current behavior: the

@@ -45,17 +45,13 @@ logger = logging.getLogger(__name__)
 # the agent.claude_agent_sdk.permission_mode config key (an SDK mode literal
 # — see _configured_permission_mode), then this env mapping.
 #
-# Posture, stated honestly: "auto" → acceptEdits is NOT codex parity, it is
-# merely the closest available mode. Codex's default workspace-write profile
-# still surfaces escalations for approval; acceptEdits auto-approves file
-# edits under cwd with NO Hermes approval callback in the loop — the
-# can_use_tool bridge is wired ONLY in "default" mode (see
-# build_option_fields), and bypassPermissions disables SDK permission
-# prompts entirely. Operators who want the gateway's approval flow set
-# HERMES_TERMINAL_SECURITY_MODE=approval-required or
-# agent.claude_agent_sdk.permission_mode: default in config.yaml.
+# SDK default posture is intentionally stricter than generic terminal `auto`:
+# `default` preserves Hermes' per-tool approval bridge. Mapping `auto` to
+# `acceptEdits` skips that bridge entirely, so even the fixed bounded MCP read
+# surface is denied/unguarded depending on CLI state. Explicit operator choices
+# retain their SDK literals below.
 _HERMES_TO_SDK_PERMISSION_MODE = {
-    "auto": "acceptEdits",
+    "auto": "default",
     "approval-required": "default",
     "unrestricted": "bypassPermissions",
     "yolo": "bypassPermissions",
