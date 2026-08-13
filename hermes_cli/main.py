@@ -7005,23 +7005,69 @@ def _desktop_linux_sandbox_fixup(packaged_executable: Path) -> bool:
     return True
 
 
-def _desktop_launch_options() -> tuple[list[str], str]:
+_LINUX_PASSWORD_STORES = frozenset({"gnome-libsecret", "kwallet", "kwallet5", "kwallet6", "basic"})
+
+
+def _detect_linux_password_store() -> str | None:
+    """Detect the Chromium password-store backend for the current Linux session.
+
+    Electron's safeStorage only reports encryption as available when Chromium
+    selects the right keychain backend, and Chromium's own detection routinely
+    fails under `hermes desktop` because the launcher environment doesn't look
+    like a full desktop session. Probe order: KDE session env vars, GNOME
+    Keyring's control socket, then a D-Bus ping of org.freedesktop.secrets
+    (covers any Secret Service implementation, e.g. KeePassXC). Returns None
+    when no keychain daemon is reachable.
+    """
+    kde_version = os.environ.get("KDE_SESSION_VERSION", "").strip()
+    if kde_version == "6":
+        return "kwallet6"
+    if kde_version == "5":
+        return "kwallet5"
+    if kde_version:
+        return "kwallet"
+    if os.environ.get("KDE_FULL_SESSION"):
+        return "kwallet"
+    if os.environ.get("GNOME_KEYRING_CONTROL"):
+        return "gnome-libsecret"
+    try:
+        result = subprocess.run(
+            [
+                "dbus-send", "--session", "--print-reply", "--reply-timeout=2000",
+                "--dest=org.freedesktop.secrets",
+                "/org/freedesktop/secrets",
+                "org.freedesktop.DBus.Peer.Ping",
+            ],
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return "gnome-libsecret"
+    except Exception:
+        pass
+    return None
+
+
+def _desktop_launch_options() -> tuple[list[str], str, str]:
     """Read `desktop.*` launch options from config.yaml.
 
-    Returns ``(electron_flags, disable_gpu)`` where ``electron_flags`` is a list
-    of extra Electron CLI flags and ``disable_gpu`` is one of "auto"/"1"/"0"
-    (normalized for the HERMES_DESKTOP_DISABLE_GPU env var the Electron app
-    reads). Best-effort: any config error yields the safe defaults
-    ``([], "auto")`` so a malformed config never blocks the launch.
+    Returns ``(electron_flags, disable_gpu, password_store)`` where
+    ``electron_flags`` is a list of extra Electron CLI flags, ``disable_gpu``
+    is one of "auto"/"1"/"0" (normalized for the HERMES_DESKTOP_DISABLE_GPU
+    env var the Electron app reads), and ``password_store`` is "auto" or one
+    of the Chromium password-store backends (unknown values normalize to
+    "auto"). Best-effort: any config error yields the safe defaults
+    ``([], "auto", "auto")`` so a malformed config never blocks the launch.
     """
     flags: list[str] = []
     disable_gpu = "auto"
+    password_store = "auto"
     try:
         from hermes_cli.config import load_config
 
         desktop_cfg = (load_config() or {}).get("desktop") or {}
     except Exception:
-        return flags, disable_gpu
+        return flags, disable_gpu, password_store
 
     raw_flags = desktop_cfg.get("electron_flags")
     if isinstance(raw_flags, str):
@@ -7040,7 +7086,13 @@ def _desktop_launch_options() -> tuple[list[str], str]:
             disable_gpu = "0"
         else:
             disable_gpu = "auto"
-    return flags, disable_gpu
+
+    raw_store = desktop_cfg.get("password_store", "auto")
+    if isinstance(raw_store, str):
+        low_store = raw_store.strip().lower()
+        if low_store in _LINUX_PASSWORD_STORES:
+            password_store = low_store
+    return flags, disable_gpu, password_store
 
 
 def _register_linux_desktop_entry() -> None:
@@ -7094,9 +7146,24 @@ def cmd_gui(args: argparse.Namespace):
     # `desktop.disable_gpu`). The GPU policy is bridged to the env var the
     # Electron app already reads; an explicit env var still wins over config so
     # `HERMES_DESKTOP_DISABLE_GPU=... hermes desktop` keeps working.
-    config_electron_flags, config_disable_gpu = _desktop_launch_options()
+    config_electron_flags, config_disable_gpu, config_password_store = _desktop_launch_options()
     if config_disable_gpu != "auto" and "HERMES_DESKTOP_DISABLE_GPU" not in os.environ:
         env["HERMES_DESKTOP_DISABLE_GPU"] = config_disable_gpu
+
+    # Linux keychain backend for safeStorage (`desktop.password_store`).
+    # Chromium needs the --password-store switch to pick the right keychain;
+    # without it safeStorage.isEncryptionAvailable() is often false and the
+    # desktop app refuses to persist remote gateway tokens. Config wins over
+    # detection; an explicit env var wins over both so
+    # `HERMES_DESKTOP_PASSWORD_STORE=... hermes desktop` keeps working.
+    if sys.platform == "linux" and "HERMES_DESKTOP_PASSWORD_STORE" not in os.environ:
+        password_store = (
+            config_password_store
+            if config_password_store != "auto"
+            else _detect_linux_password_store()
+        )
+        if password_store:
+            env["HERMES_DESKTOP_PASSWORD_STORE"] = password_store
 
     source_mode = getattr(args, "source", False)
     skip_build = getattr(args, "skip_build", False)
@@ -10413,6 +10480,15 @@ def cmd_dashboard(args):
             sys.exit(proc.wait())
         else:
             os.execvpe(sys.executable, reexec_argv, env)
+
+    # Apply the final process/profile policy after dashboard routing, but before
+    # importing the web server or opening dashboard state. Applying it before a
+    # named-profile re-exec could leak that profile's higher limit into the
+    # machine/default dashboard, whose lower policy intentionally cannot undo it.
+    # This also covers Desktop SSH's isolated `serve` child, which does not route.
+    from hermes_cli.resource_limits import apply_nofile_soft_limit
+
+    apply_nofile_soft_limit()
 
     if _token_file:
         _ssh_session_token = _read_ssh_session_token_file(_token_file)

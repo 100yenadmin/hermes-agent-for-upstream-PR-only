@@ -19,6 +19,16 @@ database:
   # journal_size_limit: 67108864 # cap the WAL/journal file size in bytes
 
 # =============================================================================
+# Runtime Limits
+# =============================================================================
+# Long-running Hermes server processes raise their RLIMIT_NOFILE soft limit to
+# this value when the operating system permits it. The value is clamped to the
+# hard limit and never lowers an already higher soft limit. Set to 0, false, or
+# null to disable the adjustment. Default: 4096.
+runtime:
+  nofile_soft_limit: 4096
+
+# =============================================================================
 # Model Configuration
 # =============================================================================
 model:
@@ -386,6 +396,9 @@ terminal:
 #   tirith_path: "tirith"       # Path to tirith binary (supports ~ expansion)
 #   tirith_timeout: 5           # Scan timeout in seconds
 #   tirith_fail_open: true      # Allow commands if tirith unavailable
+#   approval:
+#     transport: builtin        # Or an explicitly enabled plugin transport name
+#     transport_fallback: deny  # Set builtin to opt into fallback on transport failure
 
 # =============================================================================
 # Browser Tool Configuration

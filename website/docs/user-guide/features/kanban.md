@@ -553,6 +553,8 @@ kanban_complete(
 
 The orchestrator guidance ships in the worker's system prompt automatically — there is nothing to install or sync per profile.
 
+**Decide before you fan out.** Design decisions belong to the orchestrator, not to the workers. If two parallel cards would each have to pick the same thing — a naming scheme, a schema, a file format, an API shape — the orchestrator decides it once and stamps the decision into **both** card bodies. Workers cannot see sibling cards, so every child card body must carry every decision it depends on. Example: for the parallel cards "build the exporter" and "build the importer", don't let each worker invent its own file format — pick one up front (say, newline-delimited JSON with a `version` field) and write it into both bodies, or the two halves will never round-trip.
+
 For best results, pair it with a profile whose toolsets are restricted to board operations (`kanban`, `gateway`, `memory`) so the orchestrator literally cannot execute implementation tasks even if it tries.
 
 ## Dashboard (GUI)
@@ -955,6 +957,29 @@ it receives both diffs *and* both intents. The bundled
 [`merge-reconciler` skill](https://github.com/NousResearch/hermes-agent/blob/main/skills/autonomous-ai-agents/merge-reconciler/SKILL.md)
 gives that worker the full procedure: classify each conflicted hunk, resolve
 impartially, verify, and hand back a summary naming every decision.
+
+### Collision hotspots in parallel campaigns
+
+In wide campaigns some files become collision magnets: many workers each add a
+little to the same file, nobody owns keeping it small, and it turns into the
+site of constant merge conflicts. The mitigation is a comment convention, not a
+new primitive. A worker that notices its diff keeps colliding with siblings in
+one file — or that a file it touches keeps appearing in other cards' recent
+comments — should not silently pile on. Instead it leaves a comment on its own
+card with a recognizable prefix:
+
+```
+hotspot: hermes_cli/kanban_db.py — third conflicting edit to the dispatch loop this wave
+```
+
+and repeats the flag in its completion `metadata`. Orchestrators (or humans
+reviewing the board) who see **two or more `hotspot:` comments naming the same
+path** should create a dedicated refactor/decomposition card for that file
+**before** queuing more work that touches it — splitting the magnet file is
+cheaper than reconciling every future collision it would cause. For conflicts
+that have *already* happened, use the reconciliation-card pattern above with
+the `merge-reconciler` skill; hotspot flagging is the upstream fix that keeps
+the reconciler from becoming a standing lane.
 
 ## Multi-tenant usage
 
