@@ -3231,6 +3231,41 @@ class TestGatewayApprovalBridge:
         finally:
             approval_mod.reset_current_session_key(token)
 
+    def test_sdk_tool_start_updates_shared_activity_before_progress(self, monkeypatch):
+        """SDK lifecycle must drive the shared heartbeat activity contract."""
+        import agent.transports.claude_agent_sdk_session as session_mod
+
+        captured = {}
+
+        class _CapturingSession:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run_turn(self, user_input):
+                return _make_turn(projected_messages=[], final_text="ok")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(session_mod, "ClaudeAgentSdkSession", _CapturingSession)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        seen_progress = []
+        agent.tool_progress_callback = lambda *args: seen_progress.append(args)
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="task-1",
+        )
+
+        captured["on_tool_started"]("Bash", "sqlite3 …", {"command": "sqlite3"})
+
+        assert agent._current_tool == "Bash"
+        agent._touch_activity.assert_called_once_with("executing tool: Bash")
+        assert seen_progress == [("tool.started", "Bash", "sqlite3 …", {"command": "sqlite3"})]
+
     def test_create_session_without_gateway_context_keeps_none(self, monkeypatch):
         # CLI/bare-process posture unchanged: no context → callback stays None.
         import agent.transports.claude_agent_sdk_session as session_mod

@@ -640,6 +640,16 @@ def run_claude_agent_sdk_turn(
                 approval_callback = None
 
         def _on_tool_started(tool_name: str, preview: str, args: dict) -> None:
+            # Claude SDK tool calls bypass the native tool executor, so mirror
+            # its shared activity updates here. The gateway heartbeat reads
+            # get_activity_summary(), which derives its useful current action
+            # from these fields; without this, an active SDK turn remains
+            # stuck at its initial "initializing" state.
+            agent._current_tool = tool_name
+            try:
+                agent._touch_activity(f"executing tool: {tool_name}")
+            except Exception:
+                logger.debug("claude-sdk activity update failed", exc_info=True)
             progress_callback = getattr(agent, "tool_progress_callback", None)
             if progress_callback is None:
                 return
