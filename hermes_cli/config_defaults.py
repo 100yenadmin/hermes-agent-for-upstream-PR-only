@@ -83,8 +83,11 @@ DEFAULT_CONFIG = {
         # this cap for in-flight agents/cron/api runs to complete naturally
         # so the requesting turn is not amputated by restart_drain_timeout.
         # 0 = legacy behaviour (enter stop()/drain immediately). Default
-        # 6h is a safety valve for wedged agents, not a target latency.
-        "restart_after_turn_timeout": 21600,
+        # 30 min is a safety valve for wedged agents, not a target latency —
+        # an interactive `hermes gateway restart` must never block for hours
+        # on a turn that wedged (#79133). Long unattended turns can raise
+        # this in config.yaml.
+        "restart_after_turn_timeout": 1800,
         # Upper bound (seconds) a submitted prompt waits for the deferred
         # agent build (MCP discovery, model metadata, skills scan) before
         # failing with a visible error (#63078). The gateway's wait is
@@ -1285,6 +1288,15 @@ DEFAULT_CONFIG = {
         #   "verbose" — include a compact content preview of what changed
         # Per-platform overrides via display.platforms.<platform>.memory_notifications.
         "memory_notifications": "on",
+        # Gateway notifications when a terminal(background=true) process
+        # finishes:
+        #   "concise" — one-line status message; failures append a short
+        #               output tail (default)
+        #   "all"     — running-output updates + final raw-output message
+        #   "result"  — final raw-output message only
+        #   "error"   — final raw-output message only on non-zero exit
+        #   "off"     — no watcher messages at all
+        "background_process_notifications": "concise",
         "streaming": False,
         "timestamps": False,      # Show timestamp on user and assistant labels
         "timestamp_format": "%H:%M",  # strftime format for timestamps (e.g. "%b-%d %H:%M")
@@ -1294,6 +1306,12 @@ DEFAULT_CONFIG = {
         # behaves badly with replayed scrollback.
         "persistent_output": True,
         "persistent_output_max_lines": 200,
+        # Clear terminal scrollback as well as the visible viewport when the
+        # classic CLI performs a full redraw/resize recovery. Disabled by
+        # default because some users prefer preserving terminal history;
+        # enable when a terminal/tmux stack stamps stale prompt chrome into
+        # scrollback during fullscreen/restore window transitions.
+        "cli_rebuild_scrollback_on_redraw": False,
         # Print a one-line summary of resolved modal prompts (approval /
         # clarify) into scrollback so the question and decision survive the
         # panel repaint. Set false to keep scrollback untouched.
@@ -1920,6 +1938,24 @@ DEFAULT_CONFIG = {
         "max_turns": 20,
     },
 
+
+    # Loops — /loop recurring in-session wakeups (Claude Code parity).
+    # A loop re-runs a prompt (or slash command) on a cadence inside the
+    # live session. Fixed-interval mode fires on the user's clock;
+    # self-paced mode (no interval given) starts at the floor and backs
+    # off exponentially while the agent's replies stop changing.
+    "loops": {
+        # Smallest fixed interval accepted (seconds). Tighter cadences are
+        # raised to this floor — each tick is a full agent turn.
+        "min_interval_seconds": 30,
+        # Backstop tick budget: the loop auto-pauses after this many
+        # wakeups unless the user set --times. 0 = unlimited.
+        "max_ticks": 100,
+        # Self-paced cadence bounds (seconds).
+        "self_paced_floor_seconds": 60,
+        "self_paced_ceiling_seconds": 900,
+    },
+
     # Mixture of Agents — named presets used by /moa. A preset is an execution
     # mode around the main model, not a provider/model itself: references +
     # aggregator synthesize private guidance before each main-model iteration.
@@ -2528,6 +2564,14 @@ DEFAULT_CONFIG = {
         # to the TTL/crash/stale recovery paths. Set false to keep orphans
         # frozen for manual forensics.
         "reconcile_orphans": True,
+        # Notify subscriptions survive a task reaching ``done`` (completion
+        # is reversible — controllers reopen done work for review
+        # corrections), and are normally removed on archive. On boards that
+        # never archive, the notifier GC purges subscriptions for tasks
+        # that have been ``done`` with no new activity for this many days,
+        # so stale rows don't accumulate and get scanned on every notifier
+        # tick forever. Set 0 to disable the sweep.
+        "done_sub_retention_days": 30,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
@@ -2621,6 +2665,62 @@ DEFAULT_CONFIG = {
         #     openrouter:
         #       url: https://example.com/my-curation.json
         "providers": {},
+    },
+
+    # Per-model metadata overrides — manually declare context_window,
+    # max_output_tokens, capabilities, or model family for any
+    # provider+model. Recognized fields: context_window,
+    # max_output_tokens, supports_tools, supports_vision,
+    # supports_reasoning, model_family.
+    #
+    # Semantics:
+    #   1. Explicit (model_overrides.<provider>.<model_id>): wins over
+    #      models.dev, OpenRouter, and hardcoded defaults for the fields
+    #      it sets. NOTE: an explicit model.context_length (global) and a
+    #      custom_providers per-model context_length are user settings at
+    #      other layers and are consulted in the resolution chain order
+    #      documented in agent/model_metadata.py.
+    #   2. Fill-gap defaults (model_overrides.<provider>._default and
+    #      model_overrides._default): apply ONLY to models the catalog
+    #      does not know. They never displace catalog data for known
+    #      models, so a _default cannot accidentally clamp every model
+    #      of a provider.
+    #
+    # An unknown model id (not in models.dev) starts from safe defaults
+    # (200K context, tools on, vision/reasoning off) and the override
+    # patches the fields it sets — overriding a model the catalog
+    # doesn't know yet is the supported self-unblock path (#84482,
+    # #8731).
+    #
+    # Provider keys accept the Hermes provider id (as used elsewhere in
+    # this file) or the models.dev provider id; model ids match
+    # case-insensitively.
+    #
+    # Example:
+    #   model_overrides:
+    #     upstage:
+    #       solar-pro4:
+    #         context_window: 524288
+    #       syn-pro:
+    #         context_window: 65536
+    #     custom:my-local-vllm:
+    #       my-llava-model:
+    #         context_window: 8192
+    #         supports_vision: true
+    #         supports_reasoning: false
+    #         supports_tools: true
+    #     _default:            # fill-gap only: models not in the catalog
+    #       context_window: 128000
+    "model_overrides": {},
+
+    # models.dev registry — provider/model metadata (context windows,
+    # capabilities, pricing, modalities).  The agent fetches this on startup
+    # and serves from cache; a background daemon refreshes stale data.
+    # Override ``url`` to point at a mirror (e.g. a self-hosted copy behind
+    # a corporate proxy).  ETag conditional GET ensures refreshes are
+    # cheap (304 = no download).
+    "models_dev": {
+        "url": "",  # empty = default https://models.dev/api.json
     },
 
     # Network settings — workarounds for connectivity issues.
@@ -3385,7 +3485,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 34,
+    "_config_version": 35,
 }
 
 # Optional environment variables that enhance functionality

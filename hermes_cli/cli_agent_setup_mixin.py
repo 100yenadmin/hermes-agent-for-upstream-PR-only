@@ -459,6 +459,7 @@ class CLIAgentSetupMixin:
                     )
                 self._restore_session_cwd(session_meta, quiet=_quiet_mode)
                 self._restore_session_yolo(session_meta, quiet=_quiet_mode)
+                self._restore_session_model(session_meta, quiet=_quiet_mode)
             else:
                 if _quiet_mode:
                     print(
@@ -725,6 +726,7 @@ class CLIAgentSetupMixin:
             )
             self._restore_session_cwd(session_meta)
             self._restore_session_yolo(session_meta)
+            self._restore_session_model(session_meta)
         else:
             accent_color = _accent_hex()
             self._console_print(
