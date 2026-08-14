@@ -301,6 +301,78 @@ def _swallow_interrupt_result(future: Any) -> None:
         logger.debug("SDK interrupt control request failed", exc_info=True)
 
 
+def _http_mcp_entries_from_config() -> dict[str, dict]:
+    """Return third-party HTTP MCPs discovered in Hermes' merged config, in
+    the McpHttpServerConfig shape the SDK wants ({"type": "http", "url": ...}).
+
+    Reads (in order, later overrides earlier) ``$HERMES_HOME/config.yaml``
+    then ``$HERMES_HOME/profiles/<profile>/config.yaml`` and pulls every
+    ``mcp_servers.<name>`` entry that carries a ``url:`` field (i.e. HTTP
+    MCPs). ``${...}`` env placeholders in the URL are resolved against the
+    gateway process env. Entries without a URL (stdio subprocess, in-process)
+    are ignored. Returns ``{}`` on any read/parse failure — the caller keeps
+    working with just the hybrid + stdio wrapper.
+
+    Rationale: HTTP MCPs registered in Hermes end up in the registry under a
+    toolset ``mcp-<name>`` that isn't included in the agent's default enabled
+    toolsets, so ``get_tool_definitions()`` returns them behind tool_search's
+    tier-2 deferral — the hybrid bridge (which snapshots ``agent.tools`` at
+    session build) never sees them. Exposing them straight to the SDK client
+    bypasses the whole toolset-filter path.
+    """
+    import os as _os
+    import re as _re
+    try:
+        import yaml as _yaml  # type: ignore
+    except Exception:
+        return {}
+
+    home = _os.environ.get("HERMES_HOME") or _os.path.expanduser("~/.hermes")
+    profile = _os.environ.get("HERMES_PROFILE") or "default"
+    paths = [
+        _os.path.join(home, "config.yaml"),
+        _os.path.join(home, "profiles", profile, "config.yaml"),
+    ]
+
+    merged: dict[str, Any] = {}
+    for p in paths:
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                data = _yaml.safe_load(fh) or {}
+            block = (data.get("mcp_servers") or {}) if isinstance(data, dict) else {}
+            if isinstance(block, dict):
+                merged.update(block)
+        except FileNotFoundError:
+            continue
+        except Exception:
+            logger.debug("failed to read %s for HTTP MCP discovery", p, exc_info=True)
+            continue
+
+    _env_re = _re.compile(r"\$\{([A-Z0-9_]+)\}")
+
+    def _resolve_env(s: str) -> str:
+        return _env_re.sub(lambda m: _os.environ.get(m.group(1), ""), s)
+
+    out: dict[str, dict] = {}
+    for name, cfg in merged.items():
+        if not isinstance(cfg, dict):
+            continue
+        url = cfg.get("url")
+        if not isinstance(url, str) or not url.strip():
+            continue
+        resolved = _resolve_env(url).strip()
+        if not resolved:
+            continue
+        entry: dict[str, Any] = {"type": "http", "url": resolved}
+        headers = cfg.get("headers")
+        if isinstance(headers, dict) and headers:
+            entry["headers"] = {
+                str(k): _resolve_env(str(v)) for k, v in headers.items()
+            }
+        out[name] = entry
+    return out
+
+
 # Substrings in SDK/CLI errors that signal broken subscription credentials.
 # Conservative on purpose — mirrors codex's _OAUTH_REFRESH_FAILURE_HINTS
 # contract: every needle is a phrase, never a bare token. Bare "401" matched
@@ -484,6 +556,27 @@ def _provider_flag(config_key: str, default: bool = False) -> bool:
     return bool(value)
 
 
+def _configured_hybrid_exclude() -> list:
+    """agent.claude_agent_sdk.hybrid_mcp_bridge_exclude from config.yaml.
+
+    Names to drop from the hybrid bridge (both buckets). Match on the raw
+    Hermes registry name, no ``mcp__`` prefix. Non-string entries are
+    dropped silently — a typo is a config error the operator will notice
+    when the tool doesn't disappear, not a reason to widen exposure.
+    """
+    raw = _provider_config().get("hybrid_mcp_bridge_exclude")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        name = entry.strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
 def _build_hermes_tools_mcp_config(
     hermes_session_id: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -545,6 +638,14 @@ class ClaudeAgentSdkSession:
         resume_session_id: Optional[str] = None,
         on_stream_delta: Optional[Callable[[str], None]] = None,
         on_unsolicited_result: Optional[Callable[[list[str]], None]] = None,
+        # Hybrid MCP bridge (ported from PR #56413): when both `agent` and
+        # `tools` are provided, an in-process MCP server exposing the full
+        # Hermes tool registry (including proxified third-party MCPs) is
+        # added to `mcp_servers` alongside the stdio `hermes-tools` wrapper.
+        # None on either param disables the bridge — fcava's original
+        # behaviour (stdio-only wrapper) is preserved.
+        agent: Optional[Any] = None,
+        tools: Optional[List[dict]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._model = model
@@ -574,6 +675,9 @@ class ClaudeAgentSdkSession:
         # enter the projected transcript; the gateway's stream consumer
         # handles rate limiting and the already_sent final-send dedup.
         self._on_stream_delta = on_stream_delta
+        # Hybrid MCP bridge inputs (see param docstring above).
+        self._agent = agent
+        self._tools = tools
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
@@ -1393,10 +1497,90 @@ class ClaudeAgentSdkSession:
         """The ClaudeAgentOptions field dict — plain data so tests can assert
         on it without importing the SDK."""
         mcp_servers: dict[str, Any] = {}
-        if self._include_hermes_tools:
+        # Hybrid in-process MCP bridge (ported from PR #56413) — exposes the
+        # full Hermes tool registry, including proxified third-party MCP
+        # servers, which the stdio `hermes-tools` wrapper cannot reach
+        # because credentials live in the gateway process env and don't
+        # propagate to the subprocess. Activation requires ALL of:
+        #   1. the operator opted in via
+        #      ``agent.claude_agent_sdk.hybrid_mcp_bridge: true``
+        #      (the runtime call site enforces this — it passes
+        #      ``agent=None, tools=None`` when the flag is off);
+        #   2. the caller supplied both ``agent`` and ``tools`` (session-
+        #      level belt-and-suspenders for the flag).
+        # The bridge splits into two in-process servers:
+        #   - ``hermes-tools`` — stdio-legacy names (see
+        #     ``HERMES_TOOLS_LEGACY_NAMES``). Preserves operator grants
+        #     stored in ``~/.claude/settings.json`` that key on
+        #     ``mcp__hermes-tools__<tool>``: a box on
+        #     ``permission_mode: default`` would otherwise face an
+        #     approval storm for tools it already granted.
+        #   - ``hermes-hybrid`` — everything else (proxified MCPs +
+        #     agent-level tools).
+        # The exclude list from config is applied to BOTH buckets so an
+        # operator can keep the wide bridge for proxified MCPs without
+        # inheriting a specific tool (delegate_task, cron_*, terminal, ...).
+        hybrid_active = False
+        if self._agent is not None and self._tools:
+            try:
+                from agent.transports.hermes_hybrid_mcp import (
+                    HERMES_TOOLS_SERVER,
+                    HYBRID_SERVER,
+                    build_hybrid_mcp_server,
+                )
+                from agent.transports.hermes_tool_exposure import (
+                    HERMES_TOOLS_LEGACY_NAMES,
+                )
+
+                exclude_names = _configured_hybrid_exclude()
+                mcp_servers[HERMES_TOOLS_SERVER] = build_hybrid_mcp_server(
+                    self._agent,
+                    self._tools,
+                    server_name=HERMES_TOOLS_SERVER,
+                    only_names=HERMES_TOOLS_LEGACY_NAMES,
+                    exclude_names=exclude_names,
+                )
+                mcp_servers[HYBRID_SERVER] = build_hybrid_mcp_server(
+                    self._agent,
+                    self._tools,
+                    server_name=HYBRID_SERVER,
+                    exclude_names=(
+                        list(exclude_names) + list(HERMES_TOOLS_LEGACY_NAMES)
+                    ),
+                )
+                hybrid_active = True
+            except Exception as exc:  # noqa: BLE001
+                # Never break session start on hybrid bridge failure — the
+                # stdio wrapper still provides the curated tool set.
+                logger.warning(
+                    "hybrid MCP bridge failed to build (%s) — falling back "
+                    "to stdio hermes-tools only",
+                    exc,
+                )
+        # The stdio ``hermes-tools`` wrapper exposes ~25 curated tools that
+        # the hybrid bridge already re-exposes under the same server name
+        # (``hermes-tools``) when active — registering both concurrently
+        # would send Claude two copies of every curated tool under the same
+        # server. Skip stdio when hybrid is active. (Hybrid failure above
+        # falls back to stdio via ``hybrid_active`` staying False.)
+        if self._include_hermes_tools and not hybrid_active:
             mcp_servers["hermes-tools"] = _build_hermes_tools_mcp_config(
                 hermes_session_id=self._hermes_session_id
             )
+
+        # Third-party HTTP MCPs configured in Hermes (config.yaml
+        # mcp_servers.<name>.url) are NOT reachable via the hybrid bridge:
+        # get_tool_definitions() returns only the tools registered under a
+        # toolset already enabled on the agent, and the ``mcp-<name>``
+        # toolsets these HTTP servers register under aren't in the agent's
+        # enabled_toolsets by default. Instead of chasing that path, we
+        # expose them directly to the SDK — the SDK's own MCP client
+        # connects to each HTTP endpoint natively (McpHttpServerConfig)
+        # and surfaces the tools as ``mcp__<name>__<tool>`` verbatim.
+        for entry_name, entry_cfg in _http_mcp_entries_from_config().items():
+            if entry_name in mcp_servers:
+                continue
+            mcp_servers[entry_name] = entry_cfg
 
         system_prompt: Any = {"type": "preset", "preset": "claude_code"}
         if self._system_prompt_append:

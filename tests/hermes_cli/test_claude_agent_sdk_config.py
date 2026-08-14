@@ -45,6 +45,16 @@ class TestClaudeAgentSdkDefaults:
         # null = streaming-dependent built-in (90s with streaming on,
         # disabled with streaming off); 0 = explicitly disabled.
         assert block["post_tool_quiet_timeout"] is None
+        # Hybrid in-process MCP bridge off by default — the wide bridge
+        # exposes agent-level tools whose enablement is a security choice;
+        # operators opt in explicitly. This pin fails if a well-meaning
+        # rebase flips the default: any deployment that upgrades would
+        # silently start routing the full registry into the SDK.
+        assert block["hybrid_mcp_bridge"] is False
+        # Empty exclude list = expose everything the bridge can reach.
+        # A non-empty default here would surprise operators who read the
+        # docs and expect the whole registry.
+        assert block["hybrid_mcp_bridge_exclude"] == []
         # Every default in the block must be falsy — a new key that defaults
         # truthy is a behavior change and needs its own explicit pin here.
         for key, value in block.items():
