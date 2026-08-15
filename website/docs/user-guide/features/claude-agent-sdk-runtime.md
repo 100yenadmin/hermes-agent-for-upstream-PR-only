@@ -62,7 +62,7 @@ Ambient Claude settings are isolated: the runtime pins the SDK's `setting_source
 
 ## What Hermes still provides
 
-- **hermes-tools MCP server** — memory and `session_search` shims (plus the standard Hermes tool surface) are exposed into the SDK's loop over stdio. When `hybrid_mcp_bridge: true`, this becomes an in-process MCP server under the same name (`mcp__hermes-tools__*`) — operator grants stored in `~/.claude/settings.json` keep matching without a migration step. The extra tools the bridge unlocks (third-party MCPs + agent-level tools) land under a second server, `mcp__hermes-hybrid__*`.
+- **hermes-tools MCP server** — a curated stdio surface: memory and `session_search` shims; browser/web/media/skills/TTS tools; and bounded `read_file` / `search_files` inspection. It does not expose shell, file mutation, process control, or generic Git tools. When `hybrid_mcp_bridge: true`, the standard surface becomes an in-process MCP server under the same name (`mcp__hermes-tools__*`) — operator grants stored in `~/.claude/settings.json` keep matching without a migration step. Extra bridge-only third-party MCP and agent-level tools are exposed separately as `mcp__hermes-hybrid__*`.
 - **Transcripts and continuity** — the SDK's typed message stream is projected into Hermes' messages shape and persisted; across gateway restarts the runtime resumes the same SDK session, and a failed resume retries fresh with a bounded continuity digest.
 - **Interrupts** — `/stop` and new-message preemption route into the SDK's interrupt.
 

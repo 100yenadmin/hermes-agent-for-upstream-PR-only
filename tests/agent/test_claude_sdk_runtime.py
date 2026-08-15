@@ -24,6 +24,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.claude_sdk_runtime import run_claude_agent_sdk_turn
+from agent.conversation_loop import _handle_claude_sdk_turn_with_fallback
 from agent.transports.claude_agent_sdk_session import (
     ClaudeAgentSdkSession,
     classify_auth_failure,
@@ -44,8 +45,18 @@ def _isolate_provider_config(monkeypatch):
     `load_config_readonly` themselves (the last patch wins).
     """
     import hermes_cli.config as cfg
+    from gateway.session_context import reset_session_vars
+    from tools.terminal_tool import set_approval_callback
 
+    # Tests in this module create gateway-shaped contextvars and CLI callbacks.
+    # Reset both around every case so a later bare-CLI assertion cannot inherit
+    # state from a prior test in the same process.
+    reset_session_vars()
+    set_approval_callback(None)
     monkeypatch.setattr(cfg, "load_config_readonly", lambda *a, **k: {}, raising=False)
+    yield
+    set_approval_callback(None)
+    reset_session_vars()
 
 
 # ---------- SDK stand-in types (duck-typed by class NAME) ----------
@@ -129,6 +140,28 @@ class ResultMessage:
     usage: Optional[dict] = None
     uuid: Optional[str] = "uuid-1"
     errors: Optional[list] = None
+    api_error_status: Optional[int] = None
+
+
+class TestClaudeSdkFallbackBridge:
+    def test_quota_error_activates_configured_fallback(self):
+        class Agent:
+            def __init__(self):
+                self.reason, self.status = None, []
+            def _run_claude_agent_sdk_turn(self, **kwargs):
+                return {"error": "SDK result error (HTTP 429): You've hit your session limit"}
+            def _try_activate_fallback(self, reason=None):
+                self.reason = reason
+                return True
+            def _buffer_status(self, text):
+                self.status.append(text)
+        agent = Agent()
+        assert _handle_claude_sdk_turn_with_fallback(
+            agent, user_message="continue", original_user_message="continue",
+            messages=[], effective_task_id="test", should_review_memory=False,
+        ) is None
+        assert agent.reason.value == "rate_limit"
+        assert agent.status == ["⚠️ Claude session limit reached — switching to fallback provider..."]
 
 
 # ---------- projector ----------
@@ -349,6 +382,18 @@ def _make_session(script=None, connect_exc=None, **kwargs):
 
 
 class TestSession:
+    def test_quota_429_contradictory_success_surfaces_result_for_fallback(self):
+        session, _ = _make_session(script=[ResultMessage(
+            result="You've hit your session limit", is_error=True,
+            subtype="success", api_error_status=429,
+        )])
+        try:
+            turn = session.run_turn("continue")
+        finally:
+            session.close()
+        assert "HTTP 429" in (turn.error or "")
+        assert "session limit" in (turn.error or "").lower()
+
     def test_happy_turn(self):
         script = [
             AssistantMessage(
@@ -447,23 +492,36 @@ class TestSession:
         assert options["system_prompt"]["preset"] == "claude_code"
         assert "hermes-tools" in options["mcp_servers"]
         mcp = options["mcp_servers"]["hermes-tools"]
-        assert mcp["args"] == ["-m", "agent.transports.hermes_tools_mcp_server"]
+        assert mcp["args"] == [
+            "-m",
+            "agent.transports.hermes_tools_mcp_server",
+            "--profile",
+            "claude-agent-sdk",
+        ]
         # Hard rule: a metered key never reaches any child of this runtime.
         assert "ANTHROPIC_API_KEY" not in (mcp.get("env") or {})
-        assert options["permission_mode"] in {
-            "acceptEdits", "default", "bypassPermissions",
-        }
+        # Agent SDK defaults fail closed to `default`: this is the only mode
+        # that installs Hermes' approval bridge, so falling through to the
+        # terminal "auto" mapping (`acceptEdits`) silently removes the bridge
+        # and makes otherwise-bounded MCP tools impossible to approve.
+        assert options["permission_mode"] == "default"
         # Explicit SDK isolation: None would load ALL of ~/.claude and
         # .claude/settings*, letting ambient settings shadow the gateway's
         # approval posture. The empty list is the SDK's isolation mode.
         assert options["setting_sources"] == []
 
-    def test_askuserquestion_in_disallowed_tools(self):
-        # No answer channel for AskUserQuestion in hermes — the model must
-        # ask in plain text; the tool is removed from its context.
+    def test_native_read_is_disallowed_in_favor_of_bounded_mcp_read(self):
+        # The Claude SDK profile exposes protected-path-aware Hermes MCP
+        # read_file. Native Read duplicates it but causes an approval card for
+        # every normal inspection, so only that duplicate is removed. Bash and
+        # all native write tools remain available and approval-gated.
         session, _ = _make_session(script=[ResultMessage(result="ok")])
         fields = session.build_option_fields()
-        assert fields["disallowed_tools"] == ["AskUserQuestion"]
+        assert fields["disallowed_tools"] == ["AskUserQuestion", "Read"]
+        assert "Bash" not in fields["disallowed_tools"]
+        assert "Edit" not in fields["disallowed_tools"]
+        assert "Write" not in fields["disallowed_tools"]
+        assert "mcp__hermes-tools__read_file" not in fields["disallowed_tools"]
 
     def test_config_permission_mode_overrides_env_mapping(self, monkeypatch):
         # agent.claude_agent_sdk.permission_mode (an SDK literal) wins over
@@ -489,8 +547,8 @@ class TestSession:
         assert explicit.build_option_fields()["permission_mode"] == "default"
 
     def test_invalid_config_permission_mode_falls_back(self, monkeypatch):
-        # A typo must never silently change the posture — the env mapping
-        # stands (default env → acceptEdits).
+        # A typo must never silently loosen the posture — it falls back to the
+        # SDK's safe default, which retains the Hermes approval bridge.
         import hermes_cli.config as cfg
 
         monkeypatch.delenv("HERMES_TERMINAL_SECURITY_MODE", raising=False)
@@ -503,7 +561,13 @@ class TestSession:
             raising=False,
         )
         session, _ = _make_session(script=[ResultMessage(result="ok")])
-        assert session.build_option_fields()["permission_mode"] == "acceptEdits"
+        assert session.build_option_fields()["permission_mode"] == "default"
+
+    def test_unknown_terminal_security_mode_falls_back_to_default(self, monkeypatch):
+        """Unknown terminal modes must retain the approval-bridge posture."""
+        monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "unexpected-mode")
+        session, _ = _make_session(script=[ResultMessage(result="ok")])
+        assert session.build_option_fields()["permission_mode"] == "default"
 
     def test_empty_config_permission_mode_keeps_env_mapping(self, monkeypatch):
         # "" (the canonical default) = current behavior: the
@@ -1570,6 +1634,39 @@ class TestStreaming:
         assert [m["role"] for m in turn.projected_messages] == ["assistant"]
         assert turn.final_text == "Hello"
 
+    def test_tool_adjacent_assistant_text_reaches_interim_callback_once(self):
+        commentary = []
+        script = [
+            AssistantMessage(content=[
+                TextBlock("I will inspect the project first."),
+                ToolUseBlock(id="t1", name="Bash", input={"command": "pwd"}),
+            ]),
+            UserMessage(content=[ToolResultBlock(tool_use_id="t1", content="/tmp")]),
+            ResultMessage(result="Final answer"),
+        ]
+        session, _ = _make_session(script=script, on_interim_assistant=commentary.append)
+        try:
+            turn = session.run_turn("inspect")
+        finally:
+            session.close()
+        assert commentary == ["I will inspect the project first."]
+        assert turn.final_text == "Final answer"
+
+    def test_tool_iteration_callback_runs_before_turn_returns(self):
+        iterations = []
+        script = [
+            AssistantMessage(content=[ToolUseBlock(id="t1", name="Bash", input={"command": "pwd"})]),
+            UserMessage(content=[ToolResultBlock(tool_use_id="t1", content="/tmp")]),
+            ResultMessage(result="Final answer"),
+        ]
+        session, _ = _make_session(script=script, on_tool_iteration=lambda: iterations.append(True))
+        try:
+            turn = session.run_turn("inspect")
+        finally:
+            session.close()
+        assert iterations == [True]
+        assert turn.tool_iterations == 1
+
     def test_subagent_deltas_are_not_forwarded(self):
         got = []
         script = [
@@ -2085,6 +2182,17 @@ class TestSystemPromptAppend:
         assert expected_memory in out
         assert expected_user in out
 
+    def test_mcp_inspection_preference_is_in_effective_sdk_prompt(self, tmp_path, monkeypatch):
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        self._home(tmp_path, monkeypatch)
+        out = build_system_prompt_append() or ""
+        assert "For multi-step tool work, provide a brief user-facing status" in out
+        assert "never reveal private reasoning" in out
+        assert "prefer the Hermes MCP `read_file` and `search_files` tools before Bash" in out
+        assert "database client, process/service state, network operation" in out
+        assert "Bash remains subject to normal approval" in out
+
     def test_memory_guidance_present_skill_sentence_stripped(self, tmp_path, monkeypatch):
         # MEMORY_GUIDANCE ships verbatim EXCEPT its one sentence instructing
         # the skill tool (skill_manage is not exposed — checklist #3:
@@ -2254,6 +2362,8 @@ class TestSystemPromptAppend:
         assert "skill_manage" not in out
         tools = captured.get("available_tools") or set()
         assert "memory" in tools and "session_search" in tools
+        assert {"read_file", "search_files"} <= tools
+        assert not tools & {"terminal", "shell", "write_file", "patch", "process"}
         assert set(EXPOSED_TOOLS) <= tools
 
     def test_root_files_are_not_read(self, tmp_path, monkeypatch):
@@ -2499,6 +2609,40 @@ def _plant_claude_agent_sdk_stand_in(monkeypatch) -> None:
 # no Telegram prompt ever reached the operator, though the gateway registers
 # a notify channel around every turn. The bridge routes SDK permission
 # requests onto that same tools.approval queue.
+
+
+class TestSdkBoundedMcpInspectionPermissions:
+    """Only fixed Hermes MCP file inspection tools bypass SDK prompting."""
+
+    @pytest.mark.parametrize("tool_name", [
+        "mcp__hermes-tools__read_file",
+        "mcp__hermes-tools__search_files",
+    ])
+    def test_bounded_inspection_mcp_tools_are_auto_allowed(self, tool_name):
+        calls = []
+        session, _ = _make_session(
+            approval_callback=lambda *a, **k: calls.append((a, k)) or "once",
+            permission_mode="default",
+        )
+        result = asyncio.run(session._make_can_use_tool()(tool_name, {}, None))
+        assert type(result).__name__ == "PermissionResultAllow"
+        assert calls == []
+
+    @pytest.mark.parametrize("tool_name", [
+        "mcp__hermes-tools__write_file",
+        "mcp__hermes-tools__read_file_evil",
+        "mcp__other-server__read_file",
+        "Bash",
+    ])
+    def test_non_bounded_tools_still_use_approval_bridge(self, tool_name):
+        calls = []
+        session, _ = _make_session(
+            approval_callback=lambda *a, **k: calls.append((a, k)) or "once",
+            permission_mode="default",
+        )
+        result = asyncio.run(session._make_can_use_tool()(tool_name, {"command": "ls"}, None))
+        assert type(result).__name__ == "PermissionResultAllow"
+        assert len(calls) == 1
 
 
 class TestGatewayApprovalBridge:
@@ -3156,6 +3300,116 @@ class TestGatewayApprovalBridge:
             assert captured.get("approval_callback") is not None
         finally:
             approval_mod.reset_current_session_key(token)
+
+    def test_sdk_tool_start_updates_shared_activity_before_progress(self, monkeypatch):
+        """SDK lifecycle must drive the shared heartbeat activity contract."""
+        import agent.transports.claude_agent_sdk_session as session_mod
+
+        captured = {}
+
+        class _CapturingSession:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run_turn(self, user_input):
+                return _make_turn(projected_messages=[], final_text="ok")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(session_mod, "ClaudeAgentSdkSession", _CapturingSession)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        seen_progress = []
+        agent.tool_progress_callback = lambda *args: seen_progress.append(args)
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="task-1",
+        )
+
+        captured["on_tool_started"]("Bash", "sqlite3 …", {"command": "sqlite3"})
+
+        assert agent._current_tool == "Bash"
+        agent._touch_activity.assert_called_once_with("executing tool: Bash")
+        assert seen_progress == [("tool.started", "Bash", "sqlite3 …", {"command": "sqlite3"})]
+
+    def test_sdk_tool_result_updates_isolated_live_iteration_counter(self, monkeypatch):
+        """SDK result advances its guarded visibility count, not native state."""
+        import agent.transports.claude_agent_sdk_session as session_mod
+
+        captured = {}
+
+        class _CapturingSession:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run_turn(self, user_input):
+                return _make_turn(projected_messages=[], final_text="ok")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(session_mod, "ClaudeAgentSdkSession", _CapturingSession)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        agent._current_turn_id = "turn-one"
+        agent._api_call_count = 0
+        run_claude_agent_sdk_turn(
+            agent, user_message="hi", original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}], effective_task_id="task-1",
+        )
+        captured["on_tool_iteration"]()
+        assert agent._sdk_visibility_iteration_count == 1
+        assert agent._api_call_count == 0
+
+    def test_late_sdk_callback_is_fenced_after_turn_replacement(self, monkeypatch):
+        import agent.transports.claude_agent_sdk_session as session_mod
+
+        captured = {}
+        class _CapturingSession:
+            def __init__(self, **kwargs): captured.update(kwargs)
+            def run_turn(self, user_input): return _make_turn(projected_messages=[], final_text="ok")
+            def close(self): pass
+        monkeypatch.setattr(session_mod, "ClaudeAgentSdkSession", _CapturingSession)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        agent._current_turn_id = "turn-one"
+        run_claude_agent_sdk_turn(agent, user_message="one", original_user_message="one", messages=[{"role": "user", "content": "one"}], effective_task_id="one")
+        stale = captured["on_tool_iteration"]
+        agent._current_turn_id = "turn-two"
+        run_claude_agent_sdk_turn(agent, user_message="two", original_user_message="two", messages=[{"role": "user", "content": "two"}], effective_task_id="two")
+        stale()
+        assert agent._sdk_visibility_iteration_count == 0
+
+    def test_sdk_interim_relay_scrubs_redacts_and_deduplicates(self, monkeypatch):
+        import agent.transports.claude_agent_sdk_session as session_mod
+
+        captured = {}
+        class _CapturingSession:
+            def __init__(self, **kwargs): captured.update(kwargs)
+            def run_turn(self, user_input): return _make_turn(projected_messages=[], final_text="ok")
+            def close(self): pass
+        monkeypatch.setattr(session_mod, "ClaudeAgentSdkSession", _CapturingSession)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        agent._current_turn_id = "turn-one"
+        agent._strip_think_blocks.side_effect = lambda text: text.replace("<think>private</think>", "")
+        agent._delivered_interim_texts = set()
+        agent._interim_text_was_delivered.side_effect = lambda text: text in agent._delivered_interim_texts
+        agent._record_delivered_interim_text.side_effect = lambda text: agent._delivered_interim_texts.add(text)
+        delivered = []
+        agent.interim_assistant_callback = lambda text, **kw: delivered.append((text, kw))
+        run_claude_agent_sdk_turn(agent, user_message="one", original_user_message="one", messages=[{"role": "user", "content": "one"}], effective_task_id="one")
+        relay = captured["on_interim_assistant"]
+        relay("<think>private</think> Checking token sk-ant-12345678901234567890")
+        relay("<think>private</think> Checking token sk-ant-12345678901234567890")
+        assert len(delivered) == 1
+        assert "private" not in delivered[0][0]
+        assert "12345678901234567890" not in delivered[0][0]
+        assert delivered[0][1] == {"already_streamed": False}
 
     def test_create_session_without_gateway_context_keeps_none(self, monkeypatch):
         # CLI/bare-process posture unchanged: no context → callback stays None.

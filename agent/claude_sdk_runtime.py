@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,23 @@ _MEMORY_TOOL_DISAMBIGUATION = (
     "runtime that store is unmanaged (no capacity gauge, no curation, no "
     "backup) and its contents are treated as disposable. Every fact worth "
     "keeping goes through the memory tool."
+)
+
+# The SDK profile exposes only these bounded native Hermes inspection tools
+# for filesystem work. Prefer them before Bash: they retain protected-path
+# checks and need no approval round-trip. This grants no additional permission:
+# database, process, service, network, and other shell-only work stays gated.
+_MCP_INSPECTION_PREFERENCE = (
+    "## SDK inspection, status, and operational-record tools\n"
+    "For multi-step tool work, provide a brief user-facing status before a "
+    "distinct tool phase when useful. Keep it concise and factual; never "
+    "reveal private reasoning. For routine filesystem inspection, prefer the "
+    "Hermes MCP `read_file` and `search_files` tools before Bash. Use `read_file` "
+    "contents and `search_files` to locate files or search their contents. "
+    "They enforce Hermes protected-path rules. Use Bash only when the task "
+    "genuinely requires a shell-only capability (for example a database "
+    "client, process/service state, network operation, or an unavailable "
+    "tool); Bash remains subject to normal approval."
 )
 
 # Observed live twice: models write "topic word word word" discovery queries;
@@ -267,6 +285,10 @@ def build_system_prompt_append(
     except Exception:  # pragma: no cover
         logger.debug("session_search guidance unavailable", exc_info=True)
 
+    # SDK-specific capability preference follows general memory/search guidance
+    # and stays small enough that it cannot crowd out the skills index.
+    blocks.append(_MCP_INSPECTION_PREFERENCE)
+
     # Skills index for the read-side tools, filtered to the honest
     # MCP-exposed surface. `memory` joins only when the shim is actually
     # registered (see the two-predicate gate above); EXPOSED_TOOLS is the
@@ -274,9 +296,9 @@ def build_system_prompt_append(
     # in the MCP child's env and cannot be evaluated here.
     try:
         from agent import prompt_builder
-        from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+        from agent.transports.hermes_tools_mcp_server import exposed_tools_for_profile
 
-        advertised = set(EXPOSED_TOOLS) | {"session_search"}
+        advertised = set(exposed_tools_for_profile("claude-agent-sdk")) | {"session_search"}
         if memory_tool_exposed:
             advertised.add("memory")
         index = prompt_builder.build_skills_system_prompt(
@@ -591,6 +613,58 @@ def run_claude_agent_sdk_turn(
     except Exception:
         logger.debug("approval turn-context refresh failed", exc_info=True)
 
+    def _make_visibility_callbacks():
+        """Create visibility callbacks fenced to this exact Hermes turn."""
+        visibility_turn_id = str(getattr(agent, "_current_turn_id", "") or "")
+        lock = getattr(agent, "_sdk_visibility_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            agent._sdk_visibility_lock = lock
+        with lock:
+            agent._sdk_visibility_epoch = getattr(agent, "_sdk_visibility_epoch", 0) + 1
+            visibility_epoch = agent._sdk_visibility_epoch
+            agent._sdk_visibility_turn_id = visibility_turn_id
+            agent._sdk_visibility_iteration_count = 0
+
+        def _visibility_is_current() -> bool:
+            with lock:
+                return (
+                    getattr(agent, "_sdk_visibility_epoch", None) == visibility_epoch
+                    and getattr(agent, "_sdk_visibility_turn_id", None) == visibility_turn_id
+                    and getattr(agent, "_current_turn_id", None) == visibility_turn_id
+                    and not getattr(agent, "_interrupt_requested", False)
+                )
+
+        def _on_tool_iteration() -> None:
+            with lock:
+                if not _visibility_is_current():
+                    return
+                agent._sdk_visibility_iteration_count += 1
+            try:
+                agent._touch_activity("completed SDK tool iteration")
+            except Exception:
+                logger.debug("claude-sdk iteration activity update failed", exc_info=True)
+
+        def _relay_interim_assistant(text: str) -> None:
+            if not _visibility_is_current() or not isinstance(text, str):
+                return
+            visible = agent._strip_think_blocks(text).strip()
+            if visible:
+                from agent.redact import redact_sensitive_text
+                visible = redact_sensitive_text(visible)
+            if not visible or visible == "(empty)" or agent._interim_text_was_delivered(visible):
+                return
+            callback = getattr(agent, "interim_assistant_callback", None)
+            if callback is None:
+                return
+            try:
+                callback(visible, already_streamed=False)
+                agent._record_delivered_interim_text(visible)
+            except Exception:
+                logger.debug("interim assistant relay raised", exc_info=True)
+
+        return _relay_interim_assistant, _on_tool_iteration
+
     def _create_session(resume_id: Optional[str]) -> None:
         from agent.runtime_cwd import resolve_agent_cwd
 
@@ -621,6 +695,16 @@ def run_claude_agent_sdk_turn(
                 approval_callback = None
 
         def _on_tool_started(tool_name: str, preview: str, args: dict) -> None:
+            # Claude SDK tool calls bypass the native tool executor, so mirror
+            # its shared activity updates here. The gateway heartbeat reads
+            # get_activity_summary(), which derives its useful current action
+            # from these fields; without this, an active SDK turn remains
+            # stuck at its initial "initializing" state.
+            agent._current_tool = tool_name
+            try:
+                agent._touch_activity(f"executing tool: {tool_name}")
+            except Exception:
+                logger.debug("claude-sdk activity update failed", exc_info=True)
             progress_callback = getattr(agent, "tool_progress_callback", None)
             if progress_callback is None:
                 return
@@ -736,6 +820,8 @@ def run_claude_agent_sdk_turn(
             hermes_session_id=getattr(agent, "session_id", None),
             resume_session_id=resume_id,
             on_stream_delta=_relay_stream_delta,
+            on_interim_assistant=on_interim_assistant,
+            on_tool_iteration=on_tool_iteration,
             on_unsolicited_result=on_unsolicited_result,
             # Operator budget cap (agent.claude_agent_sdk.max_budget_usd);
             # None = no budget. Read per session creation so a config edit
@@ -813,6 +899,17 @@ def run_claude_agent_sdk_turn(
             "error": None,
             "agent_persisted": True,
         }
+
+    on_interim_assistant, on_tool_iteration = _make_visibility_callbacks()
+    live_session = getattr(agent, "_claude_sdk_session", None)
+    if live_session is not None:
+        try:
+            live_session.set_turn_visibility_callbacks(
+                on_interim_assistant=on_interim_assistant,
+                on_tool_iteration=on_tool_iteration,
+            )
+        except Exception:
+            logger.debug("claude-sdk visibility callback refresh failed", exc_info=True)
 
     turn = None
     resumed = False

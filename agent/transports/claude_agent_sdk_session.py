@@ -45,17 +45,13 @@ logger = logging.getLogger(__name__)
 # the agent.claude_agent_sdk.permission_mode config key (an SDK mode literal
 # — see _configured_permission_mode), then this env mapping.
 #
-# Posture, stated honestly: "auto" → acceptEdits is NOT codex parity, it is
-# merely the closest available mode. Codex's default workspace-write profile
-# still surfaces escalations for approval; acceptEdits auto-approves file
-# edits under cwd with NO Hermes approval callback in the loop — the
-# can_use_tool bridge is wired ONLY in "default" mode (see
-# build_option_fields), and bypassPermissions disables SDK permission
-# prompts entirely. Operators who want the gateway's approval flow set
-# HERMES_TERMINAL_SECURITY_MODE=approval-required or
-# agent.claude_agent_sdk.permission_mode: default in config.yaml.
+# SDK default posture is intentionally stricter than generic terminal `auto`:
+# `default` preserves Hermes' per-tool approval bridge. Mapping `auto` to
+# `acceptEdits` skips that bridge entirely, so even the fixed bounded MCP read
+# surface is denied/unguarded depending on CLI state. Explicit operator choices
+# retain their SDK literals below.
 _HERMES_TO_SDK_PERMISSION_MODE = {
-    "auto": "acceptEdits",
+    "auto": "default",
     "approval-required": "default",
     "unrestricted": "bypassPermissions",
     "yolo": "bypassPermissions",
@@ -102,6 +98,15 @@ def _configured_permission_mode() -> Optional[str]:
 # The SDK's own setting-source literals (verified against the installed
 # claude-agent-sdk 0.2.120 SettingSource type).
 _SDK_SETTING_SOURCES = ("user", "project", "local")
+
+# These are the only two filesystem-capable tools exposed by the fixed
+# ``claude-agent-sdk`` Hermes MCP profile. Their handlers retain the native
+# file safety/read-block checks; an exact identity check avoids treating a
+# generic MCP prefix or a lookalike server/tool as trusted.
+_SDK_AUTO_ALLOWED_MCP_INSPECTION_TOOLS = frozenset({
+    "mcp__hermes-tools__read_file",
+    "mcp__hermes-tools__search_files",
+})
 
 
 def _configured_setting_sources() -> list:
@@ -601,7 +606,12 @@ def _build_hermes_tools_mcp_config(
     return {
         "type": "stdio",
         "command": sys.executable,
-        "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
+        "args": [
+            "-m",
+            "agent.transports.hermes_tools_mcp_server",
+            "--profile",
+            "claude-agent-sdk",
+        ],
         "env": env,
     }
 
@@ -637,6 +647,8 @@ class ClaudeAgentSdkSession:
         hermes_session_id: Optional[str] = None,
         resume_session_id: Optional[str] = None,
         on_stream_delta: Optional[Callable[[str], None]] = None,
+        on_interim_assistant: Optional[Callable[[str], None]] = None,
+        on_tool_iteration: Optional[Callable[[], None]] = None,
         on_unsolicited_result: Optional[Callable[[list[str]], None]] = None,
         # Hybrid MCP bridge (ported from PR #56413): when both `agent` and
         # `tools` are provided, an in-process MCP server exposing the full
@@ -654,7 +666,7 @@ class ClaudeAgentSdkSession:
             or _configured_permission_mode()
             or _HERMES_TO_SDK_PERMISSION_MODE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
-                "acceptEdits",
+                "default",
             )
         )
         self._system_prompt_append = system_prompt_append
@@ -674,10 +686,19 @@ class ClaudeAgentSdkSession:
         # Display-only partial-text consumer (W4 streaming). Deltas never
         # enter the projected transcript; the gateway's stream consumer
         # handles rate limiting and the already_sent final-send dedup.
+        self._turn_callback_lock = threading.RLock()
         self._on_stream_delta = on_stream_delta
         # Hybrid MCP bridge inputs (see param docstring above).
         self._agent = agent
         self._tools = tools
+        # Completed assistant prose that accompanies a tool call is a true
+        # interim status, not final-answer text. It follows the gateway's
+        # existing commentary callback so platforms can render it separately.
+        # These callbacks are refreshed before EVERY run_turn: a session may
+        # safely span several Hermes turns, while visibility must stay scoped
+        # to the current one.
+        self._on_interim_assistant = on_interim_assistant
+        self._on_tool_iteration = on_tool_iteration
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
@@ -708,6 +729,17 @@ class ClaudeAgentSdkSession:
         self._on_unsolicited_result = on_unsolicited_result
         self._unsolicited_text: list[str] = []
         self._unsolicited_delivered: set[str] = set()
+
+    def set_turn_visibility_callbacks(
+        self,
+        *,
+        on_interim_assistant: Optional[Callable[[str], None]],
+        on_tool_iteration: Optional[Callable[[], None]],
+    ) -> None:
+        """Atomically install current-turn, runtime-owned visibility hooks."""
+        with self._turn_callback_lock:
+            self._on_interim_assistant = on_interim_assistant
+            self._on_tool_iteration = on_tool_iteration
 
     # ---------- lifecycle ----------
 
@@ -1154,6 +1186,7 @@ class ClaudeAgentSdkSession:
                     continue
                 if not interrupted:
                     self._notify_tool_started(message)
+                    self._notify_interim_assistant(message)
                 projection = projector.project(message)
                 if watch is not None:
                     # Outstanding-tool evidence: ToolUseBlocks issue, tool
@@ -1190,6 +1223,7 @@ class ClaudeAgentSdkSession:
                         out["messages"].extend(projection.messages)
                     if projection.is_tool_iteration:
                         out["tool_iterations"] += 1
+                        self._notify_tool_iteration()
                     if projection.final_text is not None:
                         out["final_text"] = projection.final_text
                 if projection.is_result:
@@ -1203,7 +1237,8 @@ class ClaudeAgentSdkSession:
                     subtype = getattr(message, "subtype", "") or ""
                     if getattr(message, "is_error", False):
                         errors = getattr(message, "errors", None) or []
-                        if subtype == "success" and not errors:
+                        api_error_status = getattr(message, "api_error_status", None)
+                        if subtype == "success" and not errors and not api_error_status:
                             # Contradictory envelope: is_error=True yet
                             # subtype="success" with nothing in errors. The
                             # CLI emits this shape rarely (2026-08-11: it
@@ -1222,10 +1257,12 @@ class ClaudeAgentSdkSession:
                                 message,
                             )
                             break
-                        err_text = (
-                            f"SDK result error (subtype={subtype}): "
-                            + ("; ".join(str(e) for e in errors) or subtype)
-                        )
+                        detail = "; ".join(str(e) for e in errors) or getattr(
+                            message, "result", None
+                        ) or subtype
+                        err_text = f"SDK result error (subtype={subtype}): {detail}"
+                        if api_error_status:
+                            err_text += f" (HTTP {api_error_status})"
                         # A turn WE interrupted before any assistant content
                         # ends as is_error/error_during_execution in the CLI
                         # ("[ede_diagnostic] result_type=user…") — that is the
@@ -1473,6 +1510,39 @@ class ClaudeAgentSdkSession:
         except Exception:  # pragma: no cover - display callback
             logger.debug("stream delta callback raised", exc_info=True)
 
+    def _notify_interim_assistant(self, message: Any) -> None:
+        """Relay completed tool-adjacent assistant prose as commentary."""
+        if getattr(message, "parent_tool_use_id", None):
+            return
+        with self._turn_callback_lock:
+            callback = self._on_interim_assistant
+        if callback is None:
+            return
+        if type(message).__name__ != "AssistantMessage":
+            return
+        blocks = list(getattr(message, "content", None) or [])
+        if not any(type(block).__name__ == "ToolUseBlock" for block in blocks):
+            return
+        text = "\n".join(
+            str(getattr(block, "text", "") or "")
+            for block in blocks
+            if type(block).__name__ == "TextBlock" and getattr(block, "text", "")
+        ).strip()
+        if not text:
+            return
+        try:
+            callback(text)
+        except Exception:  # pragma: no cover - display callback
+            logger.debug("interim assistant callback raised", exc_info=True)
+
+    def _notify_tool_iteration(self) -> None:
+        if self._on_tool_iteration is None:
+            return
+        try:
+            self._on_tool_iteration()
+        except Exception:  # pragma: no cover - display callback
+            logger.debug("tool-iteration callback raised", exc_info=True)
+
     def _notify_tool_started(self, message: Any) -> None:
         """Bridge ToolUseBlocks to Hermes tool-progress (gateway breadcrumbs),
         mirroring codex_runtime._codex_note_to_tool_progress (#38835)."""
@@ -1635,7 +1705,12 @@ class ClaudeAgentSdkSession:
             # dead-ends with "The user did not answer the questions." The model
             # must ask in plain text (Telegram-compatible); full option-button
             # mapping is a later feature.
-            "disallowed_tools": ["AskUserQuestion"],
+            #
+            # Native Read duplicates the bounded Hermes MCP read_file surface,
+            # but turns ordinary inspection into approval-card noise. Keep the
+            # protected-path-aware MCP tool and disallow only the duplicate
+            # native tool; Bash and all write-capable native tools are unchanged.
+            "disallowed_tools": ["AskUserQuestion", "Read"],
         }
         if self._resume_session_id:
             fields["resume"] = self._resume_session_id
@@ -1714,6 +1789,8 @@ class ClaudeAgentSdkSession:
         PermissionResultAllow: Any,
         PermissionResultDeny: Any,
     ) -> Any:
+        if tool_name in _SDK_AUTO_ALLOWED_MCP_INSPECTION_TOOLS:
+            return PermissionResultAllow()
         try:
             kwargs: dict = {"allow_permanent": False}
             # tool_use_id correlation (P2.a): the SDK guarantees a
