@@ -317,9 +317,10 @@ def _http_mcp_entries_from_config() -> dict[str, dict]:
     gateway process env. Header-bearing entries are refused: the SDK
     serializes its MCP config into the Claude CLI's ``--mcp-config`` process
     argument, so forwarding a resolved Authorization header would expose the
-    secret to local process inspection. Entries without a URL (stdio
-    subprocess, in-process) are ignored. Returns ``{}`` on any read/parse
-    failure — the caller keeps working with just the hybrid + stdio wrapper.
+    secret to local process inspection. Entries without a valid resolved
+    HTTP(S) URL (stdio subprocess, in-process, missing env placeholder) are
+    ignored without logging the URL. Returns ``{}`` on any read/parse failure
+    — the caller keeps working with just the hybrid + stdio wrapper.
 
     Rationale: HTTP MCPs registered in Hermes end up in the registry under a
     toolset ``mcp-<name>`` that isn't included in the agent's default enabled
@@ -330,6 +331,8 @@ def _http_mcp_entries_from_config() -> dict[str, dict]:
     """
     import os as _os
     import re as _re
+    from urllib.parse import urlsplit as _urlsplit
+
     try:
         import yaml as _yaml  # type: ignore
     except Exception:
@@ -368,9 +371,6 @@ def _http_mcp_entries_from_config() -> dict[str, dict]:
         url = cfg.get("url")
         if not isinstance(url, str) or not url.strip():
             continue
-        resolved = _resolve_env(url).strip()
-        if not resolved:
-            continue
         headers = cfg.get("headers")
         if isinstance(headers, dict) and headers:
             # Never resolve or log header values. ClaudeAgentOptions passes
@@ -381,6 +381,18 @@ def _http_mcp_entries_from_config() -> dict[str, dict]:
             logger.warning(
                 "claude-agent-sdk: refusing HTTP MCP %r because it requires "
                 "headers that the SDK would expose in process arguments",
+                str(name),
+            )
+            continue
+        resolved = _resolve_env(url).strip()
+        parsed = _urlsplit(resolved)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            # Missing env placeholders commonly produce `https:///path`.
+            # Do not hand malformed config to the child or log the resolved
+            # URL: it may itself contain credentials.
+            logger.warning(
+                "claude-agent-sdk: refusing HTTP MCP %r because its resolved "
+                "URL is not a valid HTTP(S) endpoint",
                 str(name),
             )
             continue

@@ -944,6 +944,31 @@ class TestHttpMcpSecurity:
             }
         }
 
+    def test_malformed_resolved_url_is_refused_without_url_in_logs(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        from agent.transports.claude_agent_sdk_session import (
+            _http_mcp_entries_from_config,
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_PROFILE", "test")
+        monkeypatch.delenv("MISSING_MCP_HOST", raising=False)
+        (tmp_path / "config.yaml").write_text(
+            """mcp_servers:
+  broken-search:
+    url: https://${MISSING_MCP_HOST}/mcp
+""",
+            encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            entries = _http_mcp_entries_from_config()
+
+        assert entries == {}
+        assert "broken-search" in caplog.text
+        assert "https:///mcp" not in caplog.text
+
 
 # ---------- hermes session id plumbing to the MCP shims (#26567) ----------
 
