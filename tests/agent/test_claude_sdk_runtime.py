@@ -291,6 +291,12 @@ class TestAuthClassifier:
             )
             is None
         )
+        assert (
+            classify_auth_failure(
+                "mcp server weather: Unauthorized — invalid region scope"
+            )
+            is None
+        )
 
 
 # ---------- session (fake client) ----------
@@ -322,7 +328,7 @@ class _FakeClient:
         self.options = options
         self._script = list(script or [])
         self._connect_exc = connect_exc
-        self.queried: list[str] = []
+        self.queried: list[Any] = []
         self.disconnected = False
         self.interrupted = False
         self._pending: deque = deque()
@@ -337,7 +343,10 @@ class _FakeClient:
             raise self._connect_exc
 
     async def query(self, text):
-        self.queried.append(text)
+        if isinstance(text, str):
+            self.queried.append(text)
+        else:
+            self.queried.append([message async for message in text])
         self._pending.extend(self._script)
         if not any(type(m).__name__ == "ResultMessage" for m in self._script):
             self._pending.append(_EOS)
@@ -422,6 +431,80 @@ class TestSession:
         ]
         assert holder["client"].queried == ["read /x please"]
         assert not turn.should_retire
+
+    def test_mixed_text_and_data_image_reaches_sdk_as_native_content(self):
+        session, holder = _make_session(script=[ResultMessage(result="a diagram")])
+        try:
+            turn = session.run_turn([
+                {"type": "text", "text": "Inspect this diagram."},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,aGVsbG8=",
+                    },
+                },
+            ])
+        finally:
+            session.close()
+
+        assert turn.error is None
+        assert holder["client"].queried == [[{
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Inspect this diagram."},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "aGVsbG8=",
+                        },
+                    },
+                ],
+            },
+            "parent_tool_use_id": None,
+        }]]
+
+    def test_image_only_url_reaches_sdk_without_fabricated_prompt(self):
+        session, holder = _make_session(script=[ResultMessage(result="a photo")])
+        try:
+            turn = session.run_turn([{
+                "type": "image_url",
+                "image_url": {"url": "https://example.test/photo.png"},
+            }])
+        finally:
+            session.close()
+
+        assert turn.error is None
+        (query,), = holder["client"].queried
+        assert query["message"]["content"] == [{
+            "type": "image",
+            "source": {
+                "type": "url",
+                "url": "https://example.test/photo.png",
+            },
+        }]
+
+    def test_malformed_image_is_disclosed_instead_of_claimed_attached(
+        self, caplog
+    ):
+        session, holder = _make_session(script=[ResultMessage(result="cannot inspect")])
+        with caplog.at_level(logging.WARNING):
+            try:
+                turn = session.run_turn([{
+                    "type": "image_url",
+                    "image_url": {"url": "not-an-image-source"},
+                }])
+            finally:
+                session.close()
+
+        assert turn.error is None
+        (query,) = holder["client"].queried
+        assert "image attachment unavailable" in query.lower()
+        assert "what do you see" not in query.lower()
+        assert "image attachment" in caplog.text.lower()
 
     def test_sdk_error_result_surfaces(self):
         script = [ResultMessage(subtype="error_max_turns", is_error=False)]
@@ -791,6 +874,75 @@ class TestBackgroundReviewSuppressed:
         # Counter machinery stays intact: the interval crossing still resets
         # it, exactly as before — only the spawn is suppressed.
         assert agent._iters_since_skill == 0
+
+
+# ---------- direct HTTP MCP security -------------------------------------
+
+
+class TestHttpMcpSecurity:
+    def test_default_off_never_discovers_direct_http_servers(self, monkeypatch):
+        from agent.transports import claude_agent_sdk_session as mod
+
+        discover = MagicMock(return_value={
+            "remote": {"type": "http", "url": "https://mcp.example.test"}
+        })
+        monkeypatch.setattr(mod, "_http_mcp_entries_from_config", discover)
+        session, _ = _make_session(script=[ResultMessage(result="ok")])
+
+        fields = session.build_option_fields()
+
+        discover.assert_not_called()
+        assert "remote" not in fields["mcp_servers"]
+
+    def test_header_bearing_server_is_refused_without_secret_in_logs(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        from agent.transports.claude_agent_sdk_session import (
+            _http_mcp_entries_from_config,
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_PROFILE", "test")
+        monkeypatch.setenv("PRIVATE_MCP_TOKEN", "super-secret-token")
+        (tmp_path / "config.yaml").write_text(
+            """mcp_servers:
+  private-search:
+    url: https://mcp.example.test
+    headers:
+      Authorization: Bearer ${PRIVATE_MCP_TOKEN}
+""",
+            encoding="utf-8",
+        )
+
+        with caplog.at_level(logging.WARNING):
+            entries = _http_mcp_entries_from_config()
+
+        assert entries == {}
+        assert "private-search" in caplog.text
+        assert "super-secret-token" not in caplog.text
+        assert "Authorization" not in caplog.text
+
+    def test_headerless_server_is_safe_to_register(self, monkeypatch, tmp_path):
+        from agent.transports.claude_agent_sdk_session import (
+            _http_mcp_entries_from_config,
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_PROFILE", "test")
+        (tmp_path / "config.yaml").write_text(
+            """mcp_servers:
+  public-search:
+    url: https://mcp.example.test
+""",
+            encoding="utf-8",
+        )
+
+        assert _http_mcp_entries_from_config() == {
+            "public-search": {
+                "type": "http",
+                "url": "https://mcp.example.test",
+            }
+        }
 
 
 # ---------- hermes session id plumbing to the MCP shims (#26567) ----------

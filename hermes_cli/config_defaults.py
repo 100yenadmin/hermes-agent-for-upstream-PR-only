@@ -372,10 +372,13 @@ DEFAULT_CONFIG = {
             "post_tool_quiet_timeout": None,
             # Hybrid in-process MCP bridge (PR #56413 port). false (default)
             # keeps the byte-identical fcava behaviour: only the stdio
-            # `hermes-tools` wrapper is registered, third-party proxified
-            # MCPs stay invisible to the SDK loop. Set true to route the
-            # full Hermes tool registry (including proxified MCPs and
-            # agent-level tools) into the SDK via an in-process MCP server.
+            # `hermes-tools` wrapper is registered, and direct third-party
+            # HTTP MCP passthrough stays disabled. Set true to route the full
+            # Hermes tool registry (including proxified MCPs and agent-level
+            # tools) into the SDK via in-process MCP servers. Headerless HTTP
+            # MCPs are also passed through directly when the bridge succeeds;
+            # header-bearing HTTP MCPs are refused because the SDK serializes
+            # their config into a process argument.
             # Curated stdio-legacy tools stay under the `hermes-tools`
             # server name so existing ~/.claude/settings.json grants keep
             # matching; everything else is exposed under `hermes-hybrid`.

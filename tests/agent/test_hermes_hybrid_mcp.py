@@ -419,6 +419,67 @@ class TestHybridBridgeEnabledGate:
         monkeypatch.setattr(sess, "_provider_config", lambda: {})
         assert runtime._hybrid_bridge_enabled() is False
 
+    def test_session_fails_closed_even_if_caller_supplies_bridge_inputs(
+        self, monkeypatch, fake_sdk, stub_invoke_deps
+    ):
+        from agent.transports import claude_agent_sdk_session as sess
+
+        http_loader = types.SimpleNamespace(calls=0)
+
+        def _load_http():
+            http_loader.calls += 1
+            return {
+                "remote": {
+                    "type": "http",
+                    "url": "https://mcp.example.test",
+                }
+            }
+
+        monkeypatch.setattr(sess, "_provider_config", lambda: {})
+        monkeypatch.setattr(sess, "_http_mcp_entries_from_config", _load_http)
+        session = sess.ClaudeAgentSdkSession(
+            cwd="/tmp",
+            agent=_StubAgent(),
+            tools=[_openai_spec("web_search")],
+        )
+        fields = session.build_option_fields()
+
+        assert http_loader.calls == 0
+        assert "hermes-hybrid" not in fields["mcp_servers"]
+        assert "remote" not in fields["mcp_servers"]
+
+    def test_direct_headerless_http_requires_successful_hybrid_opt_in(
+        self, monkeypatch, fake_sdk, stub_invoke_deps
+    ):
+        from agent.transports import claude_agent_sdk_session as sess
+
+        monkeypatch.setattr(
+            sess, "_provider_config", lambda: {"hybrid_mcp_bridge": True}
+        )
+        monkeypatch.setattr(
+            sess,
+            "_http_mcp_entries_from_config",
+            lambda: {
+                "remote": {
+                    "type": "http",
+                    "url": "https://mcp.example.test",
+                }
+            },
+        )
+        session = sess.ClaudeAgentSdkSession(
+            cwd="/tmp",
+            agent=_StubAgent(),
+            tools=[_openai_spec("web_search")],
+        )
+
+        fields = session.build_option_fields()
+
+        assert "hermes-hybrid" in fields["mcp_servers"]
+        assert fields["mcp_servers"]["remote"] == {
+            "type": "http",
+            "url": "https://mcp.example.test",
+        }
+
     def test_enabled_when_flag_true(self, monkeypatch):
         from agent import claude_sdk_runtime as runtime
         from agent.transports import claude_agent_sdk_session as sess
