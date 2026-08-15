@@ -42,13 +42,12 @@ from typing import Any, Dict, List, Optional, Tuple
 #   - todo / memory / delegate_task / session_search — ``_AGENT_LOOP_TOOLS``;
 #     they require live mid-loop agent state, which a stateless/out-of-process
 #     dispatcher cannot provide.
-# Tool names historically exposed under the ``hermes-tools`` MCP server (the
-# stdio subprocess wrapper). Consumed by the hybrid bridge to keep those
-# tools under the same server name for backward compatibility with operator
-# grants stored in ``~/.claude/settings.json`` (which key on
-# ``mcp__hermes-tools__<tool>``). Union of the stdio wrapper's
-# ``EXPOSED_TOOLS`` list plus the two agent-level tools it exposes through
-# dedicated stateless shims (``memory``, ``session_search``).
+# Tool names that must remain under the ``hermes-tools`` MCP server when the
+# hybrid bridge replaces the stdio subprocess. This preserves operator grants
+# stored in ``~/.claude/settings.json`` (which key on
+# ``mcp__hermes-tools__<tool>``) and the Claude SDK profile's exact-name
+# auto-allowlist. The set is the historical stdio surface plus the SDK
+# profile's bounded inspection tools.
 HERMES_TOOLS_LEGACY_NAMES: "frozenset[str]" = frozenset()  # populated below
 
 
@@ -93,6 +92,11 @@ HERMES_TOOLS_LEGACY_NAMES = frozenset((
     # via dedicated stateless shims (see ``hermes_tools_mcp_server.py``).
     "memory",
     "session_search",
+    # The Claude SDK stdio profile adds these protected-path-aware readers.
+    # Keep their server identity stable when hybrid mode takes over: the SDK
+    # permission bridge auto-allows only the exact hermes-tools identities.
+    "read_file",
+    "search_files",
     # Present in the stdio wrapper's ``EXPOSED_TOOLS`` but not in the
     # module-level ``CURATED_STATELESS_TOOLS`` — grants for these under
     # ``mcp__hermes-tools__*`` would otherwise stop matching when the

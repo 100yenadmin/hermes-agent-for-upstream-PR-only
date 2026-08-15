@@ -501,9 +501,8 @@ class TestSession:
         # Hard rule: a metered key never reaches any child of this runtime.
         assert "ANTHROPIC_API_KEY" not in (mcp.get("env") or {})
         # Agent SDK defaults fail closed to `default`: this is the only mode
-        # that installs Hermes' approval bridge, so falling through to the
-        # terminal "auto" mapping (`acceptEdits`) silently removes the bridge
-        # and makes otherwise-bounded MCP tools impossible to approve.
+        # that installs Hermes' approval bridge. The terminal `auto` posture
+        # maps here too, so green-field deployments retain that bridge.
         assert options["permission_mode"] == "default"
         # Explicit SDK isolation: None would load ALL of ~/.claude and
         # .claude/settings*, letting ambient settings shadow the gateway's
@@ -2613,6 +2612,10 @@ def _plant_claude_agent_sdk_stand_in(monkeypatch) -> None:
 
 class TestSdkBoundedMcpInspectionPermissions:
     """Only fixed Hermes MCP file inspection tools bypass SDK prompting."""
+
+    @pytest.fixture(autouse=True)
+    def _sdk_permission_results(self, monkeypatch):
+        _plant_claude_agent_sdk_stand_in(monkeypatch)
 
     @pytest.mark.parametrize("tool_name", [
         "mcp__hermes-tools__read_file",

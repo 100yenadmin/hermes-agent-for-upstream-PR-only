@@ -218,6 +218,15 @@ class TestLegacyNames:
         assert "memory" in HERMES_TOOLS_LEGACY_NAMES
         assert "session_search" in HERMES_TOOLS_LEGACY_NAMES
 
+    def test_includes_sdk_profile_inspection_tools(self):
+        """Hybrid mode replaces the SDK stdio server, so its bounded readers
+        must retain the exact ``mcp__hermes-tools__*`` identities that the
+        SDK permission bridge auto-allows."""
+        from agent.transports.hermes_tool_exposure import HERMES_TOOLS_LEGACY_NAMES
+
+        assert "read_file" in HERMES_TOOLS_LEGACY_NAMES
+        assert "search_files" in HERMES_TOOLS_LEGACY_NAMES
+
     def test_includes_kanban_review_tools(self):
         """``kanban_request_review`` and ``kanban_request_changes`` ship in
         the stdio wrapper's ``EXPOSED_TOOLS`` but not in the module-level

@@ -1536,10 +1536,12 @@ class ClaudeAgentSdkSession:
             logger.debug("interim assistant callback raised", exc_info=True)
 
     def _notify_tool_iteration(self) -> None:
-        if self._on_tool_iteration is None:
+        with self._turn_callback_lock:
+            callback = self._on_tool_iteration
+        if callback is None:
             return
         try:
-            self._on_tool_iteration()
+            callback()
         except Exception:  # pragma: no cover - display callback
             logger.debug("tool-iteration callback raised", exc_info=True)
 

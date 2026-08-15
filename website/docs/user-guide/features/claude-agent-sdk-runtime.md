@@ -49,14 +49,14 @@ All keys live under `agent.claude_agent_sdk` in `config.yaml` (see `cli-config.y
 | `streaming` | `false` | Emit the SDK's partial-message deltas into the gateway streaming pipeline. |
 | `allow_metered_key` | `false` | Allow startup with a metered Anthropic key present (disables the fail-closed guard AND the env scrub). |
 | `append_file` | `""` | Operator persona/soul file appended to the system prompt. |
-| `permission_mode` | `""` | An SDK permission mode literal (`default`, `acceptEdits`, `plan`, `bypassPermissions`, `dontAsk`, `auto`). Empty keeps the `HERMES_TERMINAL_SECURITY_MODE` mapping. Set `default` to route SDK tool permissions through Hermes' approval flow. |
+| `permission_mode` | `""` | An SDK permission mode literal (`default`, `acceptEdits`, `plan`, `bypassPermissions`, `dontAsk`, `auto`). Empty keeps the `HERMES_TERMINAL_SECURITY_MODE` mapping (`auto` maps to the fail-closed SDK `default` mode). |
 | `max_budget_usd` | `null` | Per-query USD cap forwarded to the SDK; the turn ends with `error_max_budget_usd` when exceeded. `null` = no budget. |
 | `hybrid_mcp_bridge` | `false` | Opt in to the in-process MCP bridge that exposes the FULL Hermes tool registry (proxified third-party MCPs + agent-level tools) to the SDK loop. `false` (default) keeps the stdio `hermes-tools` wrapper only — byte-identical to the fcava-provider default. Off by default because the wide bridge exposes agent-level tools whose enablement is a security choice. |
 | `hybrid_mcp_bridge_exclude` | `[]` | Tool names to drop from the hybrid bridge (both `hermes-tools` and `hermes-hybrid` buckets). Ignored when `hybrid_mcp_bridge` is `false`. Use to keep the wide bridge for proxified MCPs without inheriting high-blast tools (`delegate_task`, `cron_*`, `read_terminal`, `terminal`). Match on the raw Hermes registry name (no `mcp__` prefix). |
 
 ### Permission posture, honestly
 
-The default mapping (`HERMES_TERMINAL_SECURITY_MODE=auto`) selects the SDK's `acceptEdits` mode: file edits under the working directory are auto-approved and **no Hermes approval callback is in the loop**. This is the closest usable-unattended mode, not codex parity. Hermes' approval callback is bridged only in `default` mode (`permission_mode: default` or `HERMES_TERMINAL_SECURITY_MODE=approval-required`).
+The default mapping (`HERMES_TERMINAL_SECURITY_MODE=auto`) selects the SDK's `default` mode and installs Hermes' approval callback. The fixed bounded `mcp__hermes-tools__read_file` and `search_files` identities bypass the approval round-trip because their handlers retain Hermes' protected-path checks; shell and mutation tools still require normal approval. Operators can explicitly select another SDK mode, including `acceptEdits`, through `permission_mode`.
 
 Ambient Claude settings are isolated: the runtime pins the SDK's `setting_sources` to the empty list, so `~/.claude/settings.json` and project `.claude/settings*.json` cannot re-permission tools or add hooks underneath the configured posture. (This also means `CLAUDE.md` files are not loaded — this runtime composes its own system-prompt append from Hermes' memory, skills index, and your `append_file`.)
 
