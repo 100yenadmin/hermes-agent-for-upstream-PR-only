@@ -1237,7 +1237,8 @@ class ClaudeAgentSdkSession:
                     subtype = getattr(message, "subtype", "") or ""
                     if getattr(message, "is_error", False):
                         errors = getattr(message, "errors", None) or []
-                        if subtype == "success" and not errors:
+                        api_error_status = getattr(message, "api_error_status", None)
+                        if subtype == "success" and not errors and not api_error_status:
                             # Contradictory envelope: is_error=True yet
                             # subtype="success" with nothing in errors. The
                             # CLI emits this shape rarely (2026-08-11: it
@@ -1256,10 +1257,12 @@ class ClaudeAgentSdkSession:
                                 message,
                             )
                             break
-                        err_text = (
-                            f"SDK result error (subtype={subtype}): "
-                            + ("; ".join(str(e) for e in errors) or subtype)
-                        )
+                        detail = "; ".join(str(e) for e in errors) or getattr(
+                            message, "result", None
+                        ) or subtype
+                        err_text = f"SDK result error (subtype={subtype}): {detail}"
+                        if api_error_status:
+                            err_text += f" (HTTP {api_error_status})"
                         # A turn WE interrupted before any assistant content
                         # ends as is_error/error_during_execution in the CLI
                         # ("[ede_diagnostic] result_type=user…") — that is the

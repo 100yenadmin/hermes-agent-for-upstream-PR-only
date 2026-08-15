@@ -1491,6 +1491,32 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def _handle_claude_sdk_turn_with_fallback(
+    agent,
+    *,
+    user_message: Any,
+    original_user_message: Any,
+    messages: List[Dict[str, Any]],
+    effective_task_id: str,
+    should_review_memory: bool,
+) -> Optional[Dict[str, Any]]:
+    """Run the SDK lane and activate normal fallback for a true quota failure."""
+    result = agent._run_claude_agent_sdk_turn(
+        user_message=user_message,
+        original_user_message=original_user_message,
+        messages=messages,
+        effective_task_id=effective_task_id,
+        should_review_memory=should_review_memory,
+    )
+    error = str(result.get("error") or "").lower()
+    if ("http 429" in error or "session limit" in error) and agent._try_activate_fallback(
+        reason=FailoverReason.rate_limit
+    ):
+        agent._buffer_status("⚠️ Claude session limit reached — switching to fallback provider...")
+        return None
+    return result
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -1710,13 +1736,16 @@ def run_conversation(
     # owns the whole agent loop (tools, permissions, subscription OAuth).
     # See agent/transports/claude_agent_sdk_session.py.
     if agent.api_mode == "claude_agent_sdk":
-        return agent._run_claude_agent_sdk_turn(
+        _sdk_result = _handle_claude_sdk_turn_with_fallback(
+            agent,
             user_message=user_message,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
         )
+        if _sdk_result is not None:
+            return _sdk_result
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()

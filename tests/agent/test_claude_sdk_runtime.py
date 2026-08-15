@@ -24,6 +24,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.claude_sdk_runtime import run_claude_agent_sdk_turn
+from agent.conversation_loop import _handle_claude_sdk_turn_with_fallback
 from agent.transports.claude_agent_sdk_session import (
     ClaudeAgentSdkSession,
     classify_auth_failure,
@@ -139,6 +140,28 @@ class ResultMessage:
     usage: Optional[dict] = None
     uuid: Optional[str] = "uuid-1"
     errors: Optional[list] = None
+    api_error_status: Optional[int] = None
+
+
+class TestClaudeSdkFallbackBridge:
+    def test_quota_error_activates_configured_fallback(self):
+        class Agent:
+            def __init__(self):
+                self.reason, self.status = None, []
+            def _run_claude_agent_sdk_turn(self, **kwargs):
+                return {"error": "SDK result error (HTTP 429): You've hit your session limit"}
+            def _try_activate_fallback(self, reason=None):
+                self.reason = reason
+                return True
+            def _buffer_status(self, text):
+                self.status.append(text)
+        agent = Agent()
+        assert _handle_claude_sdk_turn_with_fallback(
+            agent, user_message="continue", original_user_message="continue",
+            messages=[], effective_task_id="test", should_review_memory=False,
+        ) is None
+        assert agent.reason.value == "rate_limit"
+        assert agent.status == ["⚠️ Claude session limit reached — switching to fallback provider..."]
 
 
 # ---------- projector ----------
@@ -359,6 +382,18 @@ def _make_session(script=None, connect_exc=None, **kwargs):
 
 
 class TestSession:
+    def test_quota_429_contradictory_success_surfaces_result_for_fallback(self):
+        session, _ = _make_session(script=[ResultMessage(
+            result="You've hit your session limit", is_error=True,
+            subtype="success", api_error_status=429,
+        )])
+        try:
+            turn = session.run_turn("continue")
+        finally:
+            session.close()
+        assert "HTTP 429" in (turn.error or "")
+        assert "session limit" in (turn.error or "").lower()
+
     def test_happy_turn(self):
         script = [
             AssistantMessage(
