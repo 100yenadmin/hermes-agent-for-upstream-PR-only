@@ -884,6 +884,40 @@ class ClaudeAgentSdkSession:
     def __exit__(self, *exc: Any) -> None:
         self.close()
 
+    # ---------- context usage ----------
+
+    def context_usage(self) -> Optional[dict]:
+        """Live context usage reported by the CLI, or None if unavailable.
+
+        Ground truth, unlike Hermes' own estimate on this lane: api_messages
+        holds FULL tool payloads that are never sent to the CLI, so the local
+        estimate over-reports by an order of magnitude (1.5-2.4M tokens for a
+        transcript whose real size was ~111k). Callers that need a real number
+        -- status lines, compaction heuristics -- must use this instead.
+
+        Returns the SDK's ContextUsageResponse mapping: totalTokens, maxTokens
+        (already reduced by the autocompact buffer), contextWindow, the
+        percentage used, model, and isAutoCompactEnabled.
+
+        Best-effort by design: a disconnected session, an older SDK without the
+        method, or a query failure all yield None rather than raising into a
+        status path.
+        """
+        client = self._client
+        if client is None or self._loop is None:
+            return None
+        getter = getattr(client, "get_context_usage", None)
+        if not callable(getter):
+            return None  # SDK predates get_context_usage()
+        try:
+            usage = self._run_coro(getter(), timeout=10.0)
+        except Exception:
+            logger.debug(
+                "claude-agent-sdk context-usage query failed", exc_info=True
+            )
+            return None
+        return usage if isinstance(usage, dict) else None
+
     # ---------- interrupt ----------
 
     def consume_interrupt(self) -> None:
