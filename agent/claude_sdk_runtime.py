@@ -331,6 +331,39 @@ def build_system_prompt_append(
     return "\n\n".join(out_parts) or None
 
 
+def _sdk_context_prompt_tokens(usage: dict, fallback: int) -> int:
+    """Prompt size of the LAST SDK iteration — i.e. real context pressure.
+
+    LOCAL DIVERGENCE (2026-08-14). ``ResultMessage.usage`` AGGREGATES across
+    every internal iteration of a turn. Each iteration re-reads the whole
+    prompt from cache, so on a tool-heavy turn the aggregate answers "how many
+    tokens did this turn bill?" — NOT "how big is the prompt?".
+
+    Feeding the aggregate to the context compressor over-reported this session
+    by ~25x (3,601,066 reported vs ~145k real), which pinned the runtime footer
+    to a clamped 100% and made gateway hygiene fire every ~5 minutes forever
+    against a threshold it could never satisfy.
+
+    The aggregate remains correct for BILLING and is still used for session
+    totals / cost persistence; only context-pressure consumers use this value.
+    Falls back to the aggregate when per-iteration data is absent, so a future
+    SDK that drops ``iterations`` degrades to today's behaviour rather than
+    reporting zero (which would disable compression entirely).
+    """
+    iterations = usage.get("iterations")
+    if not isinstance(iterations, (list, tuple)) or not iterations:
+        return fallback
+    last = iterations[-1]
+    if not isinstance(last, dict):
+        return fallback
+    total = (
+        _coerce_usage_int(last.get("input_tokens"))
+        + _coerce_usage_int(last.get("cache_read_input_tokens"))
+        + _coerce_usage_int(last.get("cache_creation_input_tokens"))
+    )
+    return total or fallback
+
+
 def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, bool):
         return 0
@@ -412,10 +445,24 @@ def _record_claude_sdk_usage(agent, turn) -> dict[str, Any]:
         "reasoning_tokens": 0,
     }
 
+    # Context pressure != tokens billed. See _sdk_context_prompt_tokens.
+    context_prompt_tokens = _sdk_context_prompt_tokens(usage, prompt_tokens)
+    if context_prompt_tokens != prompt_tokens:
+        logger.debug(
+            "claude-sdk context tokens: using last-iteration %d (turn aggregate "
+            "was %d) for context pressure; aggregate retained for billing.",
+            context_prompt_tokens, prompt_tokens,
+        )
+
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:
         try:
-            compressor.update_from_response(usage_dict)
+            compressor_usage = dict(usage_dict)
+            compressor_usage["prompt_tokens"] = context_prompt_tokens
+            compressor_usage["total_tokens"] = (
+                context_prompt_tokens + completion_tokens
+            )
+            compressor.update_from_response(compressor_usage)
         except Exception:
             logger.debug("claude-sdk usage update failed", exc_info=True)
 
@@ -457,7 +504,10 @@ def _record_claude_sdk_usage(agent, turn) -> dict[str, Any]:
 
     return {
         **usage_dict,
-        "last_prompt_tokens": prompt_tokens,
+        # Context-pressure value: drives the runtime footer's context_pct and
+        # gateway session hygiene. usage_dict still carries the BILLING
+        # aggregate under "prompt_tokens".
+        "last_prompt_tokens": context_prompt_tokens,
         "estimated_cost_usd": None,
         "cost_status": "included",
         "cost_source": "claude-subscription",

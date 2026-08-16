@@ -5780,11 +5780,27 @@ def _resolve_auto_route(
     # config is resolved before this chain and remains the operator's
     # deliberate opt-in; without it, aux features simply no-op.
     if runtime_api_mode == "claude_agent_sdk":
-        logger.debug(
-            "aux auto-detect disabled: main provider is claude-agent-sdk "
-            "(subscription lane, fail-closed)"
-        )
-        return None, None, ""
+        # Keep auxiliary work on the same subscription-owned SDK route rather
+        # than silently falling through to a metered provider.
+        try:
+            from agent.claude_sdk_aux_client import ClaudeSdkAuxClient
+
+            sdk_aux_model = runtime_model or "claude-sonnet-5"
+            sdk_aux_client = ClaudeSdkAuxClient(default_model=sdk_aux_model)
+            _tag_effective_provider(sdk_aux_client, "claude-agent-sdk")
+            logger.debug(
+                "aux auto-detect: routing to claude-agent-sdk one-shot "
+                "(subscription lane, model=%s)",
+                sdk_aux_model,
+            )
+            return sdk_aux_client, sdk_aux_model, "claude-agent-sdk"
+        except Exception:
+            logger.warning(
+                "aux auto-detect: claude-agent-sdk one-shot client unavailable; "
+                "failing closed rather than routing auxiliary work to a metered provider.",
+                exc_info=True,
+            )
+            return None, None, ""
 
     # ── Warn once if OPENAI_BASE_URL is set but config.yaml uses a named
     #    provider (not 'custom').  This catches the common "env poisoning"
@@ -6261,6 +6277,19 @@ def resolve_provider_client(
         # chat.completions.create() is translated to /v1/messages.
         return _maybe_wrap_anthropic(
             client_obj, final_model_str, api_key_str, base_url_str, api_mode,
+        )
+
+    if provider == "claude-agent-sdk":
+        from agent.claude_sdk_aux_client import ClaudeSdkAuxClient
+
+        final_model = _normalize_resolved_model(
+            model or "claude-sonnet-5", provider
+        )
+        client = ClaudeSdkAuxClient(default_model=final_model)
+        return (
+            _to_async_client(client, final_model, is_vision=is_vision)
+            if async_mode
+            else (client, final_model)
         )
 
     # ── Auto: try all providers in priority order ────────────────────

@@ -756,6 +756,54 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     (which constructs a fresh ``AIAgent`` per turn and depends on this
     DB roundtrip).
     """
+    # LOCAL DIVERGENCE (2026-08-14) -- claude-agent-sdk lane only.
+    #
+    # On this lane the stored snapshot is NOT Hermes' native composed prompt:
+    # claude_sdk_runtime.py (~line 793) deliberately overwrites it with
+    # "[claude_code preset]\n\n" + the --append-system-prompt blob, so the audit
+    # trail records the EFFECTIVE prompt the CLI actually sends.
+    #
+    # That snapshot can never satisfy _stored_prompt_matches_runtime(): the SDK
+    # composer hardcodes "Provider: claude-agent-sdk (Claude subscription)"
+    # (claude_sdk_runtime.py:180) while system_prompt.py:677 emits the bare
+    # `agent.provider` ("claude-agent-sdk"), and the comparison is exact string
+    # equality. Verified against state.db: every SDK session stores the
+    # decorated label, so the check returned False on EVERY turn, forever.
+    #
+    # Two consequences, both fixed by short-circuiting here:
+    #   1. A WARNING/INFO claiming "prefix cache will miss ... quota drain" fired
+    #      every turn. Misleading on this lane -- the CLI owns the wire prompt
+    #      (preset + append, byte-stable per session), so rebuilding Hermes'
+    #      _cached_system_prompt costs local CPU, not tokens. The noise masked
+    #      genuine cache misses on lanes where reuse DOES matter.
+    #   2. Continuations fell through to the brand-new-session path below,
+    #      re-firing the on_session_start plugin hook and the cold-start credits
+    #      seed on every turn instead of once per session.
+    #
+    # Gated on `conversation_history` so a genuine first turn still takes the
+    # full path (hook + credits seed). The snapshot is still persisted, keeping
+    # an audit fallback if the runtime's own overwrite fails. Reuse is
+    # deliberately NOT attempted: the sentinel is not a native prompt and must
+    # never become _cached_system_prompt.
+    if conversation_history and getattr(agent, "api_mode", None) == "claude_agent_sdk":
+        logger.debug(
+            "claude-agent-sdk lane: skipping stored-prompt reuse for session %s "
+            "(runtime owns the wire prompt; snapshot is an audit record).",
+            agent.session_id,
+        )
+        agent._cached_system_prompt = agent._build_system_prompt(system_message)
+        if agent._session_db:
+            try:
+                agent._session_db.update_system_prompt(
+                    agent.session_id, agent._cached_system_prompt
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Session DB update_system_prompt failed for session %s: %s.",
+                    agent.session_id, exc,
+                )
+        return
+
     stored_prompt = None
     stored_state = "missing"
     if conversation_history and agent._session_db:

@@ -3394,6 +3394,27 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        # claude-agent-sdk lane: the SDK owns tool execution, so the tool-batch
+        # drain points below are never reached and the stash would strand (the
+        # turn-finalizer fallback only redelivers when nothing else is queued).
+        # The SDK's streaming-input mode accepts a second query() on the live
+        # session and injects it at the next turn boundary — its own steering
+        # contract. Prefer it; fall through to the stash when there is no live
+        # turn to steer into. Returning early is what makes delivery
+        # exactly-once: an accepted native steer is never also stashed.
+        if getattr(self, "api_mode", None) == "claude_agent_sdk":
+            _sdk_steer = getattr(
+                getattr(self, "_claude_sdk_session", None), "steer", None
+            )
+            if callable(_sdk_steer):
+                try:
+                    if _sdk_steer(cleaned):
+                        return True
+                except Exception:
+                    logger.debug(
+                        "claude-sdk native steer failed; falling back to stash",
+                        exc_info=True,
+                    )
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             # Test stubs that built AIAgent via object.__new__ skip __init__.

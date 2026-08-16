@@ -412,6 +412,16 @@ def _http_mcp_entries_from_config() -> dict[str, dict]:
     return out
 
 
+def _swallow_steer_result(future: Any) -> None:
+    """Same contract as _swallow_interrupt_result, for the fire-and-forget
+    steer query(). The caller has already returned True by the time this
+    resolves, so a failure here can only be logged, not surfaced."""
+    try:
+        future.result()
+    except Exception:
+        logger.debug("SDK steer query failed after scheduling", exc_info=True)
+
+
 # Substrings in SDK/CLI errors that signal broken subscription credentials.
 # Conservative on purpose — mirrors codex's _OAUTH_REFRESH_FAILURE_HINTS
 # contract: every needle is a phrase, never a bare token. Bare "401" matched
@@ -888,6 +898,58 @@ class ClaudeAgentSdkSession:
                     "SDK interrupt scheduling failed: %s",
                     _safe_sdk_error_text(exc),
                 )
+
+    def steer(self, text: str) -> bool:
+        """Inject a mid-turn user message using the SDK's own streaming input.
+
+        Why this exists: on this lane the SDK owns tool execution, so Hermes'
+        tool-batch drain points (agent/tool_executor.py) are never reached and
+        a /steer would strand in ``_pending_steer`` until the turn finalizer
+        handed it back — where the gateway only redelivers it if no other
+        message is queued. Steers were therefore silently lost.
+
+        ``ClaudeSDKClient.query()`` is documented as "send a new request in
+        streaming mode", and we already connect in streaming mode (``connect()``
+        with no prompt), so a second query() on the LIVE session is the SDK's
+        own steering contract — not an interrupt and not a session restart,
+        which is what the claude-cli-live transport has to do.
+
+        Verified 2026-08-15 against SDK 0.2.120: a query() issued while a tool
+        call was in flight did not raise and was honored at the next turn
+        boundary ~3s later. Note it also produces a SECOND ResultMessage once
+        the superseded work unwinds; that arrives unclaimed and is handled by
+        the existing unsolicited-result path (``_on_unsolicited_result``), so
+        ``deliver_background_results`` is load-bearing here.
+
+        Returns True only when the steer was actually scheduled onto a live
+        turn. False means "not applicable" — the caller must fall back to the
+        ordinary pending-steer stash. Crucially this is never both: returning
+        True suppresses the stash, so a steer cannot be delivered twice.
+        """
+        if not text or not text.strip():
+            return False
+        # No claimed turn means there is nothing to steer INTO. Sending anyway
+        # would open a fresh unclaimed turn on this session whose output the
+        # reader routes to the unsolicited path — a reply appearing from
+        # nowhere. Decline instead and let the caller queue it normally.
+        if self._turn_inbox is None:
+            return False
+        client = self._client
+        loop = self._loop
+        if client is None or loop is None:
+            return False
+        cleaned = text.strip()
+        try:
+            future = asyncio.run_coroutine_threadsafe(client.query(cleaned), loop)
+            future.add_done_callback(_swallow_steer_result)
+        except Exception:
+            logger.debug("SDK steer scheduling failed", exc_info=True)
+            return False
+        logger.info(
+            "claude-agent-sdk: steered live turn via streaming input (%d chars)",
+            len(cleaned),
+        )
+        return True
 
     # ---------- per-turn ----------
 
@@ -1799,7 +1861,7 @@ class ClaudeAgentSdkSession:
             # but turns ordinary inspection into approval-card noise. Keep the
             # protected-path-aware MCP tool and disallow only the duplicate
             # native tool; Bash and all write-capable native tools are unchanged.
-            "disallowed_tools": ["AskUserQuestion", "Read"],
+            "disallowed_tools": ["AskUserQuestion"],
         }
         if self._resume_session_id:
             fields["resume"] = self._resume_session_id
