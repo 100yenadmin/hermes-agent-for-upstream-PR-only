@@ -884,13 +884,27 @@ def run_claude_agent_sdk_turn(
         def _relay_stream_delta(text: str) -> None:
             # Late-bound: the gateway assigns stream_delta_callback per turn
             # AFTER the session exists (and clears it between turns).
-            callback = getattr(agent, "stream_delta_callback", None)
-            if callback is None:
-                return
-            try:
-                callback(text)
-            except Exception:
-                logger.debug("stream delta relay raised", exc_info=True)
+            # Fan out to BOTH display sinks, mirroring the native runtimes
+            # (run_agent.py: [self.stream_delta_callback, self._stream_callback]).
+            # `stream_delta_callback` is the CLI/TUI sink. `_stream_callback` is
+            # the one the JSON-RPC gateway installs via run_conversation's
+            # `stream_callback=` kwarg, and that is the sink the DESKTOP listens
+            # on (it feeds the `message.delta` notification). Relaying only to
+            # the first meant the desktop never streamed on this runtime, no
+            # matter how the operator set display.streaming.
+            callbacks = [
+                cb
+                for cb in (
+                    getattr(agent, "stream_delta_callback", None),
+                    getattr(agent, "_stream_callback", None),
+                )
+                if cb is not None
+            ]
+            for cb in callbacks:
+                try:
+                    cb(text)
+                except Exception:
+                    logger.debug("stream delta relay raised", exc_info=True)
 
         append = build_system_prompt_append(
             platform=getattr(agent, "platform", None),
