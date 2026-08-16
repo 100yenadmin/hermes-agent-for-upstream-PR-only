@@ -714,6 +714,7 @@ class ClaudeAgentSdkSession:
         on_interim_assistant: Optional[Callable[[str], None]] = None,
         on_tool_iteration: Optional[Callable[[], None]] = None,
         on_unsolicited_result: Optional[Callable[[list[str]], None]] = None,
+        on_compaction: Optional[Callable[[str], None]] = None,
         # Hybrid MCP bridge (ported from PR #56413): the explicit config
         # opt-in plus both `agent` and `tools` activate in-process servers
         # exposing the full Hermes registry (including proxified third-party
@@ -735,6 +736,7 @@ class ClaudeAgentSdkSession:
         self._system_prompt_append = system_prompt_append
         self._approval_callback = approval_callback
         self._on_tool_started = on_tool_started
+        self._on_compaction = on_compaction
         self._max_budget_usd = max_budget_usd
         self._client_factory = client_factory  # test seam
         self._include_hermes_tools = include_hermes_tools
@@ -883,6 +885,36 @@ class ClaudeAgentSdkSession:
 
     def __exit__(self, *exc: Any) -> None:
         self.close()
+
+    # ---------- compaction ----------
+
+    def _build_compaction_hooks(self) -> Optional[dict]:
+        """PreCompact -> on_compaction(trigger), or None when unwired.
+
+        ``trigger`` is the SDK's own literal: "auto" for the CLI's automatic
+        compaction (the one that silently stalls a turn) or "manual" for an
+        explicit /compact. The callback is best-effort: it must never fail the
+        hook, because refusing a hook can block the compaction itself.
+        """
+        if self._on_compaction is None:
+            return None
+        try:
+            from claude_agent_sdk import HookMatcher
+        except Exception:  # pragma: no cover - SDK predates hooks
+            logger.debug("claude-agent-sdk: HookMatcher unavailable", exc_info=True)
+            return None
+
+        async def _on_pre_compact(input_data, tool_use_id, context):
+            try:
+                trigger = ""
+                if isinstance(input_data, dict):
+                    trigger = str(input_data.get("trigger") or "")
+                self._on_compaction(trigger or "auto")
+            except Exception:
+                logger.debug("compaction status callback failed", exc_info=True)
+            return {}
+
+        return {"PreCompact": [HookMatcher(hooks=[_on_pre_compact])]}
 
     # ---------- context usage ----------
 
@@ -1904,6 +1936,12 @@ class ClaudeAgentSdkSession:
             # native tool; Bash and all write-capable native tools are unchanged.
             "disallowed_tools": ["AskUserQuestion"],
         }
+        # The CLI owns compaction on this lane, so its PreCompact hook is the
+        # only honest signal that a turn stalled to compact. Registered only
+        # when a consumer asked for it, so the default option set is unchanged.
+        _compaction_hooks = self._build_compaction_hooks()
+        if _compaction_hooks is not None:
+            fields["hooks"] = _compaction_hooks
         if self._resume_session_id:
             fields["resume"] = self._resume_session_id
         # Default OFF (upstream-conservative): partial messages only when the

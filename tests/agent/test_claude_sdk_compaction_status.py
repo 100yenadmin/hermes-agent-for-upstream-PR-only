@@ -1,0 +1,79 @@
+"""The CLI's own compaction must be visible on the claude-agent-sdk lane.
+
+Hermes never compacts here (the CLI owns context), so a turn can stall for a
+compaction with nothing to show for it. The SDK's PreCompact hook is the only
+honest signal, and it must surface through the SHARED status wording -- the
+gateway's noise filter is built from those same template constants (#69550),
+so a re-inlined string would be silently dropped on chat surfaces.
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS
+from agent.transports import claude_agent_sdk_session as M
+
+
+def _session(on_compaction):
+    s = M.ClaudeAgentSdkSession.__new__(M.ClaudeAgentSdkSession)
+    s._on_compaction = on_compaction
+    return s
+
+
+def test_no_hooks_registered_when_unwired():
+    """Default option set must be unchanged for callers that don't want this."""
+    assert _session(None)._build_compaction_hooks() is None
+
+
+def test_registers_a_precompact_hook_when_wired():
+    hooks = _session(lambda trigger: None)._build_compaction_hooks()
+
+    assert hooks is not None
+    assert set(hooks) == {"PreCompact"}
+    matchers = hooks["PreCompact"]
+    assert len(matchers) == 1
+    assert len(matchers[0].hooks) == 1
+
+
+@pytest.mark.parametrize("trigger", ["auto", "manual"])
+def test_hook_forwards_the_sdk_trigger_verbatim(trigger):
+    seen = []
+    hooks = _session(seen.append)._build_compaction_hooks()
+    callback = hooks["PreCompact"][0].hooks[0]
+
+    result = asyncio.run(callback({"trigger": trigger}, None, {"signal": None}))
+
+    assert seen == [trigger]
+    assert result == {}
+
+
+def test_missing_trigger_defaults_to_auto():
+    """A payload without `trigger` is still a real compaction — announce it."""
+    seen = []
+    hooks = _session(seen.append)._build_compaction_hooks()
+    callback = hooks["PreCompact"][0].hooks[0]
+
+    asyncio.run(callback({}, None, {"signal": None}))
+
+    assert seen == ["auto"]
+
+
+def test_a_raising_callback_never_fails_the_hook():
+    """Refusing a hook can block the compaction itself — always return {}."""
+
+    def _boom(trigger):
+        raise RuntimeError("status pipeline down")
+
+    hooks = _session(_boom)._build_compaction_hooks()
+    callback = hooks["PreCompact"][0].hooks[0]
+
+    assert asyncio.run(callback({"trigger": "auto"}, None, {"signal": None})) == {}
+
+
+def test_status_wording_is_single_sourced():
+    """Pin the reuse: these are the constants the gateway filter is built from."""
+    assert "Compacting context" in COMPACTION_STATUS
+    assert "compaction complete" in COMPACTION_DONE_STATUS.lower()

@@ -890,6 +890,30 @@ def run_claude_agent_sdk_turn(
 
             on_unsolicited_result = _deliver_background_result
 
+        def _on_compaction(trigger: str) -> None:
+            """CLI is compacting — surface it with the SHARED status wording.
+
+            Reuses conversation_compression's constants rather than inventing a
+            second vocabulary: the gateway's noise filter is built from those
+            same templates (#69550), so a re-inlined string would be silently
+            dropped on chat surfaces.
+
+            A manual /compact is the user's own action and already has its own
+            feedback, so only the automatic case is announced -- that is the one
+            that stalls a turn with no explanation.
+            """
+            if str(trigger).strip().lower() == "manual":
+                return
+            try:
+                from agent.conversation_compression import COMPACTION_STATUS
+
+                agent._sdk_compaction_pending = True
+                emit = getattr(agent, "_emit_status", None)
+                if callable(emit):
+                    emit(COMPACTION_STATUS)
+            except Exception:
+                logger.debug("failed to emit CLI compaction status", exc_info=True)
+
         agent._claude_sdk_session = ClaudeAgentSdkSession(
             cwd=cwd,
             model=getattr(agent, "model", None) or None,
@@ -902,6 +926,7 @@ def run_claude_agent_sdk_turn(
             on_interim_assistant=on_interim_assistant,
             on_tool_iteration=on_tool_iteration,
             on_unsolicited_result=on_unsolicited_result,
+            on_compaction=_on_compaction,
             # Operator budget cap (agent.claude_agent_sdk.max_budget_usd);
             # None = no budget. Read per session creation so a config edit
             # applies on the next session, same as the append snapshot.
@@ -1067,6 +1092,19 @@ def run_claude_agent_sdk_turn(
                 resumed = False
                 continue
         break
+
+    # Close the compaction status opened by the PreCompact hook. The CLI cannot
+    # produce a turn result without finishing a compaction it started, so a
+    # completed turn IS the terminal edge -- no second event needed. Uses the
+    # shared _emit_compaction_done so the wording stays single-sourced.
+    if getattr(agent, "_sdk_compaction_pending", False):
+        agent._sdk_compaction_pending = False
+        try:
+            from agent.conversation_compression import _emit_compaction_done
+
+            _emit_compaction_done(agent)
+        except Exception:
+            logger.debug("failed to emit CLI compaction completion", exc_info=True)
 
     # Interrupt handoff (codex_runtime parity, its ~739-746): capture BEFORE
     # the consume below zeroes the agent flag — the result dict needs it, and
