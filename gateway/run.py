@@ -18951,6 +18951,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 # deliberately stale for every real gateway surface.
                                 _hyg_agent.platform = _GATEWAY_HYGIENE_PLATFORM
                                 _hyg_cleanup_deferred = False
+                                _hyg_rotated = False
+                                _hyg_in_place = False
                                 try:
                                     # Gateway hygiene runs before the user turn
                                     # starts and already owns the session binding.
@@ -19390,7 +19392,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # Evict the cached agent so the next turn
                                     # rebuilds its system prompt from current
                                     # SOUL.md, memory, and skills.
-                                    self._evict_cached_agent(session_key)
+                                    #
+                                    # ONLY when compression actually changed the
+                                    # transcript. A no-op compression still costs
+                                    # a full eviction: release_clients() drops the
+                                    # agent's provider session, and on the
+                                    # claude-agent-sdk lane that discards the CLI's
+                                    # prompt cache, so the next turn re-writes the
+                                    # entire prefix to rebuild a prompt that did
+                                    # not change. That lane skips Hermes compaction
+                                    # by design (conversation_compression, "CLI
+                                    # owns context"), so hygiene no-ops every cycle
+                                    # and the eviction was pure waste.
+                                    if _hyg_rotated or _hyg_in_place:
+                                        self._evict_cached_agent(session_key)
                                     if not _hyg_cleanup_deferred:
                                         await self._cleanup_agent_resources_off_loop(
                                             _hyg_agent, context="session hygiene"
