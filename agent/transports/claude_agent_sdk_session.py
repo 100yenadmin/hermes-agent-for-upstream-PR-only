@@ -774,6 +774,7 @@ class ClaudeAgentSdkSession:
         on_tool_iteration: Optional[Callable[[], None]] = None,
         on_unsolicited_result: Optional[Callable[[list[str]], None]] = None,
         on_compaction: Optional[Callable[[str], None]] = None,
+        on_compact_boundary: Optional[Callable[[str], None]] = None,
         # Hybrid MCP bridge (ported from PR #56413): the explicit config
         # opt-in plus both `agent` and `tools` activate in-process servers
         # exposing the full Hermes registry (including proxified third-party
@@ -796,6 +797,7 @@ class ClaudeAgentSdkSession:
         self._approval_callback = approval_callback
         self._on_tool_started = on_tool_started
         self._on_compaction = on_compaction
+        self._on_compact_boundary = on_compact_boundary
         self._max_budget_usd = max_budget_usd
         self._client_factory = client_factory  # test seam
         self._include_hermes_tools = include_hermes_tools
@@ -974,6 +976,57 @@ class ClaudeAgentSdkSession:
             return {}
 
         return {"PreCompact": [HookMatcher(hooks=[_on_pre_compact])]}
+
+    def _handle_compact_boundary(self, message: Any) -> None:
+        """compact_boundary -> on_compact_boundary(trigger): compaction FINISHED.
+
+        The SDK exposes ``PreCompact`` as a hook but has no post-side
+        counterpart, which is why the completion edge was originally deferred to
+        the end of the turn. That was wrong: the CLI *does* announce completion,
+        as a plain ``system`` message with ``subtype="compact_boundary"``, and
+        the SDK's parser passes unknown subtypes through its generic fallback,
+        so it arrives on the normal message stream mid-turn.
+
+        The distinction is not cosmetic. Emitting at turn end put the notice in
+        the one place it could never be seen: non-durable statuses are deleted
+        by end-of-turn progress cleanup, so it was created and destroyed in the
+        same instant (measured 2026-08-16 -- boundary at 07:41:16, deferred emit
+        at 07:42:17, 61s late and invisible). Firing here restores the native
+        contract every other provider already follows -- notice right after
+        compaction, cleaned up with the rest of the turn's progress -- and makes
+        COMPACTION_DONE_STATUS's "continuing turn" literally true again.
+
+        Best-effort by construction: a raising callback must not break the turn
+        that is still streaming.
+        """
+        if (
+            type(message).__name__ != "SystemMessage"
+            or getattr(message, "subtype", "") != "compact_boundary"
+        ):
+            return
+        data = getattr(message, "data", None)
+        metadata = None
+        if isinstance(data, dict):
+            # The SDK hands this over snake_cased ("compact_metadata", observed
+            # in production 2026-08-16); the CLI's own transcript writes the
+            # camelCase original. Accept both so the trigger stays accurate if
+            # the normalization changes -- an unreadable trigger is not fatal
+            # (it falls back to "auto"), just less honest.
+            metadata = data.get("compact_metadata") or data.get("compactMetadata")
+        trigger = ""
+        if isinstance(metadata, dict):
+            trigger = str(metadata.get("trigger") or "")
+        logger.info(
+            "claude-agent-sdk compact_boundary: session=%s trigger=%s",
+            getattr(message, "session_id", None) or self._session_id or "none",
+            trigger or "unknown",
+        )
+        if self._on_compact_boundary is None:
+            return
+        try:
+            self._on_compact_boundary(trigger or "auto")
+        except Exception:
+            logger.debug("compact_boundary callback failed", exc_info=True)
 
     # ---------- context usage ----------
 
@@ -1438,6 +1491,7 @@ class ClaudeAgentSdkSession:
                 early_sid = getattr(message, "session_id", None)
                 if early_sid:
                     self._session_id = early_sid
+                self._handle_compact_boundary(message)
                 if self._interrupt_event.is_set():
                     # Previously `break`. Bailing out before this turn's
                     # ResultMessage orphaned it in the shared stream, and the

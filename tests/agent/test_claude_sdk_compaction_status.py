@@ -121,3 +121,106 @@ def test_missing_callback_is_logged_not_silent(caplog):
 # which cannot be exercised without standing up a full turn. It is deliberately
 # left to production verification rather than covered by a source-text grep --
 # a test that asserts on source is not evidence the line ever runs.
+
+
+# ── Completion edge: compact_boundary ───────────────────────────────────────
+# The SDK has no PostCompact hook, so the completion edge was originally
+# deferred to the end of the turn. That put it exactly where end-of-turn
+# progress cleanup deletes non-durable statuses -- emitted and destroyed in the
+# same instant. The CLI does announce completion, as a `system` message with
+# subtype `compact_boundary` that the SDK's generic subtype fallback passes
+# through mid-turn. Measured 2026-08-16: boundary at 07:41:16, deferred emit at
+# 07:42:17 -- 61s late and invisible.
+
+
+class SystemMessage:
+    """Stands in for the SDK's SystemMessage.
+
+    The handler dispatches on ``type(message).__name__`` rather than isinstance
+    (the SDK is an optional import), so this class must genuinely BE named
+    SystemMessage -- that name is the contract under test.
+    """
+
+    def __init__(self, subtype, data=None, session_id="sess-1"):
+        self.subtype = subtype
+        self.data = data
+        self.session_id = session_id
+
+
+def _boundary_session(on_compact_boundary):
+    s = M.ClaudeAgentSdkSession.__new__(M.ClaudeAgentSdkSession)
+    s._on_compact_boundary = on_compact_boundary
+    s._session_id = "sess-1"
+    return s
+
+
+def _boundary(trigger="auto"):
+    return SystemMessage(
+        "compact_boundary",
+        {"compact_metadata": {"trigger": trigger, "preTokens": 697652}},
+    )
+
+
+def test_boundary_fires_the_completion_callback():
+    seen = []
+    _boundary_session(seen.append)._handle_compact_boundary(_boundary("auto"))
+    assert seen == ["auto"]
+
+
+def test_boundary_forwards_the_manual_trigger():
+    """The runtime decides what to announce; the transport reports the truth."""
+    seen = []
+    _boundary_session(seen.append)._handle_compact_boundary(_boundary("manual"))
+    assert seen == ["manual"]
+
+
+def test_boundary_without_metadata_defaults_to_auto():
+    seen = []
+    msg = SystemMessage("compact_boundary", {})
+    _boundary_session(seen.append)._handle_compact_boundary(msg)
+    assert seen == ["auto"]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        SystemMessage("init", {}),
+        SystemMessage("task_started", {}),
+    ],
+)
+def test_other_system_subtypes_are_ignored(message):
+    seen = []
+    _boundary_session(seen.append)._handle_compact_boundary(message)
+    assert seen == []
+
+
+def test_non_system_messages_are_ignored():
+    class ResultMessage:
+        subtype = "compact_boundary"  # right subtype, wrong message type
+        data = {}
+
+    seen = []
+    _boundary_session(seen.append)._handle_compact_boundary(ResultMessage())
+    assert seen == []
+
+
+def test_unwired_boundary_callback_is_safe():
+    """No callback wired must not raise on the live message path."""
+    _boundary_session(None)._handle_compact_boundary(_boundary())
+
+
+def test_a_raising_boundary_callback_never_breaks_the_turn():
+    """This runs inside the message loop of a turn that is still streaming."""
+
+    def _boom(trigger):
+        raise RuntimeError("status pipeline down")
+
+    _boundary_session(_boom)._handle_compact_boundary(_boundary())
+
+
+def test_boundary_is_logged(caplog):
+    with caplog.at_level("INFO", logger="agent.transports.claude_agent_sdk_session"):
+        _boundary_session(None)._handle_compact_boundary(_boundary("auto"))
+
+    assert "compact_boundary" in caplog.text
+    assert "trigger=auto" in caplog.text

@@ -100,6 +100,20 @@ rather than trusting its name.
 assume.** This is the single most misleading default on the lane: it makes
 autocompaction look broken at 600–700k when it is simply not due yet.
 
+**Shrinking the window desynchronises Hermes' own sizing.** Hermes resolves
+`context_length` from model metadata (`claude-opus-5` → 1,000,000), which is not
+what the CLI is running with once this knob is set. The runtime footer read
+**16% while the CLI was at 53%** of its real window and one turn from
+autocompacting; because compaction fires at 267,000 against a denominator of
+1,000,000, the gauge could never have exceeded ~27% — the whole scale squashed
+into its bottom quarter. Gateway session hygiene sizes off the same value.
+
+`_sync_context_length_from_cli()` corrects it from `context_usage()["maxTokens"]`
+once per session (the value is fixed at spawn, and the query is a real
+round-trip to the child). The compressor's `context_length` setter invalidates
+the derived budgets, so the threshold follows the window rather than stranding a
+threshold above `maxTokens` that can never be reached.
+
 Lowering the window is a real trade. Measured on a live session, dropping to
 300k moved `cache_read` from 678,625 to 36,516 per request. But 36k is the
 *post-compaction floor*, climbing back toward the threshold — the honest
@@ -159,8 +173,9 @@ That merge lives in a module-level function rather than inline in
 ## 6. Compaction visibility
 
 Because Hermes does not compact here, a turn can stall for two minutes inside a
-CLI compaction with nothing to show the user. The SDK's `PreCompact` hook is the
-only honest signal.
+CLI compaction with nothing to show the user. Two signals bracket it: the SDK's
+`PreCompact` hook on the way in, and the CLI's `compact_boundary` stream message
+on the way out.
 
 `_build_compaction_hooks()` registers it **only when `on_compaction` is wired**,
 so the default option set is unchanged for callers that do not want it. The hook:
@@ -174,9 +189,30 @@ so the default option set is unchanged for callers that do not want it. The hook
   Telegram noise filter is **built from those same constants**, so a re-inlined
   string is silently dropped on chat surfaces.
 
-The completion edge fires after the turn loop breaks — a completed turn is the
-terminal edge, since the CLI cannot produce a result without finishing a
-compaction it started.
+**The completion edge is a stream message, not a hook.** The SDK offers no
+`PostCompact`, which originally led to firing the completion at the end of the
+turn — "a completed turn is the terminal edge". That reasoning is sound and the
+result was still useless: end-of-turn is exactly where progress cleanup deletes
+the message, so the notice was created and destroyed in the same instant.
+
+The CLI does announce completion, as a plain `system` message with
+`subtype="compact_boundary"` carrying `compact_metadata` (`trigger`,
+`preTokens`, `durationMs`). The SDK's message parser routes unknown subtypes
+through a generic `SystemMessage` fallback, so it arrives on the ordinary
+message stream mid-turn. `_handle_compact_boundary()` fires the completion
+there. Measured 2026-08-16: boundary at 07:41:16 vs the deferred emit at
+07:42:17 — **61 seconds late, and invisible**.
+
+The end-of-turn emit survives as a fallback for a CLI that stops streaming the
+boundary; whichever fires first clears `_sdk_compaction_pending`, so the notice
+is emitted exactly once.
+
+> **Do not "fix" an invisible notice by making its status durable.** Cleanup is
+> not the bug — every other provider's compaction runs mid-turn, so the notice
+> is naturally visible for the rest of the turn and cleaned up with the other
+> progress messages. Only one event type is durable (`fallback`,
+> `_status_event_is_durable` in `gateway/run.py`). Diverging here would leave a
+> permanent bubble per compaction on one lane and paper over the wrong edge.
 
 On chat surfaces these are gated behind `compression.progress_notices: true`.
 
@@ -226,7 +262,8 @@ evidence.
 | Idle `claude` subprocesses accumulating | Orphan reap (§4) and cache displacement (§7) |
 | Context never compacts | `context_usage()` — the default threshold is 967,000, not 80% |
 | Compaction knob has no effect | It is probably inert (§3); confirm with `context_usage()` |
-| Notice never appeared | `compression.progress_notices`; confirm wording is single-sourced (§6) |
+| Notice never appeared | `compression.progress_notices`; then grep `compact_boundary` — a notice emitted at turn end is deleted by cleanup (§6) |
+| Footer % looks far too low | `context_usage()["maxTokens"]` vs `context_compressor.context_length` (§3) |
 | Cache-write cost per turn | Hygiene should be skipped on this lane (§2) |
 
 ---
@@ -237,11 +274,19 @@ evidence.
 |---|---|
 | `tests/agent/test_claude_sdk_child_reap.py` | Disconnect timeout, PID-reuse guard, zombie handling |
 | `tests/agent/test_claude_sdk_context_usage.py` | CLI ground-truth context reporting |
-| `tests/agent/test_claude_sdk_compaction_status.py` | PreCompact hook, trigger forwarding, status single-sourcing, emit logging |
+| `tests/agent/test_claude_sdk_compaction_status.py` | PreCompact hook, trigger forwarding, status single-sourcing, emit logging, compact_boundary completion edge |
+| `tests/agent/test_claude_sdk_context_length.py` | CLI `maxTokens` overriding metadata, per-session caching, degradation |
 | `tests/agent/test_claude_sdk_configured_env.py` | `env` passthrough, stringification, metered-denylist guard |
 | `tests/gateway/test_agent_cache_displacement.py` | Displaced-agent release, mid-turn protection |
 
-**Known gap:** the compaction *start* log sits in a closure inside
+**Known gap:** the compaction *start* and *completion* closures both sit inside
 `run_claude_agent_sdk_turn()` and cannot be exercised without standing up a full
-turn. It is left to production verification rather than covered by a source-text
-assertion, which would claim coverage without evidence the line ever runs.
+turn. The transport-side halves they depend on (`_build_compaction_hooks`,
+`_handle_compact_boundary`) are covered directly; the closures themselves are
+left to production verification rather than covered by a source-text assertion,
+which would claim coverage without evidence the line ever runs.
+
+**Pre-existing, unrelated:** `tests/agent/test_auxiliary_client.py` fails to
+import (`_resolve_auto` was renamed `_resolve_auto_route`), which aborts
+collection for any run that includes it. Pass
+`--ignore=tests/agent/test_auxiliary_client.py` to get a signal from the rest.

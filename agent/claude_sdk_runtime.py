@@ -364,6 +364,63 @@ def _sdk_context_prompt_tokens(usage: dict, fallback: int) -> int:
     return total or fallback
 
 
+def _sync_context_length_from_cli(agent: Any) -> None:
+    """Point the compressor's context_length at the CLI's REAL window.
+
+    Hermes sizes context from model metadata -- 1,000,000 for claude-opus-5 --
+    but on this lane the window is whatever the spawned CLI is actually running
+    with, and ``agent.claude_agent_sdk.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW`` can
+    cut that to a fraction. Measured 2026-08-16 with the window at 300,000: the
+    runtime footer read 16% while the CLI sat at 53% of its real window, one
+    turn from autocompacting. The gauge could never have read above ~27%,
+    because compaction fires at 267k of a denominator of 1,000,000 -- so the
+    whole scale was squashed into its bottom quarter. Gateway session hygiene
+    sizes off the same value.
+
+    ``maxTokens`` is fixed when the CLI is spawned, so this is queried once per
+    session and cached -- ``context_usage()`` is a real round-trip to the child.
+    The attempt is cached on failure too: retrying every turn would spend up to
+    the query timeout on the turn path to re-learn the same unavailability.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    session = getattr(agent, "_claude_sdk_session", None)
+    if compressor is None or session is None:
+        return
+    if getattr(agent, "_sdk_ctxlen_synced_for", None) is session:
+        return
+    agent._sdk_ctxlen_synced_for = session
+
+    usage = None
+    try:
+        usage = session.context_usage()
+    except Exception:
+        logger.debug("claude-sdk context-length sync failed", exc_info=True)
+    max_tokens = 0
+    if isinstance(usage, dict):
+        max_tokens = _coerce_usage_int(usage.get("maxTokens"))
+    if max_tokens <= 0:
+        logger.debug(
+            "claude-sdk context length: CLI did not report maxTokens; keeping "
+            "the model-metadata value (%s)",
+            getattr(compressor, "context_length", None),
+        )
+        return
+
+    previous = getattr(compressor, "context_length", 0) or 0
+    if previous == max_tokens:
+        return
+    try:
+        compressor.context_length = max_tokens
+    except Exception:
+        logger.debug("claude-sdk context-length assignment failed", exc_info=True)
+        return
+    logger.info(
+        "claude-sdk context length: %d (CLI maxTokens) replaces %d "
+        "(model metadata) for footer and hygiene sizing",
+        max_tokens, previous,
+    )
+
+
 def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, bool):
         return 0
@@ -456,6 +513,11 @@ def _record_claude_sdk_usage(agent, turn) -> dict[str, Any]:
 
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:
+        # BEFORE update_from_response, which compares last_prompt_tokens against
+        # threshold_tokens: the setter invalidates the derived budgets, so
+        # syncing first means even the first turn's compression decision is
+        # taken against the CLI's real window rather than the metadata one.
+        _sync_context_length_from_cli(agent)
         try:
             compressor_usage = dict(usage_dict)
             compressor_usage["prompt_tokens"] = context_prompt_tokens
@@ -921,6 +983,30 @@ def run_claude_agent_sdk_turn(
             except Exception:
                 logger.debug("failed to emit CLI compaction status", exc_info=True)
 
+        def _on_compact_boundary(trigger: str) -> None:
+            """Compaction finished — close the status the PreCompact hook opened.
+
+            This is the real terminal edge, mid-turn, ~1 minute before the turn
+            ends. The end-of-turn emit below is now only a fallback for a CLI
+            that stops streaming compact_boundary; whichever fires first clears
+            the pending flag, so the notice is emitted exactly once.
+
+            Guarded on the pending flag rather than emitted unconditionally: a
+            manual /compact is never announced on the start side, and announcing
+            only its completion would be a notice for an event the user was
+            never told had begun.
+            """
+            if not getattr(agent, "_sdk_compaction_pending", False):
+                return
+            agent._sdk_compaction_pending = False
+            try:
+                from agent.conversation_compression import _emit_compaction_done
+
+                logger.info("CLI compaction finished (trigger=%s)", trigger)
+                _emit_compaction_done(agent)
+            except Exception:
+                logger.debug("failed to emit CLI compaction completion", exc_info=True)
+
         agent._claude_sdk_session = ClaudeAgentSdkSession(
             cwd=cwd,
             model=getattr(agent, "model", None) or None,
@@ -934,6 +1020,7 @@ def run_claude_agent_sdk_turn(
             on_tool_iteration=on_tool_iteration,
             on_unsolicited_result=on_unsolicited_result,
             on_compaction=_on_compaction,
+            on_compact_boundary=_on_compact_boundary,
             # Operator budget cap (agent.claude_agent_sdk.max_budget_usd);
             # None = no budget. Read per session creation so a config edit
             # applies on the next session, same as the append snapshot.
@@ -1111,15 +1198,25 @@ def run_claude_agent_sdk_turn(
                 continue
         break
 
-    # Close the compaction status opened by the PreCompact hook. The CLI cannot
-    # produce a turn result without finishing a compaction it started, so a
-    # completed turn IS the terminal edge -- no second event needed. Uses the
-    # shared _emit_compaction_done so the wording stays single-sourced.
+    # FALLBACK ONLY. _on_compact_boundary above is the real terminal edge and
+    # normally clears the flag mid-turn; reaching here means the CLI started a
+    # compaction and never streamed its compact_boundary (older/newer CLI, or a
+    # turn that died mid-compaction). A completed turn still proves the
+    # compaction ended, so this closes the dangling status rather than leaving
+    # "🗜️ Compacting..." as the user's last word from the turn.
+    #
+    # Do NOT promote this back to the primary path: end-of-turn is exactly where
+    # end-of-turn progress cleanup deletes the message, so the notice is emitted
+    # and destroyed in the same instant (see _handle_compact_boundary).
     if getattr(agent, "_sdk_compaction_pending", False):
         agent._sdk_compaction_pending = False
         try:
             from agent.conversation_compression import _emit_compaction_done
 
+            logger.info(
+                "CLI compaction: no compact_boundary seen; emitting completion "
+                "at turn end (fallback)"
+            )
             _emit_compaction_done(agent)
         except Exception:
             logger.debug("failed to emit CLI compaction completion", exc_info=True)
