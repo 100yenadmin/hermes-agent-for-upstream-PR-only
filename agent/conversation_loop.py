@@ -782,10 +782,12 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     #      seed on every turn instead of once per session.
     #
     # Gated on `conversation_history` so a genuine first turn still takes the
-    # full path (hook + credits seed). The snapshot is still persisted, keeping
-    # an audit fallback if the runtime's own overwrite fails. Reuse is
-    # deliberately NOT attempted: the sentinel is not a native prompt and must
-    # never become _cached_system_prompt.
+    # full path (hook + credits seed). Reuse is deliberately NOT attempted: the
+    # sentinel is not a native prompt and must never become
+    # _cached_system_prompt. Equally important, the freshly built native prompt
+    # is NOT written back here: a long-lived SDK session does not re-enter the
+    # runtime's session-creation path, so that write would permanently replace
+    # the effective-prompt audit snapshot after turn one.
     if conversation_history and getattr(agent, "api_mode", None) == "claude_agent_sdk":
         logger.debug(
             "claude-agent-sdk lane: skipping stored-prompt reuse for session %s "
@@ -793,16 +795,6 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             agent.session_id,
         )
         agent._cached_system_prompt = agent._build_system_prompt(system_message)
-        if agent._session_db:
-            try:
-                agent._session_db.update_system_prompt(
-                    agent.session_id, agent._cached_system_prompt
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Session DB update_system_prompt failed for session %s: %s.",
-                    agent.session_id, exc,
-                )
         return
 
     stored_prompt = None

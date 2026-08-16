@@ -103,3 +103,18 @@ def test_metered_opt_in_permits_the_key(env_config):
     env_config(env={"ANTHROPIC_API_KEY": "sk-ant-metered"}, metered_allowed=True)
 
     assert M._sdk_env_overrides()["ANTHROPIC_API_KEY"] == "sk-ant-metered"
+
+
+def test_subscription_shaped_anthropic_token_is_preserved(env_config, monkeypatch):
+    """ANTHROPIC_TOKEN is shared by metered and setup-token flows in Hermes."""
+    monkeypatch.setattr(M, "_is_subscription_oauth_token", lambda value: True)
+    env_config(env={"ANTHROPIC_TOKEN": "oauth-token"}, metered_allowed=False)
+
+    assert M._sdk_env_overrides()["ANTHROPIC_TOKEN"] == "oauth-token"
+
+
+def test_metered_anthropic_token_is_scrubbed_from_parent(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_TOKEN", "metered-token")
+    monkeypatch.setattr(M, "_is_subscription_oauth_token", lambda value: False)
+
+    assert M._scrubbed_sdk_env()["ANTHROPIC_TOKEN"] == ""

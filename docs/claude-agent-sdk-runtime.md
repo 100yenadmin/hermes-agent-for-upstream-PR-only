@@ -151,8 +151,8 @@ is **25.0s** for exactly this reason: a shorter timeout than the SDK's internal
 ~20s ladder abandons the child mid-shutdown and strands a ~260 MB process that
 GC can never reap.
 
-If disconnect still fails, teardown escalates: `SIGTERM` → 5s → `SIGKILL`. Two
-guards apply before any signal:
+If disconnect still fails, teardown uses psutil's cross-platform ladder:
+`terminate()` → 5s → `kill()`. Two guards apply before either operation:
 
 - `_is_own_sdk_child(pid)` — the PID must be a live child of *this* process.
   Guards against PID reuse killing an unrelated process.
@@ -167,9 +167,11 @@ browser, and background processes should survive.
 
 The lane is a subscription lane. `_scrubbed_sdk_env()` blanks every metered
 billing vector present in the parent environment (`ANTHROPIC_API_KEY`,
-`ANTHROPIC_AUTH_TOKEN`, the Bedrock/Vertex switches, AWS credentials,
-`GOOGLE_APPLICATION_CREDENTIALS`). Only keys **actually present** are blanked —
-writing `""` for absent ones can itself confuse credential chains.
+`ANTHROPIC_AUTH_TOKEN`, metered-shaped `ANTHROPIC_TOKEN`, the Bedrock/Vertex
+switches, AWS credentials, `GOOGLE_APPLICATION_CREDENTIALS`). A subscription-
+shaped setup/OAuth `ANTHROPIC_TOKEN` is preserved. Only keys **actually
+present** are blanked — writing `""` for absent ones can itself confuse
+credential chains.
 
 `allow_metered_key: true` is the operator's explicit opt-in and disables the
 scrub, since the documented escape hatch would otherwise hand the CLI a blanked
@@ -299,6 +301,8 @@ evidence.
 | `tests/agent/test_claude_sdk_compaction_status.py` | PreCompact hook, trigger forwarding, status single-sourcing, emit logging, compact_boundary completion edge |
 | `tests/agent/test_claude_sdk_context_length.py` | CLI `maxTokens` overriding metadata, per-session caching, degradation |
 | `tests/agent/test_claude_sdk_configured_env.py` | `env` passthrough, stringification, metered-denylist guard |
+| `tests/agent/test_claude_sdk_aux_routing.py` | Subscription-only one-shot routing, tool isolation, child env scrub, terminal-error handling |
+| `tests/agent/test_system_prompt_restore.py` | Effective SDK prompt snapshot survives continuing turns |
 | `tests/gateway/test_agent_cache_displacement.py` | Displaced-agent release, mid-turn protection |
 
 **Known gap:** the compaction *start* and *completion* closures both sit inside
@@ -307,8 +311,3 @@ turn. The transport-side halves they depend on (`_build_compaction_hooks`,
 `_handle_compact_boundary`) are covered directly; the closures themselves are
 left to production verification rather than covered by a source-text assertion,
 which would claim coverage without evidence the line ever runs.
-
-**Pre-existing, unrelated:** `tests/agent/test_auxiliary_client.py` fails to
-import (`_resolve_auto` was renamed `_resolve_auto_route`), which aborts
-collection for any run that includes it. Pass
-`--ignore=tests/agent/test_auxiliary_client.py` to get a signal from the rest.

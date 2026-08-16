@@ -34,6 +34,8 @@ class TestClaudeAgentSdkDefaults:
         # "" = current behavior: the HERMES_TERMINAL_SECURITY_MODE mapping
         # stands; a non-empty value is an SDK permission_mode literal.
         assert block["permission_mode"] == ""
+        # No child-process environment overrides unless explicitly configured.
+        assert block["env"] == {}
         # [] = full SDK settings isolation; deployments that keep tool
         # grants in ~/.claude/settings.json opt in with e.g. ["user"].
         assert block["setting_sources"] == []
@@ -88,6 +90,7 @@ class TestUserConfigMerge:
         assert block["streaming"] is False
         assert block["allow_metered_key"] is False
         assert block["append_file"] == ""
+        assert block["env"] == {}
         assert set(block) == set(DEFAULT_CONFIG["agent"]["claude_agent_sdk"])
         # The user's own key survives beside the filled-in block.
         assert cfg["agent"]["max_turns"] == 5

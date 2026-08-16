@@ -12,23 +12,16 @@ import asyncio
 import subprocess
 import sys
 import threading
-import time
 
+import psutil
 import pytest
 
 from agent.transports import claude_agent_sdk_session as M
 
 
-def _alive(pid: int) -> bool:
-    """Live (non-zombie) process check."""
-    try:
-        with open(f"/proc/{pid}/status", encoding="utf-8") as fh:
-            state = next(
-                (line.split()[1] for line in fh if line.startswith("State:")), "Z"
-            )
-    except OSError:
-        return False
-    return state != "Z"
+def _alive(proc: subprocess.Popen) -> bool:
+    """Portable live-process check for children owned by this test."""
+    return proc.poll() is None
 
 
 @pytest.fixture
@@ -52,37 +45,56 @@ def test_timeout_budget_exceeds_sdk_close_ladder():
     assert M._SDK_DISCONNECT_TIMEOUT_S > 20.0
 
 
-def test_cooperative_child_dies_on_sigterm(child):
-    proc = child(["sleep", "300"])
-    assert _alive(proc.pid)
+@pytest.mark.live_system_guard_bypass
+def test_cooperative_child_dies_on_terminate(child):
+    proc = child([sys.executable, "-c", "import time; time.sleep(300)"])
+    assert _alive(proc)
 
     M._force_kill_sdk_child(proc.pid)
 
     proc.wait(timeout=5)
-    assert not _alive(proc.pid)
+    assert not _alive(proc)
 
 
-def test_sigterm_ignoring_child_escalates_to_sigkill(child):
-    proc = child([
-        sys.executable,
-        "-c",
-        "import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(300)",
-    ])
-    time.sleep(1.0)  # let the handler install
+def test_uncooperative_child_escalates_after_wait_timeout(monkeypatch):
+    class _StubbornProcess:
+        pid = 123
+        terminated = False
+        killed = False
 
-    started = time.monotonic()
-    M._force_kill_sdk_child(proc.pid)
-    elapsed = time.monotonic() - started
+        def ppid(self):
+            return psutil.Process().pid
 
-    proc.wait(timeout=5)
-    assert not _alive(proc.pid)
-    assert elapsed >= 4.5, "SIGKILL must follow a grace period, not fire immediately"
+        def status(self):
+            return psutil.STATUS_RUNNING
+
+        def terminate(self):
+            self.terminated = True
+
+        def wait(self, timeout):
+            assert timeout == 5.0
+            raise psutil.TimeoutExpired(timeout, pid=123)
+
+        def is_running(self):
+            return True
+
+        def kill(self):
+            self.killed = True
+
+    process = _StubbornProcess()
+    monkeypatch.setattr(M, "_own_sdk_child_process", lambda pid: process)
+
+    M._force_kill_sdk_child(123)
+
+    assert process.terminated is True
+    assert process.killed is True
 
 
+@pytest.mark.live_system_guard_bypass
 def test_never_signals_a_process_that_is_not_our_live_child(child):
-    assert M._is_own_sdk_child(1) is False  # init — never ours
+    assert M._is_own_sdk_child(psutil.Process().pid) is False
 
-    proc = child(["sleep", "300"])
+    proc = child([sys.executable, "-c", "import time; time.sleep(300)"])
     proc.kill()
     proc.wait()
     assert M._is_own_sdk_child(proc.pid) is False  # reaped: pid may be reused
@@ -90,8 +102,9 @@ def test_never_signals_a_process_that_is_not_our_live_child(child):
     assert M._force_kill_sdk_child(None) is None
 
 
+@pytest.mark.live_system_guard_bypass
 def test_close_reaps_child_when_disconnect_hangs(child, monkeypatch):
-    proc = child(["sleep", "300"])
+    proc = child([sys.executable, "-c", "import time; time.sleep(300)"])
 
     class _Process:
         pid = proc.pid
@@ -118,12 +131,12 @@ def test_close_reaps_child_when_disconnect_hangs(child, monkeypatch):
 
     monkeypatch.setattr(M, "_SDK_DISCONNECT_TIMEOUT_S", 1.0)
     assert M._sdk_child_pid(session._client) == proc.pid
-    assert _alive(proc.pid)
+    assert _alive(proc)
 
     session.close()
 
     proc.wait(timeout=5)
-    assert not _alive(proc.pid), "hung disconnect() stranded the CLI child"
+    assert not _alive(proc), "hung disconnect() stranded the CLI child"
     assert session._client is None
 
 

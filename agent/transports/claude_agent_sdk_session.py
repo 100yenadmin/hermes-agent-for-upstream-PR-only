@@ -119,7 +119,7 @@ def _sdk_env_overrides() -> dict[str, str]:
     metered_allowed = _provider_flag("allow_metered_key")
     overrides: dict[str, str] = {} if metered_allowed else _scrubbed_sdk_env()
     for key, value in _configured_sdk_env().items():
-        if not metered_allowed and key in _METERED_ENV_DENYLIST:
+        if not metered_allowed and _is_metered_sdk_env_value(key, value):
             logger.warning(
                 "agent.claude_agent_sdk.env[%s] is a metered billing vector — "
                 "ignoring (set allow_metered_key: true to permit it)",
@@ -604,6 +604,7 @@ def _hermes_repo_root() -> str:
 _METERED_ENV_DENYLIST = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_TOKEN",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "AWS_ACCESS_KEY_ID",
@@ -627,12 +628,31 @@ def _is_subscription_oauth_token(value: str) -> bool:
         return False
 
 
+def _is_metered_sdk_env_value(key: str, value: str) -> bool:
+    """Whether an SDK child env value can switch billing off subscription.
+
+    ``ANTHROPIC_TOKEN`` is ambiguous in Hermes: a setup/OAuth token is the
+    desired subscription credential, while every unrecognised shape is
+    treated as metered.  The other denylisted variables are always metered
+    routing vectors when non-empty.
+    """
+    if key not in _METERED_ENV_DENYLIST or not value:
+        return False
+    if key == "ANTHROPIC_TOKEN":
+        return not _is_subscription_oauth_token(value)
+    return True
+
+
 def _scrubbed_sdk_env() -> dict[str, str]:
     """Empty-string overrides for every metered billing vector currently set
     in the parent environment. Only PRESENT keys are overridden — writing
     ``""`` for absent ones would introduce empty vars the child never had
     (an empty AWS_ACCESS_KEY_ID can itself confuse AWS credential chains)."""
-    return {key: "" for key in _METERED_ENV_DENYLIST if os.environ.get(key)}
+    return {
+        key: ""
+        for key in _METERED_ENV_DENYLIST
+        if _is_metered_sdk_env_value(key, os.environ.get(key, ""))
+    }
 
 
 # The SDK serializes the stdio MCP config — env INCLUDED — into the claude
@@ -932,12 +952,18 @@ class ClaudeAgentSdkSession:
             # loop thread dies below and its shielded reap never finishes, so
             # fall back to killing the child directly.
             pid = _sdk_child_pid(self._client)
+            # Capture the psutil identity before waiting on disconnect. If the
+            # original child exits and its PID is reused during the timeout,
+            # this object will fail psutil's identity check instead of
+            # resolving the reused PID as a fresh kill target.
+            child_process = _own_sdk_child_process(pid) if pid else None
             try:
                 self._run_coro(
                     self._client.disconnect(), timeout=_SDK_DISCONNECT_TIMEOUT_S
                 )
             except Exception:  # pragma: no cover - best-effort cleanup
-                _force_kill_sdk_child(pid)
+                if child_process is not None:
+                    _force_kill_sdk_child(pid, process=child_process)
             self._client = None
         self._stop_loop_thread()
 
@@ -2236,45 +2262,71 @@ def _sdk_child_pid(client: Any) -> Optional[int]:
         return None
 
 
-def _is_own_sdk_child(pid: int) -> bool:
-    """Guard against PID reuse: only reap a LIVE child of THIS process.
+def _own_sdk_child_process(pid: int) -> Any:
+    """Return the live psutil Process when ``pid`` is our direct child.
 
-    A zombie counts as already dead — it holds no RSS and needs no signal.
+    psutil is Hermes' canonical cross-platform PID layer.  Keeping the
+    ``Process`` object also protects the TERM→KILL ladder against PID reuse:
+    psutil checks the process identity before destructive operations.
     """
-    ppid = None
-    state = ""
+    import psutil
+
     try:
-        with open(f"/proc/{pid}/status", encoding="utf-8") as fh:
-            for line in fh:
-                if line.startswith("PPid:"):
-                    ppid = int(line.split()[1])
-                elif line.startswith("State:"):
-                    state = line.split()[1]
-    except (OSError, ValueError, IndexError):
-        return False
-    return ppid == os.getpid() and state != "Z"
+        process = psutil.Process(int(pid))
+        if process.ppid() != os.getpid():
+            return None
+        if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
+            return None
+        return process
+    except (psutil.Error, OSError, TypeError, ValueError):
+        return None
 
 
-def _force_kill_sdk_child(pid: Optional[int]) -> None:
+def _is_own_sdk_child(pid: int) -> bool:
+    """Guard against PID reuse: only reap a live child of this process."""
+    return _own_sdk_child_process(pid) is not None
+
+
+def _force_kill_sdk_child(pid: Optional[int], *, process: Any = None) -> None:
     """Last-resort reap when disconnect() times out and strands the CLI child."""
-    if not pid or not _is_own_sdk_child(pid):
+    if not pid:
         return
-    import signal
+    if process is None:
+        process = _own_sdk_child_process(pid)
+    if process is None:
+        return
+    import psutil
 
     try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        return
-    deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline:
-        time.sleep(0.1)
-        if not _is_own_sdk_child(pid):
-            logger.info("claude-agent-sdk stranded child %s reaped (SIGTERM)", pid)
+        if (
+            int(process.pid) != int(pid)
+            or process.ppid() != os.getpid()
+            or not process.is_running()
+            or process.status() == psutil.STATUS_ZOMBIE
+        ):
             return
+        process.terminate()
+    except (psutil.Error, OSError, TypeError, ValueError):
+        return
     try:
-        os.kill(pid, signal.SIGKILL)
-        logger.warning("claude-agent-sdk stranded child %s required SIGKILL", pid)
-    except OSError:
+        process.wait(timeout=5.0)
+        logger.info("claude-agent-sdk stranded child %s reaped (terminate)", pid)
+        return
+    except psutil.NoSuchProcess:
+        return
+    except psutil.TimeoutExpired:
+        pass
+    except (psutil.Error, OSError):
+        return
+    try:
+        # is_running() performs psutil's identity check, so a reused PID is
+        # never killed as though it were the original CLI child.
+        if process.is_running():
+            process.kill()
+            logger.warning(
+                "claude-agent-sdk stranded child %s required forced kill", pid
+            )
+    except (psutil.NoSuchProcess, psutil.Error, OSError):
         pass
 
 

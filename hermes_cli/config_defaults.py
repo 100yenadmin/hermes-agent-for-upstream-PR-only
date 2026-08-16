@@ -337,6 +337,10 @@ DEFAULT_CONFIG = {
             # approval flow without env archaeology. Invalid values are
             # ignored with a warning (never silently loosened).
             "permission_mode": "",
+            # Extra environment for the spawned Claude CLI. Values are
+            # stringified. Metered-billing vectors are rejected unless
+            # allow_metered_key is explicitly true.
+            "env": {},
             # Per-query USD budget forwarded to the SDK's max_budget_usd:
             # the turn stops with error_max_budget_usd once exceeded
             # (surfaced honestly in the reply). null (the default) = no

@@ -10,11 +10,26 @@ so a re-inlined string would be silently dropped on chat surfaces.
 from __future__ import annotations
 
 import asyncio
+import sys
+from types import ModuleType
 
 import pytest
 
 from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS
 from agent.transports import claude_agent_sdk_session as M
+
+
+@pytest.fixture(autouse=True)
+def _optional_sdk_stand_in(monkeypatch):
+    """Hook tests must not require the optional provider extra in CI."""
+    module = ModuleType("claude_agent_sdk")
+
+    class HookMatcher:
+        def __init__(self, *, hooks):
+            self.hooks = hooks
+
+    module.HookMatcher = HookMatcher
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", module)
 
 
 def _session(on_compaction):

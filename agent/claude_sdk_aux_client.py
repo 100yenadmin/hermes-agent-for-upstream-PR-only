@@ -28,9 +28,10 @@ Design constraints
 ------------------
 * **Text only.**  Auxiliary tasks (compression, title generation, web
   extraction, ...) summarise text; they must never touch the filesystem or
-  spawn child MCP servers.  ``allowed_tools=[]`` plus ``mcp_servers={}``
-  keeps each call a pure completion -- this also avoids the cost of booting
-  MCP servers for a one-line summary.
+  spawn child MCP servers.  ``tools=[]`` removes the built-in Claude Code
+  tools (``allowed_tools`` is only a permission allowlist), while
+  ``mcp_servers={}`` keeps MCP tools absent.  This also avoids the cost of
+  booting MCP servers for a one-line summary.
 * **No inherited settings.**  ``setting_sources=[]`` keeps user/project
   CLAUDE.md and settings.json out of an auxiliary prompt, so aux behaviour
   does not drift with the operator's editor config.
@@ -53,7 +54,7 @@ import time
 from types import SimpleNamespace
 from typing import Any
 
-from agent.claude_cli_direct_client import _messages_to_prompt
+from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,62 @@ DEFAULT_TIMEOUT = 600.0
 
 class ClaudeSdkAuxError(RuntimeError):
     """Raised when a one-shot auxiliary SDK query cannot produce text."""
+
+
+def _render_message_content(content: Any) -> str:
+    """Render only the textual portion of an OpenAI-shaped message.
+
+    Auxiliary SDK calls are deliberately text-only.  Image/file blocks are
+    skipped rather than serialised into a misleading Python/JSON blob, while
+    ordinary structured text and tool results keep their readable content.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, dict):
+        for key in ("text", "content"):
+            value = content.get(key)
+            if isinstance(value, str):
+                return value.strip()
+        return ""
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str) and item.strip():
+                parts.append(item.strip())
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+        return "\n".join(parts)
+    return str(content).strip()
+
+
+def _messages_to_prompt(messages: list[dict[str, Any]]) -> str:
+    """Flatten chat messages for the SDK's one-shot string query surface."""
+    sections = [
+        "You are performing a non-interactive auxiliary text task for Hermes. "
+        "Return the requested answer directly; do not use tools or ask follow-up "
+        "questions.",
+    ]
+    labels = {
+        "system": "System",
+        "user": "User",
+        "assistant": "Assistant",
+        "tool": "Tool result",
+    }
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        rendered = _render_message_content(message.get("content"))
+        if not rendered:
+            continue
+        role = str(message.get("role") or "context").strip().lower()
+        label = labels.get(role, "Context")
+        sections.append(f"{label}:\n{rendered}")
+    sections.append("Complete the auxiliary task described above.")
+    return "\n\n".join(sections)
 
 
 def _run_coro_blocking(coro, timeout: float):
@@ -94,18 +151,27 @@ async def _collect_text(prompt: str, *, model: str) -> tuple[str, Any, str]:
         query,
     )
 
+    # Import lazily to keep this lightweight facade importable without the
+    # optional SDK extra.  The same override builder as the persistent lane is
+    # load-bearing here: query() also spawns a CLI inheriting the parent env.
+    from agent.transports.claude_agent_sdk_session import _sdk_env_overrides
+
     options = ClaudeAgentOptions(
         model=model,
+        tools=[],
         allowed_tools=[],
         mcp_servers={},
         setting_sources=[],
         permission_mode="dontAsk",
         max_turns=1,
+        env=_sdk_env_overrides(),
     )
 
     parts: list[str] = []
     usage: Any = None
     stop_reason = "stop"
+    terminal_error: str | None = None
+    saw_result = False
 
     async for message in query(prompt=prompt, options=options):
         if isinstance(message, AssistantMessage):
@@ -117,11 +183,29 @@ async def _collect_text(prompt: str, *, model: str) -> tuple[str, Any, str]:
                     if text:
                         parts.append(text)
         elif isinstance(message, ResultMessage):
+            saw_result = True
             usage = getattr(message, "usage", None)
-            # The SDK can report a contradictory envelope (is_error=True with
-            # subtype='success'); mirror the main transport's tolerance and
-            # judge on whether any text actually arrived.
+            subtype = str(getattr(message, "subtype", None) or "")
             stop_reason = getattr(message, "stop_reason", None) or "stop"
+            if getattr(message, "is_error", False) or subtype not in ("", "success"):
+                errors = getattr(message, "errors", None) or []
+                detail = (
+                    "; ".join(str(error) for error in errors)
+                    or str(getattr(message, "result", None) or subtype or "unknown error")
+                )
+                terminal_error = redact_sensitive_text(detail, force=True)
+
+    if terminal_error is not None:
+        # Fail closed even when partial assistant text preceded the terminal
+        # error.  Returning that text as a successful compression/title can
+        # silently persist a truncated result.
+        raise ClaudeSdkAuxError(
+            f"claude-agent-sdk auxiliary query failed: {terminal_error}"
+        )
+    if not saw_result:
+        raise ClaudeSdkAuxError(
+            "claude-agent-sdk auxiliary query ended without a terminal result"
+        )
 
     return "".join(parts), usage, stop_reason
 
@@ -155,9 +239,17 @@ class _AuxCompletions:
 
         prompt = _messages_to_prompt(messages)
 
-        text, usage, stop_reason = _run_coro_blocking(
-            _collect_text(prompt, model=model), timeout
-        )
+        try:
+            text, usage, stop_reason = _run_coro_blocking(
+                _collect_text(prompt, model=model), timeout
+            )
+        except ClaudeSdkAuxError:
+            raise
+        except Exception as exc:
+            safe_error = redact_sensitive_text(str(exc), force=True)
+            raise ClaudeSdkAuxError(
+                f"claude-agent-sdk auxiliary query failed: {safe_error}"
+            ) from None
 
         if not text.strip():
             raise ClaudeSdkAuxError(
