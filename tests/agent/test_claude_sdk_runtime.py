@@ -713,14 +713,14 @@ class TestSession:
         # approval posture. The empty list is the SDK's isolation mode.
         assert options["setting_sources"] == []
 
-    def test_native_read_is_disallowed_in_favor_of_bounded_mcp_read(self):
-        # The Claude SDK profile exposes protected-path-aware Hermes MCP
-        # read_file. Native Read duplicates it but causes an approval card for
-        # every normal inspection, so only that duplicate is removed. Bash and
-        # all native write tools remain available and approval-gated.
+    def test_native_read_remains_available_as_bounded_fallback(self):
+        # Hermes MCP reads may be unavailable while the MCP server re-registers.
+        # Native Read is bounded/paginated and avoids an approval-gated Bash
+        # fallback that can dump unbounded content into the local mirror.
         session, _ = _make_session(script=[ResultMessage(result="ok")])
         fields = session.build_option_fields()
-        assert fields["disallowed_tools"] == ["AskUserQuestion", "Read"]
+        assert fields["disallowed_tools"] == ["AskUserQuestion"]
+        assert "Read" not in fields["disallowed_tools"]
         assert "Bash" not in fields["disallowed_tools"]
         assert "Edit" not in fields["disallowed_tools"]
         assert "Write" not in fields["disallowed_tools"]
@@ -2929,15 +2929,14 @@ class TestSystemPromptAppend:
         assert "session_search" in out
 
 
-class TestAuxLaneFailClosed:
-    def test_aux_auto_detect_disabled_under_claude_sdk(self, monkeypatch):
-        # Validator C7 (HIGH): with the main provider on the subscription
-        # lane, aux tasks (title-gen, compression) silently fell through to
-        # the metered OpenRouter/Nous auto-detect chain. Auto-detect must
-        # fail closed; explicit aux config remains the operator's opt-in.
+class TestAuxLaneSubscriptionRouting:
+    def test_aux_auto_detect_uses_same_sdk_subscription_lane(self, monkeypatch):
+        # Auto auxiliary work must not fall through to a metered provider, but
+        # it can safely use the same subscription-owned Agent SDK one-shot path.
         from agent.auxiliary_client import _resolve_auto
+        from agent.claude_sdk_aux_client import ClaudeSdkAuxClient
 
-        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-fake-key")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "«redacted:sk-…»")
         client, model = _resolve_auto(main_runtime={
             "provider": "claude-agent-sdk",
             "model": "claude-opus-4-8",
@@ -2945,7 +2944,8 @@ class TestAuxLaneFailClosed:
             "base_url": "",
             "api_key": "claude-subscription-oauth",
         })
-        assert client is None and model is None
+        assert isinstance(client, ClaudeSdkAuxClient)
+        assert model == "claude-opus-4-8"
 
 
 class TestSdkAvailabilityGate:
