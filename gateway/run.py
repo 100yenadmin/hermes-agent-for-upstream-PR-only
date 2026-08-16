@@ -18749,6 +18749,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _hyg_configured_model = _hyg_model
                 _hyg_configured_provider = _hyg_provider
                 _hyg_configured_base_url = _hyg_base_url
+                _hyg_runtime = {}
 
                 try:
                     _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
@@ -18878,6 +18879,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _cooldown_state["remaining_seconds"],
                                 )
                                 _needs_compress = False
+
+                if _needs_compress and (_hyg_runtime or {}).get(
+                    "api_mode"
+                ) == "claude_agent_sdk":
+                    # compress_context() returns early on this lane: the Claude
+                    # Code CLI owns the real conversation and runs its own
+                    # compaction, so Hermes compaction is a guaranteed no-op.
+                    # Running hygiene anyway still builds a throwaway AIAgent,
+                    # seeds a system prompt and restores the whole transcript --
+                    # real work for a result we already know.
+                    logger.info(
+                        "Session hygiene: skipping compression for %s; the "
+                        "claude-agent-sdk lane compacts inside the CLI, so "
+                        "Hermes compaction cannot shrink it (use /compress to "
+                        "force a local summary)",
+                        session_entry.session_id,
+                    )
+                    _needs_compress = False
 
                 if _needs_compress:
                     logger.info(
