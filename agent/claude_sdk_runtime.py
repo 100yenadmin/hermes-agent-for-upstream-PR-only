@@ -1046,6 +1046,17 @@ def run_claude_agent_sdk_turn(
             turn = agent._claude_sdk_session.run_turn(user_input=send_input)
         except Exception as exc:
             safe_exc = redact_sensitive_text(str(exc), force=True)
+            # A PreCompact hook may have opened a transient user-visible status.
+            # This exception bypasses the normal terminal edge below; clear it
+            # here so a later unrelated turn cannot announce stale completion.
+            if getattr(agent, "_sdk_compaction_pending", False):
+                agent._sdk_compaction_pending = False
+                try:
+                    emit = getattr(agent, "_emit_status", None)
+                    if callable(emit):
+                        emit("⚠️ Context compaction interrupted")
+                except Exception:
+                    logger.debug("failed to close interrupted compaction status", exc_info=True)
             # Do not use logger.exception here: it appends the raw exception
             # string after the redacted message to the log record.
             logger.error("claude-agent-sdk turn failed: %s", safe_exc)

@@ -1981,17 +1981,10 @@ class ClaudeAgentSdkSession:
             # back in via agent.claude_agent_sdk.setting_sources — see
             # _configured_setting_sources.
             "setting_sources": _configured_setting_sources(),
-            # Hermes has no AskUserQuestion answer channel: a tap approves the
-            # tool but the chosen option never reaches the CLI, so the tool
-            # dead-ends with "The user did not answer the questions." The model
-            # must ask in plain text (Telegram-compatible); full option-button
-            # mapping is a later feature.
-            #
-            # Native Read duplicates the bounded Hermes MCP read_file surface,
-            # but turns ordinary inspection into approval-card noise. Keep the
-            # protected-path-aware MCP tool and disallow only the duplicate
-            # native tool; Bash and all write-capable native tools are unchanged.
-            "disallowed_tools": ["AskUserQuestion"],
+            # AskUserQuestion has no native answer bridge. Native Read stays
+            # behind the protected-path-aware, bounded Hermes MCP surface in
+            # every supported SDK permission mode.
+            "disallowed_tools": ["AskUserQuestion", "Read"],
         }
         # The CLI owns compaction on this lane, so its PreCompact hook is the
         # only honest signal that a turn stalled to compact. Registered only

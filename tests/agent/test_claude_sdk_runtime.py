@@ -713,14 +713,12 @@ class TestSession:
         # approval posture. The empty list is the SDK's isolation mode.
         assert options["setting_sources"] == []
 
-    def test_native_read_remains_available_as_bounded_fallback(self):
-        # Hermes MCP reads may be unavailable while the MCP server re-registers.
-        # Native Read is bounded/paginated and avoids an approval-gated Bash
-        # fallback that can dump unbounded content into the local mirror.
+    def test_native_read_is_disallowed_in_favor_of_bounded_mcp_read(self):
+        # Native Read must remain behind Hermes's protected-path-aware bounded
+        # MCP read surface under every supported SDK permission mode.
         session, _ = _make_session(script=[ResultMessage(result="ok")])
         fields = session.build_option_fields()
-        assert fields["disallowed_tools"] == ["AskUserQuestion"]
-        assert "Read" not in fields["disallowed_tools"]
+        assert fields["disallowed_tools"] == ["AskUserQuestion", "Read"]
         assert "Bash" not in fields["disallowed_tools"]
         assert "Edit" not in fields["disallowed_tools"]
         assert "Write" not in fields["disallowed_tools"]
