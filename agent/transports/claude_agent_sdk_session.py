@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -34,6 +35,7 @@ from typing import Any, Callable, Optional
 # TurnResult is the shared contract with the runtime glue — reused verbatim
 # from the codex session module (same fields, same semantics) so
 # ``run_claude_agent_sdk_turn`` mirrors ``run_codex_app_server_turn`` 1:1.
+from agent.redact import redact_sensitive_text
 from agent.transports.codex_app_server_session import TurnResult
 from agent.transports.claude_sdk_event_projector import ClaudeSdkEventProjector
 
@@ -67,6 +69,65 @@ _SDK_PERMISSION_MODES = (
     "dontAsk",
     "auto",
 )
+
+
+def _configured_sdk_env() -> dict:
+    """agent.claude_agent_sdk.env — extra environment for the CLI subprocess.
+
+    The Claude Code CLI reads operational knobs from its environment that the
+    SDK exposes no typed option for. Measured on 0.2.120: only
+    ``CLAUDE_CODE_AUTO_COMPACT_WINDOW`` moves the context ceiling and the
+    autocompact threshold (300000 -> maxTokens 300000, threshold 267000);
+    ``CLAUDE_CODE_MAX_CONTEXT_TOKENS`` and ``CLAUDE_AUTOCOMPACT_PCT_OVERRIDE``
+    are inert. That ratio is exactly why this is a generic config surface and
+    not a named option per knob — the knobs are undocumented and shift.
+
+    Values are stringified; a non-mapping or unreadable config yields {} so a
+    bad edit cannot strip the scrubbed env that ships alongside it.
+    """
+    raw = _provider_config().get("env")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for key, value in raw.items():
+        if value is None:
+            continue
+        try:
+            out[str(key)] = str(value)
+        except Exception:
+            logger.warning(
+                "agent.claude_agent_sdk.env[%r] is not stringifiable — ignoring", key
+            )
+    return out
+
+
+def _sdk_env_overrides() -> dict[str, str]:
+    """The full env override set handed to the spawned CLI.
+
+    Metered-vector scrub first (see _METERED_ENV_DENYLIST).
+    agent.claude_agent_sdk.allow_metered_key: true is the operator's explicit
+    "bill me metered" opt-in (the same flag the startup guard honors), so it
+    disables the scrub too — otherwise the documented escape hatch would hand
+    the CLI an environment with the key blanked.
+
+    Operator-configured env is applied last so deliberate knobs win over
+    defaults, but it must NOT win over the scrub: a plain update() would let
+    ``env: {ANTHROPIC_API_KEY: ...}`` overwrite the scrub's "" and silently
+    re-arm metered billing behind allow_metered_key: false. Denylisted keys
+    are therefore dropped (loudly) unless the metered opt-in is set.
+    """
+    metered_allowed = _provider_flag("allow_metered_key")
+    overrides: dict[str, str] = {} if metered_allowed else _scrubbed_sdk_env()
+    for key, value in _configured_sdk_env().items():
+        if not metered_allowed and key in _METERED_ENV_DENYLIST:
+            logger.warning(
+                "agent.claude_agent_sdk.env[%s] is a metered billing vector — "
+                "ignoring (set allow_metered_key: true to permit it)",
+                key,
+            )
+            continue
+        overrides[key] = value
+    return overrides
 
 
 def _configured_permission_mode() -> Optional[str]:
@@ -302,36 +363,25 @@ def _swallow_interrupt_result(future: Any) -> None:
     at teardown — retrieve and demote it."""
     try:
         future.result()
-    except Exception:
-        logger.debug("SDK interrupt control request failed", exc_info=True)
+    except Exception as exc:
+        logger.debug(
+            "SDK interrupt control request failed: %s",
+            _safe_sdk_error_text(exc),
+        )
 
 
 def _http_mcp_entries_from_config() -> dict[str, dict]:
-    """Return third-party HTTP MCPs discovered in Hermes' merged config, in
-    the McpHttpServerConfig shape the SDK wants ({"type": "http", "url": ...}).
+    """Return explicitly opted-in, credential-free HTTP MCPs for the SDK.
 
-    Reads (in order, later overrides earlier) ``$HERMES_HOME/config.yaml``
-    then ``$HERMES_HOME/profiles/<profile>/config.yaml`` and pulls every
-    ``mcp_servers.<name>`` entry that carries a ``url:`` field (i.e. HTTP
-    MCPs). ``${...}`` env placeholders in the URL are resolved against the
-    gateway process env. Header-bearing entries are refused: the SDK
-    serializes its MCP config into the Claude CLI's ``--mcp-config`` process
-    argument, so forwarding a resolved Authorization header would expose the
-    secret to local process inspection. Entries without a valid resolved
-    HTTP(S) URL (stdio subprocess, in-process, missing env placeholder) are
-    ignored without logging the URL. Returns ``{}`` on any read/parse failure
-    — the caller keeps working with just the hybrid + stdio wrapper.
-
-    Rationale: HTTP MCPs registered in Hermes end up in the registry under a
-    toolset ``mcp-<name>`` that isn't included in the agent's default enabled
-    toolsets, so ``get_tool_definitions()`` returns them behind tool_search's
-    tier-2 deferral — the hybrid bridge (which snapshots ``agent.tools`` at
-    session build) never sees them. Exposing them straight to the SDK client
-    bypasses the whole toolset-filter path.
+    Direct registration shares the ``hybrid_mcp_bridge`` opt-in and exclusion
+    list. Header-bearing, templated, userinfo-bearing, and credential-like
+    query or fragment URLs are refused because the SDK serializes this config
+    into the Claude CLI's ``--mcp-config`` process argument. Returns ``{}`` on
+    any read/parse failure and never logs a URL or credential value.
     """
     import os as _os
     import re as _re
-    from urllib.parse import urlsplit as _urlsplit
+    from urllib.parse import unquote as _unquote, urlsplit as _urlsplit
 
     try:
         import yaml as _yaml  # type: ignore
@@ -359,46 +409,76 @@ def _http_mcp_entries_from_config() -> dict[str, dict]:
             logger.debug("failed to read %s for HTTP MCP discovery", p, exc_info=True)
             continue
 
-    _env_re = _re.compile(r"\$\{([A-Z0-9_]+)\}")
+    if not _provider_flag("hybrid_mcp_bridge", default=False):
+        return {}
 
-    def _resolve_env(s: str) -> str:
-        return _env_re.sub(lambda m: _os.environ.get(m.group(1), ""), s)
+    _env_re = _re.compile(r"\$\{[^}]*\}")
+    _secret_field_re = _re.compile(
+        r"(?:api[_-]?key|token|secret|password|credential|authorization|auth)",
+        _re.I,
+    )
+    excluded_names = set(_configured_hybrid_exclude())
 
     out: dict[str, dict] = {}
-    for name, cfg in merged.items():
+    for raw_name, cfg in merged.items():
         if not isinstance(cfg, dict):
             continue
         url = cfg.get("url")
         if not isinstance(url, str) or not url.strip():
             continue
-        headers = cfg.get("headers")
-        if isinstance(headers, dict) and headers:
-            # Never resolve or log header values. ClaudeAgentOptions passes
-            # mcp_servers through `--mcp-config <json>`, making every value
-            # visible in the child process argv. Dropping the headers and
-            # connecting anonymously would be a misleading auth downgrade;
-            # refuse the whole server instead.
+        name = str(raw_name)
+        url = url.strip()
+        if name in excluded_names:
+            logger.info("claude-agent-sdk: HTTP MCP %r excluded by config", name)
+            continue
+        if cfg.get("headers"):
             logger.warning(
-                "claude-agent-sdk: refusing HTTP MCP %r because it requires "
-                "headers that the SDK would expose in process arguments",
-                str(name),
+                "claude-agent-sdk: refusing HTTP MCP %r because it has headers",
+                name,
             )
             continue
-        resolved = _resolve_env(url).strip()
-        parsed = _urlsplit(resolved)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            # Missing env placeholders commonly produce `https:///path`.
-            # Do not hand malformed config to the child or log the resolved
-            # URL: it may itself contain credentials.
+        if _env_re.search(url):
             logger.warning(
-                "claude-agent-sdk: refusing HTTP MCP %r because its resolved "
-                "URL is not a valid HTTP(S) endpoint",
-                str(name),
+                "claude-agent-sdk: refusing HTTP MCP %r because its URL is templated",
+                name,
             )
             continue
-        entry: dict[str, Any] = {"type": "http", "url": resolved}
-        out[str(name)] = entry
+        try:
+            parsed = _urlsplit(url)
+        except ValueError:
+            logger.warning(
+                "claude-agent-sdk: refusing HTTP MCP %r because its URL is malformed",
+                name,
+            )
+            continue
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            logger.warning(
+                "claude-agent-sdk: refusing HTTP MCP %r because its URL is not HTTP(S)",
+                name,
+            )
+            continue
+        # Direct HTTP MCP configuration is passed to the SDK/CLI process.
+        # Treat every query, fragment, or userinfo component as secret-bearing:
+        # a denylist cannot safely distinguish signed/public query parameters
+        # from encoded credentials (including nested percent encoding).
+        if parsed.username is not None or parsed.query or parsed.fragment:
+            logger.warning(
+                "claude-agent-sdk: refusing HTTP MCP %r because its URL has userinfo, query, or fragment",
+                name,
+            )
+            continue
+        out[name] = {"type": "http", "url": url}
     return out
+
+
+def _swallow_steer_result(future: Any) -> None:
+    """Same contract as _swallow_interrupt_result, for the fire-and-forget
+    steer query(). The caller has already returned True by the time this
+    resolves, so a failure here can only be logged, not surfaced."""
+    try:
+        future.result()
+    except Exception:
+        logger.debug("SDK steer query failed after scheduling", exc_info=True)
 
 
 # Substrings in SDK/CLI errors that signal broken subscription credentials.
@@ -412,7 +492,6 @@ _AUTH_FAILURE_HINTS = (
     "please run /login",
     "invalid api key",
     "authentication_error",
-    "401 unauthorized",
     "oauth token",
     "token has expired",
     "expired token",
@@ -420,8 +499,20 @@ _AUTH_FAILURE_HINTS = (
     "setup-token",
 )
 
+_AUTH_401_UNAUTHORIZED_RE = re.compile(r"\b401\W{0,3}unauthorized\b")
+_AUTH_UNAUTHORIZED_HTTP_401_RE = re.compile(
+    r"\bunauthorized\W{0,15}\(?http\s*401\b"
+)
 
-def classify_auth_failure(*parts: str) -> Optional[str]:
+
+def _safe_sdk_error_text(value: Any) -> str:
+    """Redact provider/SDK diagnostics before they cross a transport boundary."""
+    return redact_sensitive_text(str(value or ""), force=True)
+
+
+def classify_auth_failure(
+    *parts: str, mcp_attributed: bool = False
+) -> Optional[str]:
     """Return a user-friendly re-auth hint if the strings look like a Claude
     subscription auth failure; otherwise None. The hint keeps the underlying
     error text: a hit retires the session, so the evidence must survive the
@@ -429,9 +520,19 @@ def classify_auth_failure(*parts: str) -> Optional[str]:
     haystack = " ".join(p for p in parts if p).lower()
     if not haystack:
         return None
-    for needle in _AUTH_FAILURE_HINTS:
-        if needle in haystack:
-            original = next((p.strip() for p in parts if p and p.strip()), "")
+    if mcp_attributed or "mcp__" in haystack or "mcp server" in haystack:
+        return None
+    matched_401 = (
+        _AUTH_401_UNAUTHORIZED_RE.search(haystack)
+        or _AUTH_UNAUTHORIZED_HTTP_401_RE.search(haystack)
+    )
+    for needle in (None, *_AUTH_FAILURE_HINTS):
+        if (needle is None and matched_401) or (
+            needle is not None and needle in haystack
+        ):
+            original = _safe_sdk_error_text(
+                next((p.strip() for p in parts if p and p.strip()), "")
+            )
             if len(original) > 400:
                 original = original[:400] + "…"
             return (
@@ -672,6 +773,8 @@ class ClaudeAgentSdkSession:
         on_interim_assistant: Optional[Callable[[str], None]] = None,
         on_tool_iteration: Optional[Callable[[], None]] = None,
         on_unsolicited_result: Optional[Callable[[list[str]], None]] = None,
+        on_compaction: Optional[Callable[[str], None]] = None,
+        on_compact_boundary: Optional[Callable[[str], None]] = None,
         # Hybrid MCP bridge (ported from PR #56413): the explicit config
         # opt-in plus both `agent` and `tools` activate in-process servers
         # exposing the full Hermes registry (including proxified third-party
@@ -693,6 +796,8 @@ class ClaudeAgentSdkSession:
         self._system_prompt_append = system_prompt_append
         self._approval_callback = approval_callback
         self._on_tool_started = on_tool_started
+        self._on_compaction = on_compaction
+        self._on_compact_boundary = on_compact_boundary
         self._max_budget_usd = max_budget_usd
         self._client_factory = client_factory  # test seam
         self._include_hermes_tools = include_hermes_tools
@@ -822,10 +927,17 @@ class ClaudeAgentSdkSession:
         # instead of raising against a torn-down one.
         self._stop_reader()
         if self._client is not None and self._loop is not None:
+            # Budget must exceed the SDK transport's own escalation ladder
+            # (stdin lock + graceful wait + SIGTERM + SIGKILL); on timeout the
+            # loop thread dies below and its shielded reap never finishes, so
+            # fall back to killing the child directly.
+            pid = _sdk_child_pid(self._client)
             try:
-                self._run_coro(self._client.disconnect(), timeout=10.0)
+                self._run_coro(
+                    self._client.disconnect(), timeout=_SDK_DISCONNECT_TIMEOUT_S
+                )
             except Exception:  # pragma: no cover - best-effort cleanup
-                pass
+                _force_kill_sdk_child(pid)
             self._client = None
         self._stop_loop_thread()
 
@@ -834,6 +946,121 @@ class ClaudeAgentSdkSession:
 
     def __exit__(self, *exc: Any) -> None:
         self.close()
+
+    # ---------- compaction ----------
+
+    def _build_compaction_hooks(self) -> Optional[dict]:
+        """PreCompact -> on_compaction(trigger), or None when unwired.
+
+        ``trigger`` is the SDK's own literal: "auto" for the CLI's automatic
+        compaction (the one that silently stalls a turn) or "manual" for an
+        explicit /compact. The callback is best-effort: it must never fail the
+        hook, because refusing a hook can block the compaction itself.
+        """
+        if self._on_compaction is None:
+            return None
+        try:
+            from claude_agent_sdk import HookMatcher
+        except Exception:  # pragma: no cover - SDK predates hooks
+            logger.debug("claude-agent-sdk: HookMatcher unavailable", exc_info=True)
+            return None
+
+        async def _on_pre_compact(input_data, tool_use_id, context):
+            try:
+                trigger = ""
+                if isinstance(input_data, dict):
+                    trigger = str(input_data.get("trigger") or "")
+                self._on_compaction(trigger or "auto")
+            except Exception:
+                logger.debug("compaction status callback failed", exc_info=True)
+            return {}
+
+        return {"PreCompact": [HookMatcher(hooks=[_on_pre_compact])]}
+
+    def _handle_compact_boundary(self, message: Any) -> None:
+        """compact_boundary -> on_compact_boundary(trigger): compaction FINISHED.
+
+        The SDK exposes ``PreCompact`` as a hook but has no post-side
+        counterpart, which is why the completion edge was originally deferred to
+        the end of the turn. That was wrong: the CLI *does* announce completion,
+        as a plain ``system`` message with ``subtype="compact_boundary"``, and
+        the SDK's parser passes unknown subtypes through its generic fallback,
+        so it arrives on the normal message stream mid-turn.
+
+        The distinction is not cosmetic. Emitting at turn end put the notice in
+        the one place it could never be seen: non-durable statuses are deleted
+        by end-of-turn progress cleanup, so it was created and destroyed in the
+        same instant (measured 2026-08-16 -- boundary at 07:41:16, deferred emit
+        at 07:42:17, 61s late and invisible). Firing here restores the native
+        contract every other provider already follows -- notice right after
+        compaction, cleaned up with the rest of the turn's progress -- and makes
+        COMPACTION_DONE_STATUS's "continuing turn" literally true again.
+
+        Best-effort by construction: a raising callback must not break the turn
+        that is still streaming.
+        """
+        if (
+            type(message).__name__ != "SystemMessage"
+            or getattr(message, "subtype", "") != "compact_boundary"
+        ):
+            return
+        data = getattr(message, "data", None)
+        metadata = None
+        if isinstance(data, dict):
+            # The SDK hands this over snake_cased ("compact_metadata", observed
+            # in production 2026-08-16); the CLI's own transcript writes the
+            # camelCase original. Accept both so the trigger stays accurate if
+            # the normalization changes -- an unreadable trigger is not fatal
+            # (it falls back to "auto"), just less honest.
+            metadata = data.get("compact_metadata") or data.get("compactMetadata")
+        trigger = ""
+        if isinstance(metadata, dict):
+            trigger = str(metadata.get("trigger") or "")
+        logger.info(
+            "claude-agent-sdk compact_boundary: session=%s trigger=%s",
+            getattr(message, "session_id", None) or self._session_id or "none",
+            trigger or "unknown",
+        )
+        if self._on_compact_boundary is None:
+            return
+        try:
+            self._on_compact_boundary(trigger or "auto")
+        except Exception:
+            logger.debug("compact_boundary callback failed", exc_info=True)
+
+    # ---------- context usage ----------
+
+    def context_usage(self) -> Optional[dict]:
+        """Live context usage reported by the CLI, or None if unavailable.
+
+        Ground truth, unlike Hermes' own estimate on this lane: api_messages
+        holds FULL tool payloads that are never sent to the CLI, so the local
+        estimate over-reports by an order of magnitude (1.5-2.4M tokens for a
+        transcript whose real size was ~111k). Callers that need a real number
+        -- status lines, compaction heuristics -- must use this instead.
+
+        Returns the SDK's ContextUsageResponse mapping: totalTokens, maxTokens
+        (already reduced by the autocompact buffer), contextWindow, the
+        percentage used, model, and isAutoCompactEnabled.
+
+        Best-effort by design: a disconnected session, an older SDK without the
+        method, or a query failure all yield None rather than raising into a
+        status path.
+        """
+        client = self._client
+        if client is None or self._loop is None:
+            return None
+        getter = getattr(client, "get_context_usage", None)
+        if not callable(getter):
+            return None  # SDK predates get_context_usage()
+        try:
+            usage = self._run_coro(getter(), timeout=10.0)
+        except Exception:
+            logger.debug(
+                "claude-agent-sdk context-usage query failed", exc_info=True
+            )
+            return None
+        return usage if isinstance(usage, dict) else None
 
     # ---------- interrupt ----------
 
@@ -851,8 +1078,63 @@ class ClaudeAgentSdkSession:
                     self._client.interrupt(), self._loop
                 )
                 future.add_done_callback(_swallow_interrupt_result)
-            except Exception:  # pragma: no cover
-                logger.debug("SDK interrupt scheduling failed", exc_info=True)
+            except Exception as exc:  # pragma: no cover
+                logger.debug(
+                    "SDK interrupt scheduling failed: %s",
+                    _safe_sdk_error_text(exc),
+                )
+
+    def steer(self, text: str) -> bool:
+        """Inject a mid-turn user message using the SDK's own streaming input.
+
+        Why this exists: on this lane the SDK owns tool execution, so Hermes'
+        tool-batch drain points (agent/tool_executor.py) are never reached and
+        a /steer would strand in ``_pending_steer`` until the turn finalizer
+        handed it back — where the gateway only redelivers it if no other
+        message is queued. Steers were therefore silently lost.
+
+        ``ClaudeSDKClient.query()`` is documented as "send a new request in
+        streaming mode", and we already connect in streaming mode (``connect()``
+        with no prompt), so a second query() on the LIVE session is the SDK's
+        own steering contract — not an interrupt and not a session restart,
+        which is what the claude-cli-live transport has to do.
+
+        Verified 2026-08-15 against SDK 0.2.120: a query() issued while a tool
+        call was in flight did not raise and was honored at the next turn
+        boundary ~3s later. Note it also produces a SECOND ResultMessage once
+        the superseded work unwinds; that arrives unclaimed and is handled by
+        the existing unsolicited-result path (``_on_unsolicited_result``), so
+        ``deliver_background_results`` is load-bearing here.
+
+        Returns True only when the steer was actually scheduled onto a live
+        turn. False means "not applicable" — the caller must fall back to the
+        ordinary pending-steer stash. Crucially this is never both: returning
+        True suppresses the stash, so a steer cannot be delivered twice.
+        """
+        if not text or not text.strip():
+            return False
+        # No claimed turn means there is nothing to steer INTO. Sending anyway
+        # would open a fresh unclaimed turn on this session whose output the
+        # reader routes to the unsolicited path — a reply appearing from
+        # nowhere. Decline instead and let the caller queue it normally.
+        if self._turn_inbox is None:
+            return False
+        client = self._client
+        loop = self._loop
+        if client is None or loop is None:
+            return False
+        cleaned = text.strip()
+        try:
+            future = asyncio.run_coroutine_threadsafe(client.query(cleaned), loop)
+            future.add_done_callback(_swallow_steer_result)
+        except Exception:
+            logger.debug("SDK steer scheduling failed", exc_info=True)
+            return False
+        logger.info(
+            "claude-agent-sdk: steered live turn via streaming input (%d chars)",
+            len(cleaned),
+        )
+        return True
 
     # ---------- per-turn ----------
 
@@ -881,11 +1163,22 @@ class ClaudeAgentSdkSession:
         the partial transcript and the resumable session id (no retire);
         only a grace expiry hard-cancels and retires."""
         result = TurnResult()
+        prompt = _coerce_turn_input(user_input)
+        if isinstance(prompt, str) and not prompt.strip():
+            self._interrupt_event.clear()
+            result.final_text = (
+                "This Claude Agent SDK route can't process an empty message. "
+                "Please send text or a supported image."
+            )
+            result.error = result.final_text
+            result.api_call_made = False
+            return result
         try:
             self.ensure_started()
         except Exception as exc:
-            hint = classify_auth_failure(str(exc))
-            result.error = hint or f"claude-agent-sdk startup failed: {exc}"
+            safe_exc = _safe_sdk_error_text(exc)
+            hint = classify_auth_failure(safe_exc)
+            result.error = hint or f"claude-agent-sdk startup failed: {safe_exc}"
             result.should_retire = True
             # A refusal to start is fatal to the run, not turn-scoped: the
             # metered-key guard and an uninstallable SDK are config errors
@@ -919,7 +1212,6 @@ class ClaudeAgentSdkSession:
             self._interrupt_event.clear()
             result.interrupted = True
             return result
-        prompt = _coerce_turn_input(user_input)
 
         import concurrent.futures
 
@@ -1046,8 +1338,9 @@ class ClaudeAgentSdkSession:
                     trip = None
         except Exception as exc:
             self._interrupt_event.clear()
-            hint = classify_auth_failure(str(exc))
-            result.error = hint or f"claude-agent-sdk turn failed: {exc}"
+            safe_exc = _safe_sdk_error_text(exc)
+            hint = classify_auth_failure(safe_exc)
+            result.error = hint or f"claude-agent-sdk turn failed: {safe_exc}"
             result.should_retire = True
             if hint is not None:
                 # Auth failures are fatal; other mid-turn exceptions stay
@@ -1083,6 +1376,9 @@ class ClaudeAgentSdkSession:
             # next turn on this session object.
             self._interrupt_event.clear()
         if turn_data["error"]:
+            # A prior MCP tool use is not evidence that this terminal SDK
+            # error belongs to MCP; preserve fail-closed Claude auth handling
+            # unless the error text itself identifies an MCP origin.
             hint = classify_auth_failure(turn_data["error"])
             result.error = hint or turn_data["error"]
             if hint is not None:
@@ -1154,11 +1450,12 @@ class ClaudeAgentSdkSession:
             "result_uuid": None,
             "model": None,
             "stream_ended": False,
+            "mcp_tool_seen": False,
         }
         ended = self._stream_ended
         if ended is not None:
             out["error"] = "SDK message stream ended before this turn" + (
-                f": {ended.error}" if ended.error else ""
+                f": {_safe_sdk_error_text(ended.error)}" if ended.error else ""
             )
             out["stream_ended"] = True
             return out
@@ -1184,7 +1481,7 @@ class ClaudeAgentSdkSession:
                 if isinstance(message, _StreamEnd):
                     out["error"] = (
                         "SDK message stream ended before this turn's result"
-                        + (f": {message.error}" if message.error else "")
+                        + (f": {_safe_sdk_error_text(message.error)}" if message.error else "")
                     )
                     out["stream_ended"] = True
                     break
@@ -1194,6 +1491,7 @@ class ClaudeAgentSdkSession:
                 early_sid = getattr(message, "session_id", None)
                 if early_sid:
                     self._session_id = early_sid
+                self._handle_compact_boundary(message)
                 if self._interrupt_event.is_set():
                     # Previously `break`. Bailing out before this turn's
                     # ResultMessage orphaned it in the shared stream, and the
@@ -1210,6 +1508,12 @@ class ClaudeAgentSdkSession:
                     if not interrupted:
                         self._forward_stream_delta(message)
                     continue
+                for block in getattr(message, "content", None) or []:
+                    if (
+                        type(block).__name__ == "ToolUseBlock"
+                        and str(getattr(block, "name", "")).startswith("mcp__")
+                    ):
+                        out["mcp_tool_seen"] = True
                 if not interrupted:
                     self._notify_tool_started(message)
                     self._notify_interim_assistant(message)
@@ -1279,13 +1583,14 @@ class ClaudeAgentSdkSession:
                             logger.warning(
                                 "claude-agent-sdk: contradictory result "
                                 "envelope (is_error=True, subtype=success, "
-                                "no errors) — treated as success: %r",
-                                message,
+                                "no errors) — treated as success (diagnostic omitted)",
                             )
                             break
-                        detail = "; ".join(str(e) for e in errors) or getattr(
-                            message, "result", None
-                        ) or subtype
+                        detail = _safe_sdk_error_text(
+                            "; ".join(str(e) for e in errors)
+                            or getattr(message, "result", None)
+                            or subtype
+                        )
                         err_text = f"SDK result error (subtype={subtype}): {detail}"
                         if api_error_status:
                             err_text += f" (HTTP {api_error_status})"
@@ -1311,7 +1616,9 @@ class ClaudeAgentSdkSession:
                             logger.info(
                                 "claude-agent-sdk: masked %s on requested "
                                 "interrupt (interrupt honored, not a "
-                                "failure): %s", subtype, err_text,
+                                "failure): %s",
+                                subtype,
+                                _safe_sdk_error_text(err_text),
                             )
                         else:
                             out["error"] = err_text
@@ -1392,8 +1699,11 @@ class ClaudeAgentSdkSession:
         except asyncio.CancelledError:  # pragma: no cover - shutdown path
             raise
         except Exception as exc:  # pragma: no cover - stream torn down
-            logger.debug("claude-agent-sdk reader loop ended", exc_info=True)
-            end = _StreamEnd(error=repr(exc))
+            logger.debug(
+                "claude-agent-sdk reader loop ended: %s",
+                _safe_sdk_error_text(exc),
+            )
+            end = _StreamEnd(error=_safe_sdk_error_text(exc))
         else:
             end = _StreamEnd(error=None)
         # The stream is gone (CLI exited or transport died). Mark it for any
@@ -1699,9 +2009,7 @@ class ClaudeAgentSdkSession:
         # explicit "bill me metered" opt-in (the same flag the startup guard
         # honors), so it disables the scrub too — otherwise the documented
         # escape hatch would hand the CLI an environment with the key blanked.
-        env_overrides: dict[str, str] = {}
-        if not _provider_flag("allow_metered_key"):
-            env_overrides = _scrubbed_sdk_env()
+        env_overrides = _sdk_env_overrides()
 
         fields = {
             "model": self._model,
@@ -1727,18 +2035,17 @@ class ClaudeAgentSdkSession:
             # back in via agent.claude_agent_sdk.setting_sources — see
             # _configured_setting_sources.
             "setting_sources": _configured_setting_sources(),
-            # Hermes has no AskUserQuestion answer channel: a tap approves the
-            # tool but the chosen option never reaches the CLI, so the tool
-            # dead-ends with "The user did not answer the questions." The model
-            # must ask in plain text (Telegram-compatible); full option-button
-            # mapping is a later feature.
-            #
-            # Native Read duplicates the bounded Hermes MCP read_file surface,
-            # but turns ordinary inspection into approval-card noise. Keep the
-            # protected-path-aware MCP tool and disallow only the duplicate
-            # native tool; Bash and all write-capable native tools are unchanged.
+            # AskUserQuestion has no native answer bridge. Native Read stays
+            # behind the protected-path-aware, bounded Hermes MCP surface in
+            # every supported SDK permission mode.
             "disallowed_tools": ["AskUserQuestion", "Read"],
         }
+        # The CLI owns compaction on this lane, so its PreCompact hook is the
+        # only honest signal that a turn stalled to compact. Registered only
+        # when a consumer asked for it, so the default option set is unchanged.
+        _compaction_hooks = self._build_compaction_hooks()
+        if _compaction_hooks is not None:
+            fields["hooks"] = _compaction_hooks
         if self._resume_session_id:
             fields["resume"] = self._resume_session_id
         # Default OFF (upstream-conservative): partial messages only when the
@@ -1912,6 +2219,63 @@ class ClaudeAgentSdkSession:
         except (TimeoutError, concurrent.futures.TimeoutError):
             future.cancel()
             raise asyncio.TimeoutError(f"coroutine exceeded {timeout}s")
+
+
+# Ceiling on the SDK transport's close ladder (5s stdin lock + 5s graceful +
+# 5s SIGTERM + 5s SIGKILL), plus slack.
+_SDK_DISCONNECT_TIMEOUT_S = 25.0
+
+
+def _sdk_child_pid(client: Any) -> Optional[int]:
+    """OS pid of the CLI subprocess behind an SDK client, if reachable."""
+    try:
+        proc = getattr(getattr(client, "_transport", None), "_process", None)
+        pid = getattr(proc, "pid", None)
+        return int(pid) if pid else None
+    except Exception:
+        return None
+
+
+def _is_own_sdk_child(pid: int) -> bool:
+    """Guard against PID reuse: only reap a LIVE child of THIS process.
+
+    A zombie counts as already dead — it holds no RSS and needs no signal.
+    """
+    ppid = None
+    state = ""
+    try:
+        with open(f"/proc/{pid}/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("PPid:"):
+                    ppid = int(line.split()[1])
+                elif line.startswith("State:"):
+                    state = line.split()[1]
+    except (OSError, ValueError, IndexError):
+        return False
+    return ppid == os.getpid() and state != "Z"
+
+
+def _force_kill_sdk_child(pid: Optional[int]) -> None:
+    """Last-resort reap when disconnect() times out and strands the CLI child."""
+    if not pid or not _is_own_sdk_child(pid):
+        return
+    import signal
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        time.sleep(0.1)
+        if not _is_own_sdk_child(pid):
+            logger.info("claude-agent-sdk stranded child %s reaped (SIGTERM)", pid)
+            return
+    try:
+        os.kill(pid, signal.SIGKILL)
+        logger.warning("claude-agent-sdk stranded child %s required SIGKILL", pid)
+    except OSError:
+        pass
 
 
 def _tool_preview(name: str, args: dict) -> str:

@@ -5521,8 +5521,24 @@ class TurnRunner:
                 # a single small file, not part of the expensive walk.
                 load_soul_identity=True,
             )
+            _displaced_agent = None
             if _cache_lock and _cache is not None:
                 with _cache_lock:
+                    # A fresh agent may DISPLACE a cached one under the same key
+                    # (signature change, session switch, memory-pressure
+                    # rebuild). The eviction paths release what they pop; a
+                    # plain overwrite released nothing, so the displaced agent's
+                    # provider session — and on the claude-agent-sdk lane its
+                    # Claude Code CLI child — was dropped to GC, which never
+                    # reaps a live subprocess. Capture it, release it below.
+                    _prev_entry = _cache.get(ctx.session_key)
+                    _prev = (
+                        _prev_entry[0]
+                        if isinstance(_prev_entry, tuple) and _prev_entry
+                        else None
+                    )
+                    if _prev is not None and _prev is not agent:
+                        _displaced_agent = _prev
                     # Record the session_id the snapshot was taken for
                     # alongside the message_count, so the cross-process
                     # guard can skip the (meaningless) count comparison
@@ -5532,6 +5548,10 @@ class TurnRunner:
                         agent, _sig, _current_msg_count, ctx.session_id,
                     )
                     self._runner._enforce_agent_cache_cap()
+            if _displaced_agent is not None:
+                self._runner._release_displaced_agent(
+                    _displaced_agent, ctx.session_key
+                )
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
 
         # Per-message state — callbacks and reasoning config change every
@@ -18837,6 +18857,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _hyg_configured_model = _hyg_model
                 _hyg_configured_provider = _hyg_provider
                 _hyg_configured_base_url = _hyg_base_url
+                _hyg_runtime = {}
 
                 try:
                     _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
@@ -18967,6 +18988,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 )
                                 _needs_compress = False
 
+                if _needs_compress and (_hyg_runtime or {}).get(
+                    "api_mode"
+                ) == "claude_agent_sdk":
+                    # compress_context() returns early on this lane: the Claude
+                    # Code CLI owns the real conversation and runs its own
+                    # compaction, so Hermes compaction is a guaranteed no-op.
+                    # Running hygiene anyway still builds a throwaway AIAgent,
+                    # seeds a system prompt and restores the whole transcript --
+                    # real work for a result we already know.
+                    logger.info(
+                        "Session hygiene: skipping compression for %s; the "
+                        "claude-agent-sdk lane compacts inside the CLI, so "
+                        "Hermes compaction cannot shrink it (use /compress to "
+                        "force a local summary)",
+                        session_entry.session_id,
+                    )
+                    _needs_compress = False
+
                 if _needs_compress:
                     logger.info(
                         "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
@@ -19039,6 +19078,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 # deliberately stale for every real gateway surface.
                                 _hyg_agent.platform = _GATEWAY_HYGIENE_PLATFORM
                                 _hyg_cleanup_deferred = False
+                                _hyg_rotated = False
+                                _hyg_in_place = False
                                 try:
                                     # Gateway hygiene runs before the user turn
                                     # starts and already owns the session binding.
@@ -19486,7 +19527,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # Evict the cached agent so the next turn
                                     # rebuilds its system prompt from current
                                     # SOUL.md, memory, and skills.
-                                    self._evict_cached_agent(session_key)
+                                    #
+                                    # ONLY when compression actually changed the
+                                    # transcript. A no-op compression still costs
+                                    # a full eviction: release_clients() drops the
+                                    # agent's provider session, and on the
+                                    # claude-agent-sdk lane that discards the CLI's
+                                    # prompt cache, so the next turn re-writes the
+                                    # entire prefix to rebuild a prompt that did
+                                    # not change. That lane skips Hermes compaction
+                                    # by design (conversation_compression, "CLI
+                                    # owns context"), so hygiene no-ops every cycle
+                                    # and the eviction was pure waste.
+                                    if _hyg_rotated or _hyg_in_place:
+                                        self._evict_cached_agent(session_key)
                                     if not _hyg_cleanup_deferred:
                                         await self._cleanup_agent_resources_off_loop(
                                             _hyg_agent, context="session hygiene"
@@ -26802,6 +26856,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             home_display,
         )
         return hashlib.sha256(repr(key_tuple).encode("utf-8")).hexdigest()
+
+    def _release_displaced_agent(self, displaced: Any, session_key: str) -> None:
+        """Release an agent that a rebuild displaced from the cache.
+
+        A fresh agent can overwrite a cached one under the same key (signature
+        change, session switch, memory-pressure rebuild). The eviction paths
+        release whatever they pop; a plain overwrite released nothing, so the
+        displaced agent's provider session — and on the claude-agent-sdk lane
+        its Claude Code CLI child — was dropped to GC, which never reaps a live
+        subprocess.
+
+        Soft release, matching ``_evict_cached_agent``: frees the client pool
+        and provider session but preserves the session's terminal sandbox,
+        browser daemon and tracked bg processes for the agent taking over.
+
+        Never touches an agent that is still serving a turn — that agent's own
+        completion path owns its teardown.
+        """
+        if displaced is None or displaced is _AGENT_PENDING_SENTINEL:
+            return
+        try:
+            running_ids = {
+                id(a)
+                for _, a in self._running_agent_items()
+                if a is not None and a is not _AGENT_PENDING_SENTINEL
+            }
+        except Exception:
+            running_ids = set()
+        if id(displaced) in running_ids:
+            logger.debug(
+                "Displaced agent for %s is mid-turn; leaving it to its own "
+                "completion path", session_key,
+            )
+            return
+        logger.info(
+            "Releasing agent displaced from the cache for session %s", session_key,
+        )
+        # Daemon thread: teardown can block on socket/subprocess shutdown and
+        # must not stall the turn that displaced it.
+        def _release() -> None:
+            # Contain failures here: an exception on a daemon thread reaches
+            # threading.excepthook, which logs a bare traceback with no context
+            # about which session it came from.
+            try:
+                self._release_evicted_agent_soft(displaced)
+            except Exception:
+                logger.debug(
+                    "Soft release of the agent displaced from %s failed",
+                    session_key, exc_info=True,
+                )
+
+        try:
+            threading.Thread(
+                target=_release,
+                daemon=True,
+                name=f"agent-displaced-{str(session_key)[:24]}",
+            ).start()
+        except Exception:
+            _release()
 
     def _evict_cached_agent(self, session_key: str) -> None:
         """Remove a cached agent for a session (called on /new, /model, etc).

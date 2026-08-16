@@ -18,6 +18,8 @@ import os
 import threading
 from typing import Any, Dict, List, Optional
 
+from agent.redact import redact_sensitive_text
+
 logger = logging.getLogger(__name__)
 
 # Cap per persona/memory source so the append can't blow the context budget
@@ -329,6 +331,121 @@ def build_system_prompt_append(
     return "\n\n".join(out_parts) or None
 
 
+def _sdk_context_prompt_tokens(usage: dict, fallback: int) -> int:
+    """Prompt size of the LAST SDK iteration — i.e. real context pressure.
+
+    LOCAL DIVERGENCE (2026-08-14). ``ResultMessage.usage`` AGGREGATES across
+    every internal iteration of a turn. Each iteration re-reads the whole
+    prompt from cache, so on a tool-heavy turn the aggregate answers "how many
+    tokens did this turn bill?" — NOT "how big is the prompt?".
+
+    Feeding the aggregate to the context compressor over-reported this session
+    by ~25x (3,601,066 reported vs ~145k real), which pinned the runtime footer
+    to a clamped 100% and made gateway hygiene fire every ~5 minutes forever
+    against a threshold it could never satisfy.
+
+    The aggregate remains correct for BILLING and is still used for session
+    totals / cost persistence; only context-pressure consumers use this value.
+    Falls back to the aggregate when per-iteration data is absent, so a future
+    SDK that drops ``iterations`` degrades to today's behaviour rather than
+    reporting zero (which would disable compression entirely).
+    """
+    iterations = usage.get("iterations")
+    if not isinstance(iterations, (list, tuple)) or not iterations:
+        return fallback
+    last = iterations[-1]
+    if not isinstance(last, dict):
+        return fallback
+    total = (
+        _coerce_usage_int(last.get("input_tokens"))
+        + _coerce_usage_int(last.get("cache_read_input_tokens"))
+        + _coerce_usage_int(last.get("cache_creation_input_tokens"))
+    )
+    return total or fallback
+
+
+def _usable_cli_context_window(value: Any) -> Optional[int]:
+    """Return a CLI window only when it is safe for Hermes tool workflows.
+
+    ``context_usage()`` is an SDK message boundary, not model metadata. Keep
+    malformed or sub-minimum reports from collapsing the parent's footer,
+    compression, and hygiene sizing; the existing metadata value is safer.
+    """
+    from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        candidate = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text or not text.isdecimal():
+            return None
+        candidate = int(text)
+    else:
+        # In particular, reject floats: silently truncating 63_999.9 turns an
+        # invalid report into a plausible but unsafe context window.
+        return None
+    return candidate if candidate >= MINIMUM_CONTEXT_LENGTH else None
+
+
+def _sync_context_length_from_cli(agent: Any) -> None:
+    """Point the compressor's context_length at the CLI's REAL window.
+
+    Hermes sizes context from model metadata -- 1,000,000 for claude-opus-5 --
+    but on this lane the window is whatever the spawned CLI is actually running
+    with, and ``agent.claude_agent_sdk.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW`` can
+    cut that to a fraction. Measured 2026-08-16 with the window at 300,000: the
+    runtime footer read 16% while the CLI sat at 53% of its real window, one
+    turn from autocompacting. The gauge could never have read above ~27%,
+    because compaction fires at 267k of a denominator of 1,000,000 -- so the
+    whole scale was squashed into its bottom quarter. Gateway session hygiene
+    sizes off the same value.
+
+    ``maxTokens`` is fixed when the CLI is spawned, so this is queried once per
+    session and cached -- ``context_usage()`` is a real round-trip to the child.
+    The attempt is cached on failure too: retrying every turn would spend up to
+    the query timeout on the turn path to re-learn the same unavailability.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    session = getattr(agent, "_claude_sdk_session", None)
+    if compressor is None or session is None:
+        return
+    if getattr(agent, "_sdk_ctxlen_synced_for", None) is session:
+        return
+    agent._sdk_ctxlen_synced_for = session
+
+    usage = None
+    try:
+        usage = session.context_usage()
+    except Exception:
+        logger.debug("claude-sdk context-length sync failed", exc_info=True)
+    max_tokens = _usable_cli_context_window(
+        usage.get("maxTokens") if isinstance(usage, dict) else None
+    )
+    if max_tokens is None:
+        logger.debug(
+            "claude-sdk context length: CLI did not report maxTokens; keeping "
+            "the model-metadata value (%s)",
+            getattr(compressor, "context_length", None),
+        )
+        return
+
+    previous = getattr(compressor, "context_length", 0) or 0
+    if previous == max_tokens:
+        return
+    try:
+        compressor.context_length = max_tokens
+    except Exception:
+        logger.debug("claude-sdk context-length assignment failed", exc_info=True)
+        return
+    logger.info(
+        "claude-sdk context length: %d (CLI maxTokens) replaces %d "
+        "(model metadata) for footer and hygiene sizing",
+        max_tokens, previous,
+    )
+
+
 def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, bool):
         return 0
@@ -410,10 +527,29 @@ def _record_claude_sdk_usage(agent, turn) -> dict[str, Any]:
         "reasoning_tokens": 0,
     }
 
+    # Context pressure != tokens billed. See _sdk_context_prompt_tokens.
+    context_prompt_tokens = _sdk_context_prompt_tokens(usage, prompt_tokens)
+    if context_prompt_tokens != prompt_tokens:
+        logger.debug(
+            "claude-sdk context tokens: using last-iteration %d (turn aggregate "
+            "was %d) for context pressure; aggregate retained for billing.",
+            context_prompt_tokens, prompt_tokens,
+        )
+
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:
+        # BEFORE update_from_response, which compares last_prompt_tokens against
+        # threshold_tokens: the setter invalidates the derived budgets, so
+        # syncing first means even the first turn's compression decision is
+        # taken against the CLI's real window rather than the metadata one.
+        _sync_context_length_from_cli(agent)
         try:
-            compressor.update_from_response(usage_dict)
+            compressor_usage = dict(usage_dict)
+            compressor_usage["prompt_tokens"] = context_prompt_tokens
+            compressor_usage["total_tokens"] = (
+                context_prompt_tokens + completion_tokens
+            )
+            compressor.update_from_response(compressor_usage)
         except Exception:
             logger.debug("claude-sdk usage update failed", exc_info=True)
 
@@ -455,7 +591,10 @@ def _record_claude_sdk_usage(agent, turn) -> dict[str, Any]:
 
     return {
         **usage_dict,
-        "last_prompt_tokens": prompt_tokens,
+        # Context-pressure value: drives the runtime footer's context_pct and
+        # gateway session hygiene. usage_dict still carries the BILLING
+        # aggregate under "prompt_tokens".
+        "last_prompt_tokens": context_prompt_tokens,
         "estimated_cost_usd": None,
         "cost_status": "included",
         "cost_source": "claude-subscription",
@@ -579,7 +718,7 @@ def _configured_max_budget_usd() -> Optional[float]:
 def run_claude_agent_sdk_turn(
     agent,
     *,
-    user_message: str,
+    user_message: Any,
     original_user_message: Any,
     messages: List[Dict[str, Any]],
     effective_task_id: str,
@@ -597,7 +736,34 @@ def run_claude_agent_sdk_turn(
       error/timeout retire      → id CLEARED → next turn fresh + digest
       stale/failed resume       → retire → clear → ONE fresh retry with digest
     """
-    from agent.transports.claude_agent_sdk_session import ClaudeAgentSdkSession
+    from agent.transports.claude_agent_sdk_session import (
+        ClaudeAgentSdkSession,
+        _coerce_turn_input,
+    )
+
+    user_input = _coerce_turn_input(user_message)
+    if isinstance(user_input, str) and not user_input.strip():
+        agent._interrupt_requested = False
+        live_session = getattr(agent, "_claude_sdk_session", None)
+        if live_session is not None:
+            try:
+                live_session.consume_interrupt()
+            except Exception:
+                logger.debug("consume_interrupt failed", exc_info=True)
+        rejection = (
+            "This Claude Agent SDK route can't process an empty message. "
+            "Please send text or a supported image."
+        )
+        return {
+            "final_response": rejection,
+            "messages": messages,
+            "api_calls": 0,
+            "completed": False,
+            "partial": True,
+            "error": rejection,
+            "interrupted": False,
+            "agent_persisted": True,
+        }
 
     # P1.b: refresh the approval-context snapshot EVERY turn (including
     # session-reuse turns). This runs on the agent turn thread, where the
@@ -811,6 +977,61 @@ def run_claude_agent_sdk_turn(
 
             on_unsolicited_result = _deliver_background_result
 
+        def _on_compaction(trigger: str) -> None:
+            """CLI is compacting — surface it with the SHARED status wording.
+
+            Reuses conversation_compression's constants rather than inventing a
+            second vocabulary: the gateway's noise filter is built from those
+            same templates (#69550), so a re-inlined string would be silently
+            dropped on chat surfaces.
+
+            A manual /compact is the user's own action and already has its own
+            feedback, so only the automatic case is announced -- that is the one
+            that stalls a turn with no explanation.
+            """
+            if str(trigger).strip().lower() == "manual":
+                return
+            try:
+                from agent.conversation_compression import COMPACTION_STATUS
+
+                agent._sdk_compaction_pending = True
+                emit = getattr(agent, "_emit_status", None)
+                if callable(emit):
+                    emit(COMPACTION_STATUS)
+                    logger.info("CLI compaction started (trigger=%s); status emitted", trigger)
+                else:
+                    logger.info(
+                        "CLI compaction started (trigger=%s); no _emit_status, "
+                        "status not emitted",
+                        trigger,
+                    )
+            except Exception:
+                logger.debug("failed to emit CLI compaction status", exc_info=True)
+
+        def _on_compact_boundary(trigger: str) -> None:
+            """Compaction finished — close the status the PreCompact hook opened.
+
+            This is the real terminal edge, mid-turn, ~1 minute before the turn
+            ends. The end-of-turn emit below is now only a fallback for a CLI
+            that stops streaming compact_boundary; whichever fires first clears
+            the pending flag, so the notice is emitted exactly once.
+
+            Guarded on the pending flag rather than emitted unconditionally: a
+            manual /compact is never announced on the start side, and announcing
+            only its completion would be a notice for an event the user was
+            never told had begun.
+            """
+            if not getattr(agent, "_sdk_compaction_pending", False):
+                return
+            agent._sdk_compaction_pending = False
+            try:
+                from agent.conversation_compression import _emit_compaction_done
+
+                logger.info("CLI compaction finished (trigger=%s)", trigger)
+                _emit_compaction_done(agent)
+            except Exception:
+                logger.debug("failed to emit CLI compaction completion", exc_info=True)
+
         agent._claude_sdk_session = ClaudeAgentSdkSession(
             cwd=cwd,
             model=getattr(agent, "model", None) or None,
@@ -823,6 +1044,8 @@ def run_claude_agent_sdk_turn(
             on_interim_assistant=on_interim_assistant,
             on_tool_iteration=on_tool_iteration,
             on_unsolicited_result=on_unsolicited_result,
+            on_compaction=_on_compaction,
+            on_compact_boundary=_on_compact_boundary,
             # Operator budget cap (agent.claude_agent_sdk.max_budget_usd);
             # None = no budget. Read per session creation so a config edit
             # applies on the next session, same as the append snapshot.
@@ -913,22 +1136,42 @@ def run_claude_agent_sdk_turn(
 
     turn = None
     resumed = False
-    send_text = user_message
+    send_input = user_input
     for attempt in (0, 1):
         if not hasattr(agent, "_claude_sdk_session") or agent._claude_sdk_session is None:
             resume_id = _persisted_sdk_session_id(agent) if attempt == 0 else None
             resumed = bool(resume_id)
-            send_text = user_message
+            send_input = user_input
             if not resume_id and len(messages) > 1:
                 digest = _render_continuity_digest(messages[:-1])
                 if digest:
-                    send_text = digest + user_message
+                    if isinstance(user_input, list):
+                        send_input = [
+                            {"type": "text", "text": digest},
+                            *user_input,
+                        ]
+                    else:
+                        send_input = digest + user_input
             _create_session(resume_id)
 
         try:
-            turn = agent._claude_sdk_session.run_turn(user_input=send_text)
+            turn = agent._claude_sdk_session.run_turn(user_input=send_input)
         except Exception as exc:
-            logger.exception("claude-agent-sdk turn failed")
+            safe_exc = redact_sensitive_text(str(exc), force=True)
+            # A PreCompact hook may have opened a transient user-visible status.
+            # This exception bypasses the normal terminal edge below; clear it
+            # here so a later unrelated turn cannot announce stale completion.
+            if getattr(agent, "_sdk_compaction_pending", False):
+                agent._sdk_compaction_pending = False
+                try:
+                    emit = getattr(agent, "_emit_status", None)
+                    if callable(emit):
+                        emit("⚠️ Context compaction interrupted")
+                except Exception:
+                    logger.debug("failed to close interrupted compaction status", exc_info=True)
+            # Do not use logger.exception here: it appends the raw exception
+            # string after the redacted message to the log record.
+            logger.error("claude-agent-sdk turn failed: %s", safe_exc)
             try:
                 agent._claude_sdk_session.close()
             except Exception:
@@ -941,7 +1184,7 @@ def run_claude_agent_sdk_turn(
                 resumed = False
                 continue
             return {
-                "final_response": f"claude-agent-sdk turn failed: {exc}",
+                "final_response": f"claude-agent-sdk turn failed: {safe_exc}",
                 "messages": messages,
                 "api_calls": 0,
                 "completed": False,
@@ -951,12 +1194,13 @@ def run_claude_agent_sdk_turn(
                 # partial — mark it failed so one-shot runs exit nonzero
                 # (mirrors conversation_loop's generic non-retryable return).
                 "failed": True,
-                "error": str(exc),
+                "error": safe_exc,
             }
 
         if getattr(turn, "should_retire", False):
             logger.warning(
-                "claude-agent-sdk session retired (turn error: %s)", turn.error
+                "claude-agent-sdk session retired (turn error: %s)",
+                redact_sensitive_text(str(turn.error or ""), force=True),
             )
             try:
                 agent._claude_sdk_session.close()
@@ -978,6 +1222,29 @@ def run_claude_agent_sdk_turn(
                 resumed = False
                 continue
         break
+
+    # FALLBACK ONLY. _on_compact_boundary above is the real terminal edge and
+    # normally clears the flag mid-turn; reaching here means the CLI started a
+    # compaction and never streamed its compact_boundary (older/newer CLI, or a
+    # turn that died mid-compaction). A completed turn still proves the
+    # compaction ended, so this closes the dangling status rather than leaving
+    # "🗜️ Compacting..." as the user's last word from the turn.
+    #
+    # Do NOT promote this back to the primary path: end-of-turn is exactly where
+    # end-of-turn progress cleanup deletes the message, so the notice is emitted
+    # and destroyed in the same instant (see _handle_compact_boundary).
+    if getattr(agent, "_sdk_compaction_pending", False):
+        agent._sdk_compaction_pending = False
+        try:
+            from agent.conversation_compression import _emit_compaction_done
+
+            logger.info(
+                "CLI compaction: no compact_boundary seen; emitting completion "
+                "at turn end (fallback)"
+            )
+            _emit_compaction_done(agent)
+        except Exception:
+            logger.debug("failed to emit CLI compaction completion", exc_info=True)
 
     # Interrupt handoff (codex_runtime parity, its ~739-746): capture BEFORE
     # the consume below zeroes the agent flag — the result dict needs it, and
@@ -1032,7 +1299,11 @@ def run_claude_agent_sdk_turn(
     agent._iters_since_skill = (
         getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
     )
-    usage_result = _record_claude_sdk_usage(agent, turn)
+    usage_result = (
+        _record_claude_sdk_usage(agent, turn)
+        if getattr(turn, "api_call_made", True)
+        else {}
+    )
 
     should_review_skills = False
     if (
@@ -1076,10 +1347,10 @@ def run_claude_agent_sdk_turn(
     result = {
         "final_response": turn.final_text,
         "messages": messages,
-        "api_calls": 1,
+        "api_calls": int(getattr(turn, "api_call_made", True)),
         "completed": not turn.interrupted and turn.error is None,
         "partial": turn.interrupted or turn.error is not None,
-        "error": turn.error,
+        "error": redact_sensitive_text(str(turn.error or ""), force=True) if turn.error else None,
         "interrupted": _user_interrupted,
         # Same persistence contract as the codex app-server path: we flushed
         # the projected rows ourselves, so the gateway must not re-write the

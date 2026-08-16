@@ -2704,11 +2704,20 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         if base_url:
             agent.base_url = base_url
         elif old_norm_provider != new_norm_provider:
-            raise ValueError(
-                f"switch_model: no base_url resolved for provider "
-                f"'{new_provider}' (switching from '{old_provider}'); "
-                "refusing to keep the previous provider's endpoint"
-            )
+            # The Claude Agent SDK is deliberately transport-owned: it starts
+            # the Claude subprocess using subscription OAuth and never makes an
+            # HTTP request through AIAgent.client.  Its provider profile
+            # therefore resolves to an empty base URL.  Clear the previous
+            # provider's HTTP endpoint instead of rejecting this valid route;
+            # retaining it would pair Claude with the old Codex/OpenAI URL.
+            if api_mode == "claude_agent_sdk":
+                agent.base_url = ""
+            else:
+                raise ValueError(
+                    f"switch_model: no base_url resolved for provider "
+                    f"'{new_provider}' (switching from '{old_provider}'); "
+                    "refusing to keep the previous provider's endpoint"
+                )
         agent.api_mode = api_mode
         # Invalidate transport cache — new api_mode may need a different transport
         if hasattr(agent, "_transport_cache"):
@@ -2760,6 +2769,15 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent.base_url = "moa://local"
             agent._client_kwargs = {}
             agent.client = build_moa_facade(agent, agent.model)
+        elif api_mode == "claude_agent_sdk":
+            # The official Claude Agent SDK owns both its subscription OAuth
+            # and subprocess transport.  It intentionally has neither an
+            # OpenAI-compatible client nor an HTTP endpoint; mirrors the
+            # initialization branch in agent_init.py.
+            agent.client = None
+            agent._client_kwargs = {}
+            agent.api_key = api_key or "claude-subscription-oauth"
+            agent.base_url = ""
         elif api_mode == "anthropic_messages":
             from agent.anthropic_adapter import (
                 build_anthropic_client,
