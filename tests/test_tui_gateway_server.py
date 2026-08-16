@@ -2929,8 +2929,17 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch, omit_messag
         def get_ancestor_display_prefix(self, _sid):
             return []
 
-        def get_messages_as_conversation(self, target, include_ancestors=False, repair_alternation=False, **_kwargs):
-            captured.setdefault("history_calls", []).append((target, include_ancestors))
+        def get_messages_as_conversation(
+            self,
+            target,
+            include_ancestors=False,
+            repair_alternation=False,
+            include_row_ids=False,
+            **_kwargs,
+        ):
+            captured.setdefault("history_calls", []).append(
+                (target, include_ancestors, include_row_ids)
+            )
             return (
                 [
                     {"role": "user", "content": "root prompt"},
@@ -2975,9 +2984,9 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch, omit_messag
     assert resp["result"]["messages"] == expected
     assert resp["result"]["message_count"] == (1 if omit_messages else 2)
     assert resp["result"]["messages_omitted"] is omit_messages
-    expected_calls = [(target, False)] if omit_messages else [
-        (target, False),
-        (target, True),
+    expected_calls = [(target, False, True)] if omit_messages else [
+        (target, False, False),
+        (target, True, False),
     ]
     assert captured["history_calls"] == expected_calls
 
@@ -5122,10 +5131,10 @@ def test_prompt_submit_truncation_falls_back_to_sid_when_session_key_null(monkey
             replaced.append((key, list(messages)))
 
     history = [
-        {"role": "user", "content": "first"},
-        {"role": "assistant", "content": "reply 1"},
-        {"role": "user", "content": "second"},
-        {"role": "assistant", "content": "reply 2"},
+        {"_row_id": 101, "role": "user", "content": "first"},
+        {"_row_id": 102, "role": "assistant", "content": "reply 1"},
+        {"_row_id": 103, "role": "user", "content": "second"},
+        {"_row_id": 104, "role": "assistant", "content": "reply 2"},
     ]
     server._sessions["null-key-trunc-sid"] = _session(
         history=list(history), session_key=None
@@ -5142,6 +5151,7 @@ def test_prompt_submit_truncation_falls_back_to_sid_when_session_key_null(monkey
                 "params": {
                     "session_id": "null-key-trunc-sid",
                     "text": "new turn",
+                    "truncate_before_row_id": 103,
                     "truncate_before_user_ordinal": 1,
                     "confirm_truncate": True,
                 },
@@ -5237,6 +5247,56 @@ def test_prompt_submit_refuses_ordinal_only_when_history_has_row_ids(monkeypatch
         assert replaced == []
     finally:
         server._sessions.pop("ordinal-only-durable-sid", None)
+
+
+def test_prompt_submit_refuses_ordinal_only_when_durable_history_is_unstamped(monkeypatch):
+    """Durability comes from state.db, not optional stamps on the live copy."""
+    replaced = []
+    history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "reply 1"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "reply 2"},
+    ]
+
+    class _FakeDB:
+        def get_messages_as_conversation(self, key, **kwargs):
+            assert key == "session-key"
+            assert kwargs["include_row_ids"] is True
+            return [dict(message, _row_id=100 + index) for index, message in enumerate(history)]
+
+        def replace_messages(self, key, messages, active_only=False, archive_dropped=False):
+            replaced.append((key, list(messages)))
+
+    server._sessions["unstamped-durable-sid"] = _session(history=list(history))
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(
+        server, "_start_agent_build", lambda *a, **k: pytest.fail("must not start a turn")
+    )
+    monkeypatch.setattr(
+        server, "_start_inflight_turn", lambda *a, **k: pytest.fail("must not start a turn")
+    )
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "unstamped-durable-sid",
+                    "text": "retry",
+                    "truncate_before_user_ordinal": 1,
+                    "confirm_truncate": True,
+                },
+            }
+        )
+
+        assert resp["error"]["code"] == 4004
+        assert "truncate_before_row_id" in resp["error"]["message"]
+        assert server._sessions["unstamped-durable-sid"]["history"] == history
+        assert replaced == []
+    finally:
+        server._sessions.pop("unstamped-durable-sid", None)
 
 
 def test_prompt_submit_truncates_by_row_id(monkeypatch):
@@ -5447,10 +5507,10 @@ def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
             replaced.append((key, list(messages)))
 
     history = [
-        {"role": "user", "content": "first"},
-        {"role": "assistant", "content": "ok"},
-        {"role": "user", "content": "second"},
-        {"role": "assistant", "content": "done"},
+        {"_row_id": 101, "role": "user", "content": "first"},
+        {"_row_id": 102, "role": "assistant", "content": "ok"},
+        {"_row_id": 103, "role": "user", "content": "second"},
+        {"_row_id": 104, "role": "assistant", "content": "done"},
     ]
     server._sessions["empty-trunc-sid"] = _session(history=list(history))
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
@@ -5470,6 +5530,7 @@ def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
                 "params": {
                     "session_id": "empty-trunc-sid",
                     "text": "fresh typed message",
+                    "truncate_before_row_id": 101,
                     "truncate_before_user_ordinal": 0,
                     "confirm_truncate": True,
                 },
@@ -5486,6 +5547,7 @@ def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
                     "params": {
                         "session_id": "empty-trunc-sid",
                         "text": "fresh typed message",
+                        "truncate_before_row_id": 101,
                         "truncate_before_user_ordinal": 0,
                         "confirm_truncate": True,
                         "confirm_empty_truncate": falsey,
@@ -5534,10 +5596,10 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
             replaced.append((key, list(messages)))
 
     history = [
-        {"role": "user", "content": "first"},
-        {"role": "assistant", "content": "ok"},
-        {"role": "user", "content": "second"},
-        {"role": "assistant", "content": "done"},
+        {"_row_id": 101, "role": "user", "content": "first"},
+        {"_row_id": 102, "role": "assistant", "content": "ok"},
+        {"_row_id": 103, "role": "user", "content": "second"},
+        {"_row_id": 104, "role": "assistant", "content": "done"},
     ]
     server._sessions["confirm-empty-sid"] = _session(
         agent=_Agent(), history=list(history)
@@ -5557,6 +5619,7 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
                 "params": {
                     "session_id": "confirm-empty-sid",
                     "text": "first",
+                    "truncate_before_row_id": 101,
                     "truncate_before_user_ordinal": 0,
                     "confirm_truncate": True,
                     "confirm_empty_truncate": True,
@@ -10309,6 +10372,21 @@ def test_session_info_reports_pending_model_switch(monkeypatch):
     assert server._session_info(agent, session)["model"] == "old/model"
 
 
+def test_session_info_includes_turn_started_at():
+    agent = types.SimpleNamespace(tools=[], model="", provider="")
+    session = {
+        "history": [],
+        "inflight_turn": {"started_at": 1_700_000_123.5},
+        "running": True,
+    }
+
+    assert server._session_info(agent, session)["turn_started_at"] == 1_700_000_123.5
+
+    session["inflight_turn"] = None
+    session["running"] = False
+    assert server._session_info(agent, session)["turn_started_at"] is None
+
+
 # ---------------------------------------------------------------------------
 # History-mutating commands must reject while session.running is True.
 # Without these guards, prompt.submit's post-run history write either
@@ -10842,6 +10920,9 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         def __init__(self):
             self.replaced = []
 
+        def get_messages_as_conversation(self, *_args, **_kwargs):
+            return []
+
         def replace_messages(self, session_id, messages, active_only=False, archive_dropped=False):
             self.replaced.append((session_id, list(messages)))
 
@@ -10899,6 +10980,9 @@ def test_prompt_submit_refuses_turn_when_truncate_persist_fails(monkeypatch):
     server._sessions["trunc-fail-sid"] = sess
 
     class _FailDb:
+        def get_messages_as_conversation(self, *_args, **_kwargs):
+            return []
+
         def replace_messages(self, session_id, messages, active_only=False, archive_dropped=False):
             raise OSError("disk full")
 
@@ -10990,6 +11074,9 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
     class _StubDb:
         def __init__(self):
             self.replaced = []
+
+        def get_messages_as_conversation(self, *_args, **_kwargs):
+            return []
 
         def replace_messages(self, session_id, messages, active_only=False, archive_dropped=False):
             self.replaced.append((session_id, list(messages)))
@@ -12972,6 +13059,42 @@ def test_session_history_uses_session_profile_db(monkeypatch, tmp_path):
         server._sessions.pop("sid", None)
 
 
+def test_session_history_ships_durable_row_ids(monkeypatch):
+    """session.history must request row-id stamps — clients resolve truncation
+    targets by content against this projection (#87059 client half)."""
+    seen: dict = {}
+
+    class _Db:
+        def get_messages_as_conversation(self, _key, include_ancestors=False, include_row_ids=False, **_kwargs):
+            seen["include_row_ids"] = include_row_ids
+
+            return [
+                {"role": "user", "content": "hello", "_row_id": 41},
+                {"role": "assistant", "content": "hi"},
+            ]
+
+    server._sessions["rowid-hist-sid"] = {
+        "session_key": "rowid-sess",
+        "history": [],
+        "history_lock": __import__("threading").Lock(),
+        "running": False,
+        "agent": None,
+        "created_at": 1.0,
+        "last_active": 1.0,
+    }
+    monkeypatch.setattr(server, "_get_db", lambda: _Db())
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.history", "params": {"session_id": "rowid-hist-sid"}}
+        )
+        assert "result" in resp, resp
+        assert seen.get("include_row_ids") is True
+        user_rows = [m for m in resp["result"]["messages"] if m.get("role") == "user"]
+        assert user_rows and user_rows[0].get("row_id") == 41
+    finally:
+        server._sessions.pop("rowid-hist-sid", None)
+
+
 def test_session_status_uses_session_profile_db(monkeypatch, tmp_path):
     """session.status must load meta from the session profile state.db."""
     profile_home = tmp_path / "profiles" / "mlperf"
@@ -14059,6 +14182,9 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
             "streaming": True,
             "user": "write a long answer",
         }
+        turn_started_at = resp["result"]["turn_started_at"]
+        assert turn_started_at == server._sessions["sid-live"]["inflight_turn"]["started_at"]
+        assert turn_started_at > 0
         assert resp["result"]["messages"] == []
 
         release.set()
@@ -14071,6 +14197,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
             }
         )
         assert completed["result"].get("inflight") is None
+        assert completed["result"]["turn_started_at"] is None
         assert completed["result"]["messages"] == [
             {"role": "user", "text": "write a long answer"},
             {"role": "assistant", "text": "partial answer complete"},
@@ -18257,6 +18384,9 @@ def test_personality_marker_does_not_shift_truncate_ordinal(monkeypatch):
         def __init__(self):
             self.replaced = []
 
+        def get_messages_as_conversation(self, *_args, **_kwargs):
+            return []
+
         def replace_messages(self, session_id, messages, active_only=False, archive_dropped=False):
             self.replaced.append((session_id, list(messages)))
 
@@ -18364,6 +18494,9 @@ def test_prompt_submit_truncation_archives_instead_of_deleting(monkeypatch):
             self._target()
 
     class _StubDb:
+        def get_messages_as_conversation(self, *_args, **_kwargs):
+            return []
+
         def replace_messages(
             self, session_id, messages, active_only=False, archive_dropped=False
         ):

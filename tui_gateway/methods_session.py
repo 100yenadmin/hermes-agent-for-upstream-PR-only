@@ -541,7 +541,7 @@ def _(rid, params: dict) -> dict:
                 # inspection/export must show what is actually stored.
                 if omit_messages:
                     raw_history = db.get_messages_as_conversation(
-                        target, repair_alternation=True
+                        target, repair_alternation=True, include_row_ids=True
                     )
                     display_history = []
                 else:
@@ -627,7 +627,7 @@ def _(rid, params: dict) -> dict:
             # display copy stays verbatim.
             if omit_messages:
                 raw_history = db.get_messages_as_conversation(
-                    target, repair_alternation=True
+                    target, repair_alternation=True, include_row_ids=True
                 )
                 display_history = []
             else:
@@ -2493,8 +2493,16 @@ def _(rid, params: dict) -> dict:
         with _session_db(session) as db:
             if db is not None:
                 try:
+                    # include_row_ids: the durable row id is how clients address
+                    # a specific persisted turn (reactions, and the Desktop's
+                    # content-based truncation-target resolution — #87059). The
+                    # projection in _history_to_messages only forwards row_id
+                    # when the row carries a stamp, so an unstamped read here
+                    # silently strips the one durable address clients can use.
                     history = db.get_messages_as_conversation(
-                        session["session_key"], include_ancestors=True
+                        session["session_key"],
+                        include_ancestors=True,
+                        include_row_ids=True,
                     )
                 except Exception:
                     pass

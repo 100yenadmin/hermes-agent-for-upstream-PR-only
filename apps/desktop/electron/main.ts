@@ -162,6 +162,7 @@ import {
   removeWorktree,
   switchBranch
 } from './git-worktree-ops'
+import { clearStaleGitLocks } from './gitlock'
 import { readAndConsumeHandoffResult } from './handoff-result'
 import {
   ATTACHMENT_UPLOAD_DEFAULT_MAX_BYTES,
@@ -2660,6 +2661,12 @@ async function checkUpdates() {
       fetchedAt: Date.now()
     }
   }
+
+  // Self-heal abandoned git lock files before fetching. A stale
+  // .git/shallow.lock from a crashed/interrupted fetch otherwise fails every
+  // later fetch ("Unable to create '.git/shallow.lock': File exists") and this
+  // check reports 'fetch-failed' forever — git never removes these itself.
+  await clearStaleGitLocks(updateRoot)
 
   const fetched = await runGit(['fetch', '--quiet', 'origin', branch], { cwd: updateRoot })
 

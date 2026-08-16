@@ -81,13 +81,15 @@ try:
         install_cmd_backspace_alias,
         install_ctrl_enter_alias,
         install_ignored_terminal_sequences,
+        install_modify_other_keys_aliases,
         install_shift_enter_alias,
     )
     install_shift_enter_alias()
     install_ctrl_enter_alias()
     install_cmd_backspace_alias()
+    install_modify_other_keys_aliases()
     install_ignored_terminal_sequences()
-    del install_shift_enter_alias, install_ctrl_enter_alias, install_cmd_backspace_alias, install_ignored_terminal_sequences
+    del install_shift_enter_alias, install_ctrl_enter_alias, install_cmd_backspace_alias, install_modify_other_keys_aliases, install_ignored_terminal_sequences
 except Exception:
     pass
 import threading
@@ -3885,7 +3887,7 @@ _TERMINAL_INPUT_MODE_RESET_SEQ = (
     "\x1b[0m"      # reset text attributes
     "\x1b[?25h"    # ensure cursor visible
 )
-_EXTENDED_ENTER_KEYS_SEQ = "\x1b[>1u\x1b[>4;2m"
+_EXTENDED_ENTER_KEYS_SEQ = "\x1b[>4;2m"
 
 
 _BACKSLASH_LINE_CONTINUATION_RE = re.compile(r"\\[ \t]*$")
@@ -3920,10 +3922,23 @@ def _terminal_supports_extended_enter_keys(env: Optional[Mapping[str, str]] = No
 def _enable_extended_enter_keys(output=None, env: Optional[Mapping[str, str]] = None) -> bool:
     """Ask allowlisted terminals to report Shift+Enter distinctly.
 
-    Writes both the Kitty keyboard protocol push (CSI >1u) and xterm
-    modifyOtherKeys level 2 (CSI >4;2m), mirroring the Ink TUI. The exit reset
-    sequence already pops/resets both modes, so this is safe across normal
-    exits, Ctrl+C, and SIGTERM cleanup.
+    Writes xterm modifyOtherKeys level 2 (CSI >4;2m), mirroring the Ink TUI.
+    We do NOT push the Kitty keyboard protocol (CSI >1u) here because
+    prompt_toolkit 3.x cannot parse Kitty CSI-u sequences for control
+    characters — Ctrl+C arrives as ``\\x1b[99;5u`` instead of ``\\x03``,
+    which neither prompt_toolkit's key bindings nor the kernel's INTR
+    mechanism can match, leaving Ctrl+C completely dead (#56684).
+
+    modifyOtherKeys=2 re-encodes ALL Ctrl+key combos as
+    ``ESC[27;5;<codepoint>~`` instead of raw control bytes.
+    ``install_modify_other_keys_aliases()`` (called at CLI startup from
+    ``hermes_cli.pt_input_extras``) populates prompt_toolkit's
+    ``ANSI_SEQUENCES`` with the full Ctrl+letter / Ctrl+digit / Ctrl+symbol
+    and Alt+letter mappings under both the modifyOtherKeys and CSI-u formats,
+    so every existing key binding continues to fire (#87711).
+
+    The exit reset sequence already pops/resets both modes, so this is
+    safe across normal exits, Ctrl+C, and SIGTERM cleanup.
     """
     if not _terminal_supports_extended_enter_keys(env):
         return False
@@ -5052,6 +5067,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
             short_uuid = uuid.uuid4().hex[:6]
             self.session_id = f"{timestamp_str}_{short_uuid}"
+        getattr(self, "_write_terminal_breadcrumb", lambda: None)()
         
         # History file for persistent input recall across sessions
         self._history_file = _hermes_home / ".hermes_history"
@@ -9247,6 +9263,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
         short_uuid = uuid.uuid4().hex[:6]
         self.session_id = f"{timestamp_str}_{short_uuid}"
+        getattr(self, "_write_terminal_breadcrumb", lambda: None)()
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
@@ -12259,6 +12276,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         }
         _cprint(labels.get(self.tool_progress_mode, ""))
 
+    def _write_terminal_breadcrumb(self) -> None:
+        """Record this terminal's live session for bare ``hermes -c``.
+
+        Called at session start and whenever ``self.session_id`` is
+        reassigned mid-run (/new, /branch, auto-compression rotation) so a
+        later bare ``-c`` in THIS terminal resumes THIS conversation's live
+        tip. Best-effort — never raises, no-op without a terminal identity
+        or when session.terminal_continue is false.
+        """
+        try:
+            from hermes_cli.terminal_breadcrumbs import write_breadcrumb
+
+            write_breadcrumb(self.session_id)
+        except Exception:
+            pass
+
     def _transfer_session_yolo(self, old_session_id: str, new_session_id: str) -> None:
         """Move YOLO bypass state from an old session key to a new one.
 
@@ -12582,6 +12615,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     and self.agent.session_id != self.session_id
                 ):
                     self.session_id = self.agent.session_id
+                    getattr(self, "_write_terminal_breadcrumb", lambda: None)()
                     self._pending_title = None
                     # Manual /compress replaces conversation_history with a new
                     # compressed handoff for the child session. Persist it from
@@ -15656,6 +15690,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             ):
                 self._transfer_session_yolo(self.session_id, self.agent.session_id)
                 self.session_id = self.agent.session_id
+                getattr(self, "_write_terminal_breadcrumb", lambda: None)()
                 self._pending_title = None
 
             # Get the final response
@@ -16040,6 +16075,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             agent._persist_session(messages, conversation_history)
             if getattr(agent, "session_id", None):
                 self.session_id = agent.session_id
+                getattr(self, "_write_terminal_breadcrumb", lambda: None)()
 
         try:
             if persist_lock is None:

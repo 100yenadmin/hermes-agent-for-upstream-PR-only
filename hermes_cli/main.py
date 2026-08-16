@@ -696,7 +696,17 @@ _apply_profile_override()
 from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
-load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
+# Updating dependencies must not import optional secret-manager libraries into
+# the updater process before ``uv`` replaces the environment.  On Windows,
+# Bitwarden's cryptography import maps ``_rust.pyd`` and the parent updater then
+# prevents its own child installer from replacing that file (#73381).  Profile
+# flags have already been stripped above, so the first remaining argument is
+# the authoritative argparse subcommand.  Dotenv/managed config still loads;
+# only external secret fetches are unnecessary for installation maintenance.
+load_hermes_dotenv(
+    project_env=PROJECT_ROOT / ".env",
+    load_external_secrets=sys.argv[1:2] != ["update"],
+)
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
@@ -1146,8 +1156,42 @@ def _confirm_startup_expensive_model_override(args) -> None:
         raise SystemExit(1)
 
 
-def _session_browse_picker(sessions: list) -> Optional[str]:
+def _session_status_tag(status: Optional[str]) -> str:
+    """Short fixed-width tag for a session lifecycle status."""
+    return {
+        "complete": "done",
+        "interrupted": "intr",
+        "error": "err",
+        "empty": "empty",
+    }.get(status or "", "-")
+
+
+def _annotate_session_statuses(sessions: list, session_db) -> None:
+    """Attach a ``_status`` key to each session row (best-effort, cheap).
+
+    Uses ``SessionDB.session_lifecycle_statuses`` — one indexed last-message
+    lookup per listed session, never a transcript scan. On any failure the
+    rows simply stay untagged and the picker renders '-' for status.
+    """
+    if session_db is None or not sessions:
+        return
+    try:
+        statuses = session_db.session_lifecycle_statuses(
+            [s.get("id") for s in sessions]
+        )
+    except Exception:
+        return
+    for s in sessions:
+        s["_status"] = statuses.get(s.get("id"), "")
+
+
+def _session_browse_picker(sessions: list, session_db=None) -> Optional[str]:
     """Interactive curses-based session browser with live search filtering.
+
+    Shows lifecycle status (done / intr / err / empty) and message count per
+    session when *session_db* is provided. With a live *session_db*, pressing
+    ``d`` on a row (while the search filter is empty) prompts y/n and deletes
+    the session via ``SessionDB.delete_session``.
 
     Returns the selected session ID, or None if cancelled.
     """
@@ -1155,11 +1199,31 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
         print("No sessions found.")
         return None
 
+    _annotate_session_statuses(sessions, session_db)
+
+    def _delete_session(session_id: str) -> bool:
+        if session_db is None:
+            return False
+        try:
+            sessions_dir = get_hermes_home() / "sessions"
+        except Exception:
+            sessions_dir = None
+        try:
+            return bool(
+                session_db.delete_session(session_id, sessions_dir=sessions_dir)
+            )
+        except Exception:
+            return False
+
     # Try curses-based picker first
     try:
         import curses
 
         result_holder = [None]
+
+        # Layout: [arrow 3] [title/preview flexible] [status 5] [msgs 5]
+        #         [active 12] [src 6] [id 18]
+        _FIXED_COLS = 3 + 5 + 2 + 5 + 2 + 12 + 6 + 18 + 6
 
         def _format_row(s, max_x):
             """Format a session row for display."""
@@ -1168,11 +1232,11 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
             source = s.get("source", "")[:6]
             last_active = _relative_time(s.get("last_active"))
             sid = s["id"][:18]
+            status = _session_status_tag(s.get("_status"))
+            msgs = s.get("message_count")
+            msgs_str = str(msgs) if isinstance(msgs, int) else "-"
 
-            # Adaptive column widths based on terminal width
-            # Layout: [arrow 3] [title/preview flexible] [active 12] [src 6] [id 18]
-            fixed_cols = 3 + 12 + 6 + 18 + 6  # arrow + active + src + id + padding
-            name_width = max(20, max_x - fixed_cols)
+            name_width = max(20, max_x - _FIXED_COLS)
 
             if title:
                 name = title[:name_width]
@@ -1181,7 +1245,10 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
             else:
                 name = sid
 
-            return f"{name:<{name_width}}  {last_active:<10}  {source:<5} {sid}"
+            return (
+                f"{name:<{name_width}}  {status:<5}  {msgs_str:>5}  "
+                f"{last_active:<10}  {source:<5} {sid}"
+            )
 
         def _match(s, query):
             """Check if a session matches the search query (case-insensitive)."""
@@ -1202,11 +1269,24 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
                 curses.init_pair(2, curses.COLOR_YELLOW, -1)  # header
                 curses.init_pair(3, curses.COLOR_CYAN, -1)  # search
                 curses.init_pair(4, 8 if curses.COLORS > 8 else curses.COLOR_WHITE, -1)  # dim
+                curses.init_pair(5, curses.COLOR_RED, -1)  # error/delete
 
             cursor = 0
             scroll_offset = 0
             search_text = ""
+            confirm_delete = None  # session dict pending y/n confirmation
+            flash = ""  # one-frame notice (e.g. "deleted <title>")
             filtered = list(sessions)
+
+            def _status_attr(status):
+                if not curses.has_colors():
+                    return curses.A_NORMAL
+                return {
+                    "complete": curses.color_pair(1),
+                    "interrupted": curses.color_pair(2),
+                    "error": curses.color_pair(5),
+                    "empty": curses.color_pair(4),
+                }.get(status or "", curses.A_NORMAL)
 
             while True:
                 stdscr.clear()
@@ -1228,7 +1308,10 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
                     if curses.has_colors():
                         header_attr |= curses.color_pair(3)
                 else:
-                    header = "  Browse sessions — ↑↓ navigate  Enter select  Type to filter  Esc quit"
+                    header = (
+                        "  Browse sessions — ↑↓ navigate  Enter select"
+                        "  Type to filter  Esc quit"
+                    )
                     header_attr = curses.A_BOLD
                     if curses.has_colors():
                         header_attr |= curses.color_pair(2)
@@ -1238,9 +1321,11 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
                     pass
 
                 # Column header line
-                fixed_cols = 3 + 12 + 6 + 18 + 6
-                name_width = max(20, max_x - fixed_cols)
-                col_header = f"   {'Title / Preview':<{name_width}}  {'Active':<10}  {'Src':<5} {'ID'}"
+                name_width = max(20, max_x - _FIXED_COLS)
+                col_header = (
+                    f"   {'Title / Preview':<{name_width}}  {'Stat':<5}  "
+                    f"{'Msgs':>5}  {'Active':<10}  {'Src':<5} {'ID'}"
+                )
                 try:
                     dim_attr = (
                         curses.color_pair(4) if curses.has_colors() else curses.A_DIM
@@ -1288,30 +1373,75 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
                                 attr |= curses.color_pair(1)
                         try:
                             stdscr.addnstr(y, 0, row, max_x - 1, attr)
+                            if i != cursor:
+                                # Recolor the status tag column in place.
+                                status = s.get("_status")
+                                tag = _session_status_tag(status)
+                                tag_x = 3 + max(20, (max_x - 3) - _FIXED_COLS) + 2
+                                if tag_x + 5 < max_x - 1:
+                                    stdscr.addnstr(
+                                        y, tag_x, f"{tag:<5}", 5, _status_attr(status)
+                                    )
                         except curses.error:
                             pass
 
                 # Footer
                 footer_y = max_y - 1
-                if filtered:
-                    footer = f"  {cursor + 1}/{len(filtered)} sessions"
-                    if len(filtered) < len(sessions):
-                        footer += f" (filtered from {len(sessions)})"
-                else:
-                    footer = f"  0/{len(sessions)} sessions"
-                try:
-                    stdscr.addnstr(
-                        footer_y,
-                        0,
-                        footer,
-                        max_x - 1,
-                        curses.color_pair(4) if curses.has_colors() else curses.A_DIM,
+                footer_attr = (
+                    curses.color_pair(4) if curses.has_colors() else curses.A_DIM
+                )
+                if confirm_delete is not None:
+                    label = (
+                        (confirm_delete.get("title") or "").strip()
+                        or (confirm_delete.get("preview") or "").strip()
+                        or confirm_delete["id"]
                     )
+                    if len(label) > 40:
+                        label = label[:37] + "..."
+                    footer = f"  Delete session '{label}'? [y/N]"
+                    footer_attr = curses.A_BOLD
+                    if curses.has_colors():
+                        footer_attr |= curses.color_pair(5)
+                elif flash:
+                    footer = f"  {flash}"
+                    flash = ""
+                else:
+                    if filtered:
+                        footer = f"  {cursor + 1}/{len(filtered)} sessions"
+                        if len(filtered) < len(sessions):
+                            footer += f" (filtered from {len(sessions)})"
+                    else:
+                        footer = f"  0/{len(sessions)} sessions"
+                    if session_db is not None and not search_text:
+                        footer += "   d delete"
+                try:
+                    stdscr.addnstr(footer_y, 0, footer, max_x - 1, footer_attr)
                 except curses.error:
                     pass
 
                 stdscr.refresh()
                 key = stdscr.getch()
+
+                if confirm_delete is not None:
+                    # y/n confirmation mode — only an explicit 'y' deletes.
+                    target = confirm_delete
+                    confirm_delete = None
+                    if key in {ord("y"), ord("Y")}:
+                        if _delete_session(target["id"]):
+                            sessions[:] = [
+                                s for s in sessions if s["id"] != target["id"]
+                            ]
+                            filtered = (
+                                [s for s in sessions if _match(s, search_text)]
+                                if search_text
+                                else list(sessions)
+                            )
+                            flash = "Deleted."
+                            if not sessions:
+                                return
+                        else:
+                            flash = "Delete failed."
+                    continue
 
                 if key in {curses.KEY_UP,}:
                     if filtered:
@@ -1344,6 +1474,15 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
                         scroll_offset = 0
                 elif key == ord("q") and not search_text:
                     return
+                elif (
+                    key == ord("d")
+                    and not search_text
+                    and session_db is not None
+                    and filtered
+                ):
+                    # 'd' only acts as delete when the filter is empty —
+                    # while a search is active it types into the query below.
+                    confirm_delete = filtered[cursor]
                 elif 32 <= key <= 126:
                     # Printable character → add to search filter
                     search_text += chr(key)
@@ -1357,7 +1496,8 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
     except Exception:
         pass
 
-    # Fallback: numbered list (Windows without curses, etc.)
+    # Fallback: numbered list (Windows without curses, etc.). Shows the same
+    # status/message-count columns but has no delete support.
     print("\n  Browse sessions  (enter number to resume, q to cancel)\n")
     for i, s in enumerate(sessions):
         title = (s.get("title") or "").strip()
@@ -1367,7 +1507,13 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
             label = label[:47] + "..."
         last_active = _relative_time(s.get("last_active"))
         src = s.get("source", "")[:6]
-        print(f"  {i + 1:>3}. {label:<50}  {last_active:<10}  {src}")
+        status = _session_status_tag(s.get("_status"))
+        msgs = s.get("message_count")
+        msgs_str = str(msgs) if isinstance(msgs, int) else "-"
+        print(
+            f"  {i + 1:>3}. {label:<50}  {status:<5}  {msgs_str:>5}  "
+            f"{last_active:<10}  {src}"
+        )
 
     while True:
         try:
@@ -2662,17 +2808,56 @@ def cmd_chat(args):
                 print("Use 'hermes sessions list' to see available sessions.")
                 sys.exit(1)
         else:
-            # -c with no argument — continue the most recent session
-            source = "tui" if use_tui else "cli"
-            last_id = _resolve_last_session(source=source)
-            if not last_id and source == "tui":
-                last_id = _resolve_last_session(source="cli")
-            if last_id:
-                args.resume = last_id
+            # -c with no argument — prefer this terminal's own breadcrumb
+            # (written at session start / rotation) so side-by-side terminals
+            # each continue their own conversation. Falls back to the
+            # most-recent session when there is no valid breadcrumb, or when
+            # session.terminal_continue is false in config.yaml.
+            try:
+                from hermes_cli.terminal_breadcrumbs import resolve_breadcrumb_session
+
+                _crumb_id = resolve_breadcrumb_session()
+            except Exception:
+                _crumb_id = None
+            if _crumb_id:
+                args.resume = _crumb_id
             else:
-                kind = "TUI" if use_tui else "CLI"
-                print(f"No previous {kind} session found to continue.")
-                sys.exit(1)
+                # No valid breadcrumb — continue the most recent session
+                source = "tui" if use_tui else "cli"
+                last_id = _resolve_last_session(source=source)
+                if not last_id and source == "tui":
+                    last_id = _resolve_last_session(source="cli")
+                if last_id:
+                    args.resume = last_id
+                else:
+                    kind = "TUI" if use_tui else "CLI"
+                    print(f"No previous {kind} session found to continue.")
+                    sys.exit(1)
+
+    # --resume @claude / --resume @codex: import a foreign session (Claude
+    # Code / Codex CLI) and resume the newly created Hermes session.
+    _resume_foreign = getattr(args, "resume", None)
+    if isinstance(_resume_foreign, str) and _resume_foreign.strip().lower() in (
+        "@claude",
+        "@codex",
+    ):
+        from hermes_cli.foreign_sessions import (
+            import_foreign_session,
+            pick_foreign_session,
+        )
+
+        _foreign_source = _resume_foreign.strip().lower().lstrip("@")
+        _picked = pick_foreign_session(_foreign_source)
+        if _picked is None:
+            sys.exit(1)
+        try:
+            _imported_id = import_foreign_session(_picked.source, _picked.path)
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        print(f"✓ Imported as {_imported_id} — resuming it now.")
+        print(f"  (later: hermes --resume {_imported_id})")
+        args.resume = _imported_id
 
     # Resolve --resume by title if it's not a direct session ID
     resume_val = getattr(args, "resume", None)
@@ -8590,12 +8775,17 @@ def _run_quarantined_install(
         moved = _quarantine_running_hermes_exe(scripts_dir)
     try:
         _run_install_with_heartbeat(cmd, env=env)
-    except BaseException:
-        # Restore shims if pip/uv didn't write replacements (e.g. install
-        # failed before the entry-points step). Don't swallow the error.
+    finally:
+        # Restore shims when the installer didn't write replacements — on
+        # FAILURE (install died before the entry-points step) and on SUCCESS
+        # too: uv audits an already-satisfied editable install as a no-op and
+        # rewrites no entry points, which would otherwise leave the shims
+        # quarantined aside and `hermes` missing from PATH after a green
+        # install (#75584). _restore_quarantined_exes skips any shim the
+        # installer actually replaced, so this never clobbers fresh output.
+        # Errors are not swallowed — the finally re-raises whatever escaped.
         if scripts_dir is not None:
             _restore_quarantined_exes(moved)
-        raise
 
 
 def _cleanup_quarantined_exes(scripts_dir: Path | None = None) -> None:
@@ -12362,6 +12552,38 @@ def main():
         "grant",
         help="Request the grants (opens the dialog attributed to CuaDriver)",
     )
+    computer_use_browser_approve = computer_use_sub.add_parser(
+        "browser-approve",
+        help="Mint a single-use token authorizing browser attachment for one exact window",
+        description=(
+            "Runs `cua-driver browser-approve` to mint a five-minute,\n"
+            "single-use token that authorizes ONE browser preparation for the\n"
+            "exact process (and window) you name. Give the printed token to\n"
+            "the agent; it passes it as approval_token on the\n"
+            "cua_browser_prepare action.\n\n"
+            "This is the explicit human boundary for attaching to a browser —\n"
+            "especially an existing signed-in profile, where the DevTools\n"
+            "protocol can see that profile's live pages, cookies, and storage.\n"
+            "Ordinary tool approval never substitutes for this grant, so a\n"
+            "model can never mint or guess the token itself.\n\n"
+            "Find the pid/window_id via the agent (list_windows) or ask it to\n"
+            "read them from a native capture."
+        ),
+    )
+    computer_use_browser_approve.add_argument(
+        "--pid", type=int, required=True,
+        help="Exact browser process id to authorize",
+    )
+    computer_use_browser_approve.add_argument(
+        "--window-id", type=int, default=None,
+        help="Exact native window id (required for existing-profile attachment)",
+    )
+    computer_use_browser_approve.add_argument(
+        "--profile-mode",
+        choices=["isolated_new", "isolated_named", "existing_profile"],
+        default="isolated_new",
+        help="Preparation the token authorizes (default: isolated_new)",
+    )
 
     def cmd_computer_use(args):
         action = getattr(args, "computer_use_action", None)
@@ -12418,6 +12640,36 @@ def main():
                 json_output=bool(getattr(args, "json", False)),
             )
             sys.exit(code)
+        if action == "browser-approve":
+            import subprocess
+            from tools.computer_use.cua_backend import (
+                cua_driver_child_env,
+                cua_driver_install_hint,
+                resolve_cua_driver_cmd,
+            )
+            binary = resolve_cua_driver_cmd()
+            if not binary:
+                print(cua_driver_install_hint())
+                sys.exit(2)
+            cmd = [binary, "browser-approve", "--pid", str(args.pid)]
+            window_id = getattr(args, "window_id", None)
+            if window_id is not None:
+                cmd += ["--window-id", str(window_id)]
+            cmd += ["--profile-mode", getattr(args, "profile_mode", "isolated_new")]
+            try:
+                # Interactive passthrough: cua-driver requires a TTY to mint
+                # the grant, prints the token itself, and owns the expiry.
+                proc = subprocess.run(cmd, env=cua_driver_child_env())
+            except OSError as exc:
+                print(f"cua-driver browser-approve failed to launch: {exc}", file=sys.stderr)
+                sys.exit(2)
+            if proc.returncode == 0:
+                print(
+                    "\nGive the token above to the agent — it passes it as "
+                    "approval_token on cua_browser_prepare. Single use, "
+                    "expires in ~5 minutes."
+                )
+            sys.exit(proc.returncode)
         if action == "permissions":
             perms_action = getattr(args, "computer_use_perms_action", None)
             if perms_action == "grant":
@@ -12908,6 +13160,28 @@ def main():
     )
     sessions_browse.add_argument(
         "--limit", type=int, default=500, help="Max sessions to load (default: 500)"
+    )
+
+    sessions_import = sessions_subparsers.add_parser(
+        "import",
+        help="Import a Claude Code or Codex CLI session into Hermes",
+        description=(
+            "Pull a conversation started in Claude Code (~/.claude/projects) "
+            "or Codex CLI (~/.codex/sessions) into the Hermes session store "
+            "so it can be resumed with 'hermes --resume <id>'. The foreign "
+            "files are only read, never modified."
+        ),
+    )
+    sessions_import.add_argument(
+        "--from",
+        dest="from_source",
+        choices=["claude", "codex"],
+        help="Which tool to import from (default: pick across both)",
+    )
+    sessions_import.add_argument(
+        "path",
+        nargs="?",
+        help="Path to a specific session JSONL file (skips the picker)",
     )
 
 
