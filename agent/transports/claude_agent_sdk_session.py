@@ -864,10 +864,17 @@ class ClaudeAgentSdkSession:
         # instead of raising against a torn-down one.
         self._stop_reader()
         if self._client is not None and self._loop is not None:
+            # Budget must exceed the SDK transport's own escalation ladder
+            # (stdin lock + graceful wait + SIGTERM + SIGKILL); on timeout the
+            # loop thread dies below and its shielded reap never finishes, so
+            # fall back to killing the child directly.
+            pid = _sdk_child_pid(self._client)
             try:
-                self._run_coro(self._client.disconnect(), timeout=10.0)
+                self._run_coro(
+                    self._client.disconnect(), timeout=_SDK_DISCONNECT_TIMEOUT_S
+                )
             except Exception:  # pragma: no cover - best-effort cleanup
-                pass
+                _force_kill_sdk_child(pid)
             self._client = None
         self._stop_loop_thread()
 
@@ -2036,6 +2043,63 @@ class ClaudeAgentSdkSession:
         except (TimeoutError, concurrent.futures.TimeoutError):
             future.cancel()
             raise asyncio.TimeoutError(f"coroutine exceeded {timeout}s")
+
+
+# Ceiling on the SDK transport's close ladder (5s stdin lock + 5s graceful +
+# 5s SIGTERM + 5s SIGKILL), plus slack.
+_SDK_DISCONNECT_TIMEOUT_S = 25.0
+
+
+def _sdk_child_pid(client: Any) -> Optional[int]:
+    """OS pid of the CLI subprocess behind an SDK client, if reachable."""
+    try:
+        proc = getattr(getattr(client, "_transport", None), "_process", None)
+        pid = getattr(proc, "pid", None)
+        return int(pid) if pid else None
+    except Exception:
+        return None
+
+
+def _is_own_sdk_child(pid: int) -> bool:
+    """Guard against PID reuse: only reap a LIVE child of THIS process.
+
+    A zombie counts as already dead — it holds no RSS and needs no signal.
+    """
+    ppid = None
+    state = ""
+    try:
+        with open(f"/proc/{pid}/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("PPid:"):
+                    ppid = int(line.split()[1])
+                elif line.startswith("State:"):
+                    state = line.split()[1]
+    except (OSError, ValueError, IndexError):
+        return False
+    return ppid == os.getpid() and state != "Z"
+
+
+def _force_kill_sdk_child(pid: Optional[int]) -> None:
+    """Last-resort reap when disconnect() times out and strands the CLI child."""
+    if not pid or not _is_own_sdk_child(pid):
+        return
+    import signal
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        time.sleep(0.1)
+        if not _is_own_sdk_child(pid):
+            logger.info("claude-agent-sdk stranded child %s reaped (SIGTERM)", pid)
+            return
+    try:
+        os.kill(pid, signal.SIGKILL)
+        logger.warning("claude-agent-sdk stranded child %s required SIGKILL", pid)
+    except OSError:
+        pass
 
 
 def _tool_preview(name: str, args: dict) -> str:
