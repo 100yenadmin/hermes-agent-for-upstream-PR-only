@@ -105,12 +105,20 @@ COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn...
 
 
 def _emit_compaction_done(agent: Any) -> None:
-    """Emit the structured terminal edge for a started compaction."""
+    """Emit the structured terminal edge for a started compaction.
+
+    Logged on every path. Chat delivery is otherwise the ONLY witness that this
+    fired -- the gateway logs no outbound sends, and a missing status_callback
+    returns silently -- so without these lines "did the user get the notice?"
+    is unanswerable after the fact and depends on someone watching the screen.
+    """
     status_callback = getattr(agent, "status_callback", None)
     if not status_callback:
+        logger.info("compaction done: no status_callback; completion notice not emitted")
         return
     try:
         status_callback("compacted", COMPACTION_DONE_STATUS)
+        logger.info("compaction done: completion notice emitted")
     except Exception:
         logger.debug("status_callback error in compaction completion", exc_info=True)
 

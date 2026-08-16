@@ -911,6 +911,13 @@ def run_claude_agent_sdk_turn(
                 emit = getattr(agent, "_emit_status", None)
                 if callable(emit):
                     emit(COMPACTION_STATUS)
+                    logger.info("CLI compaction started (trigger=%s); status emitted", trigger)
+                else:
+                    logger.info(
+                        "CLI compaction started (trigger=%s); no _emit_status, "
+                        "status not emitted",
+                        trigger,
+                    )
             except Exception:
                 logger.debug("failed to emit CLI compaction status", exc_info=True)
 

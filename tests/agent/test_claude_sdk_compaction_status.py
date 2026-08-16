@@ -77,3 +77,47 @@ def test_status_wording_is_single_sourced():
     """Pin the reuse: these are the constants the gateway filter is built from."""
     assert "Compacting context" in COMPACTION_STATUS
     assert "compaction complete" in COMPACTION_DONE_STATUS.lower()
+
+
+# ── Observability ───────────────────────────────────────────────────────────
+# The gateway logs no outbound sends (`grep -c outbound gateway.log` -> 0), so
+# before these lines the only witness that a compaction notice reached the user
+# was the user happening to watch the screen. Confirmed unanswerable in
+# production 2026-08-16: a real auto-compaction fired (preTokens=697,652) and
+# whether the completion notice followed could not be determined from disk.
+
+
+class _AgentWithCallback:
+    def __init__(self):
+        self.seen = []
+        self.status_callback = lambda kind, text: self.seen.append((kind, text))
+
+
+def test_completion_emit_is_logged(caplog):
+    from agent.conversation_compression import _emit_compaction_done
+
+    agent = _AgentWithCallback()
+    with caplog.at_level("INFO", logger="agent.conversation_compression"):
+        _emit_compaction_done(agent)
+
+    assert agent.seen == [("compacted", COMPACTION_DONE_STATUS)]
+    assert "completion notice emitted" in caplog.text
+
+
+def test_missing_callback_is_logged_not_silent(caplog):
+    """The silent-return path is the one that loses the notice — it must log."""
+    from agent.conversation_compression import _emit_compaction_done
+
+    class _NoCallback:
+        status_callback = None
+
+    with caplog.at_level("INFO", logger="agent.conversation_compression"):
+        _emit_compaction_done(_NoCallback())
+
+    assert "not emitted" in caplog.text
+
+
+# The START-side log lives in a closure nested inside run_claude_agent_sdk_turn,
+# which cannot be exercised without standing up a full turn. It is deliberately
+# left to production verification rather than covered by a source-text grep --
+# a test that asserts on source is not evidence the line ever runs.
