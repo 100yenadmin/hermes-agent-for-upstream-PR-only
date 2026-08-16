@@ -268,7 +268,12 @@ import {
   stagedUpdaterSupportsPrewrittenMarker,
   wrapHandoffForDetachedConsole
 } from './updater-process'
-import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from './venv-blocker-scan'
+import {
+  formatBlockerMessage,
+  formatProbeFailedMessage,
+  scanVenvBlockers,
+  stopSafeVenvBlockers
+} from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
 import { readWindowBelow } from './window-below'
@@ -3043,6 +3048,22 @@ async function backendIdentityMatches(identity) {
   return command === null ? undefined : backendCommandMatches(command)
 }
 
+// True when the recorded parent Electron is still running (same PID AND start
+// marker); false when it is gone or its PID was reused; undefined when the
+// ownership record predates parent tracking. Undefined deliberately falls back
+// to the pre-parent reap behaviour so legacy orphan cleanup keeps working.
+async function backendParentMatches(entry) {
+  if (!Number.isInteger(entry.parentPid) || typeof entry.parentStartMarker !== 'string' || !entry.parentStartMarker) {
+    return undefined
+  }
+
+  try {
+    return (await processStartMarker(entry.parentPid)) === entry.parentStartMarker
+  } catch (error) {
+    return error?.code === 'ENOENT' || error?.code === 'ESRCH' ? false : undefined
+  }
+}
+
 async function stopOwnedBackend(identity) {
   if ((await processIdentityMatches(identity)) !== true) {
     return
@@ -3092,6 +3113,7 @@ async function stopOwnedBackend(identity) {
 
 const backendOwnership = createBackendOwnership({
   matchesIdentity: backendIdentityMatches,
+  matchesParent: backendParentMatches,
   stop: stopOwnedBackend,
   store: {
     read: () => {
@@ -3120,7 +3142,12 @@ async function claimBackendChild(child, command, profile, nonce) {
       nonce,
       pid: child.pid,
       profile,
-      startMarker: await processStartMarker(child.pid)
+      startMarker: await processStartMarker(child.pid),
+      // Record the spawning Electron so reapOrphans can tell an orphaned
+      // backend (parent gone) from one owned by a live instance — a live
+      // parent's backend is never reaped (#87295).
+      parentPid: process.pid,
+      parentStartMarker: await desktopParentStartMarker()
     })
 
     child.hermesBackendIdentity = identity
@@ -3265,7 +3292,7 @@ async function releaseBackendLock(updateRoot, tag) {
 //
 // Detection (checkUpdates / commit changelog / "N behind") stays in the UI;
 // only this apply action changed.
-async function applyUpdates(opts = {}) {
+async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
   if (updateInFlight) {
     throw new Error('An update is already in progress.')
   }
@@ -3402,7 +3429,18 @@ async function applyUpdates(opts = {}) {
     // malformed output, missing psutil) abort the handoff — never proceed
     // to the detached updater when the venv state is unknown.
     if (IS_WINDOWS) {
-      const scanOutcome = await scanVenvBlockers(updateRoot)
+      let scanOutcome = await scanVenvBlockers(updateRoot)
+
+      if (scanOutcome.kind === 'blocked' && opts.stopSafeBlockers) {
+        const stopResult = await stopSafeVenvBlockers(updateRoot, scanOutcome.result)
+        rememberLog(
+          `[updates] user-approved blocker cleanup: stopped=${stopResult.stopped.join(',') || 'none'} failed=${stopResult.failed.join(',') || 'none'}`
+        )
+        // Let verified process-tree termination finish unwinding wrapper shells,
+        // then make the scanner — not the stale renderer payload — authoritative.
+        await new Promise(resolve => setTimeout(resolve, 300))
+        scanOutcome = await scanVenvBlockers(updateRoot)
+      }
 
       if (scanOutcome.kind === 'blocked') {
         const message = formatBlockerMessage(scanOutcome.result)
@@ -3411,7 +3449,7 @@ async function applyUpdates(opts = {}) {
         emitUpdateProgress({ stage: 'error', message, percent: null })
         startHermes().catch(() => {})
 
-        return { ok: false, error: 'venv-blocked', message }
+        return { ok: false, error: 'venv-blocked', message, blockers: scanOutcome.result.processes }
       }
 
       if (scanOutcome.kind === 'probe-failure') {
@@ -9673,6 +9711,15 @@ async function prepareProfileDeleteRequest(request) {
 }
 
 async function startHermes() {
+  // Only the single-instance lock holder may reap/spawn/claim the desktop
+  // backend. A lock-losing instance must stay inert even if some path reaches
+  // here (e.g. the deferred-quit window before `ready`): its reapOrphans()
+  // otherwise SIGTERMs the running instance's live backend (#87295).
+  if (!isPrimaryInstance) {
+    rememberLog('[boot] non-primary instance: skipping backend machinery')
+    throw new Error('Hermes Desktop is already running in another window.')
+  }
+
   await reapOrphanedBackendsOnce()
 
   // Latched-failure short-circuit: once bootstrap has failed in this
@@ -14105,9 +14152,17 @@ function registerDeepLinkProtocol() {
 // second-instance argv. Without the lock a second `hermes://` launch spawns a
 // whole new app instead of routing into the running one.
 const _gotSingleInstanceLock = app.requestSingleInstanceLock()
+const isPrimaryInstance = _gotSingleInstanceLock
 
-if (!_gotSingleInstanceLock) {
-  app.quit()
+if (!isPrimaryInstance) {
+  // Hard-exit, not app.quit(): the before-quit teardown coordinator defers a
+  // plain quit (event.preventDefault + async backend shutdown), and in that
+  // window `ready` still fires — the lock-losing instance then runs the full
+  // startup (shortcut registration, createWindow → startHermes), whose
+  // reapOrphans() SIGTERMs the running instance's live backend (#87295).
+  // app.exit() terminates immediately, before `ready`, so a second launch
+  // routes into the running window and never touches backend machinery.
+  app.exit(0)
 } else {
   app.on('second-instance', (_event, argv) => {
     const url = _extractDeepLink(argv)
