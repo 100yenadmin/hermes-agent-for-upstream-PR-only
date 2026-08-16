@@ -71,6 +71,65 @@ _SDK_PERMISSION_MODES = (
 )
 
 
+def _configured_sdk_env() -> dict:
+    """agent.claude_agent_sdk.env — extra environment for the CLI subprocess.
+
+    The Claude Code CLI reads operational knobs from its environment that the
+    SDK exposes no typed option for. Measured on 0.2.120: only
+    ``CLAUDE_CODE_AUTO_COMPACT_WINDOW`` moves the context ceiling and the
+    autocompact threshold (300000 -> maxTokens 300000, threshold 267000);
+    ``CLAUDE_CODE_MAX_CONTEXT_TOKENS`` and ``CLAUDE_AUTOCOMPACT_PCT_OVERRIDE``
+    are inert. That ratio is exactly why this is a generic config surface and
+    not a named option per knob — the knobs are undocumented and shift.
+
+    Values are stringified; a non-mapping or unreadable config yields {} so a
+    bad edit cannot strip the scrubbed env that ships alongside it.
+    """
+    raw = _provider_config().get("env")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for key, value in raw.items():
+        if value is None:
+            continue
+        try:
+            out[str(key)] = str(value)
+        except Exception:
+            logger.warning(
+                "agent.claude_agent_sdk.env[%r] is not stringifiable — ignoring", key
+            )
+    return out
+
+
+def _sdk_env_overrides() -> dict[str, str]:
+    """The full env override set handed to the spawned CLI.
+
+    Metered-vector scrub first (see _METERED_ENV_DENYLIST).
+    agent.claude_agent_sdk.allow_metered_key: true is the operator's explicit
+    "bill me metered" opt-in (the same flag the startup guard honors), so it
+    disables the scrub too — otherwise the documented escape hatch would hand
+    the CLI an environment with the key blanked.
+
+    Operator-configured env is applied last so deliberate knobs win over
+    defaults, but it must NOT win over the scrub: a plain update() would let
+    ``env: {ANTHROPIC_API_KEY: ...}`` overwrite the scrub's "" and silently
+    re-arm metered billing behind allow_metered_key: false. Denylisted keys
+    are therefore dropped (loudly) unless the metered opt-in is set.
+    """
+    metered_allowed = _provider_flag("allow_metered_key")
+    overrides: dict[str, str] = {} if metered_allowed else _scrubbed_sdk_env()
+    for key, value in _configured_sdk_env().items():
+        if not metered_allowed and key in _METERED_ENV_DENYLIST:
+            logger.warning(
+                "agent.claude_agent_sdk.env[%s] is a metered billing vector — "
+                "ignoring (set allow_metered_key: true to permit it)",
+                key,
+            )
+            continue
+        overrides[key] = value
+    return overrides
+
+
 def _configured_permission_mode() -> Optional[str]:
     """agent.claude_agent_sdk.permission_mode from config.yaml, validated.
 
@@ -1896,9 +1955,7 @@ class ClaudeAgentSdkSession:
         # explicit "bill me metered" opt-in (the same flag the startup guard
         # honors), so it disables the scrub too — otherwise the documented
         # escape hatch would hand the CLI an environment with the key blanked.
-        env_overrides: dict[str, str] = {}
-        if not _provider_flag("allow_metered_key"):
-            env_overrides = _scrubbed_sdk_env()
+        env_overrides = _sdk_env_overrides()
 
         fields = {
             "model": self._model,
