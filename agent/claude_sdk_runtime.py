@@ -364,6 +364,31 @@ def _sdk_context_prompt_tokens(usage: dict, fallback: int) -> int:
     return total or fallback
 
 
+def _usable_cli_context_window(value: Any) -> Optional[int]:
+    """Return a CLI window only when it is safe for Hermes tool workflows.
+
+    ``context_usage()`` is an SDK message boundary, not model metadata. Keep
+    malformed or sub-minimum reports from collapsing the parent's footer,
+    compression, and hygiene sizing; the existing metadata value is safer.
+    """
+    from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        candidate = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text or not text.isdecimal():
+            return None
+        candidate = int(text)
+    else:
+        # In particular, reject floats: silently truncating 63_999.9 turns an
+        # invalid report into a plausible but unsafe context window.
+        return None
+    return candidate if candidate >= MINIMUM_CONTEXT_LENGTH else None
+
+
 def _sync_context_length_from_cli(agent: Any) -> None:
     """Point the compressor's context_length at the CLI's REAL window.
 
@@ -395,10 +420,10 @@ def _sync_context_length_from_cli(agent: Any) -> None:
         usage = session.context_usage()
     except Exception:
         logger.debug("claude-sdk context-length sync failed", exc_info=True)
-    max_tokens = 0
-    if isinstance(usage, dict):
-        max_tokens = _coerce_usage_int(usage.get("maxTokens"))
-    if max_tokens <= 0:
+    max_tokens = _usable_cli_context_window(
+        usage.get("maxTokens") if isinstance(usage, dict) else None
+    )
+    if max_tokens is None:
         logger.debug(
             "claude-sdk context length: CLI did not report maxTokens; keeping "
             "the model-metadata value (%s)",

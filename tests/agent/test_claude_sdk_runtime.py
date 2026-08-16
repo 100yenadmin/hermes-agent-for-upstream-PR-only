@@ -937,6 +937,51 @@ class TestRuntimeGlue:
         # Skill-nudge counter parity with the codex path.
         assert agent._iters_since_skill == 2
 
+    def test_compact_boundary_completes_once_before_turn_end(self, monkeypatch):
+        """The stream boundary is primary; terminal completion is fallback only."""
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        callbacks = {}
+
+        class SpySession:
+            def __init__(self, **kwargs):
+                callbacks.update(kwargs)
+
+            def context_usage(self):
+                return None
+
+            def set_turn_visibility_callbacks(self, **kwargs):
+                pass
+
+            def run_turn(self, user_input):
+                callbacks["on_compaction"]("auto")
+                callbacks["on_compact_boundary"]("auto")
+                return _make_turn()
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(sdk_session_mod, "ClaudeAgentSdkSession", SpySession)
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        emitted = []
+        agent._emit_status = emitted.append
+        agent.status_callback = lambda kind, text: emitted.append((kind, text))
+
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="task-1",
+        )
+
+        assert agent._sdk_compaction_pending is False
+        completions = [item for item in emitted if isinstance(item, tuple)]
+        assert len(completions) == 1
+        assert completions[0][0] == "compacted"
+        assert "compaction complete" in completions[0][1].lower()
+
     def test_empty_rich_input_rejects_before_digest_or_session_creation(self):
         agent = _make_agent()
         agent._claude_sdk_session = None
