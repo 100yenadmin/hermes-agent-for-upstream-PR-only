@@ -67,7 +67,7 @@ invisible in logs.
 
 ---
 
-## 3. Autocompact knobs (`env`)
+## 3. Effective context window and autocompact knobs (`env`)
 
 The CLI reads operational knobs from its environment that the SDK exposes no
 typed option for. `agent.claude_agent_sdk.env` is a generic passthrough:
@@ -79,26 +79,48 @@ agent:
       CLAUDE_CODE_AUTO_COMPACT_WINDOW: '300000'
 ```
 
-It is deliberately generic because **most of these knobs do not work.** Measured
-against `claude-agent-sdk 0.2.120` by probing `get_context_usage()` on fresh
-clients:
+**Select the intended Opus ceiling before applying a clamp.** Fresh local probes
+against `claude-agent-sdk 0.2.120` observed these effective child values:
 
-| Variable | `maxTokens` | threshold | Verdict |
-|---|---|---|---|
-| *(baseline)* | 1,000,000 | 967,000 | — |
-| `CLAUDE_CODE_AUTO_COMPACT_WINDOW=300000` | **300,000** | **267,000** | **works** |
-| `CLAUDE_CODE_MAX_CONTEXT_TOKENS=300000` | 1,000,000 | 967,000 | inert |
-| `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=50` | 1,000,000 | 967,000 | inert |
-| `CLAUDE_CODE_DISABLE_AUTO_COMPACT` | 1,000,000 | `None` | disables |
+| Requested model | `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | `maxTokens` | threshold | source |
+|---|---:|---:|---:|---|
+| `claude-opus-5` | unset | 200,000 | 167,000 | `auto` |
+| `claude-opus-5[1m]` | unset | 1,000,000 | 967,000 | `auto` |
+| `claude-opus-5[1m]` | `300000` | 300,000 | 267,000 | `env` |
 
-Three of four plausible knobs do nothing, and they are undocumented enough to
-shift between CLI builds. That is the case for a config surface over a named
-option per knob — and the case for verifying any knob with `context_usage()`
-rather than trusting its name.
+Thus `[1m]` establishes the observed 1M-capable ceiling, while
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` can deliberately clamp that ceiling downward.
+A bare Opus identifier did not rise from 200k when given a 300k clamp in the
+measured path. Always treat the child’s `context_usage()["maxTokens"]` as the
+per-session authority, not model metadata or a configuration name.
 
-**The default threshold is 967,000 — 96.7% of the window, not the ~80% one would
-assume.** This is the single most misleading default on the lane: it makes
-autocompaction look broken at 600–700k when it is simply not due yet.
+A public Anthropic tracker issue reports a similar bare-vs-suffixed split on an
+earlier Opus generation, but it is user-reported evidence rather than a
+maintainer-documented contract. It corroborates the observation; it does not
+explain every session’s historical measurements.
+
+**Recorded operator observation, distinct from a causal claim.** Before trying
+to lower the context, the operator was certain Hermes displayed Opus at a 1M
+window. After experimenting with a 300k context limit and then a 300k
+autocompact window, removing those settings left bare Opus at 200k; `[1m]` was
+then required to obtain the larger window. That sequence is evidence worth
+preserving, but it does not by itself establish whether the change was caused by
+the knob experiments, account/session state, CLI behavior, or another factor.
+
+Most plausible alternative knobs did nothing in the same tested path:
+
+| Variable | observed result |
+|---|---|
+| `CLAUDE_CODE_MAX_CONTEXT_TOKENS=300000` | inert |
+| `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=50` | inert |
+| `CLAUDE_CODE_DISABLE_AUTO_COMPACT` | disables native autocompaction |
+
+These knobs are undocumented enough to shift between CLI builds. Verify every
+setting with `context_usage()` rather than trusting its name.
+
+**The default 1M threshold is 967,000 — 96.7% of that window, not the ~80% one
+might assume.** With the intentional 300k clamp, the measured threshold is
+267,000.
 
 **Shrinking the window desynchronises Hermes' own sizing.** Hermes resolves
 `context_length` from model metadata (`claude-opus-5` → 1,000,000), which is not
@@ -260,7 +282,7 @@ evidence.
 | Symptom | First check |
 |---|---|
 | Idle `claude` subprocesses accumulating | Orphan reap (§4) and cache displacement (§7) |
-| Context never compacts | `context_usage()` — the default threshold is 967,000, not 80% |
+| Context never compacts | `context_usage()` — threshold depends on the effective child window: 167,000 bare Opus, 967,000 for `[1m]`, or 267,000 with the intentional 300k clamp (§3) |
 | Compaction knob has no effect | It is probably inert (§3); confirm with `context_usage()` |
 | Notice never appeared | `compression.progress_notices`; then grep `compact_boundary` — a notice emitted at turn end is deleted by cleanup (§6) |
 | Footer % looks far too low | `context_usage()["maxTokens"]` vs `context_compressor.context_length` (§3) |
