@@ -6031,6 +6031,18 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     if isinstance(sync_client, BedrockAuxiliaryClient):
         return AsyncBedrockAuxiliaryClient(sync_client), model
     try:
+        from agent.claude_sdk_aux_client import ClaudeSdkAuxClient, AsyncClaudeSdkAuxClient
+
+        if isinstance(sync_client, ClaudeSdkAuxClient):
+            async_client = AsyncClaudeSdkAuxClient(sync_client)
+            _tag_effective_provider(
+                async_client,
+                _effective_provider_for_client(sync_client, ""),
+            )
+            return async_client, model
+    except ImportError:
+        pass
+    try:
         from agent.gemini_native_adapter import GeminiNativeClient, AsyncGeminiNativeClient
 
         if isinstance(sync_client, GeminiNativeClient):
@@ -9346,6 +9358,15 @@ def _call_llm_impl(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
+    is_subscription_sdk_route = (
+        _effective_provider_for_client(client, resolved_provider)
+        == "claude-agent-sdk"
+    )
+    if is_subscription_sdk_route:
+        # An auto-resolved SDK client belongs to the user's subscription;
+        # retain that concrete identity so it cannot bridge to a metered route.
+        resolved_provider = "claude-agent-sdk"
+
     effective_timeout = _effective_aux_timeout(task, timeout)
     request_provider = effective_provider or resolved_provider
     _set_relay_auxiliary_route(
@@ -9501,6 +9522,10 @@ def _call_llm_impl(
             # Retries exhausted — fall through to first_err fallback handling.
             raise _last_transient
     except Exception as first_err:
+        # The SDK facade is subscription-scoped. Its errors are terminal for
+        # this auxiliary attempt; no fallback helper may open a metered route.
+        if is_subscription_sdk_route:
+            raise
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
@@ -10132,6 +10157,15 @@ async def _async_call_llm_impl(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
+    is_subscription_sdk_route = (
+        _effective_provider_for_client(client, resolved_provider)
+        == "claude-agent-sdk"
+    )
+    if is_subscription_sdk_route:
+        # An auto-resolved SDK client belongs to the user's subscription;
+        # retain that concrete identity so it cannot bridge to a metered route.
+        resolved_provider = "claude-agent-sdk"
+
     effective_timeout = _effective_aux_timeout(task, timeout)
     request_provider = effective_provider or resolved_provider
     _set_relay_auxiliary_route(
@@ -10217,6 +10251,10 @@ async def _async_call_llm_impl(
                 ),
                 task)
     except Exception as first_err:
+        # The SDK facade is subscription-scoped. Its errors are terminal for
+        # this auxiliary attempt; no fallback helper may open a metered route.
+        if is_subscription_sdk_route:
+            raise
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)

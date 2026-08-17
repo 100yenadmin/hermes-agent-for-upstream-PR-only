@@ -275,6 +275,34 @@ class _AuxChat:
         self.completions = _AuxCompletions(owner)
 
 
+class _AsyncAuxCompletions:
+    """Awaitable adapter for the one-shot synchronous SDK facade."""
+
+    def __init__(self, sync_adapter: _AuxCompletions) -> None:
+        self._sync = sync_adapter
+
+    async def create(self, **kwargs: Any) -> Any:
+        return await asyncio.to_thread(self._sync.create, **kwargs)
+
+
+class _AsyncAuxChat:
+    def __init__(self, sync_adapter: _AuxCompletions) -> None:
+        self.completions = _AsyncAuxCompletions(sync_adapter)
+
+
+class AsyncClaudeSdkAuxClient:
+    """Async-compatible facade for subscription-safe one-shot SDK aux calls."""
+
+    def __init__(self, sync_wrapper: "ClaudeSdkAuxClient") -> None:
+        self.chat = _AsyncAuxChat(sync_wrapper.chat.completions)
+        self.api_key = sync_wrapper.api_key
+        self.base_url = sync_wrapper.base_url
+        self.default_model = sync_wrapper.default_model
+
+    async def close(self) -> None:  # pragma: no cover - no persistent client
+        return None
+
+
 class ClaudeSdkAuxClient:
     """OpenAI-shaped one-shot client over ``claude_agent_sdk.query()``."""
 
