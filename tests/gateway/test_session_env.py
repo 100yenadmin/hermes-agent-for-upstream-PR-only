@@ -145,6 +145,40 @@ def test_multiplex_session_env_pins_routed_profile_cwd(monkeypatch, tmp_path):
     ]
 
 
+def test_multiplex_profile_without_config_masks_process_default_cwd(monkeypatch, tmp_path):
+    """A fresh routed profile must not inherit the launch profile workspace."""
+    from agent.runtime_cwd import resolve_context_cwd
+    from agent.prompt_builder import build_context_files_prompt
+
+    stale = tmp_path / "default-workspace"
+    stale.mkdir()
+    (stale / "AGENTS.md").write_text("# wrong default profile\n", encoding="utf-8")
+    monkeypatch.setenv("TERMINAL_CWD", str(stale))
+    runner = object.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(multiplex_profiles=True)
+    runner.adapters = {}
+    home = tmp_path / "fresh-profile" / "home"
+    home.mkdir(parents=True)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="fresh",
+        chat_type="channel",
+        user_id="fresh-user",
+        profile="fresh",
+    )
+    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+
+    with _profile_runtime_scope(home):
+        tokens = runner._set_session_env(context)
+        try:
+            assert resolve_context_cwd() is None
+            assert "wrong default profile" not in build_context_files_prompt(
+                cwd=resolve_context_cwd(), skip_soul=True
+            )
+        finally:
+            runner._clear_session_env(tokens)
+
+
 def test_clear_session_env_restores_previous_state(monkeypatch):
     """_clear_session_env should restore contextvars to their pre-handler values."""
     runner = object.__new__(GatewayRunner)

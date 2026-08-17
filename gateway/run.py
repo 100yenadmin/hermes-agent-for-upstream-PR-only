@@ -24076,13 +24076,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
-        _session_cwd = ""
+        _session_cwd: str | None = ""
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             # The caller has already entered _profile_runtime_scope for the
             # routed profile. Read terminal.cwd from that scoped config and pin
             # it in the task-local session context. Without this, secondary
             # profiles inherit the launch profile's process-wide TERMINAL_CWD,
             # so context discovery can load another profile's AGENTS.md.
+            _session_cwd = None
             try:
                 from hermes_cli.config import (
                     apply_terminal_config_to_env,
@@ -24095,11 +24096,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     config=load_config_readonly(),
                     override=True,
                 )
-                _session_cwd = _cwd_env.get("TERMINAL_CWD", "")
+                _session_cwd = _cwd_env.get("TERMINAL_CWD")
             except Exception:
                 logger.warning(
                     "Could not resolve routed profile terminal.cwd; "
-                    "session context will continue without a cwd override",
+                    "session context will mask the process default cwd",
                     exc_info=True,
                 )
         return set_session_vars(
