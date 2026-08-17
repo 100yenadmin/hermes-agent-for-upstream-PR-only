@@ -600,8 +600,11 @@ def _append_unconfigured_rows(
                 _catalog = []
             if not _catalog:
                 _catalog = [cur_model] if cur_model else []
-            elif cur_model and cur_model in _catalog:
-                # Keep the saved model first so the picker preselects it.
+            elif cur_model:
+                # Keep the saved model first so the picker preselects it. It
+                # may be a valid new/preview model that is not in Hermes'
+                # bundled catalog yet; dropping it would make the current
+                # configuration impossible to re-select in the picker.
                 _catalog = [cur_model] + [m for m in _catalog if m != cur_model]
 
             warning = (

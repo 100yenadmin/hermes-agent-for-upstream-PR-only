@@ -30,6 +30,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 from typing import Any, Callable, Optional
 
 # TurnResult is the shared contract with the runtime glue — reused verbatim
@@ -552,6 +553,21 @@ _AUTH_UNAUTHORIZED_HTTP_401_RE = re.compile(
 def _safe_sdk_error_text(value: Any) -> str:
     """Redact provider/SDK diagnostics before they cross a transport boundary."""
     return redact_sensitive_text(str(value or ""), force=True)
+
+
+def _safe_sdk_traceback(exc: BaseException) -> str:
+    """Format traceback frames without re-emitting the exception payload.
+
+    ``logger(..., exc_info=True)`` is useful for startup diagnosis, but it also
+    appends ``str(exc)`` verbatim after the frames. SDK/import errors can carry
+    credentials, so retain the actionable call stack while routing the error
+    text itself through the normal forced-redaction boundary.
+    """
+    try:
+        frames = traceback.extract_tb(exc.__traceback__)
+        return "".join(traceback.format_list(frames)).rstrip()
+    except Exception:
+        return "<traceback unavailable>"
 
 
 def classify_auth_failure(
@@ -1291,7 +1307,11 @@ class ClaudeAgentSdkSession:
             # bare quoted key (e.g. "'anyio'"), which is undiagnosable from the
             # user-facing error string. WARNING so it reaches errors.log.
             logger.warning(
-                "claude-agent-sdk startup failed (%s)", exc, exc_info=True
+                "claude-agent-sdk startup failed (%s: %s)\n"
+                "Traceback (most recent call last):\n%s",
+                type(exc).__name__,
+                safe_exc,
+                _safe_sdk_traceback(exc),
             )
             # A refusal to start is fatal to the run, not turn-scoped: the
             # metered-key guard and an uninstallable SDK are config errors

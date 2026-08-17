@@ -2347,13 +2347,24 @@ class TestStreaming:
         )
         relay = captured.get("on_stream_delta")
         assert callable(relay)
-        seen = []
-        agent.stream_delta_callback = seen.append  # assigned AFTER creation
+        cli_seen = []
+        gateway_seen = []
+        agent.stream_delta_callback = cli_seen.append  # assigned AFTER creation
+        agent._stream_callback = gateway_seen.append
         relay("delta-text")
-        assert seen == ["delta-text"]
-        agent.stream_delta_callback = None  # cleared between turns → no crash
+        assert cli_seen == ["delta-text"]
+        assert gateway_seen == ["delta-text"]
+
+        # The CLI/TUI callback is cleared between turns, but the gateway sink
+        # remains the desktop's message.delta lane and must keep receiving.
+        agent.stream_delta_callback = None
+        relay("gateway-only")
+        assert cli_seen == ["delta-text"]
+        assert gateway_seen == ["delta-text", "gateway-only"]
+
+        agent._stream_callback = None  # both cleared → no crash
         relay("dropped")
-        assert seen == ["delta-text"]
+        assert gateway_seen == ["delta-text", "gateway-only"]
 
 
 # ---------- continuity: resume + digest fallback (W3) ----------
@@ -3193,6 +3204,26 @@ class TestFatalReason:
             session.close()
         assert turn.should_retire
         assert turn.fatal_reason == "auth"
+
+    def test_startup_traceback_keeps_frames_but_redacts_exception(self, caplog):
+        secret = "sk-ant-api03-SUPERSECRET"
+        session, _ = _make_session(
+            connect_exc=RuntimeError(f"connect failed with {secret}")
+        )
+        with caplog.at_level(
+            logging.WARNING,
+            logger="agent.transports.claude_agent_sdk_session",
+        ):
+            try:
+                turn = session.run_turn("hi")
+            finally:
+                session.close()
+
+        assert turn.should_retire
+        assert secret not in caplog.text
+        assert "claude-agent-sdk startup failed" in caplog.text
+        assert "Traceback (most recent call last)" in caplog.text
+        assert "connect" in caplog.text
 
     def test_sdk_error_result_is_not_fatal(self):
         # An in-turn SDK error (e.g. error_max_turns) is turn-scoped, not a
