@@ -1330,19 +1330,45 @@ def run_claude_agent_sdk_turn(
         and not turn.interrupted
         and (should_review_memory or should_review_skills)
     ):
-        # Deliberately NOT spawning the background review on this runtime:
-        # the fork inherits api_mode="claude_agent_sdk" and early-returns
-        # into a fresh SDK session whose tool surface has no `memory` /
-        # `skill_manage` — it would burn a subscription turn and be unable
-        # to write anything. The nudge counters above keep ticking so a
-        # bounded replacement pass can reuse them. (#25267)
-        logger.debug(
-            "claude-sdk runtime: background review skipped "
-            "(memory=%s, skills=%s) — the review fork cannot write on "
-            "this runtime",
-            should_review_memory,
-            should_review_skills,
-        )
+        # #25267 suppressed this spawn unconditionally: the fork inherits
+        # api_mode="claude_agent_sdk" and early-returns into a fresh SDK
+        # session whose tool surface has no `memory` / `skill_manage`, so it
+        # burned a subscription turn and wrote nothing.
+        #
+        # That reasoning only holds when the fork stays on THIS runtime. With
+        # auxiliary.background_review naming a concrete different
+        # provider/model, _resolve_review_runtime reports routed=True and the
+        # review runs over there — on a normal tool surface that can write.
+        # Suppressing it in that case is what left this lane unable to record
+        # anything durable across sessions.
+        #
+        # Unrouted, #25267 still applies: skip, and let the counters above
+        # keep ticking for a bounded replacement pass.
+        routed = False
+        try:
+            from agent.background_review import _resolve_review_runtime
+
+            routed = bool(_resolve_review_runtime(agent).get("routed"))
+        except Exception:
+            logger.debug("review-runtime resolve failed", exc_info=True)
+
+        if routed:
+            try:
+                agent._spawn_background_review(
+                    messages_snapshot=list(messages),
+                    review_memory=should_review_memory,
+                    review_skills=should_review_skills,
+                )
+            except Exception:
+                logger.debug("background review spawn raised", exc_info=True)
+        else:
+            logger.debug(
+                "claude-sdk runtime: background review skipped "
+                "(memory=%s, skills=%s) — the review fork cannot write on "
+                "this runtime",
+                should_review_memory,
+                should_review_skills,
+            )
 
     result = {
         "final_response": turn.final_text,

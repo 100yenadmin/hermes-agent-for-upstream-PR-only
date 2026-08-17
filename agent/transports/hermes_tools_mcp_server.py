@@ -139,6 +139,14 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "image_generate",
     "skill_view",
     "skills_list",
+    # skill_manage completes the read/write pair above. Its absence was not a
+    # policy call — it is not in `_AGENT_LOOP_TOOLS` (model_tools.py:667), so
+    # it dispatches statelessly like every other name here. Leaving it out
+    # meant a runtime on this transport could read skills but never record
+    # one, and it silently disabled the skill-review trigger too:
+    # claude_sdk_runtime gates should_review_skills on
+    # `"skill_manage" in agent.valid_tool_names`.
+    "skill_manage",
     "text_to_speech",
     # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
     # (set by the kanban dispatcher when spawning a worker). Without these

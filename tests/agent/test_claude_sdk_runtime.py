@@ -1108,43 +1108,97 @@ class TestRuntimeGlue:
         assert result["partial"] is True
 
 
-# ---------- background review must not spawn on this runtime ----------
+# ---------- background review spawns only when routed off this runtime ----------
 
 
-class TestBackgroundReviewSuppressed:
-    """The review fork inherits ``api_mode="claude_agent_sdk"`` and lands in
-    a fresh SDK session whose tool surface has no ``memory``/``skill_manage``
-    — it burns a subscription turn and cannot write anything. The runtime
-    must therefore never spawn it, while the nudge counters keep ticking so
-    a bounded replacement pass can reuse them. (#25267)"""
+class TestBackgroundReviewRouting:
+    @staticmethod
+    def _route(monkeypatch, routed):
+        import agent.background_review as br
 
-    def test_memory_nudge_does_not_spawn_review(self):
-        agent = _make_agent()
-        run_claude_agent_sdk_turn(
+        monkeypatch.setattr(
+            br, "_resolve_review_runtime", lambda _agent: {"routed": routed}
+        )
+
+    def _run(self, agent, *, want_memory=False):
+        return run_claude_agent_sdk_turn(
             agent,
             user_message="hi",
             original_user_message="hi",
             messages=[{"role": "user", "content": "hi"}],
             effective_task_id="task-1",
-            should_review_memory=True,
+            should_review_memory=want_memory,
         )
+
+    def test_unrouted_memory_nudge_does_not_spawn(self, monkeypatch):
+        self._route(monkeypatch, False)
+        agent = _make_agent()
+        self._run(agent, want_memory=True)
         agent._spawn_background_review.assert_not_called()
 
-    def test_skill_nudge_does_not_spawn_review_but_counter_still_ticks(self):
+    def test_unrouted_skill_nudge_does_not_spawn_but_counter_still_ticks(
+        self, monkeypatch
+    ):
+        self._route(monkeypatch, False)
         agent = _make_agent()
         agent._skill_nudge_interval = 1
         agent.valid_tool_names = {"skill_manage"}
-        run_claude_agent_sdk_turn(
-            agent,
-            user_message="hi",
-            original_user_message="hi",
-            messages=[{"role": "user", "content": "hi"}],
-            effective_task_id="task-1",
-        )
+        self._run(agent)
         agent._spawn_background_review.assert_not_called()
-        # Counter machinery stays intact: the interval crossing still resets
-        # it, exactly as before — only the spawn is suppressed.
         assert agent._iters_since_skill == 0
+
+    def test_routed_memory_nudge_spawns_the_review(self, monkeypatch):
+        self._route(monkeypatch, True)
+        agent = _make_agent()
+        self._run(agent, want_memory=True)
+        agent._spawn_background_review.assert_called_once()
+        assert agent._spawn_background_review.call_args.kwargs["review_memory"]
+
+    def test_routed_skill_nudge_spawns_the_review(self, monkeypatch):
+        self._route(monkeypatch, True)
+        agent = _make_agent()
+        agent._skill_nudge_interval = 1
+        agent.valid_tool_names = {"skill_manage"}
+        self._run(agent)
+        agent._spawn_background_review.assert_called_once()
+        assert agent._spawn_background_review.call_args.kwargs["review_skills"]
+
+    def test_skill_review_needs_skill_manage_exposed(self, monkeypatch):
+        self._route(monkeypatch, True)
+        agent = _make_agent()
+        agent._skill_nudge_interval = 1
+        agent.valid_tool_names = set()
+        self._run(agent)
+        agent._spawn_background_review.assert_not_called()
+
+    def test_dead_turn_never_spawns_even_when_routed(self, monkeypatch):
+        self._route(monkeypatch, True)
+        agent = _make_agent()
+        agent._claude_sdk_session.run_turn.return_value = _make_turn(
+            interrupted=True, final_text=""
+        )
+        self._run(agent, want_memory=True)
+        agent._spawn_background_review.assert_not_called()
+
+    def test_broken_resolver_falls_back_to_skipping(self, monkeypatch):
+        import agent.background_review as br
+
+        def _boom(_agent):
+            raise RuntimeError("no config")
+
+        monkeypatch.setattr(br, "_resolve_review_runtime", _boom)
+        agent = _make_agent()
+        result = self._run(agent, want_memory=True)
+        agent._spawn_background_review.assert_not_called()
+        assert result["final_response"] == "SDK_ASSISTANT"
+
+    def test_raising_spawn_does_not_take_the_turn_down(self, monkeypatch):
+        self._route(monkeypatch, True)
+        agent = _make_agent()
+        agent._spawn_background_review.side_effect = RuntimeError("thread fail")
+        result = self._run(agent, want_memory=True)
+        agent._spawn_background_review.assert_called_once()
+        assert result["final_response"] == "SDK_ASSISTANT"
 
 
 # ---------- direct HTTP MCP security -------------------------------------
