@@ -1309,10 +1309,11 @@ def run_claude_agent_sdk_turn(
     )
 
     should_review_skills = False
+    # Skill-review cadence belongs to review policy, not foreground tool
+    # availability. If routed, a distinct normal runtime owns optional writes.
     if (
         agent._skill_nudge_interval > 0
         and agent._iters_since_skill >= agent._skill_nudge_interval
-        and "skill_manage" in agent.valid_tool_names
     ):
         should_review_skills = True
         agent._iters_since_skill = 0

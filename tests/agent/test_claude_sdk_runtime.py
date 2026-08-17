@@ -1152,7 +1152,7 @@ class TestBackgroundReviewRouting:
         self._route(monkeypatch, False)
         agent = _make_agent()
         agent._skill_nudge_interval = 1
-        agent.valid_tool_names = {"skill_manage"}
+        agent.valid_tool_names = set()
         self._run(agent)
         agent._spawn_background_review.assert_not_called()
         assert agent._iters_since_skill == 0
@@ -1168,18 +1168,19 @@ class TestBackgroundReviewRouting:
         self._route(monkeypatch, True)
         agent = _make_agent()
         agent._skill_nudge_interval = 1
-        agent.valid_tool_names = {"skill_manage"}
+        agent.valid_tool_names = set()
         self._run(agent)
         agent._spawn_background_review.assert_called_once()
         assert agent._spawn_background_review.call_args.kwargs["review_skills"]
 
-    def test_skill_review_needs_skill_manage_exposed(self, monkeypatch):
+    def test_skill_review_does_not_need_foreground_skill_manage(self, monkeypatch):
         self._route(monkeypatch, True)
         agent = _make_agent()
         agent._skill_nudge_interval = 1
         agent.valid_tool_names = set()
         self._run(agent)
-        agent._spawn_background_review.assert_not_called()
+        agent._spawn_background_review.assert_called_once()
+        assert agent._spawn_background_review.call_args.kwargs["review_skills"]
 
     def test_dead_turn_never_spawns_even_when_routed(self, monkeypatch):
         self._route(monkeypatch, True)
