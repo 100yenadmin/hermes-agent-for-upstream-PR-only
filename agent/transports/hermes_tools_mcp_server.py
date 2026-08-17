@@ -420,13 +420,16 @@ def _stateless_shim_defs() -> list:
 
 
 def _build_server(profile: Optional[str] = None) -> Any:
-    """Create the FastMCP server with the selected curated tool profile.
+    """Create the MCP server with the selected curated tool profile.
 
     Unknown profiles intentionally resolve to the Codex-compatible default via
-    ``exposed_tools_for_profile`` rather than widening this subprocess.
+    ``exposed_tools_for_profile`` rather than widening this subprocess. Imports
+    stay lazy so importing this module does not require the optional MCP SDK.
     """
     try:
-        from mcp.server.fastmcp import FastMCP
+        # mcp 2.0 removed `mcp.server.fastmcp`; `mcp.server.MCPServer` is the
+        # same decorator/add_tool surface under the new name.
+        from mcp.server import MCPServer
     except ImportError as exc:  # pragma: no cover - install hint
         raise ImportError(
             f"hermes-tools MCP server requires the 'mcp' package: {exc}"
@@ -438,7 +441,7 @@ def _build_server(profile: Optional[str] = None) -> Any:
         handle_function_call,
     )
 
-    mcp = FastMCP(
+    mcp = MCPServer(
         "hermes-tools",
         instructions=(
             "Hermes Agent's tool surface, exposed for use inside a Codex "
@@ -470,11 +473,12 @@ def _build_server(profile: Optional[str] = None) -> Any:
         description = spec.get("description") or f"Hermes {name} tool"
         params_schema = spec.get("parameters") or {"type": "object", "properties": {}}
 
-        # FastMCP wants a Python callable. Build a closure that takes the
-        # arguments dict, dispatches via handle_function_call, and returns
-        # the result string. We use add_tool() for full control over the
-        # input schema (FastMCP's @tool() decorator inspects type hints,
-        # which we can't get from a JSON schema at runtime).
+        # The SDK wants a Python callable and derives the input schema from
+        # its signature — there is no inputSchema parameter on either the
+        # decorator or add_tool(). So build a closure that takes the arguments
+        # dict, dispatches via handle_function_call, returns the result
+        # string, and carries a __signature__ synthesized from the Hermes
+        # JSON Schema (see _signature_from_schema) for the SDK to read.
         def _make_handler(tool_name: str, schema: dict | None):
             sig, annots = _signature_from_schema(schema)
 
@@ -512,7 +516,7 @@ def _build_server(profile: Optional[str] = None) -> Any:
     # Stateless agent-loop shims (#26567) — registered as dedicated
     # closures so handle_function_call's `_AGENT_LOOP_TOOLS` refusal stays
     # intact for every other caller. Same signature-from-schema mechanics
-    # as the loop above so FastMCP serves the authoritative registry schema.
+    # as the loop above so the MCP SDK serves the authoritative registry schema.
     shim_count = 0
     for shim_name, shim_description, shim_schema, shim_fn in _stateless_shim_defs():
         shim_sig, shim_annots = _signature_from_schema(shim_schema)
@@ -592,8 +596,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         sys.stderr.write(f"hermes-tools MCP server cannot start: {exc}\n")
         return 2
 
-    # FastMCP runs with stdio transport by default when launched as a
-    # subprocess.
+    # MCPServer.run() defaults to stdio transport, which is what codex
+    # spawns us on.
     try:
         server.run()
     except KeyboardInterrupt:
