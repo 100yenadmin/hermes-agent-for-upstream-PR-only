@@ -302,6 +302,23 @@ The hook is wired even when no status callback is set (§6), and both watch
 lookups use `getattr` — an `AttributeError` raised on the message drain would
 break the very turn the suspension exists to protect.
 
+### Routed self-curation remains safe
+
+The SDK runtime does not start a background memory/skill review when that review
+would inherit `api_mode="claude_agent_sdk"`: a fresh SDK turn used to consume a
+subscription turn while lacking the writable loop state it needs. That remains
+an explicit skip.
+
+When `auxiliary.background_review` resolves to a *different* runtime, the same
+review is safe and should run there. The resolver is consulted at the nudge
+boundary; only a confirmed `routed=True` result starts the background review.
+Resolver or spawn failures fail closed and leave the user turn intact.
+
+The Claude SDK MCP profile also exposes `skill_manage` alongside its existing
+bounded inspection tools. It is scoped to that profile—not the Codex default
+surface—so the skill nudge can retain durable procedure knowledge without
+widening unrelated runtime capabilities.
+
 ## 7. Agent cache interaction
 
 The gateway caches one agent per session key. Every **eviction** path releases
