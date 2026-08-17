@@ -1640,13 +1640,36 @@ class ClaudeAgentSdkSession:
                     # Last reported id wins; captured even on interrupted
                     # turns — the tokens were still spent on that model.
                     out["model"] = projection.model
+                # A genuine terminal SDK error carries a result string, but it
+                # is transport diagnostics, not an assistant answer. The outer
+                # runtime needs `out["error"]` to activate provider fallback;
+                # emitting this text first persists it as an assistant message
+                # and poisons the fallback's history with a false “I am
+                # blocked” claim. Contradictory success envelopes remain a
+                # success exactly as handled below.
+                _result_subtype = getattr(message, "subtype", "") or ""
+                _result_is_error = bool(
+                    projection.is_result
+                    and (
+                        getattr(message, "is_error", False)
+                        or _result_subtype not in ("", "success")
+                    )
+                )
+                _result_is_contradictory_success = bool(
+                    _result_is_error
+                    and _result_subtype == "success"
+                    and not (getattr(message, "errors", None) or [])
+                    and not getattr(message, "api_error_status", None)
+                )
                 if not interrupted:
                     if projection.messages:
                         out["messages"].extend(projection.messages)
                     if projection.is_tool_iteration:
                         out["tool_iterations"] += 1
                         self._notify_tool_iteration()
-                    if projection.final_text is not None:
+                    if projection.final_text is not None and (
+                        not _result_is_error or _result_is_contradictory_success
+                    ):
                         out["final_text"] = projection.final_text
                 if projection.is_result:
                     usage = getattr(message, "usage", None)

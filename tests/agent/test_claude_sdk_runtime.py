@@ -523,6 +523,9 @@ class TestSession:
             session.close()
         assert "HTTP 429" in (turn.error or "")
         assert "session limit" in (turn.error or "").lower()
+        # Terminal SDK diagnostics must not become assistant history before the
+        # provider-routing layer switches to its fallback.
+        assert not turn.final_text
 
     def test_happy_turn(self):
         script = [
@@ -628,7 +631,13 @@ class TestSession:
         assert "image attachment" in caplog.text.lower()
 
     def test_sdk_error_result_surfaces(self):
-        script = [ResultMessage(subtype="error_max_turns", is_error=False)]
+        script = [
+            ResultMessage(
+                result="RAW terminal diagnostic",
+                subtype="error_max_turns",
+                is_error=False,
+            )
+        ]
         session, _ = _make_session(script=script)
         try:
             turn = session.run_turn("hi")
@@ -636,6 +645,7 @@ class TestSession:
             session.close()
         assert turn.error is not None
         assert "error_max_turns" in turn.error
+        assert not turn.final_text
 
     def test_contradictory_success_envelope_not_an_error(self):
         # 2026-08-11 incident: the CLI emitted is_error=True with
