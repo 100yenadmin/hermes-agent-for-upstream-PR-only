@@ -989,7 +989,7 @@ class TestRuntimeGlue:
         assert agent._sdk_compaction_pending is False
         completions = [item for item in emitted if isinstance(item, tuple)]
         assert len(completions) == 1
-        assert completions[0][0] == "compacted"
+        assert completions[0][0] == "compaction"
         assert "compaction complete" in completions[0][1].lower()
 
     def test_empty_rich_input_rejects_before_digest_or_session_creation(self):
