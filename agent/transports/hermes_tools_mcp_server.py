@@ -139,14 +139,6 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "image_generate",
     "skill_view",
     "skills_list",
-    # skill_manage completes the read/write pair above. Its absence was not a
-    # policy call — it is not in `_AGENT_LOOP_TOOLS` (model_tools.py:667), so
-    # it dispatches statelessly like every other name here. Leaving it out
-    # meant a runtime on this transport could read skills but never record
-    # one, and it silently disabled the skill-review trigger too:
-    # claude_sdk_runtime gates should_review_skills on
-    # `"skill_manage" in agent.valid_tool_names`.
-    "skill_manage",
     "text_to_speech",
     # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
     # (set by the kanban dispatcher when spawning a worker). Without these
@@ -180,6 +172,12 @@ _CLAUDE_AGENT_SDK_INSPECTION_TOOLS: tuple[str, ...] = (
     "search_files",
 )
 
+# The SDK lane must be able to record reusable procedure knowledge after its
+# routed background review. This is safe here because skill_manage is stateless
+# (not an _AGENT_LOOP_TOOL), and narrowing it to this profile keeps Codex's
+# existing tool surface unchanged.
+_CLAUDE_AGENT_SDK_SKILL_TOOLS: tuple[str, ...] = ("skill_manage",)
+
 
 def exposed_tools_for_profile(profile: Optional[str] = None) -> tuple[str, ...]:
     """Return the curated surface for a trusted runtime profile.
@@ -188,7 +186,11 @@ def exposed_tools_for_profile(profile: Optional[str] = None) -> tuple[str, ...]:
     Only the fixed Claude Agent SDK profile receives bounded file inspection.
     """
     if profile == "claude-agent-sdk":
-        return EXPOSED_TOOLS + _CLAUDE_AGENT_SDK_INSPECTION_TOOLS
+        return (
+            EXPOSED_TOOLS
+            + _CLAUDE_AGENT_SDK_INSPECTION_TOOLS
+            + _CLAUDE_AGENT_SDK_SKILL_TOOLS
+        )
     return EXPOSED_TOOLS
 
 
