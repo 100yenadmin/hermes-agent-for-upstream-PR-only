@@ -242,6 +242,49 @@ On chat surfaces these are gated behind `compression.progress_notices: true`.
 
 ---
 
+### The watchdog must not kill a compacting turn
+
+Between `PreCompact` and `compact_boundary` the CLI emits **nothing**.
+`_TurnWatch` cannot distinguish that silence from a wedge, so the
+`post_tool_quiet` rule (90s) tripped, interrupted the CLI mid-compaction, and
+the turn's terminal `ResultMessage` never arrived. It surfaced on the next turn
+as `discarding N stale unsolicited text(s)` and, to the user, as a turn that
+silently died at a compaction — with the "compressing" status reappearing on
+their next message.
+
+Measured (CEST):
+
+| Time | Event | Gap | Outcome |
+|---|---|---|---|
+| 03:57:17 | compaction started | — | |
+| 03:58:48 | `no compact_boundary seen` | 91s | **died** |
+| 03:59:15 | compaction started | — | |
+| 04:01:02 | `compact_boundary` | 107s | survived |
+| 05:04:07 | compaction started (post-fix) | — | |
+| 05:06:12 | `compact_boundary` | 125s | survived |
+
+91s is one `post_tool_quiet` timeout after the last tool result. The *longer*
+compaction survived, so duration is not the trigger — what matters is whether
+compaction begins while `post_tool_armed` is set, i.e. right after a tool call.
+That is why it hit tool-heavy turns and looked intermittent.
+
+`PreCompact` now calls `_TurnWatch.compaction_begin()` and `compact_boundary`
+calls `compaction_end()`, suspending both the quiet and budget rules in between.
+Three details are load-bearing:
+
+- **Bounded** by `_COMPACTION_MAX_SUSPEND` (600s). `compact_boundary` is not
+  guaranteed — the 03:57 case never produced one — so an unbounded gate would
+  trade a killed turn for a hung one.
+- **Earliest start wins** on re-entrant `PreCompact`, so a repeated hook cannot
+  extend the ceiling indefinitely.
+- **`compaction_end()` restamps** `last_activity`. Without that, a turn that
+  compacted for 91s would resume already 91s idle and trip on the very next
+  poll — the same kill, one poll later.
+
+The hook is wired even when no status callback is set (§6), and both watch
+lookups use `getattr` — an `AttributeError` raised on the message drain would
+break the very turn the suspension exists to protect.
+
 ## 7. Agent cache interaction
 
 The gateway caches one agent per session key. Every **eviction** path releases

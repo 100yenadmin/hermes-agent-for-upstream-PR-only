@@ -38,9 +38,27 @@ def _session(on_compaction):
     return s
 
 
-def test_no_hooks_registered_when_unwired():
-    """Default option set must be unchanged for callers that don't want this."""
-    assert _session(None)._build_compaction_hooks() is None
+def test_hook_is_registered_even_when_no_status_callback_is_wired():
+    """Contract change: the hook no longer exists only to emit a status.
+
+    Its primary job is now telling _TurnWatch that the silence between
+    PreCompact and compact_boundary is legitimate -- without that the quiet
+    watchdog interrupts the CLI mid-compaction and kills the turn. Skipping
+    the hook because the *status* callback is unset would leave the turn
+    killable for no benefit, so it is wired unconditionally and the callback
+    is what stays optional.
+    """
+    hooks = _session(None)._build_compaction_hooks()
+
+    assert hooks is not None
+    assert set(hooks) == {"PreCompact"}
+
+
+def test_unwired_hook_runs_clean_without_a_status_callback():
+    """It must not call None, and must still return the empty hook result."""
+    callback = _session(None)._build_compaction_hooks()["PreCompact"][0].hooks[0]
+
+    assert asyncio.run(callback({"trigger": "auto"}, None, {"signal": None})) == {}
 
 
 def test_registers_a_precompact_hook_when_wired():

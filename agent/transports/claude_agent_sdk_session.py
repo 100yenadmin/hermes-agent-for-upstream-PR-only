@@ -278,6 +278,14 @@ def _configured_post_tool_quiet_timeout() -> Optional[float]:
     return _configured_timeout_seconds("post_tool_quiet_timeout", allow_zero=True)
 
 
+# Upper bound on how long a compaction may suspend the watchdog. compact_boundary
+# is NOT guaranteed -- measured 2026-08-16, a compaction that started at 03:57:17
+# never produced one -- so an unbounded gate would trade a killed turn for a hung
+# one. 600s is an order of magnitude above the ~90-125s compactions observed in
+# production while still landing well inside the gateway's 1800s ceiling.
+_COMPACTION_MAX_SUSPEND = 600.0
+
+
 class _TurnWatch:
     """Activity evidence for one in-flight turn.
 
@@ -307,6 +315,8 @@ class _TurnWatch:
         self.post_tool_armed = False
         self.outstanding_tools = 0
         self.approvals_pending = 0
+        self.compaction_active = 0
+        self.compaction_started = 0.0
 
     # -- loop-thread writers --
 
@@ -335,6 +345,28 @@ class _TurnWatch:
         self.approvals_pending = max(0, self.approvals_pending - 1)
         self.tick()
 
+    def compaction_begin(self) -> None:
+        """PreCompact fired: the CLI is about to go silent, legitimately.
+
+        Earliest start wins -- a re-entrant PreCompact must not restart the
+        bounding clock, or a pathological loop could extend the suspension
+        indefinitely, which is exactly what the bound exists to prevent.
+        """
+        if self.compaction_active == 0:
+            self.compaction_started = time.monotonic()
+        self.compaction_active += 1
+        self.tick()
+
+    def compaction_end(self) -> None:
+        """compact_boundary arrived: resume normal watchdog rules.
+
+        tick() is load-bearing, not hygiene. Without it a turn that compacted
+        for 91s would resume already 91s idle and trip on the very next poll --
+        the same kill, one poll later.
+        """
+        self.compaction_active = max(0, self.compaction_active - 1)
+        self.tick()
+
     # -- caller-thread readers --
 
     def rebaseline(self) -> None:
@@ -347,6 +379,18 @@ class _TurnWatch:
         if self.outstanding_tools > 0 or self.approvals_pending > 0:
             return None
         now = time.monotonic()
+        # A compacting CLI is indistinguishable from a wedged one: between
+        # PreCompact and compact_boundary it emits nothing at all. Without this
+        # gate the post_tool_quiet rule reads that silence as a wedge and
+        # interrupts the CLI mid-compaction, so the terminal ResultMessage never
+        # arrives -- surfacing next turn as "discarding N stale unsolicited
+        # text(s)" and, to the user, as a turn that simply died. Bounded, so a
+        # boundary that never arrives cannot hang the turn instead.
+        if (
+            self.compaction_active > 0
+            and (now - self.compaction_started) < _COMPACTION_MAX_SUSPEND
+        ):
+            return None
         idle = now - self.last_activity
         if quiet > 0 and self.post_tool_armed and idle >= quiet:
             return "post_tool_quiet"
@@ -976,15 +1020,18 @@ class ClaudeAgentSdkSession:
     # ---------- compaction ----------
 
     def _build_compaction_hooks(self) -> Optional[dict]:
-        """PreCompact -> on_compaction(trigger), or None when unwired.
+        """PreCompact -> watchdog suspension, and on_compaction(trigger).
 
         ``trigger`` is the SDK's own literal: "auto" for the CLI's automatic
         compaction (the one that silently stalls a turn) or "manual" for an
         explicit /compact. The callback is best-effort: it must never fail the
         hook, because refusing a hook can block the compaction itself.
+
+        Wired even when ``_on_compaction`` is None. The hook's primary job is
+        no longer the status notice but telling _TurnWatch that the coming
+        silence is legitimate; skipping it when only the status callback is
+        unset would leave the turn killable mid-compaction for no benefit.
         """
-        if self._on_compaction is None:
-            return None
         try:
             from claude_agent_sdk import HookMatcher
         except Exception:  # pragma: no cover - SDK predates hooks
@@ -992,11 +1039,22 @@ class ClaudeAgentSdkSession:
             return None
 
         async def _on_pre_compact(input_data, tool_use_id, context):
+            # FIRST and unconditionally, outside the try: if a status callback
+            # raises, the suspension must still be in place. This ordering is
+            # the fix -- everything below is the pre-existing status notice.
+            #
+            # getattr, not attribute access: a hook that raises AttributeError
+            # would break the very turn it exists to protect, and the attribute
+            # is genuinely absent on sessions built without __init__.
+            watch = getattr(self, "_turn_watch", None)
+            if watch is not None:
+                watch.compaction_begin()
             try:
                 trigger = ""
                 if isinstance(input_data, dict):
                     trigger = str(input_data.get("trigger") or "")
-                self._on_compaction(trigger or "auto")
+                if self._on_compaction is not None:
+                    self._on_compaction(trigger or "auto")
             except Exception:
                 logger.debug("compaction status callback failed", exc_info=True)
             return {}
@@ -1030,6 +1088,14 @@ class ClaudeAgentSdkSession:
             or getattr(message, "subtype", "") != "compact_boundary"
         ):
             return
+        # Lift the suspension before anything else -- including the unwired-
+        # callback early return further down. Leaving it armed would hold the
+        # gate open until the bounded ceiling on every compacting turn.
+        # getattr for the same reason as the PreCompact side: this runs on the
+        # message drain, where an AttributeError would break a streaming turn.
+        watch = getattr(self, "_turn_watch", None)
+        if watch is not None:
+            watch.compaction_end()
         data = getattr(message, "data", None)
         metadata = None
         if isinstance(data, dict):
