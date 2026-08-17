@@ -103,6 +103,20 @@ COMPACTION_STATUS = (
 
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
 
+# Dedicated status_key for the compaction bubble. The gateway passes an
+# event_type straight through as the Telegram status_key (gateway/run.py
+# ``_send_or_update_status_coro``), and ``send_or_update_status`` edits ONE
+# bubble per key. Compaction used to ride on the generic "lifecycle" key that
+# all 32 ``_emit_status`` call sites share, so any other lifecycle status
+# emitted during a compaction overwrote "Compacting context" in place and the
+# user never saw that a compaction was happening. Its own key isolates it.
+#
+# The start and the done notice deliberately share this key so the completion
+# EDITS the "Compacting…" bubble into "✓ complete" rather than appending a
+# second bubble. Not "fallback", so it is still swept by end-of-turn progress
+# cleanup -- matching Codex and native Hermes, which treat this as ephemeral.
+COMPACTION_STATUS_KEY = "compaction"
+
 
 def _emit_compaction_done(agent: Any) -> None:
     """Emit the structured terminal edge for a started compaction.
@@ -117,7 +131,7 @@ def _emit_compaction_done(agent: Any) -> None:
         logger.info("compaction done: no status_callback; completion notice not emitted")
         return
     try:
-        status_callback("compacted", COMPACTION_DONE_STATUS)
+        status_callback(COMPACTION_STATUS_KEY, COMPACTION_DONE_STATUS)
         logger.info("compaction done: completion notice emitted")
     except Exception:
         logger.debug("status_callback error in compaction completion", exc_info=True)
@@ -2473,7 +2487,17 @@ def compress_context(
         )
     _compaction_status_emitted = bool(_compaction_status)
     if _compaction_status:
-        agent._emit_status(_compaction_status)
+        # Guarded like the other two emit sites in this module. Status
+        # plumbing must never be able to abort a compression: not every
+        # object reaching this path is a full AIAgent (test doubles and
+        # alternative agent shims reach it too), and an unguarded call raises
+        # AttributeError mid-compression for anything lacking the method.
+        _emit = getattr(agent, "_emit_status_event", None)
+        if _emit is not None:
+            try:
+                _emit(COMPACTION_STATUS_KEY, _compaction_status)
+            except Exception:
+                logger.debug("compaction status emit failed", exc_info=True)
     _compaction_done_emitted = False
 
     def _complete_compaction_lifecycle() -> None:
@@ -4003,7 +4027,7 @@ def _compress_context_via_codex_app_server(
         f"{approx_tokens:,}" if approx_tokens else "unknown",
     )
     try:
-        agent._emit_status(COMPACTION_STATUS)
+        agent._emit_status_event(COMPACTION_STATUS_KEY, COMPACTION_STATUS)
     except Exception:
         pass
 

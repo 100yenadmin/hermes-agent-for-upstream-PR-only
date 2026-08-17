@@ -961,6 +961,31 @@ class AIAgent:
             and getattr(self, "platform", "") == "cli"
         )
 
+    def _emit_status_event(self, event_type: str, message: str) -> None:
+        """Emit one typed lifecycle event without touching model history.
+
+        Split out of _emit_status so callers can give an event its OWN key
+        instead of sharing the generic "lifecycle" one. Consumers that key
+        status bubbles by event type (the Telegram adapter) can then replace
+        an in-place notice rather than stacking a new bubble per update.
+
+        Never raises: status plumbing must not be able to break the turn it
+        is reporting on.
+        """
+        try:
+            self._vprint(f"{self.log_prefix}{message}", force=True)
+        except Exception:
+            pass
+        status_callback = getattr(self, "status_callback", None)
+        if status_callback:
+            try:
+                status_callback(event_type, message)
+            except Exception:
+                logger.debug(
+                    "status_callback error in _emit_status_event",
+                    exc_info=True,
+                )
+
     def _emit_status(self, message: str) -> None:
         """Emit a lifecycle status message to both CLI and gateway channels.
 
@@ -971,15 +996,7 @@ class AIAgent:
         This helper never raises — exceptions are swallowed so it cannot
         interrupt the retry/fallback logic.
         """
-        try:
-            self._vprint(f"{self.log_prefix}{message}", force=True)
-        except Exception:
-            pass
-        if self.status_callback:
-            try:
-                self.status_callback("lifecycle", message)
-            except Exception:
-                logger.debug("status_callback error in _emit_status", exc_info=True)
+        self._emit_status_event("lifecycle", message)
 
     def _emit_warning(self, message: str) -> None:
         """Emit a user-visible warning through the same status plumbing.

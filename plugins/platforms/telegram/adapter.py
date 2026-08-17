@@ -5900,6 +5900,35 @@ class TelegramAdapter(BasePlatformAdapter):
             continuation_message_ids=tuple(continuation_ids),
         )
 
+    def _forget_status_message_id(self, chat_id: str, message_id: str) -> None:
+        """Drop any send_or_update_status cache entry for a deleted message.
+
+        End-of-turn progress cleanup (gateway ``cleanup_progress``) deletes
+        status bubbles, but ``_status_message_ids`` was never pruned when it
+        did. The next status for that key therefore edited a message that no
+        longer existed, burning two wasted API round-trips -- the MarkdownV2
+        attempt plus the plain-text retry -- before the fail-open path in
+        ``send_or_update_status`` sent a fresh bubble. 261 such
+        "Message to edit not found" errors were logged between 2026-07-21 and
+        2026-08-16. Dropping the id here keeps the cache honest so the next
+        status sends directly instead of probing a dead message.
+
+        Best-effort and never raises: a stale cache entry is a wasted retry,
+        not a delivery failure, so this must not break the delete path.
+        """
+        try:
+            target = str(message_id)
+            candidates = {str(chat_id)}
+            try:
+                candidates.add(str(normalize_telegram_chat_id(chat_id)))
+            except Exception:
+                pass
+            for key, cached in list(self._status_message_ids.items()):
+                if cached == target and str(key[0]) in candidates:
+                    self._status_message_ids.pop(key, None)
+        except Exception:
+            logger.debug("status id cache prune failed", exc_info=True)
+
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a previously sent Telegram message.
 
@@ -5917,6 +5946,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 chat_id=normalize_telegram_chat_id(chat_id),
                 message_id=int(message_id),
             )
+            self._forget_status_message_id(chat_id, message_id)
             return True
         except Exception as e:
             logger.debug(

@@ -242,6 +242,23 @@ On chat surfaces these are gated behind `compression.progress_notices: true`.
 
 ---
 
+### Compaction gets its own status key
+
+Start and completion both emit under `COMPACTION_STATUS_KEY` (`"compaction"`)
+via `_emit_status_event(event_type, message)`, rather than sharing the generic
+`"lifecycle"` key. That is what lets a keyed consumer — the Telegram adapter —
+**replace** the existing notice in place instead of stacking a second bubble, so
+the user sees one status that resolves rather than two that accumulate.
+
+`_emit_status_event` is the general form; `_emit_status` now delegates to it
+with `"lifecycle"`, so existing callers are unchanged.
+
+Every emit site is guarded (`getattr` + `try`). Not every object reaching the
+compression path is a full `AIAgent` — test doubles and agent shims reach it
+too — and an unguarded `agent._emit_status_event(...)` raises `AttributeError`
+mid-compression for anything lacking the method. That failure is real, not
+hypothetical: it was reproduced against the deployed tree.
+
 ### The watchdog must not kill a compacting turn
 
 Between `PreCompact` and `compact_boundary` the CLI emits **nothing**.

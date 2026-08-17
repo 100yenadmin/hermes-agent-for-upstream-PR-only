@@ -992,16 +992,19 @@ def run_claude_agent_sdk_turn(
             if str(trigger).strip().lower() == "manual":
                 return
             try:
-                from agent.conversation_compression import COMPACTION_STATUS
+                from agent.conversation_compression import (
+                    COMPACTION_STATUS,
+                    COMPACTION_STATUS_KEY,
+                )
 
                 agent._sdk_compaction_pending = True
-                emit = getattr(agent, "_emit_status", None)
+                emit = getattr(agent, "_emit_status_event", None)
                 if callable(emit):
-                    emit(COMPACTION_STATUS)
+                    emit(COMPACTION_STATUS_KEY, COMPACTION_STATUS)
                     logger.info("CLI compaction started (trigger=%s); status emitted", trigger)
                 else:
                     logger.info(
-                        "CLI compaction started (trigger=%s); no _emit_status, "
+                        "CLI compaction started (trigger=%s); no _emit_status_event, "
                         "status not emitted",
                         trigger,
                     )

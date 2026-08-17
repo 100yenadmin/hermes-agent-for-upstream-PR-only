@@ -15,7 +15,11 @@ from types import ModuleType
 
 import pytest
 
-from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS
+from agent.conversation_compression import (
+    COMPACTION_DONE_STATUS,
+    COMPACTION_STATUS,
+    COMPACTION_STATUS_KEY,
+)
 from agent.transports import claude_agent_sdk_session as M
 
 
@@ -133,7 +137,12 @@ def test_completion_emit_is_logged(caplog):
     with caplog.at_level("INFO", logger="agent.conversation_compression"):
         _emit_compaction_done(agent)
 
-    assert agent.seen == [("compacted", COMPACTION_DONE_STATUS)]
+    # Start and completion deliberately share COMPACTION_STATUS_KEY rather
+    # than using distinct "compaction"/"compacted" keys. That is the point of
+    # the typed-key change: a keyed consumer (the Telegram adapter) replaces
+    # the existing bubble in place instead of stacking a second one, so the
+    # user sees one notice that resolves rather than two that accumulate.
+    assert agent.seen == [(COMPACTION_STATUS_KEY, COMPACTION_DONE_STATUS)]
     assert "completion notice emitted" in caplog.text
 
 
