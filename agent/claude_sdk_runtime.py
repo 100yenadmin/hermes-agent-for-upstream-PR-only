@@ -1332,6 +1332,7 @@ def run_claude_agent_sdk_turn(
     if (
         turn.final_text
         and not turn.interrupted
+        and not agent.skip_background_review
         and (should_review_memory or should_review_skills)
     ):
         # #25267 suppressed this spawn unconditionally: the fork inherits

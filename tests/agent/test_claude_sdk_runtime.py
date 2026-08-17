@@ -904,6 +904,7 @@ def _make_agent():
     agent.tool_progress_callback = None
     agent._interrupt_requested = False
     agent._persist_disabled = False
+    agent.skip_background_review = False
     agent._iters_since_skill = 0
     agent._skill_nudge_interval = 0
     agent.valid_tool_names = set()
@@ -1181,6 +1182,15 @@ class TestBackgroundReviewRouting:
         self._run(agent)
         agent._spawn_background_review.assert_called_once()
         assert agent._spawn_background_review.call_args.kwargs["review_skills"]
+
+    def test_skip_background_review_blocks_routed_skill_review(self, monkeypatch):
+        self._route(monkeypatch, True)
+        agent = _make_agent()
+        agent.skip_background_review = True
+        agent._skill_nudge_interval = 1
+        agent.valid_tool_names = set()
+        self._run(agent)
+        agent._spawn_background_review.assert_not_called()
 
     def test_dead_turn_never_spawns_even_when_routed(self, monkeypatch):
         self._route(monkeypatch, True)
