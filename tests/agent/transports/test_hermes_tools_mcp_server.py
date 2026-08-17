@@ -107,15 +107,16 @@ class TestModuleSurface:
             f"because codex has built-in equivalents: {leaked}"
         )
 
-    def test_claude_sdk_profile_adds_bounded_file_and_skill_curation_tools(self):
-        """Claude gets inspection plus stateless skill curation, never shell."""
+    def test_claude_sdk_profile_adds_bounded_read_only_file_tools(self):
+        """Claude gets inspection only; no filesystem mutation tool is exposed."""
         from agent.transports.hermes_tools_mcp_server import (
             EXPOSED_TOOLS,
             exposed_tools_for_profile,
         )
 
         tools = set(exposed_tools_for_profile("claude-agent-sdk"))
-        assert {"read_file", "search_files", "skill_manage"} <= tools
+        assert {"read_file", "search_files"} <= tools
+        assert "skill_manage" not in tools
         assert "skill_manage" not in EXPOSED_TOOLS
         assert not tools & {
             "terminal", "shell", "write_file", "patch", "process",

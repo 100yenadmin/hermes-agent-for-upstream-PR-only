@@ -166,17 +166,11 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 # A host selects one of these fixed profiles at process launch. This is not a
 # user-facing setting: unknown values retain the Codex-compatible default.
 # Claude lacks Codex's native filesystem tools, so it may opt into only these
-# existing bounded inspection tools—never shell, mutation, process, or Git.
+# read-only inspection tools—never shell, mutation, process, or Git.
 _CLAUDE_AGENT_SDK_INSPECTION_TOOLS: tuple[str, ...] = (
     "read_file",
     "search_files",
 )
-
-# The SDK lane must be able to record reusable procedure knowledge after its
-# routed background review. This is safe here because skill_manage is stateless
-# (not an _AGENT_LOOP_TOOL), and narrowing it to this profile keeps Codex's
-# existing tool surface unchanged.
-_CLAUDE_AGENT_SDK_SKILL_TOOLS: tuple[str, ...] = ("skill_manage",)
 
 
 def exposed_tools_for_profile(profile: Optional[str] = None) -> tuple[str, ...]:
@@ -186,11 +180,7 @@ def exposed_tools_for_profile(profile: Optional[str] = None) -> tuple[str, ...]:
     Only the fixed Claude Agent SDK profile receives bounded file inspection.
     """
     if profile == "claude-agent-sdk":
-        return (
-            EXPOSED_TOOLS
-            + _CLAUDE_AGENT_SDK_INSPECTION_TOOLS
-            + _CLAUDE_AGENT_SDK_SKILL_TOOLS
-        )
+        return EXPOSED_TOOLS + _CLAUDE_AGENT_SDK_INSPECTION_TOOLS
     return EXPOSED_TOOLS
 
 
