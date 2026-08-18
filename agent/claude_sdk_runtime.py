@@ -85,12 +85,31 @@ def _snapshot_agent_tools_with_mcp_refresh(agent) -> Optional[List[Dict[str, Any
     return getattr(agent, "tools", None)
 
 
-# Total append budget. Blocks are included whole, in priority order; a block
-# that does not fit is SKIPPED (never truncated mid-block) and later, smaller
-# blocks may still be included. Priority = assembly order below: soul,
+# Default total append budget. Blocks are included whole, in priority order; a
+# block that does not fit is SKIPPED (never truncated mid-block) and later,
+# smaller blocks may still be included. Priority = assembly order below: soul,
 # session line, platform hint, user profile, memory, memory guidance,
 # session_search guidance, skills index.
-_APPEND_TOTAL_MAX_CHARS = 20000
+#
+# KNOWN, UNFIXED: this policy is NOT monotonic in the budget. Because a block
+# is skipped whole and later blocks keep packing, RAISING the ceiling can
+# admit one large early block that then evicts several smaller later ones —
+# measured 2026-08-18 with a 12000-char MEMORY.md, where 20000 -> 22000 traded
+# 2508 chars of guidance for 12151 chars of memory. Left as-is deliberately:
+# fixing it means a priority-aware or size-aware packer, which is a larger
+# change than restoring the identity slot. The WARNING below is what makes the
+# trade visible in the meantime.
+#
+# 22000, not the historical 20000: restoring the identity slot costs 3217 chars
+# on this box, which pushed the total for every block EXCEPT the skills index
+# from 17313 to 20532 — i.e. the fix would have paid for identity by silently
+# evicting the MCP-inspection preference. Measured against the real
+# $HERMES_HOME, not a fixture. The headroom above 20532 is deliberate slack for
+# MEMORY.md/USER.md growth, NOT room for the skills index (14010 chars): that
+# block has been evicted since before the identity fix and seating it is a
+# separate, per-turn-cost decision. Override per box with
+# ``agent.claude_agent_sdk.append_total_max_chars``.
+_APPEND_TOTAL_MAX_CHARS = 22000
 
 # Sentences that instruct the skill-WRITE tool — skill_manage is NOT exposed
 # through the MCP shims, and guidance must only describe callable tools.
@@ -151,6 +170,62 @@ def _strip_uncallable_tool_guidance(text: str) -> str:
         text.replace(_SKILL_TOOL_SENTENCE, "")
         .replace(_SKILL_MANAGE_INDEX_SENTENCE, "")
     )
+
+
+def _append_total_max_chars() -> int:
+    """Resolve ``agent.claude_agent_sdk.append_total_max_chars``.
+
+    The ceiling trades prompt cost against how much standing context the
+    agent carries, and the right answer differs per box — a headless worker
+    may want the skills index seated; a chat gateway may not want to pay
+    ~14k chars every turn for it. Absent/empty means the module
+    default. Non-numeric or non-positive values are ignored WITH A WARNING
+    rather than honoured: a 0 budget would silently strip the whole append
+    (identity included), which is the exact class of failure this budget is
+    being made loud about.
+    """
+    from agent.transports.claude_agent_sdk_session import _provider_config
+
+    raw = _provider_config().get("append_total_max_chars")
+    if raw is None or raw == "":
+        return _APPEND_TOTAL_MAX_CHARS
+    if isinstance(raw, bool):
+        # YAML `true` would int() to 1 — a nonsense budget, reject it.
+        logger.warning(
+            "agent.claude_agent_sdk.append_total_max_chars=%r is not a number "
+            "— using the default %d.", raw, _APPEND_TOTAL_MAX_CHARS,
+        )
+        return _APPEND_TOTAL_MAX_CHARS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "agent.claude_agent_sdk.append_total_max_chars=%r is not a number "
+            "— using the default %d.", raw, _APPEND_TOTAL_MAX_CHARS,
+        )
+        return _APPEND_TOTAL_MAX_CHARS
+    if value <= 0:
+        logger.warning(
+            "agent.claude_agent_sdk.append_total_max_chars=%r must be positive "
+            "— using the default %d.", raw, _APPEND_TOTAL_MAX_CHARS,
+        )
+        return _APPEND_TOTAL_MAX_CHARS
+    return value
+
+
+def _block_label(block: str) -> str:
+    """A short, log-safe identifier for a prompt block.
+
+    First line carrying a letter or digit, stripped of the box-drawing rules
+    the profile/memory headers are wrapped in. Header only — never the body —
+    so an eviction can be named in logs without spilling memory or profile
+    content into them.
+    """
+    for line in block.splitlines():
+        stripped = line.strip("═─-=# \t")
+        if any(ch.isalnum() for ch in stripped):
+            return stripped[:60]
+    return "<unlabelled>"
 
 
 def build_system_prompt_append(
@@ -397,15 +472,22 @@ def build_system_prompt_append(
     # oversized block never evicts later, smaller ones.
     out_parts: list[str] = []
     used = 0
+    budget = _append_total_max_chars()
     for block in blocks:
         block = block.strip()
         if not block:
             continue
         cost = len(block) + (2 if out_parts else 0)
-        if used + cost > _APPEND_TOTAL_MAX_CHARS:
-            logger.debug(
-                "append budget: skipping a %d-char block (used %d/%d)",
-                len(block), used, _APPEND_TOTAL_MAX_CHARS,
+        if used + cost > budget:
+            # WARNING, not DEBUG: an eviction here silently deletes standing
+            # instructions the operator believes are in force. That is how
+            # "append_file replaces SOUL.md" survived — nothing above DEBUG
+            # ever said a block went missing. Named so the loss is
+            # actionable; header only, so logs stay free of memory content.
+            logger.warning(
+                "append budget: dropped block %r (%d chars; %d/%d used). "
+                "Raise agent.claude_agent_sdk.append_total_max_chars to keep it.",
+                _block_label(block), len(block), used, budget,
             )
             continue
         out_parts.append(block)
