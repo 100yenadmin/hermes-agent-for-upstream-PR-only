@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 
 from utils import safe_json_loads
 from agent.redact import redact_sensitive_text
+from agent.tool_identity import canonical_tool_args, canonical_tool_name
 from agent.tool_result_classification import file_mutation_result_landed
 
 # ANSI escape codes for coloring tool failure indicators
@@ -152,7 +153,11 @@ def get_tool_emoji(tool_name: str, default: str = "⚡") -> str:
     1. Active skin's ``tool_emojis`` overrides (if a skin is loaded)
     2. Tool registry's per-tool ``emoji`` field
     3. *default* fallback
+
+    The name is canonicalized first, so a foreign runtime's ``Bash`` picks
+    up the same emoji as native ``terminal``.
     """
+    tool_name = canonical_tool_name(tool_name)
     # 1. Skin override
     skin = _get_skin()
     if skin and skin.tool_emojis:
@@ -448,11 +453,17 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
 
     *max_len* controls truncation.  ``None`` (default) defers to the global
     ``_tool_preview_max_len`` set via config; ``0`` means unlimited.
+
+    Name and arguments are canonicalized first (see
+    :mod:`agent.tool_identity`), so a foreign runtime's ``Read``/``file_path``
+    resolves through the same branch as native ``read_file``/``path``.
     """
     if max_len is None:
         max_len = _tool_preview_max_len
     if not args:
         return None
+    args = canonical_tool_args(tool_name, args)
+    tool_name = canonical_tool_name(tool_name)
     args = redact_tool_args_for_display(tool_name, args) or args
     primary_args = {
         "terminal": "command", "web_search": "query", "web_extract": "urls",
@@ -700,17 +711,17 @@ def get_tool_verb(tool_name: str) -> str | None:
     """
     if not _friendly_tool_labels:
         return None
-    return _TOOL_VERBS.get(tool_name)
+    return _TOOL_VERBS.get(canonical_tool_name(tool_name))
 
 
 def tool_verb_connector(tool_name: str) -> str:
     """Return the connector between a verb and its preview (" for " or " ")."""
-    return " for " if tool_name in _TOOL_VERBS_FOR_CONNECTOR else " "
+    return " for " if canonical_tool_name(tool_name) in _TOOL_VERBS_FOR_CONNECTOR else " "
 
 
 def verb_drops_preview(tool_name: str) -> bool:
     """Whether the verb should render alone, without the argument preview."""
-    return tool_name in _TOOL_VERBS_NO_PREVIEW
+    return canonical_tool_name(tool_name) in _TOOL_VERBS_NO_PREVIEW
 
 
 def build_status_phrase(tool_name: str, args: dict | None, max_len: int = 49) -> str | None:
@@ -736,6 +747,7 @@ def build_status_phrase(tool_name: str, args: dict | None, max_len: int = 49) ->
     if not _friendly_tool_labels:
         return None
 
+    tool_name = canonical_tool_name(tool_name)
     verb = _TOOL_VERBS.get(tool_name)
     if verb:
         head = f"is {verb[0].lower()}{verb[1:]}"

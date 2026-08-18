@@ -4334,26 +4334,32 @@ class TurnRunner:
         # at ``tool_preview_length`` (default 40) so a long or multi-line
         # command doesn't render as a huge block — matching the budget the
         # non-terminal preview path already applies (#42634).
+        # The gate is on the CANONICAL name/args, so a child runtime's shell
+        # tool (Claude SDK ``Bash``, Codex ``exec_command``) gets the same
+        # fenced block as native ``terminal`` instead of falling through to
+        # the compact preview line.
         _code_block_full = None
         _code_block_short = None
         try:
             _progress_adapter = self._runner._adapter_for_source(ctx.source)
         except Exception:
             _progress_adapter = None
+        from agent.tool_identity import canonical_tool_args, canonical_tool_name
+        _canon_name = canonical_tool_name(tool_name)
+        _canon_args = canonical_tool_args(tool_name, args)
         if (
             getattr(_progress_adapter, "supports_code_blocks", False)
-            and tool_name == "terminal"
-            and isinstance(args, dict)
-            and isinstance(args.get("command"), str)
-            and args["command"].strip()
+            and _canon_name == "terminal"
+            and isinstance(_canon_args.get("command"), str)
+            and _canon_args["command"].strip()
         ):
             from agent.display import get_tool_preview_max_len
-            _cmd_full = args["command"].rstrip()
+            _cmd_full = _canon_args["command"].rstrip()
             # Consecutive terminal calls: drop the repeated
             # "💻 terminal" header so back-to-back commands render as
             # adjacent code blocks under a single header.
             _block_header = (
-                "" if ctx.last_was_terminal_block[0] else f"{emoji} {tool_name}\n"
+                "" if ctx.last_was_terminal_block[0] else f"{emoji} {_canon_name}\n"
             )
             _code_block_full = f"{_block_header}```\n{_cmd_full}\n```"
             # Single-line, capped preview for non-verbose modes.
