@@ -206,6 +206,67 @@ def _configured_setting_sources() -> list:
     return sources
 
 
+# ---------- stdout framing ----------
+# The SDK reads the CLI's NDJSON stdout through a line framer and kills the
+# whole message reader when one message exceeds max_buffer_size — a FATAL
+# CLIJSONDecodeError, not a skipped message, so the turn dies mid-flight and
+# the session is retired (see the retire matrix in claude_sdk_runtime). The
+# SDK's own default is 1 MiB (subprocess_cli._DEFAULT_MAX_BUFFER_SIZE), which
+# a single large tool result clears easily: production forensics on
+# 2026-08-17 21:03 EDT caught a turn killed this way right after an Edit,
+# with the CLI transcript's largest persisted line at 347 KB — the oversized
+# message never reached disk.
+#
+# Upstream treats the option, not the default, as the fix: PR #416 proposed
+# raising the default to 10 MiB and was withdrawn ("the existing
+# max_buffer_size parameter already provides the needed functionality"), and
+# issue #98 was closed by adding the option. So Hermes sets it explicitly
+# rather than carrying an SDK patch. 10 MiB matches the figure that
+# discussion converged on.
+#
+# NOTE: the SDK measures this with len() on a str, so the unit is Unicode
+# CODE POINTS despite the "bytes" wording in its error text (upstream issue
+# #1165, open). Worst-case real memory for a multibyte-heavy message is
+# therefore ~4x this number — still bounded, and the point of the limit is to
+# stop an unterminated line growing without end, not to be exact.
+_DEFAULT_MAX_BUFFER_SIZE = 10 * 1024 * 1024
+
+
+def _configured_max_buffer_size() -> int:
+    """agent.claude_agent_sdk.max_buffer_size, validated.
+
+    Same warn-and-fall-back contract as the timeout validators: bools are
+    rejected before int() (YAML `true` must not become 1), and non-numeric,
+    zero or negative values warn and yield the built-in default. There is
+    deliberately no `0 = unlimited`: the limit is the only backstop against a
+    CLI that never terminates a line, and removing it trades a killed turn
+    for an OOM on a memory-constrained host."""
+    raw = _provider_config().get("max_buffer_size")
+    if raw is None:
+        return _DEFAULT_MAX_BUFFER_SIZE
+    if isinstance(raw, bool):
+        logger.warning(
+            "agent.claude_agent_sdk.max_buffer_size=%r is a boolean, not a "
+            "size — ignoring it (using the built-in default).", raw,
+        )
+        return _DEFAULT_MAX_BUFFER_SIZE
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "agent.claude_agent_sdk.max_buffer_size=%r is not a number — "
+            "ignoring it (using the built-in default).", raw,
+        )
+        return _DEFAULT_MAX_BUFFER_SIZE
+    if value <= 0:
+        logger.warning(
+            "agent.claude_agent_sdk.max_buffer_size=%r is out of range — "
+            "ignoring it (using the built-in default).", raw,
+        )
+        return _DEFAULT_MAX_BUFFER_SIZE
+    return value
+
+
 # ---------- turn-lifetime defaults ----------
 # The soft turn budget. It was a hard wall-clock over the whole turn since the
 # provider's birth (transplanted verbatim from the codex twin, where a
@@ -2333,6 +2394,10 @@ class ClaudeAgentSdkSession:
             # back in via agent.claude_agent_sdk.setting_sources — see
             # _configured_setting_sources.
             "setting_sources": _configured_setting_sources(),
+            # Explicit, because the SDK's 1 MiB default is below what this
+            # lane's own tool results routinely produce and overflowing it
+            # kills the turn outright — see _configured_max_buffer_size.
+            "max_buffer_size": _configured_max_buffer_size(),
             # AskUserQuestion has no native answer bridge. Native Read stays
             # behind the protected-path-aware, bounded Hermes MCP surface in
             # every supported SDK permission mode.

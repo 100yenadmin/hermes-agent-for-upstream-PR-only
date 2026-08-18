@@ -913,6 +913,57 @@ class TestSession:
         session, _ = _make_session(script=[ResultMessage(result="ok")])
         assert session.build_option_fields()["permission_mode"] == "default"
 
+    def test_max_buffer_size_set_above_sdk_default(self):
+        # The SDK's 1 MiB default kills the turn outright when one CLI stdout
+        # message clears it (2026-08-17 21:03 EDT production kill). The option
+        # must always be present — falling back to the SDK default silently
+        # reintroduces that failure.
+        from agent.transports.claude_agent_sdk_session import (
+            _DEFAULT_MAX_BUFFER_SIZE,
+        )
+
+        session, _ = _make_session(script=[ResultMessage(result="ok")])
+        assert session.build_option_fields()["max_buffer_size"] == (
+            _DEFAULT_MAX_BUFFER_SIZE
+        )
+        assert _DEFAULT_MAX_BUFFER_SIZE > 1024 * 1024
+
+    def test_config_max_buffer_size_overrides_default(self, monkeypatch):
+        import hermes_cli.config as cfg
+
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {
+                "agent": {"claude_agent_sdk": {"max_buffer_size": 4194304}}
+            },
+            raising=False,
+        )
+        session, _ = _make_session(script=[ResultMessage(result="ok")])
+        assert session.build_option_fields()["max_buffer_size"] == 4194304
+
+    @pytest.mark.parametrize("bad", [True, "big", 0, -1, None])
+    def test_invalid_max_buffer_size_falls_back(self, monkeypatch, bad):
+        # A typo must not disable the only backstop against an unterminated
+        # line growing until the host OOMs, nor silently drop to 1 MiB.
+        import hermes_cli.config as cfg
+        from agent.transports.claude_agent_sdk_session import (
+            _DEFAULT_MAX_BUFFER_SIZE,
+        )
+
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {
+                "agent": {"claude_agent_sdk": {"max_buffer_size": bad}}
+            },
+            raising=False,
+        )
+        session, _ = _make_session(script=[ResultMessage(result="ok")])
+        assert session.build_option_fields()["max_buffer_size"] == (
+            _DEFAULT_MAX_BUFFER_SIZE
+        )
+
     def test_metered_key_scrubbed_from_mcp_env(self, monkeypatch):
         # RED-first: with the ambient var set, the builder must scrub it.
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-fake")
