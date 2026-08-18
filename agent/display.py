@@ -193,6 +193,24 @@ def _truncate_preview(text: str, max_len: int | None) -> str:
     return text
 
 
+def build_terminal_preview_line(command: str, max_len: int | None) -> str:
+    """Render a shell command as one capped line for a progress preview.
+
+    Uses the same ``_oneline`` + ``_truncate_preview`` pair as every other
+    preview, so a command spends its whole budget on content. Taking only
+    the *first* source line instead wastes the budget precisely when the
+    preview matters most: shell commands routinely open with boilerplate
+    (``set -e``, a ``cd``, a variable assignment), so a 120-character budget
+    could render as ``set +e``.
+
+    The result is a label, not a paste-able command — collapsing newlines
+    puts any interior ``#`` comment inline, where it would swallow the rest
+    of the line if it were run. Verbose mode's fenced block stays the
+    copyable form.
+    """
+    return _truncate_preview(_oneline(command), max_len)
+
+
 @dataclass(frozen=True)
 class ToolPreview:
     """A compact tool preview plus presentation facts lost to truncation."""

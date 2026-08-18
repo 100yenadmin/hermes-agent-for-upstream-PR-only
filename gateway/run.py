@@ -4353,7 +4353,10 @@ class TurnRunner:
             and isinstance(_canon_args.get("command"), str)
             and _canon_args["command"].strip()
         ):
-            from agent.display import get_tool_preview_max_len
+            from agent.display import (
+                build_terminal_preview_line,
+                get_tool_preview_max_len,
+            )
             _cmd_full = _canon_args["command"].rstrip()
             # Consecutive terminal calls: drop the repeated
             # "💻 terminal" header so back-to-back commands render as
@@ -4362,16 +4365,14 @@ class TurnRunner:
                 "" if ctx.last_was_terminal_block[0] else f"{emoji} {_canon_name}\n"
             )
             _code_block_full = f"{_block_header}```\n{_cmd_full}\n```"
-            # Single-line, capped preview for non-verbose modes.
+            # Single-line, capped preview for non-verbose modes.  Built by
+            # the shared display helper so the whole budget goes to content;
+            # this used to take only the FIRST source line, which rendered a
+            # command opening with `set -e`, a `cd`, or a variable
+            # assignment as just those few characters.
             _pl = get_tool_preview_max_len()
             _cap = _pl if _pl > 0 else 40
-            _lines = _cmd_full.splitlines()
-            _cmd_short = _lines[0] if _lines else _cmd_full
-            _multiline = len(_lines) > 1
-            if len(_cmd_short) > _cap:
-                _cmd_short = _cmd_short[:_cap - 3] + "..."
-            elif _multiline:
-                _cmd_short = _cmd_short + " ..."
+            _cmd_short = build_terminal_preview_line(_cmd_full, _cap)
             _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
 
         # Verbose mode: show detailed arguments, respects tool_preview_length
