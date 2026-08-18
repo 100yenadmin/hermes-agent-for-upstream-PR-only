@@ -494,6 +494,7 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         "cronjob": "action",
         "execute_code": "code", "browser_exec": "code", "delegate_task": "goal",
         "clarify": "question", "skill_manage": "name",
+        "ToolSearch": "query",
     }
 
     # browser_exec: prefer the leading `# …` comment as a friendly step label
@@ -690,12 +691,20 @@ _TOOL_VERBS: dict[str, str] = {
     "clarify": "Asking",
     "memory": "Updating memory",
     "todo": "Updating tasks",
+    "update_active_task": "Updating the active task",
+    # Not a Hermes tool and deliberately absent from the identity map -- it
+    # has no native counterpart -- but the user sees it constantly on
+    # runtimes that defer tool schemas, so it still earns a verb.
+    "ToolSearch": "Loading tools",
 }
 
 # Verbs that read better without the raw argument preview appended.
 _TOOL_VERBS_NO_PREVIEW: frozenset[str] = frozenset({
     "skills_list",
     "session_search",
+    # The whole record is the argument; there is no short primary value to
+    # show, and echoing the first line of the document would mislead.
+    "update_active_task",
 })
 
 # Verbs that take a "for" connector before the preview (search-style phrasing):
@@ -703,6 +712,7 @@ _TOOL_VERBS_NO_PREVIEW: frozenset[str] = frozenset({
 _TOOL_VERBS_FOR_CONNECTOR: frozenset[str] = frozenset({
     "web_search",
     "search_files",
+    "ToolSearch",
 })
 
 _friendly_tool_labels: bool = True

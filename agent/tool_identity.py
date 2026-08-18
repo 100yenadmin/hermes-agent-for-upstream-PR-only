@@ -52,22 +52,67 @@ _MCP_DOT_PREFIX = "mcp."
 INTERNAL_MCP_SERVER = "hermes-tools"
 
 
+# Separator between server and tool in a third-party MCP display label.
+# A middle dot rather than ``__``: the underscores are wire scaffolding, the
+# server is information.
+MCP_SERVER_SEPARATOR = " · "
+
+
+def _split_mcp(tool_name: str) -> tuple[str, str] | None:
+    """Split an MCP tool name into ``(server, tool)``, or None if not MCP.
+
+    Handles both conventions: ``mcp__<server>__<tool>`` (Claude Agent SDK /
+    Anthropic wire format) and ``mcp.<server>.<tool>`` (Codex app-server
+    bridge).  A malformed name with no tool part yields None so callers fall
+    through to treating it as an ordinary name.
+    """
+    if tool_name.startswith(_MCP_UNDERSCORE_PREFIX):
+        parts = tool_name.split("__", 2)
+    elif tool_name.startswith(_MCP_DOT_PREFIX):
+        parts = tool_name.split(".", 2)
+    else:
+        return None
+    if len(parts) == 3 and parts[1] and parts[2]:
+        return parts[1], parts[2]
+    return None
+
+
 def strip_mcp_namespace(tool_name: str) -> str:
     """Return the bare tool name for internal-MCP-routed Hermes tools.
 
     ``mcp__hermes-tools__read_file`` -> ``read_file``.  Third-party servers
     (``mcp__linear__get_issue``) are returned unchanged.
     """
-    if tool_name.startswith(_MCP_UNDERSCORE_PREFIX):
-        parts = tool_name.split("__", 2)
-        if len(parts) == 3 and parts[1] == INTERNAL_MCP_SERVER and parts[2]:
-            return parts[2]
-        return tool_name
-    if tool_name.startswith(_MCP_DOT_PREFIX):
-        parts = tool_name.split(".", 2)
-        if len(parts) == 3 and parts[1] == INTERNAL_MCP_SERVER and parts[2]:
-            return parts[2]
+    split = _split_mcp(tool_name)
+    if split is not None and split[0] == INTERNAL_MCP_SERVER:
+        return split[1]
     return tool_name
+
+
+def display_tool_label(tool_name: str) -> str:
+    """Return the human-facing name for a tool that has no curated verb.
+
+    The no-verb fallback is the one rendering path that prints a tool's own
+    name to the user, so it is where raw wire names leak.  ``mcp__`` and the
+    doubled underscores are transport scaffolding -- the user did not choose
+    them and they carry no meaning.
+
+    Hermes' own tools drop the namespace entirely: they *are* Hermes tools,
+    merely arriving by another road, and they render identically no matter
+    which runtime called them.  Third-party servers keep their identity but
+    lose the scaffolding (``mcp__linear__get_issue`` -> ``linear · get_issue``)
+    -- hiding which server ran a tool would be misleading, but spelling it in
+    wire format is just noise.
+    """
+    if not tool_name:
+        return tool_name
+    split = _split_mcp(tool_name)
+    if split is None:
+        return canonical_tool_name(tool_name)
+    server, tool = split
+    if server == INTERNAL_MCP_SERVER:
+        return canonical_tool_name(tool)
+    return f"{server}{MCP_SERVER_SEPARATOR}{tool}"
 
 
 # Foreign tool name -> Hermes-native tool name.

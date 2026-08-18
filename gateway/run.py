@@ -4344,7 +4344,11 @@ class TurnRunner:
             _progress_adapter = self._runner._adapter_for_source(ctx.source)
         except Exception:
             _progress_adapter = None
-        from agent.tool_identity import canonical_tool_args, canonical_tool_name
+        from agent.tool_identity import (
+            canonical_tool_args,
+            canonical_tool_name,
+            display_tool_label,
+        )
         _canon_name = canonical_tool_name(tool_name)
         _canon_args = canonical_tool_args(tool_name, args)
         if (
@@ -4439,10 +4443,21 @@ class TurnRunner:
                 else:
                     msg = f"{emoji} {_verb}{tool_verb_connector(tool_name)}{preview}"
             else:
-                msg = f"{emoji} {tool_name}: \"{preview}\""
+                # No curated verb, so the tool's own name is what the user
+                # sees -- the one path where a raw wire name leaks. Strip the
+                # MCP scaffolding; a third-party server stays visible as
+                # "linear · get_issue".
+                _label = display_tool_label(tool_name)
+                # A tool with no preview rule yields no preview, and the
+                # caller's fallback is the tool name itself -- which rendered
+                # as `name: "name"`. Say it once.
+                if preview in (tool_name, _label):
+                    msg = f"{emoji} {_label}"
+                else:
+                    msg = f"{emoji} {_label}: \"{preview}\""
             ctx.last_was_terminal_block[0] = False
         else:
-            msg = f"{emoji} {tool_name}..."
+            msg = f"{emoji} {display_tool_label(tool_name)}..."
             ctx.last_was_terminal_block[0] = False
 
         # Dedup: collapse consecutive identical progress messages.
@@ -29170,7 +29185,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _parts.append(
                                 f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
                             )
-                        _action = _a.get("current_tool") or _a.get("last_activity_desc")
+                        _action = _a.get("current_tool")
+                        if _action:
+                            # The activity summary deliberately keeps the
+                            # runtime's raw tool name; this is a user-facing
+                            # line, so canonicalize here rather than there --
+                            # otherwise the heartbeat reads "Bash" while the
+                            # progress line above it reads "terminal".
+                            from agent.tool_identity import display_tool_label
+                            _action = display_tool_label(str(_action))
+                        else:
+                            _action = _a.get("last_activity_desc")
                         if _action:
                             _parts.append(str(_action))
                         if _parts:

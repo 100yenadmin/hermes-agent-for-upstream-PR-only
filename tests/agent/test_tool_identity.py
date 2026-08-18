@@ -240,8 +240,16 @@ class TestThreeLaneDisplayParity:
 class TestNonTerminalRuntimesUnaffected:
     """Canonicalization must not invent behaviour for unmapped tools."""
 
-    def test_unmapped_tool_gets_no_verb_and_no_shell_identity(self):
-        assert get_tool_verb("ToolSearch") is None
+    def test_unmapped_tool_keeps_its_own_identity(self):
+        """``ToolSearch`` has no native counterpart, so it stays itself.
+
+        It later gained a *display verb*, which is a different decision: a
+        verb describes what the user is watching, while identity decides
+        which curated behaviour a tool inherits. Giving ToolSearch a verb
+        must not give it another tool's identity — above all not
+        ``terminal``, which would route it into the shell code-block path.
+        """
+        assert canonical_tool_name("ToolSearch") == "ToolSearch"
         assert canonical_tool_name("ToolSearch") != "terminal"
 
     def test_third_party_mcp_tool_renders_without_error(self):
