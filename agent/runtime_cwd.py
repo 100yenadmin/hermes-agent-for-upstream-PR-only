@@ -60,6 +60,18 @@ def _session_cwd_override() -> tuple[bool, str]:
     return True, str(value).strip()
 
 
+def context_cwd_is_masked() -> bool:
+    """Return whether context discovery must not use the process cwd.
+
+    A multiplexed profile with no configured workspace intentionally resolves
+    to ``None`` for compatibility with callers that expect an optional Path.
+    This separate predicate preserves the distinction between that explicit
+    mask and the ordinary unset state used by local CLI fallback.
+    """
+    pinned, override = _session_cwd_override()
+    return pinned and not override
+
+
 def resolve_agent_cwd() -> Path:
     pinned, override = _session_cwd_override()
     if pinned:
