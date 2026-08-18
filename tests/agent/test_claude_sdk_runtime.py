@@ -1939,8 +1939,12 @@ class TestHermesSessionIdPlumbing:
 
         monkeypatch.setattr(rt, "build_system_prompt_append", fake_append)
         monkeypatch.setattr(sdk_session_mod, "ClaudeAgentSdkSession", SpySession)
+        import agent.runtime_cwd as runtime_cwd
+
+        monkeypatch.setattr(runtime_cwd, "resolve_agent_cwd", lambda: "/resolved-workspace")
         agent = _make_agent()
         agent._claude_sdk_session = None
+        agent.session_cwd = "/unvalidated-stale-workspace"
         agent.platform = "telegram"
         run_claude_agent_sdk_turn(
             agent,
@@ -1955,6 +1959,7 @@ class TestHermesSessionIdPlumbing:
         assert captured["platform"] == "telegram"
         assert captured["session_id"] == "sess-1"
         assert captured["model"] == "claude-opus-4-8"
+        assert captured["cwd"] == "/resolved-workspace"
 
     @staticmethod
     def _run_with_spy_session(monkeypatch, config_block):
@@ -2803,6 +2808,128 @@ class TestSystemPromptAppend:
         assert out is not None
         assert out.startswith("# Override persona")
         assert "# Native soul identity" not in out
+
+    def test_workspace_context_file_is_in_sdk_append(self, tmp_path, monkeypatch):
+        """SDK turns must receive the same Hermes project instructions as native turns."""
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        self._home(tmp_path, monkeypatch)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / ".hermes.md").write_text(
+            "# Workspace contract\nRun the project check before reporting success."
+        )
+
+        out = build_system_prompt_append(cwd=str(workspace)) or ""
+
+        assert "# Project Context" in out
+        assert "Run the project check before reporting success." in out
+        # Context-file discovery uses a process-local warning queue. Drain it
+        # so this direct builder test cannot leak state into native prompt tests.
+        from agent.prompt_builder import drain_truncation_warnings
+
+        drain_truncation_warnings()
+
+    def test_coding_workspace_snapshot_is_in_sdk_append(self, tmp_path, monkeypatch):
+        """SDK turns retain the native coding workspace snapshot."""
+        from agent.claude_sdk_runtime import build_system_prompt_append
+        import agent.coding_context as coding_context
+
+        self._home(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            coding_context,
+            "coding_system_prompt_parts",
+            lambda **_kwargs: (["Coding posture"], ["Workspace snapshot"], ["Coding tail"]),
+        )
+
+        out = build_system_prompt_append(cwd=str(tmp_path), platform="telegram") or ""
+
+        assert "Coding posture" in out
+        assert "Workspace snapshot" in out
+        assert "Coding tail" in out
+        from agent.prompt_builder import drain_truncation_warnings
+
+        drain_truncation_warnings()
+
+    def test_workspace_snapshot_survives_large_project_context(self, tmp_path, monkeypatch):
+        """A large project file must not silently evict the SDK workspace snapshot."""
+        from agent.claude_sdk_runtime import build_system_prompt_append
+        import agent.coding_context as coding_context
+        import agent.prompt_builder as prompt_builder
+
+        self._home(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            prompt_builder,
+            "build_context_files_prompt",
+            lambda **_kwargs: "PROJECT-CONTEXT " + "p" * 16_000,
+        )
+        monkeypatch.setattr(
+            coding_context,
+            "coding_system_prompt_parts",
+            lambda **_kwargs: ([], ["WORKSPACE-SNAPSHOT " + "w" * 3_500], []),
+        )
+
+        out = build_system_prompt_append(cwd=str(tmp_path)) or ""
+
+        assert "PROJECT-CONTEXT" in out
+        assert "WORKSPACE-SNAPSHOT" in out
+
+    def test_oversized_workspace_snapshot_is_capped_not_dropped(self, tmp_path, monkeypatch):
+        """An oversized coding snapshot remains represented within the workspace cap."""
+        from agent.claude_sdk_runtime import (
+            _APPEND_TOTAL_MAX_CHARS,
+            build_system_prompt_append,
+        )
+        import agent.coding_context as coding_context
+        import agent.prompt_builder as prompt_builder
+
+        self._home(tmp_path, monkeypatch)
+        monkeypatch.setattr(prompt_builder, "build_context_files_prompt", lambda **_kwargs: "")
+        monkeypatch.setattr(
+            coding_context,
+            "coding_system_prompt_parts",
+            lambda **_kwargs: ([], ["OVERSIZED-WORKSPACE " + "w" * 22_000], []),
+        )
+
+        out = build_system_prompt_append(cwd=str(tmp_path)) or ""
+
+        assert "OVERSIZED-WORKSPACE" in out
+        assert len(out) <= _APPEND_TOTAL_MAX_CHARS
+
+    def test_workspace_snapshot_survives_capped_soul(self, tmp_path, monkeypatch):
+        """The workspace block must fit after the maximum-size SDK soul block."""
+        from agent.claude_sdk_runtime import build_system_prompt_append
+        import agent.coding_context as coding_context
+        import agent.prompt_builder as prompt_builder
+
+        self._home(tmp_path, monkeypatch, soul="CAPPED-SOUL " + "s" * 8_000)
+        monkeypatch.setattr(prompt_builder, "build_context_files_prompt", lambda **_kwargs: "")
+        monkeypatch.setattr(
+            coding_context,
+            "coding_system_prompt_parts",
+            lambda **_kwargs: ([], ["SOUL-COMPATIBLE-WORKSPACE " + "w" * 12_000], []),
+        )
+
+        out = build_system_prompt_append(cwd=str(tmp_path)) or ""
+
+        assert "CAPPED-SOUL" in out
+        assert "SOUL-COMPATIBLE-WORKSPACE" in out
+
+    def test_project_context_warning_queue_drains_after_builder_error(self, tmp_path, monkeypatch):
+        """A failed SDK context build cannot leak warnings into later native prompts."""
+        from agent.claude_sdk_runtime import build_system_prompt_append
+        import agent.prompt_builder as prompt_builder
+
+        self._home(tmp_path, monkeypatch)
+
+        def record_then_fail(**_kwargs):
+            prompt_builder._record_truncation_warning("SDK test warning")
+            raise RuntimeError("transient context read failure")
+
+        monkeypatch.setattr(prompt_builder, "build_context_files_prompt", record_then_fail)
+        build_system_prompt_append(cwd=str(tmp_path))
+
+        assert prompt_builder.drain_truncation_warnings() == []
 
     def test_gauge_blocks_are_the_native_render(self, tmp_path, monkeypatch):
         # Byte-pin: the memory/user blocks are EXACTLY what the native

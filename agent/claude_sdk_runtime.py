@@ -26,6 +26,11 @@ logger = logging.getLogger(__name__)
 # (Hermes' native files are hard-capped anyway; the soul file is ours).
 _APPEND_SOURCE_MAX_CHARS = 8000
 
+# The SDK append also carries persona, memory, skill, and session guidance. Keep
+# workspace material bounded as one unit so a large project instruction cannot
+# evict the corresponding coding snapshot under the append-wide budget.
+_SDK_WORKSPACE_CONTEXT_MAX_CHARS = 9_998
+
 
 def _read_capped(path: str, cap: int = _APPEND_SOURCE_MAX_CHARS) -> str:
     try:
@@ -150,6 +155,7 @@ def build_system_prompt_append(
     platform: Optional[str] = None,
     session_id: Optional[str] = None,
     model: Optional[str] = None,
+    cwd: Optional[str] = None,
 ) -> Optional[str]:
     """Compose the system-prompt append for the SDK session.
 
@@ -234,6 +240,67 @@ def build_system_prompt_append(
                 blocks.append(hint.strip())
         except Exception:  # pragma: no cover
             logger.debug("platform hint lookup failed", exc_info=True)
+
+    # The SDK preset intentionally does not load ambient Claude project
+    # settings, but SDK turns must still receive Hermes' explicit project
+    # instructions from the resolved session workspace. SOUL.md is already
+    # handled by the identity slot above, so avoid duplicating it here.
+    if cwd:
+        project_context = ""
+        try:
+            from agent.prompt_builder import (
+                build_context_files_prompt,
+                drain_truncation_warnings,
+            )
+
+            project_context = build_context_files_prompt(cwd=cwd, skip_soul=True)
+        except Exception:  # pragma: no cover - never block session creation
+            logger.debug("SDK project context composition failed", exc_info=True)
+        finally:
+            # The native conversation loop drains these to its status channel.
+            # SDK prompt construction bypasses that loop, so drain on both
+            # success and error rather than leaking into a later native prompt.
+            try:
+                for warning in drain_truncation_warnings():
+                    logger.warning("SDK project context: %s", warning)
+            except Exception:  # pragma: no cover
+                logger.debug("SDK project-context warning drain failed", exc_info=True)
+
+        coding_context = ""
+        try:
+            from agent.coding_context import coding_system_prompt_parts
+
+            coding_prefix, coding_workspace, coding_tail = coding_system_prompt_parts(
+                platform=platform,
+                cwd=cwd,
+                model=model,
+            )
+            coding_context = "\n\n".join(
+                part.strip()
+                for part in (*coding_prefix, *coding_workspace, *coding_tail)
+                if isinstance(part, str) and part.strip()
+            )
+        except Exception:  # pragma: no cover - never block session creation
+            logger.debug("SDK coding context composition failed", exc_info=True)
+
+        # Keep project instructions and coding snapshot atomic in the append.
+        # Reserve the workspace snapshot first; project context is safely
+        # shortened rather than allowing a valid large file to drop it entirely.
+        # A pathological coding snapshot is capped too, so this combined block
+        # always survives the append-wide whole-block budget.
+        coding_context = coding_context[:_SDK_WORKSPACE_CONTEXT_MAX_CHARS]
+        separator = "\n\n" if project_context and coding_context else ""
+        project_limit = max(
+            0,
+            _SDK_WORKSPACE_CONTEXT_MAX_CHARS - len(coding_context) - len(separator),
+        )
+        workspace_context = separator.join(
+            part
+            for part in (project_context[:project_limit], coding_context)
+            if part
+        )
+        if workspace_context:
+            blocks.append(workspace_context)
 
     # Memory is gated by TWO predicates, mirroring the registration site
     # (hermes_tools_mcp_server._stateless_shim_defs): the store BLOCKS ride
@@ -834,7 +901,7 @@ def run_claude_agent_sdk_turn(
     def _create_session(resume_id: Optional[str]) -> None:
         from agent.runtime_cwd import resolve_agent_cwd
 
-        cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
+        cwd = str(resolve_agent_cwd())
         try:
             from tools.terminal_tool import _get_approval_callback
             approval_callback = _get_approval_callback()
@@ -896,6 +963,7 @@ def run_claude_agent_sdk_turn(
             platform=getattr(agent, "platform", None),
             session_id=getattr(agent, "session_id", None),
             model=getattr(agent, "model", None),
+            cwd=cwd,
         )
 
         # Delivery half of the stream-ownership fix: when the CLI finishes a
