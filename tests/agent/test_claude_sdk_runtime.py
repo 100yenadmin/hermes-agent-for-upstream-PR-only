@@ -1920,11 +1920,15 @@ class TestHermesSessionIdPlumbing:
 
     def test_runtime_passes_context_to_append_builder(self, monkeypatch):
         # W2: the append builder receives the agent's platform/session/model
-        # so the session line and platform hint reflect the live session.
+        # so the session line and platform hint reflect the live session. The
+        # SDK process uses the validated runtime cwd, while prompt discovery
+        # keeps None as the native fallback sentinel so the install-tree guard
+        # can distinguish fallback from an operator-selected directory.
         import agent.claude_sdk_runtime as rt
         import agent.transports.claude_agent_sdk_session as sdk_session_mod
 
         captured = {}
+        session_captured = {}
 
         def fake_append(**kwargs):
             captured.update(kwargs)
@@ -1932,7 +1936,7 @@ class TestHermesSessionIdPlumbing:
 
         class SpySession:
             def __init__(self, **kwargs):
-                pass
+                session_captured.update(kwargs)
 
             def run_turn(self, user_input):
                 return _make_turn()
@@ -1942,9 +1946,11 @@ class TestHermesSessionIdPlumbing:
         import agent.runtime_cwd as runtime_cwd
 
         monkeypatch.setattr(runtime_cwd, "resolve_agent_cwd", lambda: "/resolved-workspace")
+        monkeypatch.setattr(runtime_cwd, "resolve_context_cwd", lambda: None)
         agent = _make_agent()
         agent._claude_sdk_session = None
         agent.session_cwd = "/unvalidated-stale-workspace"
+        agent.skip_context_files = True
         agent.platform = "telegram"
         run_claude_agent_sdk_turn(
             agent,
@@ -1959,7 +1965,31 @@ class TestHermesSessionIdPlumbing:
         assert captured["platform"] == "telegram"
         assert captured["session_id"] == "sess-1"
         assert captured["model"] == "claude-opus-4-8"
-        assert captured["cwd"] == "/resolved-workspace"
+        assert captured["cwd"] is None
+        assert captured["include_project_context"] is False
+        assert session_captured["cwd"] == "/resolved-workspace"
+
+        # A validated, explicitly configured context cwd is forwarded as an
+        # explicit path and project files return to their default-on posture.
+        captured.clear()
+        session_captured.clear()
+        agent._claude_sdk_session = None
+        agent.skip_context_files = False
+        monkeypatch.setattr(
+            runtime_cwd,
+            "resolve_context_cwd",
+            lambda: "/configured-workspace",
+        )
+        run_claude_agent_sdk_turn(
+            agent,
+            user_message="again",
+            original_user_message="again",
+            messages=[{"role": "user", "content": "again"}],
+            effective_task_id="task-2",
+        )
+        assert captured["cwd"] == "/configured-workspace"
+        assert captured["include_project_context"] is True
+        assert session_captured["cwd"] == "/resolved-workspace"
 
     @staticmethod
     def _run_with_spy_session(monkeypatch, config_block):
@@ -2842,7 +2872,7 @@ class TestSystemPromptAppend:
         drain_truncation_warnings()
 
     def test_coding_workspace_snapshot_is_in_sdk_append(self, tmp_path, monkeypatch):
-        """SDK turns retain the native coding workspace snapshot."""
+        """SDK turns retain the workspace and operator tail, not false tool guidance."""
         from agent.claude_sdk_runtime import build_system_prompt_append
         import agent.coding_context as coding_context
 
@@ -2855,12 +2885,71 @@ class TestSystemPromptAppend:
 
         out = build_system_prompt_append(cwd=str(tmp_path), platform="telegram") or ""
 
-        assert "Coding posture" in out
+        # The native prefix names patch/write_file/terminal/todo, which are not
+        # present on the default SDK surface. The claude_code preset plus the
+        # SDK-specific inspection guidance own behavior; only the workspace
+        # snapshot and configured operator tail are portable here.
+        assert "Coding posture" not in out
         assert "Workspace snapshot" in out
         assert "Coding tail" in out
         from agent.prompt_builder import drain_truncation_warnings
 
         drain_truncation_warnings()
+
+    def test_project_context_preserves_native_fallback_policy(self, tmp_path, monkeypatch):
+        """A fallback cwd stays None so prompt_builder can guard install trees."""
+        from agent.claude_sdk_runtime import build_system_prompt_append
+        import agent.coding_context as coding_context
+        import agent.prompt_builder as prompt_builder
+
+        self._home(tmp_path, monkeypatch)
+        captured = {}
+
+        def fake_project_context(**kwargs):
+            captured.update(kwargs)
+            return ""
+
+        monkeypatch.setattr(prompt_builder, "build_context_files_prompt", fake_project_context)
+        monkeypatch.setattr(
+            coding_context,
+            "coding_system_prompt_parts",
+            lambda **_kwargs: ([], [], []),
+        )
+
+        build_system_prompt_append(cwd=None, platform="telegram")
+
+        assert captured["cwd"] is None
+        assert captured["skip_soul"] is True
+        assert captured["allow_install_tree_fallback"] is False
+
+    def test_skip_project_context_keeps_coding_snapshot(self, tmp_path, monkeypatch):
+        """skip_context_files does not disable the independent coding snapshot."""
+        from agent.claude_sdk_runtime import build_system_prompt_append
+        import agent.coding_context as coding_context
+        import agent.prompt_builder as prompt_builder
+
+        self._home(tmp_path, monkeypatch)
+
+        def unexpected_project_context(**_kwargs):
+            raise AssertionError("project context must stay disabled")
+
+        monkeypatch.setattr(
+            prompt_builder,
+            "build_context_files_prompt",
+            unexpected_project_context,
+        )
+        monkeypatch.setattr(
+            coding_context,
+            "coding_system_prompt_parts",
+            lambda **_kwargs: ([], ["WORKSPACE-WITH-PROJECT-FILES-DISABLED"], []),
+        )
+
+        out = build_system_prompt_append(
+            cwd=str(tmp_path),
+            include_project_context=False,
+        ) or ""
+
+        assert "WORKSPACE-WITH-PROJECT-FILES-DISABLED" in out
 
     def test_workspace_snapshot_survives_large_project_context(self, tmp_path, monkeypatch):
         """A large project file must not silently evict the SDK workspace snapshot."""

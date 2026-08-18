@@ -156,6 +156,7 @@ def build_system_prompt_append(
     session_id: Optional[str] = None,
     model: Optional[str] = None,
     cwd: Optional[str] = None,
+    include_project_context: bool = True,
 ) -> Optional[str]:
     """Compose the system-prompt append for the SDK session.
 
@@ -243,17 +244,25 @@ def build_system_prompt_append(
 
     # The SDK preset intentionally does not load ambient Claude project
     # settings, but SDK turns must still receive Hermes' explicit project
-    # instructions from the resolved session workspace. SOUL.md is already
-    # handled by the identity slot above, so avoid duplicating it here.
-    if cwd:
-        project_context = ""
+    # instructions from the resolved session workspace. ``cwd=None`` is a
+    # meaningful native sentinel: prompt_builder then treats os.getcwd() as a
+    # fallback and can refuse an accidental Hermes install-tree context. SOUL.md
+    # is already handled by the identity slot above, so avoid duplicating it.
+    project_context = ""
+    if include_project_context:
         try:
             from agent.prompt_builder import (
                 build_context_files_prompt,
                 drain_truncation_warnings,
             )
 
-            project_context = build_context_files_prompt(cwd=cwd, skip_soul=True)
+            project_context = build_context_files_prompt(
+                cwd=cwd,
+                skip_soul=True,
+                allow_install_tree_fallback=(
+                    str(platform or "").strip().lower() in {"cli", "tui"}
+                ),
+            )
         except Exception:  # pragma: no cover - never block session creation
             logger.debug("SDK project context composition failed", exc_info=True)
         finally:
@@ -266,41 +275,45 @@ def build_system_prompt_append(
             except Exception:  # pragma: no cover
                 logger.debug("SDK project-context warning drain failed", exc_info=True)
 
-        coding_context = ""
-        try:
-            from agent.coding_context import coding_system_prompt_parts
+    coding_context = ""
+    try:
+        from agent.coding_context import coding_system_prompt_parts
 
-            coding_prefix, coding_workspace, coding_tail = coding_system_prompt_parts(
-                platform=platform,
-                cwd=cwd,
-                model=model,
-            )
-            coding_context = "\n\n".join(
-                part.strip()
-                for part in (*coding_prefix, *coding_workspace, *coding_tail)
-                if isinstance(part, str) and part.strip()
-            )
-        except Exception:  # pragma: no cover - never block session creation
-            logger.debug("SDK coding context composition failed", exc_info=True)
+        _coding_prefix, coding_workspace, coding_tail = coding_system_prompt_parts(
+            platform=platform,
+            cwd=cwd,
+            model=model,
+        )
+        # The native coding prefix names patch/write_file/terminal/todo, which
+        # are not present on the default SDK surface. The claude_code preset and
+        # _MCP_INSPECTION_PREFERENCE own SDK behavior; retain only the portable
+        # workspace snapshot and explicit operator instructions here.
+        coding_context = "\n\n".join(
+            part.strip()
+            for part in (*coding_workspace, *coding_tail)
+            if isinstance(part, str) and part.strip()
+        )
+    except Exception:  # pragma: no cover - never block session creation
+        logger.debug("SDK coding context composition failed", exc_info=True)
 
-        # Keep project instructions and coding snapshot atomic in the append.
-        # Reserve the workspace snapshot first; project context is safely
-        # shortened rather than allowing a valid large file to drop it entirely.
-        # A pathological coding snapshot is capped too, so this combined block
-        # always survives the append-wide whole-block budget.
-        coding_context = coding_context[:_SDK_WORKSPACE_CONTEXT_MAX_CHARS]
-        separator = "\n\n" if project_context and coding_context else ""
-        project_limit = max(
-            0,
-            _SDK_WORKSPACE_CONTEXT_MAX_CHARS - len(coding_context) - len(separator),
-        )
-        workspace_context = separator.join(
-            part
-            for part in (project_context[:project_limit], coding_context)
-            if part
-        )
-        if workspace_context:
-            blocks.append(workspace_context)
+    # Keep project instructions and coding snapshot atomic in the append.
+    # Reserve the workspace snapshot first; project context is safely
+    # shortened rather than allowing a valid large file to drop it entirely.
+    # A pathological coding snapshot is capped too, so this combined block
+    # always survives the append-wide whole-block budget.
+    coding_context = coding_context[:_SDK_WORKSPACE_CONTEXT_MAX_CHARS]
+    separator = "\n\n" if project_context and coding_context else ""
+    project_limit = max(
+        0,
+        _SDK_WORKSPACE_CONTEXT_MAX_CHARS - len(coding_context) - len(separator),
+    )
+    workspace_context = separator.join(
+        part
+        for part in (project_context[:project_limit], coding_context)
+        if part
+    )
+    if workspace_context:
+        blocks.append(workspace_context)
 
     # Memory is gated by TWO predicates, mirroring the registration site
     # (hermes_tools_mcp_server._stateless_shim_defs): the store BLOCKS ride
@@ -899,9 +912,10 @@ def run_claude_agent_sdk_turn(
         return _relay_interim_assistant, _on_tool_iteration
 
     def _create_session(resume_id: Optional[str]) -> None:
-        from agent.runtime_cwd import resolve_agent_cwd
+        from agent.runtime_cwd import resolve_agent_cwd, resolve_context_cwd
 
         cwd = str(resolve_agent_cwd())
+        context_cwd = resolve_context_cwd()
         try:
             from tools.terminal_tool import _get_approval_callback
             approval_callback = _get_approval_callback()
@@ -977,7 +991,10 @@ def run_claude_agent_sdk_turn(
             platform=getattr(agent, "platform", None),
             session_id=getattr(agent, "session_id", None),
             model=getattr(agent, "model", None),
-            cwd=cwd,
+            cwd=str(context_cwd) if context_cwd is not None else None,
+            include_project_context=not bool(
+                getattr(agent, "skip_context_files", False)
+            ),
         )
 
         # Delivery half of the stream-ownership fix: when the CLI finishes a
