@@ -5617,6 +5617,12 @@ class TurnRunner:
                 prefill_messages=self._runner._prefill_messages or None,
                 reasoning_config=reasoning_config,
                 service_tier=self._runner._service_tier,
+                fast_auto_on_seconds=cfg_get(
+                    ctx.user_config,
+                    "agent",
+                    "fast_auto_on_seconds",
+                    default=60,
+                ),
                 request_overrides=turn_route.get("request_overrides"),
                 providers_allowed=pr.get("only"),
                 providers_ignored=pr.get("ignore"),
@@ -5730,6 +5736,16 @@ class TurnRunner:
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config = reasoning_config
         agent.service_tier = self._runner._service_tier
+        from agent.fast_mode import normalize_fast_auto_on_seconds
+
+        agent.fast_auto_on_seconds = normalize_fast_auto_on_seconds(
+            cfg_get(
+                ctx.user_config,
+                "agent",
+                "fast_auto_on_seconds",
+                default=60,
+            )
+        )
         agent.request_overrides = turn_route.get("request_overrides") or {}
         # Must-deliver notes for THIS turn ride the current user message
         # (api_content sidecar), never the system prompt: staged by
@@ -8047,7 +8063,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         }
 
         service_tier = getattr(self, "_service_tier", None)
-        if not service_tier:
+        if not service_tier or service_tier in {"auto", "cold"}:
             route["request_overrides"] = {}
             return route
 
@@ -9324,7 +9340,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> None:
         """Set or clear the session-scoped /fast override.
 
-        ``service_tier`` is "priority" or None (explicit normal). Pass
+        ``service_tier`` is "priority", "auto", "cold", or None. Pass
         ``clear=True`` to remove the override entirely (fall back to config).
         """
         if not session_key:
@@ -9342,7 +9358,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Load Priority Processing setting from config.yaml.
 
         Reads agent.service_tier from config.yaml. Accepted values mirror the CLI:
-        "fast"/"priority"/"on" => "priority", while "normal"/"off" disables it.
+        "fast"/"priority"/"on" => "priority"; "auto"/"cold" are policies.
         Returns None when unset or unsupported.
         """
         cfg = _load_gateway_runtime_config()
@@ -9353,6 +9369,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         if value in {"fast", "priority", "on"}:
             return "priority"
+        if value in {"auto", "cold"}:
+            return value
         logger.warning("Unknown service_tier '%s', ignoring", raw)
         return None
 
@@ -22258,6 +22276,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     disabled_toolsets=disabled_toolsets,
                     reasoning_config=reasoning_config,
                     service_tier=self._service_tier,
+                    fast_auto_on_seconds=cfg_get(
+                        user_config,
+                        "agent",
+                        "fast_auto_on_seconds",
+                        default=60,
+                    ),
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
