@@ -339,9 +339,10 @@ DEFAULT_CONFIG = {
             # pipeline (the top-level `streaming:` block still governs how the
             # deltas are displayed). Default off — upstream-conservative.
             "streaming": False,
-            # The provider exists to bill the Claude subscription and refuses to
-            # start while a metered ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN
-            # could silently take over billing. Set true to allow that.
+            # The provider defaults to the Claude subscription and refuses known
+            # metered lanes: API-key sources and enabled/active subscription
+            # Extra Usage reported by the CLI. Set true to allow metering
+            # explicitly (and label reported metered turns honestly).
             "allow_metered_key": False,
             # Optional operator persona/soul file appended to the system prompt
             # ("" = none).

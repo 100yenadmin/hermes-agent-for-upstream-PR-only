@@ -107,6 +107,22 @@ class SystemMessage:
 
 
 @dataclass
+class RateLimitInfo:
+    status: str = "allowed"
+    rate_limit_type: Optional[str] = "five_hour"
+    overage_status: Optional[str] = None
+    overage_disabled_reason: Optional[str] = None
+    raw: dict = field(default_factory=dict)
+
+
+@dataclass
+class RateLimitEvent:
+    rate_limit_info: RateLimitInfo
+    uuid: str = "rate-1"
+    session_id: str = "sdk-session-1"
+
+
+@dataclass
 class ServerToolUseBlock:
     id: str
     name: str
@@ -141,6 +157,7 @@ class ResultMessage:
     uuid: Optional[str] = "uuid-1"
     errors: Optional[list] = None
     api_error_status: Optional[int] = None
+    total_cost_usd: Optional[float] = None
 
 
 class TestClaudeSdkFallbackBridge:
@@ -427,6 +444,115 @@ def _make_session(script=None, connect_exc=None, **kwargs):
 
 
 class TestSession:
+    def test_reported_api_key_source_fails_closed(self):
+        session, holder = _make_session(
+            script=[
+                SystemMessage(
+                    data={"apiKeySource": "ANTHROPIC_API_KEY"},
+                    session_id="sdk-keyed",
+                ),
+                ResultMessage(result="must not be delivered"),
+            ]
+        )
+        try:
+            turn = session.run_turn("hi")
+        finally:
+            session.close()
+        assert turn.error is not None
+        assert "API-key source" in turn.error
+        assert turn.final_text == ""
+        assert turn.should_retire is True
+        assert turn.fatal_reason == "startup"
+        assert holder["client"].interrupted is True
+
+    def test_enabled_subscription_overage_fails_closed_before_fallback(self):
+        session, holder = _make_session(
+            script=[
+                RateLimitEvent(
+                    RateLimitInfo(
+                        overage_status="allowed",
+                        raw={"isUsingOverage": False},
+                    )
+                ),
+                ResultMessage(result="must not be delivered"),
+            ]
+        )
+        try:
+            turn = session.run_turn("hi")
+        finally:
+            session.close()
+        assert turn.error is not None
+        assert "extra usage is enabled" in turn.error
+        assert turn.final_text == ""
+        assert turn.should_retire is True
+        assert turn.fatal_reason == "startup"
+        assert holder["client"].interrupted is True
+
+    def test_disabled_overage_and_oauth_source_verify_subscription_lane(self):
+        session, _holder = _make_session(
+            script=[
+                SystemMessage(
+                    data={"apiKeySource": "none"},
+                    session_id="sdk-subscription",
+                ),
+                RateLimitEvent(
+                    RateLimitInfo(
+                        overage_status="rejected",
+                        raw={"isUsingOverage": False},
+                    )
+                ),
+                ResultMessage(result="included"),
+            ]
+        )
+        try:
+            turn = session.run_turn("hi")
+        finally:
+            session.close()
+        assert turn.error is None
+        assert turn.final_text == "included"
+        assert turn.billing_mode == "subscription_included"
+        assert turn.billing_evidence == {
+            "api_key_source": "none",
+            "is_using_overage": False,
+            "overage_status": "rejected",
+            "rate_limit_type": "five_hour",
+        }
+
+    def test_explicit_metered_opt_in_allows_and_labels_reported_lane(
+        self, monkeypatch
+    ):
+        import hermes_cli.config as cfg
+
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {
+                "agent": {"claude_agent_sdk": {"allow_metered_key": True}}
+            },
+            raising=False,
+        )
+        session, _holder = _make_session(
+            script=[
+                SystemMessage(data={"apiKeySource": "ANTHROPIC_API_KEY"}),
+                RateLimitEvent(
+                    RateLimitInfo(
+                        rate_limit_type="overage",
+                        overage_status="allowed",
+                        raw={"isUsingOverage": True},
+                    )
+                ),
+                ResultMessage(result="metered", total_cost_usd=0.25),
+            ]
+        )
+        try:
+            turn = session.run_turn("hi")
+        finally:
+            session.close()
+        assert turn.error is None
+        assert turn.final_text == "metered"
+        assert turn.billing_mode == "sdk_reported_metered"
+        assert turn.total_cost_usd == 0.25
+
     def test_empty_turn_rejects_before_start_and_following_turn_works(self):
         session, holder = _make_session(script=[ResultMessage(result="usable")])
         session.request_interrupt()
@@ -890,6 +1016,7 @@ def _make_turn(**overrides):
         tool_iterations=2,
         final_text="SDK_ASSISTANT",
         should_retire=False,
+        billing_mode="subscription_included",
         token_usage_last={"input_tokens": 7, "output_tokens": 3},
         token_usage_total=None,
     )
@@ -4472,6 +4599,42 @@ class TestModelAttribution:
         _record_claude_sdk_usage(agent, turn)
         kwargs = db.update_token_counts.call_args.kwargs
         assert kwargs["model"] == "claude-sonnet-5"
+
+    def test_explicit_metered_turn_is_not_recorded_as_subscription_included(self):
+        from agent.claude_sdk_runtime import _record_claude_sdk_usage
+
+        agent = _make_agent()
+        db = MagicMock()
+        agent._session_db = db
+        agent._session_db_created = True
+        agent.session_id = "sess-metered-1"
+        turn = _make_turn(
+            billing_mode="sdk_reported_metered",
+            total_cost_usd=0.25,
+        )
+        result = _record_claude_sdk_usage(agent, turn)
+        kwargs = db.update_token_counts.call_args.kwargs
+        assert kwargs["billing_mode"] == "sdk_reported_metered"
+        assert kwargs["actual_cost_usd"] == 0.25
+        assert kwargs["cost_status"] == "reported"
+        assert result["cost_status"] == "reported"
+        assert result["actual_cost_usd"] == 0.25
+
+    def test_missing_billing_evidence_is_not_recorded_as_included(self):
+        from agent.claude_sdk_runtime import _record_claude_sdk_usage
+
+        agent = _make_agent()
+        db = MagicMock()
+        agent._session_db = db
+        agent._session_db_created = True
+        agent.session_id = "sess-unverified-1"
+        turn = _make_turn(billing_mode=None)
+        result = _record_claude_sdk_usage(agent, turn)
+        kwargs = db.update_token_counts.call_args.kwargs
+        assert kwargs["billing_mode"] == "unknown"
+        assert kwargs["cost_status"] == "unknown"
+        assert kwargs["cost_source"] == "claude-agent-sdk-unverified"
+        assert result["cost_status"] == "unknown"
 
 
 class TestUnsolicitedDelivery:

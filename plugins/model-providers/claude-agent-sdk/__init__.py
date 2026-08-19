@@ -4,9 +4,14 @@ Unlike the ``anthropic`` provider (raw Messages API: API-key pay-per-token,
 or OAuth that bills overage credits), this provider hands the whole turn to
 Anthropic's ``claude-agent-sdk``, which authenticates with the **Claude
 subscription** (``CLAUDE_CODE_OAUTH_TOKEN`` / the ``~/.claude`` credential
-store) — the officially supported third-party path. Hermes resolves NO
-credentials for it: the SDK subprocess self-authenticates, which is why
-``auth_type="oauth_external"`` and ``env_vars`` is only advisory.
+store) for a local operator-controlled session. Hermes offers no hosted Claude
+login and forwards no user credentials: the SDK subprocess self-authenticates,
+which is why ``auth_type="oauth_external"`` and ``env_vars`` is only advisory.
+
+This is not represented as blanket third-party OAuth approval. Anthropic's
+current Agent SDK and authentication policy directs third-party products and
+services to API-key authentication unless previously approved; the user guide
+documents that boundary explicitly.
 
 Runtime: ``api_mode="claude_agent_sdk"`` — an agent-loop runtime dispatched
 by an early return in run_conversation(), exactly like ``codex_app_server``.
@@ -22,8 +27,8 @@ claude_agent_sdk = ProviderProfile(
     aliases=("claude-sdk", "claude-code-sdk", "claude_agent_sdk"),
     display_name="Claude (Agent SDK / subscription)",
     description=(
-        "Claude Code's agent loop via the official Agent SDK, billed to the "
-        "Claude subscription (never a metered API key)."
+        "Claude Code's agent loop via the official Agent SDK, using the local "
+        "operator's Claude subscription by default (metering fails closed)."
     ),
     api_mode="claude_agent_sdk",
     env_vars=("CLAUDE_CODE_OAUTH_TOKEN",),

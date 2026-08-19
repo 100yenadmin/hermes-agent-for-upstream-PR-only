@@ -4,8 +4,9 @@ Owns one Claude Agent SDK client per Hermes session — the structural twin of
 ``codex_app_server_session.py``, with the Codex JSON-RPC subprocess replaced
 by Anthropic's official ``claude-agent-sdk`` (which manages the Claude Code
 CLI subprocess, its agent loop, and — critically — **subscription OAuth**:
-``CLAUDE_CODE_OAUTH_TOKEN`` / the ``~/.claude`` credential store, never a
-metered ``ANTHROPIC_API_KEY``). See GitHub issue #25267.
+``CLAUDE_CODE_OAUTH_TOKEN`` / the ``~/.claude`` credential store by default;
+known metered sources and Extra Usage fail closed unless the operator opts in).
+See GitHub issue #25267.
 
 Lifecycle:
     session = ClaudeAgentSdkSession(cwd="/home/x/proj", model="claude-opus-4-8")
@@ -102,7 +103,9 @@ def _configured_sdk_env() -> dict:
     return out
 
 
-def _sdk_env_overrides() -> dict[str, str]:
+def _sdk_env_overrides(
+    *, metered_allowed: Optional[bool] = None
+) -> dict[str, str]:
     """The full env override set handed to the spawned CLI.
 
     Metered-vector scrub first (see _METERED_ENV_DENYLIST).
@@ -117,7 +120,8 @@ def _sdk_env_overrides() -> dict[str, str]:
     re-arm metered billing behind allow_metered_key: false. Denylisted keys
     are therefore dropped (loudly) unless the metered opt-in is set.
     """
-    metered_allowed = _provider_flag("allow_metered_key")
+    if metered_allowed is None:
+        metered_allowed = _provider_flag("allow_metered_key")
     overrides: dict[str, str] = {} if metered_allowed else _scrubbed_sdk_env()
     for key, value in _configured_sdk_env().items():
         if not metered_allowed and _is_metered_sdk_env_value(key, value):
@@ -950,6 +954,12 @@ class ClaudeAgentSdkSession:
         self._on_unsolicited_result = on_unsolicited_result
         self._unsolicited_text: list[str] = []
         self._unsolicited_delivered: set[str] = set()
+        # One immutable billing posture per child. The startup environment,
+        # post-start evidence guard, and accounting label must never disagree
+        # because config.yaml changed while a long-lived SDK session was live.
+        self._allow_metered = _provider_flag("allow_metered_key")
+        self._billing_evidence: dict[str, Any] = {}
+        self._billing_guard_error: Optional[str] = None
 
     def set_turn_visibility_callbacks(
         self,
@@ -969,17 +979,16 @@ class ClaudeAgentSdkSession:
         returns the session marker (SDK session ids arrive on first result)."""
         if self._client is not None:
             return self._session_id or "pending"
-        # Hard rule, enforced fail-closed: this provider exists to bill the
-        # Claude SUBSCRIPTION. If a metered ANTHROPIC_API_KEY is present the
+        # Hard default, enforced fail-closed: this provider targets the Claude
+        # SUBSCRIPTION. If a metered ANTHROPIC_API_KEY is present the
         # underlying CLI would silently prefer it — refuse to start instead.
         # ANTHROPIC_TOKEN is in the set because it alone authenticates
         # Hermes' NATIVE Anthropic lane (x-api-key, metered) — but Hermes
         # also persists subscription setup tokens there, so only an
         # API-key-shaped value counts as a metered vector.
-        allow_metered = _provider_flag("allow_metered_key")
         for metered_var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_TOKEN"):
             value = os.environ.get(metered_var)
-            if not value or allow_metered:
+            if not value or self._allow_metered:
                 continue
             if metered_var == "ANTHROPIC_TOKEN" and _is_subscription_oauth_token(value):
                 continue
@@ -1150,6 +1159,94 @@ class ClaudeAgentSdkSession:
             self._on_compact_boundary(trigger or "auto")
         except Exception:
             logger.debug("compact_boundary callback failed", exc_info=True)
+
+    def _observe_billing_evidence(self, message: Any) -> None:
+        """Record the CLI's machine-readable billing lane and fail closed.
+
+        Environment scrubbing protects against billing vectors Hermes knows
+        about. The child remains the authority for what it actually selected:
+        ``system/init.apiKeySource`` reports API-key use, while the pinned SDK's
+        typed ``RateLimitEvent`` exposes subscription Extra Usage. Unless the
+        operator explicitly set ``allow_metered_key``, either signal is a
+        fatal configuration/account-state mismatch, not an "included" turn.
+        """
+        name = type(message).__name__
+        if name == "SystemMessage" and getattr(message, "subtype", "") == "init":
+            data = getattr(message, "data", None)
+            if isinstance(data, dict) and (
+                "apiKeySource" in data or "api_key_source" in data
+            ):
+                source = data.get("apiKeySource", data.get("api_key_source"))
+                source_text = str(source or "none").strip() or "none"
+                self._billing_evidence["api_key_source"] = source_text
+                if (
+                    not self._allow_metered
+                    and source_text.lower() != "none"
+                    and self._billing_guard_error is None
+                ):
+                    self._billing_guard_error = (
+                        "claude-agent-sdk billing guard: the CLI reported "
+                        f"API-key source {source_text!r}. Remove the metered "
+                        "credential, or set agent.claude_agent_sdk."
+                        "allow_metered_key: true to opt in explicitly."
+                    )
+            return
+
+        if name != "RateLimitEvent":
+            return
+        info = getattr(message, "rate_limit_info", None)
+        if info is None:
+            return
+        raw = getattr(info, "raw", None)
+        raw = raw if isinstance(raw, dict) else {}
+        is_using_overage = raw.get("isUsingOverage")
+        if isinstance(is_using_overage, bool):
+            self._billing_evidence["is_using_overage"] = is_using_overage
+        overage_status = getattr(info, "overage_status", None)
+        if overage_status is None:
+            overage_status = raw.get("overageStatus")
+        if overage_status is not None:
+            self._billing_evidence["overage_status"] = str(overage_status)
+        rate_limit_type = getattr(info, "rate_limit_type", None)
+        if rate_limit_type is None:
+            rate_limit_type = raw.get("rateLimitType")
+        if rate_limit_type is not None:
+            self._billing_evidence["rate_limit_type"] = str(rate_limit_type)
+
+        if self._allow_metered or self._billing_guard_error is not None:
+            return
+        if is_using_overage is True:
+            self._billing_guard_error = (
+                "claude-agent-sdk billing guard: metered subscription Extra "
+                "Usage is active. Disable Extra Usage in the Claude account, "
+                "or set agent.claude_agent_sdk.allow_metered_key: true to "
+                "opt in explicitly."
+            )
+        elif str(overage_status or "").lower() in {"allowed", "allowed_warning"}:
+            self._billing_guard_error = (
+                "claude-agent-sdk billing guard: subscription extra usage is "
+                "enabled and could silently become metered when the included "
+                "limit is exhausted. Disable Extra Usage in the Claude "
+                "account, or set agent.claude_agent_sdk.allow_metered_key: "
+                "true to opt in explicitly."
+            )
+
+    def _reported_billing_mode(self) -> str:
+        source = str(self._billing_evidence.get("api_key_source") or "").lower()
+        using_overage = self._billing_evidence.get("is_using_overage")
+        rate_limit_type = str(
+            self._billing_evidence.get("rate_limit_type") or ""
+        ).lower()
+        if (source and source != "none") or using_overage is True:
+            return "sdk_reported_metered"
+        if rate_limit_type == "overage" and using_overage is not False:
+            return "sdk_reported_metered"
+        if not self._allow_metered:
+            # Any contrary evidence trips the guard before accounting.
+            return "subscription_included"
+        if source == "none" and using_overage is False:
+            return "subscription_included"
+        return "unknown"
 
     # ---------- context usage ----------
 
@@ -1501,6 +1598,10 @@ class ClaudeAgentSdkSession:
         result.token_usage_last = turn_data["usage"]
         result.token_usage_total = turn_data["usage"]
         result.model_last = turn_data.get("model")
+        result.billing_mode = turn_data.get("billing_mode", "unknown")
+        result.billing_evidence = turn_data.get("billing_evidence", {})
+        result.total_cost_usd = turn_data.get("total_cost_usd")
+        result.api_call_made = turn_data.get("api_call_made", True)
         result.thread_id = self._session_id
         result.turn_id = turn_data.get("result_uuid")
         result.interrupted = self._interrupt_event.is_set()
@@ -1517,6 +1618,14 @@ class ClaudeAgentSdkSession:
             if hint is not None:
                 result.should_retire = True
                 result.fatal_reason = "auth"
+        if turn_data.get("billing_guard_violation"):
+            # This is durable account/config state, not a transient provider
+            # billing error: the generic "billing" fatal_reason is a retry
+            # sentinel, which would repeatedly spend calls against the same
+            # unsafe lane. "startup" stops the run until the operator fixes
+            # Extra Usage/credentials or explicitly opts into metering.
+            result.should_retire = True
+            result.fatal_reason = "startup"
         if turn_data.get("stream_ended"):
             # A dead stream is permanent on this session object: the reader
             # exited, _stream_ended stays set, and ensure_started() keeps
@@ -1584,6 +1693,11 @@ class ClaudeAgentSdkSession:
             "model": None,
             "stream_ended": False,
             "mcp_tool_seen": False,
+            "billing_guard_violation": False,
+            "billing_mode": self._reported_billing_mode(),
+            "billing_evidence": dict(self._billing_evidence),
+            "total_cost_usd": None,
+            "api_call_made": True,
         }
         ended = self._stream_ended
         if ended is not None:
@@ -1592,11 +1706,19 @@ class ClaudeAgentSdkSession:
             )
             out["stream_ended"] = True
             return out
+        if self._billing_guard_error is not None:
+            out["error"] = self._billing_guard_error
+            out["billing_guard_violation"] = True
+            out["billing_mode"] = self._reported_billing_mode()
+            out["billing_evidence"] = dict(self._billing_evidence)
+            out["api_call_made"] = False
+            return out
         inbox: Any = asyncio.Queue()
         # Claim the stream BEFORE query() — a fast first message must not land
         # while no turn is claimed and get routed away as unsolicited.
         self._turn_inbox = inbox
         interrupted = False
+        billing_guarded = False
         try:
             query_input = (
                 _sdk_user_message_stream(prompt)
@@ -1625,6 +1747,17 @@ class ClaudeAgentSdkSession:
                 if early_sid:
                     self._session_id = early_sid
                 self._handle_compact_boundary(message)
+                if self._billing_guard_error is not None and not billing_guarded:
+                    billing_guarded = True
+                    out["error"] = self._billing_guard_error
+                    out["billing_guard_violation"] = True
+                    try:
+                        await self._client.interrupt()
+                    except Exception:
+                        logger.debug(
+                            "claude-agent-sdk billing-guard interrupt failed",
+                            exc_info=True,
+                        )
                 if self._interrupt_event.is_set():
                     # Previously `break`. Bailing out before this turn's
                     # ResultMessage orphaned it in the shared stream, and the
@@ -1638,7 +1771,7 @@ class ClaudeAgentSdkSession:
                         # A partial delta proves the post-tool model call is
                         # alive — the quiet watchdog stands down.
                         watch.disarm_post_tool()
-                    if not interrupted:
+                    if not interrupted and not billing_guarded:
                         self._forward_stream_delta(message)
                     continue
                 for block in getattr(message, "content", None) or []:
@@ -1647,7 +1780,7 @@ class ClaudeAgentSdkSession:
                         and str(getattr(block, "name", "")).startswith("mcp__")
                     ):
                         out["mcp_tool_seen"] = True
-                if not interrupted:
+                if not interrupted and not billing_guarded:
                     self._notify_tool_started(message)
                     self._notify_interim_assistant(message)
                 projection = projector.project(message)
@@ -1702,7 +1835,7 @@ class ClaudeAgentSdkSession:
                     and not (getattr(message, "errors", None) or [])
                     and not getattr(message, "api_error_status", None)
                 )
-                if not interrupted:
+                if not interrupted and not billing_guarded:
                     if projection.messages:
                         out["messages"].extend(projection.messages)
                     if projection.is_tool_iteration:
@@ -1720,6 +1853,9 @@ class ClaudeAgentSdkSession:
                     if sid:
                         self._session_id = sid
                     out["result_uuid"] = getattr(message, "uuid", None)
+                    out["total_cost_usd"] = getattr(
+                        message, "total_cost_usd", None
+                    )
                     subtype = getattr(message, "subtype", "") or ""
                     if getattr(message, "is_error", False):
                         errors = getattr(message, "errors", None) or []
@@ -1777,8 +1913,9 @@ class ClaudeAgentSdkSession:
                                 _safe_sdk_error_text(err_text),
                             )
                         else:
-                            out["error"] = err_text
-                    elif subtype not in ("", "success"):
+                            if not billing_guarded:
+                                out["error"] = err_text
+                    elif subtype not in ("", "success") and not billing_guarded:
                         # e.g. error_max_turns / error_max_budget_usd — surface
                         # honestly; the partial transcript is still projected.
                         out["error"] = f"SDK turn ended: {subtype}"
@@ -1818,6 +1955,8 @@ class ClaudeAgentSdkSession:
                         )
                         continue
                 self._handle_unsolicited(residue)
+        out["billing_mode"] = self._reported_billing_mode()
+        out["billing_evidence"] = dict(self._billing_evidence)
         return out
 
     # ---------- stream ownership ----------
@@ -1847,6 +1986,7 @@ class ClaudeAgentSdkSession:
         end: _StreamEnd
         try:
             async for message in self._client.receive_messages():
+                self._observe_billing_evidence(message)
                 inbox = self._turn_inbox
                 if inbox is not None:
                     inbox.put_nowait(message)
@@ -2165,7 +2305,9 @@ class ClaudeAgentSdkSession:
         # explicit "bill me metered" opt-in (the same flag the startup guard
         # honors), so it disables the scrub too — otherwise the documented
         # escape hatch would hand the CLI an environment with the key blanked.
-        env_overrides = _sdk_env_overrides()
+        env_overrides = _sdk_env_overrides(
+            metered_allowed=self._allow_metered
+        )
 
         fields = {
             "model": self._model,

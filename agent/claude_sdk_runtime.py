@@ -2,8 +2,9 @@
 
 The structural twin of ``agent/codex_runtime.py``'s app-server path: hands the
 entire turn to Anthropic's official ``claude-agent-sdk`` (which drives the
-Claude Code CLI's own agent loop under **subscription OAuth** — never a
-metered API key) and projects its typed message stream back into Hermes'
+Claude Code CLI's own agent loop under subscription OAuth by default, with
+known metered lanes refused unless explicitly enabled) and projects its typed
+message stream back into Hermes'
 messages list so transcript persistence and recall keep working. GitHub
 issue #25267.
 
@@ -14,6 +15,7 @@ issue #25267.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 from typing import Any, Dict, List, Optional
@@ -541,14 +543,51 @@ def _coerce_usage_int(value: Any) -> int:
     return 0
 
 
+def _claude_sdk_billing_accounting(turn) -> tuple[str, str, str, Optional[float]]:
+    """Return (mode, status, source, actual_cost) from child evidence.
+
+    ``ResultMessage.total_cost_usd`` is a usage value, not proof of which lane
+    paid it. It becomes an actual cost only when the CLI's init/rate-limit
+    messages identified a metered lane. The default fail-closed session guard
+    labels safe turns ``subscription_included``; an explicit metered opt-in
+    with incomplete evidence stays unknown rather than being called included.
+    """
+    mode = str(getattr(turn, "billing_mode", None) or "unknown")
+    actual_cost: Optional[float] = None
+    if mode == "sdk_reported_metered":
+        raw_cost = getattr(turn, "total_cost_usd", None)
+        if not isinstance(raw_cost, bool):
+            try:
+                candidate = float(raw_cost)
+            except (TypeError, ValueError):
+                candidate = -1.0
+            if candidate >= 0 and math.isfinite(candidate):
+                actual_cost = candidate
+        return (
+            mode,
+            "reported" if actual_cost is not None else "unknown",
+            "claude-agent-sdk",
+            actual_cost,
+        )
+    if mode == "subscription_included":
+        return mode, "included", "claude-subscription", None
+    return "unknown", "unknown", "claude-agent-sdk-unverified", None
+
+
 def _record_claude_sdk_usage(agent, turn) -> dict[str, Any]:
     """Translate SDK ResultMessage usage into Hermes accounting.
 
     The SDK reports Anthropic-shaped usage: input_tokens, output_tokens,
-    cache_read_input_tokens, cache_creation_input_tokens. Billing is
-    subscription-included by construction (the SDK authenticates with the
-    Claude subscription; there is no per-token invoice on this path)."""
+    cache_read_input_tokens, cache_creation_input_tokens. Billing labels come
+    from the child evidence captured by ``ClaudeAgentSdkSession``; never call
+    an explicitly allowed API-key/Extra-Usage turn subscription-included."""
     agent.session_api_calls += 1
+
+    billing_mode, cost_status, cost_source, actual_cost = (
+        _claude_sdk_billing_accounting(turn)
+    )
+    agent.session_cost_status = cost_status
+    agent.session_cost_source = cost_source
 
     # Attribution: the configured model wins; when it is unset (documented
     # default — the CLI picks), back-fill from the model id the SDK itself
@@ -564,9 +603,12 @@ def _record_claude_sdk_usage(agent, turn) -> dict[str, Any]:
                 agent._session_db.update_token_counts(
                     agent.session_id,
                     model=resolved_model,
+                    actual_cost_usd=actual_cost,
+                    cost_status=cost_status,
+                    cost_source=cost_source,
                     billing_provider=agent.provider,
                     billing_base_url=agent.base_url,
-                    billing_mode="subscription_included",
+                    billing_mode=billing_mode,
                     api_call_count=1,
                 )
             except Exception as exc:
@@ -574,7 +616,14 @@ def _record_claude_sdk_usage(agent, turn) -> dict[str, Any]:
                     "claude-sdk api-call persistence failed (session=%s): %s",
                     agent.session_id, exc,
                 )
-        return {}
+        if billing_mode == "subscription_included":
+            return {}
+        return {
+            "estimated_cost_usd": None,
+            "actual_cost_usd": actual_cost,
+            "cost_status": cost_status,
+            "cost_source": cost_source,
+        }
 
     from agent.usage_pricing import CanonicalUsage
 
@@ -641,9 +690,6 @@ def _record_claude_sdk_usage(agent, turn) -> dict[str, Any]:
     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
 
-    agent.session_cost_status = "included"
-    agent.session_cost_source = "claude-subscription"
-
     if agent._session_db and agent.session_id:
         try:
             if not agent._session_db_created:
@@ -655,11 +701,12 @@ def _record_claude_sdk_usage(agent, turn) -> dict[str, Any]:
                 cache_read_tokens=canonical_usage.cache_read_tokens,
                 cache_write_tokens=canonical_usage.cache_write_tokens,
                 reasoning_tokens=0,
-                cost_status="included",
-                cost_source="claude-subscription",
+                actual_cost_usd=actual_cost,
+                cost_status=cost_status,
+                cost_source=cost_source,
                 billing_provider=agent.provider,
                 billing_base_url=agent.base_url,
-                billing_mode="subscription_included",
+                billing_mode=billing_mode,
                 model=resolved_model,
                 api_call_count=1,
             )
@@ -676,8 +723,9 @@ def _record_claude_sdk_usage(agent, turn) -> dict[str, Any]:
         # aggregate under "prompt_tokens".
         "last_prompt_tokens": context_prompt_tokens,
         "estimated_cost_usd": None,
-        "cost_status": "included",
-        "cost_source": "claude-subscription",
+        "actual_cost_usd": actual_cost,
+        "cost_status": cost_status,
+        "cost_source": cost_source,
     }
 
 

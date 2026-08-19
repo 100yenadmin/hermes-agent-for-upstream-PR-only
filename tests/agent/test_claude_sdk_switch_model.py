@@ -25,6 +25,11 @@ def _agent():
         _transport_cache={},
         _credential_pool=None,
         _credential_pool_entry_id=None,
+        # Upstream's transactional switch now refreshes this flag before the
+        # SDK client branch. Supply the new production contract so this test's
+        # intentionally broad post-swap AttributeError catch cannot roll the
+        # core fields back before reaching the behavior it is meant to pin.
+        _read_reasoning_echo_from_config=lambda: False,
         quiet_mode=True,
     )
 

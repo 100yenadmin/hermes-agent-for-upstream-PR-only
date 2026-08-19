@@ -5,7 +5,7 @@ sidebar_label: Claude Agent SDK Runtime
 
 # Claude Agent SDK Runtime
 
-Hermes can hand entire turns to Anthropic's official [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview), which drives the Claude Code CLI's own agent loop under **Claude subscription OAuth** — never a metered API key. It is the structural twin of the [Codex App-Server Runtime](/user-guide/features/codex-app-server-runtime): the external agent runs the loop and its tools; Hermes stays the shell around it (sessions DB, gateway platforms, memory, transcripts, slash commands).
+Hermes can hand entire turns to Anthropic's official [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview), which drives the Claude Code CLI's own agent loop under **Claude subscription OAuth by default**. Known metered lanes fail closed unless the operator opts in explicitly. It is the structural twin of the [Codex App-Server Runtime](/user-guide/features/codex-app-server-runtime): the external agent runs the loop and its tools; Hermes stays the shell around it (sessions DB, gateway platforms, memory, transcripts, slash commands).
 
 Select it like any provider:
 
@@ -32,13 +32,20 @@ The Python package is an opt-in extra that lazy-installs at first use, or explic
 pip install 'hermes-agent[claude-agent-sdk]'
 ```
 
+### Authentication-policy boundary
+
+Anthropic's current [authentication and credential-use policy](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use) and [Agent SDK overview](https://code.claude.com/docs/en/agent-sdk/overview#get-started) direct third-party products and services to API-key authentication unless previously approved, and prohibit offering Claude.ai login or routing subscription credentials on users' behalf.
+
+This mode is narrowly designed for an individual operator running a local Hermes process against that operator's own local Claude Code authentication. Hermes does not implement a hosted Claude login, collect the credential, or relay it for another user. That architectural boundary is **not** an Anthropic approval or a promise that policy will remain unchanged. Do not expose this subscription mode as authentication for a hosted or managed third-party service; use API-key authentication or obtain Anthropic's approval for that use case.
+
 ## Billing posture (fail-closed)
 
 This provider exists to bill the **subscription**. Accordingly:
 
 - If a metered `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` is set, the runtime **refuses to start** rather than silently switch billing. Set `agent.claude_agent_sdk.allow_metered_key: true` to explicitly allow it.
 - The spawned CLI's environment gets metered billing vectors neutralized (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, metered-shaped `ANTHROPIC_TOKEN`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, AWS static credentials, `GOOGLE_APPLICATION_CREDENTIALS`) unless `allow_metered_key` is set. Subscription-shaped OAuth/setup tokens and HOME/PATH are untouched.
-- Usage is recorded as `subscription_included` — token counts are tracked, cost shows as *included*.
+- The child is the final authority: `system/init.apiKeySource` and typed `RateLimitEvent` messages are inspected. With the default guard, a reported API-key source or enabled/active subscription Extra Usage stops and retires the SDK session before Hermes can silently continue on a metered lane.
+- Safe turns are recorded as `subscription_included`. When `allow_metered_key: true` admits a child-reported metered lane, Hermes labels it `sdk_reported_metered` and persists the SDK-reported cost instead of claiming it was included.
 
 ## Configuration
 
@@ -47,7 +54,7 @@ All keys live under `agent.claude_agent_sdk` in `config.yaml` (see `cli-config.y
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `streaming` | `false` | Emit the SDK's partial-message deltas into the gateway streaming pipeline. |
-| `allow_metered_key` | `false` | Allow startup with a metered Anthropic key present (disables the fail-closed guard AND the env scrub). |
+| `allow_metered_key` | `false` | Explicit metered-billing opt-in. Allows API-key sources and subscription Extra Usage reported by the child, and disables the env scrub/guard that would otherwise refuse them. |
 | `append_file` | `""` | Operator persona/soul file appended to the system prompt. |
 | `permission_mode` | `""` | An SDK permission mode literal (`default`, `acceptEdits`, `plan`, `bypassPermissions`, `dontAsk`, `auto`). Empty keeps the `HERMES_TERMINAL_SECURITY_MODE` mapping (`auto` maps to the fail-closed SDK `default` mode). |
 | `env` | `{}` | Extra environment for the spawned Claude CLI. Values are stringified; metered-billing vectors are rejected unless `allow_metered_key` is true. |

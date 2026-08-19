@@ -35,7 +35,7 @@ All keys live under `agent.claude_agent_sdk` in `config.yaml`.
 | `permission_mode` | str | *(SDK default)* | Passed to the SDK **verbatim**; validated against the installed SDK's literals (`default`, `acceptEdits`, `plan`, `bypassPermissions`, `dontAsk`, `auto`). An invalid value is rejected rather than guessed. |
 | `setting_sources` | list | *(none)* | Which on-disk setting sources the CLI may read. Empty by default — opt in explicitly with `["user"]`. Unknown entries are dropped with a warning. |
 | `append_file` | path | *(none)* | Operator persona/guidance file appended to the system prompt. Set-but-unreadable warns rather than silently continuing. |
-| `allow_metered_key` | bool | false | Explicit "bill me metered" opt-in. Disables the credential scrub (§5). |
+| `allow_metered_key` | bool | false | Explicit "bill me metered" opt-in. Disables the credential scrub and the child-reported API-key/Extra-Usage refusal (§5). |
 | `deliver_background_results` | bool | false | Deliver results produced by background work. |
 | `max_budget_usd` | float | *(none)* | Forwarded to the SDK's `max_budget_usd`; the query stops with `error_max_budget_usd` once exceeded. Non-numeric, non-positive, and boolean values are ignored with a warning — a `0` cap would fail every turn instantly, and YAML `true` would `float()` to a nonsense `1.0`. |
 | `env` | mapping | `{}` | Arbitrary environment passed to the CLI subprocess (§3). |
@@ -93,6 +93,13 @@ Thus `[1m]` establishes the observed 1M-capable ceiling, while
 A bare Opus identifier did not rise from 200k when given a 300k clamp in the
 measured path. Always treat the child’s `context_usage()["maxTokens"]` as the
 per-session authority, not model metadata or a configuration name.
+
+An independent Max-plan report on 2026-08-19, using Claude Code 2.1.220,
+observed both bare `claude-sonnet-5` and bare `claude-opus-5` at 1M. That
+conflicts with the local observation above and is evidence that CLI/account
+behavior changes across environments, not a reason to replace one static table
+with another. The runtime's `context_usage()["maxTokens"]` probe remains the
+only supported authority for the live session.
 
 A public Anthropic tracker issue reports a similar bare-vs-suffixed split on an
 earlier Opus generation, but it is user-reported evidence rather than a
@@ -172,6 +179,17 @@ switches, AWS credentials, `GOOGLE_APPLICATION_CREDENTIALS`). A subscription-
 shaped setup/OAuth `ANTHROPIC_TOKEN` is preserved. Only keys **actually
 present** are blanked — writing `""` for absent ones can itself confuse
 credential chains.
+
+The child then supplies stronger, post-start evidence. The init
+`SystemMessage.data["apiKeySource"]` reports whether an API key was selected,
+and the pinned SDK's typed `RateLimitEvent` carries `isUsingOverage` plus
+`overageStatus`. With the default guard, any non-`none` API-key source or
+enabled/active subscription Extra Usage interrupts the turn, retires the
+session, and stops the run as a durable account/configuration error. This also
+prevents accounting from labeling a reported metered turn as
+`subscription_included`. `allow_metered_key: true` is the one explicit escape
+hatch for both classes; admitted metered turns are labeled
+`sdk_reported_metered` and their reported cost is persisted.
 
 `allow_metered_key: true` is the operator's explicit opt-in and disables the
 scrub, since the documented escape hatch would otherwise hand the CLI a blanked
