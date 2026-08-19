@@ -10023,6 +10023,10 @@ def _notification_poller_loop(
     from tools.process_registry import process_registry, format_process_notification
 
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
+    # Events dequeued here but not actually dispatched. Handed back to the
+    # shared queue when this poller exits, so a rejected dispatch (below) never
+    # loses the notification. Also used by the shutdown drain.
+    deferred: list = []
     _last_kanban_poll = 0.0
     _last_loop_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
@@ -10068,16 +10072,33 @@ def _notification_poller_loop(
                         session["_kanban_pending"] = []
                 if _batch:
                     rid = f"__notif__{int(time.time() * 1000)}"
+                    # ``claim_unseen_events_for_sub`` advanced the subscription
+                    # cursor when these events were collected, so the buffer is
+                    # the only remaining copy. _run_prompt_submit returns False
+                    # without starting a turn when the session is closing or a
+                    # queued-prompt generation lost the race — dropping the
+                    # batch there loses the notification permanently. Put it
+                    # back (ahead of anything collected since, preserving
+                    # order) so the next poll retries it.
+                    _restore_batch = False
                     try:
                         _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                        _restore_batch = (
+                            _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                            is False
+                        )
                     except Exception as exc:
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "
                             f"{type(exc).__name__}: {exc}",
                             file=sys.stderr,
                         )
+                        _restore_batch = True
+                    if _restore_batch:
                         with session["history_lock"]:
+                            session["_kanban_pending"] = _batch + list(
+                                session.get("_kanban_pending") or []
+                            )
                             session["running"] = False
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
@@ -10157,7 +10178,7 @@ def _notification_poller_loop(
         try:
             _emit("message.start", sid)
             if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
+                _dispatch_started = _run_prompt_submit(
                     rid,
                     sid,
                     session,
@@ -10166,7 +10187,16 @@ def _notification_poller_loop(
                     display_metadata=_async_delegation_display_metadata(evt),
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _dispatch_started = _run_prompt_submit(rid, sid, session, text)
+            if _dispatch_started is False:
+                # No turn started (session closing or re-registered), so the
+                # event was never delivered. Acknowledging it here would
+                # consume the only copy — release the claim and hand it back.
+                release_event_delivery(evt, _claim)
+                deferred.append(evt)
+                with session["history_lock"]:
+                    session["running"] = False
+                break
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -10182,7 +10212,6 @@ def _notification_poller_loop(
     # before exiting so nothing is lost on shutdown). Events owned by other
     # live sessions are set aside and re-queued so their poller still sees them.
     # Orphaned events (owner gone) are dropped — same guard as the main loop.
-    deferred: list = []
     while not process_registry.completion_queue.empty():
         try:
             evt = process_registry.completion_queue.get_nowait()
@@ -10235,7 +10264,7 @@ def _notification_poller_loop(
         try:
             _emit("message.start", sid)
             if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
+                _dispatch_started = _run_prompt_submit(
                     rid,
                     sid,
                     session,
@@ -10244,7 +10273,16 @@ def _notification_poller_loop(
                     display_metadata=_async_delegation_display_metadata(evt),
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _dispatch_started = _run_prompt_submit(rid, sid, session, text)
+            if _dispatch_started is False:
+                # Same rule as the live loop: an unstarted turn means the
+                # event is still undelivered, so defer it rather than
+                # acknowledge it away on the way out.
+                release_event_delivery(evt, _claim)
+                deferred.append(evt)
+                with session["history_lock"]:
+                    session["running"] = False
+                continue
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
