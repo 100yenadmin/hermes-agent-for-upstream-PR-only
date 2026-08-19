@@ -146,6 +146,18 @@ gateway:
     invalid:               "無効な目標: {error}"
     set:                   "⊙ 目標を設定しました ({budget} ターンの予算): {goal}\n目標が完了するか、一時停止/解除されるか、予算が尽きるまで作業を続けます。\nコントロール: /goal status · /goal pause · /goal resume · /goal clear"
 
+  plan:
+    unavailable:           "このセッションではプランモードを利用できません。"
+    entered:               "📝 プランモードをオンにしました。計画のみを行います — 承認いただくまで変更を伴うツールはブロックされます。計画は .hermes/plans/ に書き出し、その後で承認をお願いします。\nコントロール: /plan status · /plan show · /plan approve · /plan reject <feedback> · /plan exit"
+    "off":                 "プランモードはオフです。/plan で開始できます。"
+    not_active:            "プランモードは有効ではありません — 承認または却下する対象がありません。"
+    no_plan:               "計画ファイルはまだ書き出されていません。"
+    show:                  "📝 計画ファイル: {path}"
+    approved:              "✅ 計画が承認されました — 次のターンから実行が解除されます。"
+    rejected:              "↩ プランモードを継続します。計画の改善を続けてください。"
+    rejected_feedback:     "↩ プランモードを継続します。フィードバック: {feedback}"
+    exited:                "プランモードをオフにしました — 保留中の計画は破棄されました (未承認)。変更を伴うツールのブロックを解除しました。"
+
   help:
     header:                "📖 **Hermes コマンド**\n"
     skill_header:          "\n⚡ **スキルコマンド** ({count} 件アクティブ):"

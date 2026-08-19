@@ -146,6 +146,18 @@ gateway:
     invalid:               "잘못된 목표: {error}"
     set:                   "⊙ 목표 설정됨 ({budget}회 예산): {goal}\n목표가 완료되거나, 일시정지/삭제하거나, 예산이 소진될 때까지 계속 작업하겠습니다.\n제어: /goal status · /goal pause · /goal resume · /goal clear"
 
+  plan:
+    unavailable:           "이 세션에서는 계획 모드를 사용할 수 없습니다."
+    entered:               "📝 계획 모드를 켰습니다. 계획만 세우겠습니다 — 승인하기 전까지 변경 도구는 차단됩니다. 계획은 .hermes/plans/ 아래에 작성한 뒤 승인을 요청하겠습니다.\n제어: /plan status · /plan show · /plan approve · /plan reject <feedback> · /plan exit"
+    "off":                 "계획 모드가 꺼져 있습니다. /plan 으로 시작하세요."
+    not_active:            "계획 모드가 활성화되어 있지 않습니다 — 승인하거나 거절할 대상이 없습니다."
+    no_plan:               "아직 작성된 계획 파일이 없습니다."
+    show:                  "📝 계획 파일: {path}"
+    approved:              "✅ 계획이 승인되었습니다 — 다음 턴부터 실행이 해제됩니다."
+    rejected:              "↩ 계획 모드를 유지합니다. 계획을 계속 다듬어 주세요."
+    rejected_feedback:     "↩ 계획 모드를 유지합니다. 피드백: {feedback}"
+    exited:                "계획 모드를 껐습니다 — 대기 중이던 계획은 폐기되었습니다(승인되지 않음). 변경 도구가 해제되었습니다."
+
   help:
     header:                "📖 **Hermes 명령**\n"
     skill_header:          "\n⚡ **스킬 명령** ({count}개 활성):"

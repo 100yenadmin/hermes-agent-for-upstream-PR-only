@@ -572,6 +572,89 @@ def _(rid, params: dict) -> dict:
     # In the TUI the slash worker subprocess has no reader for that queue,
     # so we handle them here and return a structured payload.
 
+    if name == "plan":
+        # Wire the TUI's /plan to the SAME persisted PlanManager state +
+        # enforcement the CLI and messaging gateway use. Previously /plan fell
+        # through to the skill scan (advisory only), so TUI sessions never
+        # entered the persisted enforced state. The dispatch guard in
+        # agent/tool_executor reads this state from the shared SessionDB, so
+        # persisting it here is what makes enforcement hold for TUI turns.
+        if not session:
+            return _err(rid, 4001, "no active session")
+        try:
+            from hermes_cli.plan_mode import PlanManager
+        except Exception as exc:
+            return _err(rid, 5030, f"plan mode unavailable: {exc}")
+
+        sid_key = _plan_session_id(session)
+        if not sid_key:
+            return _err(rid, 4001, "no session key")
+        mgr = PlanManager(session_id=sid_key)
+        lower = arg.strip().lower()
+
+        if lower == "status":
+            return _ok(rid, {"type": "exec", "output": mgr.status_line()})
+        if lower == "show":
+            s = mgr.state
+            if s is None or s.plan_path is None:
+                return _ok(rid, {"type": "exec", "output": "No plan file has been written yet."})
+            return _ok(rid, {"type": "exec", "output": f"📝 Plan file: {s.plan_path}"})
+        if lower == "approve":
+            if mgr.approve() is None:
+                return _ok(rid, {"type": "exec", "output": "Plan mode is not active — nothing to approve."})
+            _refresh_agent_for_plan(session)
+            return _ok(rid, {"type": "exec", "output": "✅ Plan approved — execution unlocks on the next turn."})
+        if lower == "reject" or lower.startswith("reject "):
+            if not mgr.is_active():
+                return _ok(rid, {"type": "exec", "output": "Plan mode is not active — nothing to reject."})
+            feedback = arg[len("reject"):].strip()
+            mgr.keep_planning()
+            out = (
+                f"↩ Staying in plan mode. Feedback: {feedback}"
+                if feedback
+                else "↩ Staying in plan mode. Keep refining the plan."
+            )
+            return _ok(rid, {"type": "exec", "output": out})
+        if lower == "exit":
+            # /plan exit DISCARDS a pending plan — it never approves it.
+            had = mgr.exit()
+            _refresh_agent_for_plan(session)
+            out = (
+                "Plan mode off — the pending plan was discarded (not approved). Mutating tools are unlocked."
+                if had
+                else "Plan mode is off."
+            )
+            return _ok(rid, {"type": "exec", "output": out})
+
+        # Bare /plan → enter enforcement mode.
+        mgr.enter(entered_by="user")
+        _refresh_agent_for_plan(session)
+        notice = (
+            "📝 Plan mode on. I'll plan only — mutating tools are blocked until you approve.\n"
+            "Controls: /plan status · /plan show · /plan approve · /plan reject <feedback> · /plan exit"
+        )
+        if not arg.strip():
+            return _ok(rid, {"type": "exec", "output": notice})
+
+        # /plan <request> → also preserve the documented plan-skill dispatch,
+        # seeded with the request (resolved by name; the /plan slash command is
+        # skipped from the registry because it collides with this command).
+        seeded = None
+        try:
+            from agent.skill_commands import (
+                build_skill_invocation_message_by_identifier,
+            )
+
+            seeded = build_skill_invocation_message_by_identifier(
+                "plan", arg.strip(), task_id=sid_key
+            )
+        except Exception:
+            seeded = None
+        return _ok(
+            rid,
+            {"type": "send", "notice": notice, "message": seeded or arg.strip()},
+        )
+
     if name in {"queue", "q"}:
         if not arg:
             return _err(rid, 4004, "usage: /queue <prompt>")

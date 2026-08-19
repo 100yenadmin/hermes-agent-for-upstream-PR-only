@@ -146,6 +146,18 @@ gateway:
     invalid:               "無效目標：{error}"
     set:                   "⊙ 目標已設定（{budget} 輪預算）：{goal}\n我會持續工作直到目標完成、你暫停／清除目標，或預算耗盡。\n控制指令：/goal status · /goal pause · /goal resume · /goal clear"
 
+  plan:
+    unavailable:           "此工作階段不支援計畫模式。"
+    entered:               "📝 計畫模式已開啟。我只會擬定計畫 — 在你核准之前，會修改內容的工具都會被阻擋。我會將計畫寫入 .hermes/plans/，然後請你核准。\n控制指令：/plan status · /plan show · /plan approve · /plan reject <feedback> · /plan exit"
+    "off":                 "計畫模式已關閉。使用 /plan 進入。"
+    not_active:            "計畫模式未啟用 — 沒有可核准或拒絕的內容。"
+    no_plan:               "尚未寫入任何計畫檔案。"
+    show:                  "📝 計畫檔案：{path}"
+    approved:              "✅ 計畫已核准 — 執行將於下一輪解鎖。"
+    rejected:              "↩ 繼續留在計畫模式。請繼續完善計畫。"
+    rejected_feedback:     "↩ 繼續留在計畫模式。意見：{feedback}"
+    exited:                "計畫模式已關閉 — 待核准的計畫已捨棄（未核准）。會修改內容的工具已解鎖。"
+
   help:
     header:                "📖 **Hermes 指令**\n"
     skill_header:          "\n⚡ **技能指令**（{count} 個作用中）："

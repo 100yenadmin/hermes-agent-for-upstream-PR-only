@@ -146,6 +146,18 @@ gateway:
     invalid:               "Obiettivo non valido: {error}"
     set:                   "⊙ Obiettivo impostato (budget di {budget} turni): {goal}\nContinuerò a lavorare finché l'obiettivo non sarà completato, lo metterai in pausa/lo cancellerai, oppure il budget sarà esaurito.\nControlli: /goal status · /goal pause · /goal resume · /goal clear"
 
+  plan:
+    unavailable:           "La modalità pianificazione non è disponibile in questa sessione."
+    entered:               "📝 Modalità pianificazione attiva. Mi limiterò a pianificare — gli strumenti che modificano sono bloccati finché non approvi. Scriverò il piano in .hermes/plans/ e poi chiederò l'approvazione.\nControlli: /plan status · /plan show · /plan approve · /plan reject <feedback> · /plan exit"
+    "off":                 "La modalità pianificazione è disattivata. Attivala con /plan."
+    not_active:            "La modalità pianificazione non è attiva — non c'è nulla da approvare o rifiutare."
+    no_plan:               "Non è ancora stato scritto alcun file di piano."
+    show:                  "📝 File del piano: {path}"
+    approved:              "✅ Piano approvato — l'esecuzione si sblocca al turno successivo."
+    rejected:              "↩ Resto in modalità pianificazione. Continua a perfezionare il piano."
+    rejected_feedback:     "↩ Resto in modalità pianificazione. Feedback: {feedback}"
+    exited:                "Modalità pianificazione disattivata — il piano in sospeso è stato scartato (non approvato). Gli strumenti che modificano sono sbloccati."
+
   help:
     header:                "📖 **Comandi Hermes**\n"
     skill_header:          "\n⚡ **Comandi skill** ({count} attivi):"

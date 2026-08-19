@@ -16024,6 +16024,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "kanban": self._handle_kanban_command,
                 "subgoal": self._handle_subgoal_command,
                 "heartbeat": self._handle_heartbeat_command,
+                # /plan is safe mid-run — it only mutates persisted plan state,
+                # which the next turn's agent build reads. It does not interrupt
+                # the running turn.
+                "plan": self._handle_plan_command,
                 "yolo": self._handle_yolo_command,
                 "verbose": self._handle_verbose_command,
                 "footer": self._handle_footer_command,
@@ -17435,6 +17439,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "goal":
             return await self._handle_goal_command(event)
+
+        if canonical == "plan":
+            return await self._handle_plan_command(event)
 
         if canonical == "loop":
             return await self._handle_loop_command(event)
@@ -21080,6 +21087,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None, None
         max_turns = self._goal_max_turns_from_config()
         return GoalManager(session_id=sid, default_max_turns=max_turns), session_entry
+
+    def _get_plan_manager_for_event(self, event: "MessageEvent"):
+        """Return a PlanManager bound to the session for this gateway event.
+
+        Returns ``(manager, session_entry)`` or ``(None, None)`` if the
+        plan_mode module can't be loaded.
+        """
+        try:
+            from hermes_cli.plan_mode import PlanManager
+        except Exception as exc:
+            logger.debug("plan manager unavailable: %s", exc)
+            return None, None
+        try:
+            session_entry = self.session_store.get_or_create_session(event.source)
+        except Exception as exc:
+            logger.debug("plan manager: session lookup failed: %s", exc)
+            return None, None
+        sid = getattr(session_entry, "session_id", None) or ""
+        if not sid:
+            return None, None
+        return PlanManager(session_id=sid), session_entry
 
     async def _get_heartbeat_manager_for_event(self, event: "MessageEvent"):
         """Return a HeartbeatManager bound to the session for this event.
@@ -27830,6 +27858,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from agent.skill_utils import parse_config_string_list
 
         disabled_toolsets = parse_config_string_list(agent_cfg_local.get("disabled_toolsets")) or None
+
+        # Plan mode: materialise the `plan_mode: always` default for a fresh
+        # session, then fold any active restriction into the toolset selection.
+        # Adding the `plan` toolset to enabled_toolsets also busts the agent
+        # cache signature so the restricted agent rebuilds on entry.
+        try:
+            from hermes_cli import plan_mode as _plan_mode
+            _plan_mode.ensure_default_for_session(session_id or "")
+            enabled_toolsets, disabled_toolsets = _plan_mode.apply_session_toolset_policy(
+                session_id or "", enabled_toolsets, disabled_toolsets,
+            )
+        except Exception as _plan_exc:
+            logger.debug("plan-mode toolset policy skipped: %s", _plan_exc)
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):

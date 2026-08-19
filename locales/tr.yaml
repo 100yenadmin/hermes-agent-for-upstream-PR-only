@@ -146,6 +146,18 @@ gateway:
     invalid:               "Geçersiz hedef: {error}"
     set:                   "⊙ Hedef ayarlandı ({budget} turluk bütçe): {goal}\nHedef tamamlanana, siz duraklatana/temizleyene veya bütçe tükenene kadar çalışmaya devam edeceğim.\nKontroller: /goal status · /goal pause · /goal resume · /goal clear"
 
+  plan:
+    unavailable:           "Bu oturumda plan modu kullanılamıyor."
+    entered:               "📝 Plan modu açık. Yalnızca plan yapacağım — siz onaylayana kadar değişiklik yapan araçlar engellenir. Planı .hermes/plans/ altına yazacak ve ardından onay isteyeceğim.\nKontroller: /plan status · /plan show · /plan approve · /plan reject <feedback> · /plan exit"
+    "off":                 "Plan modu kapalı. /plan ile başlatabilirsiniz."
+    not_active:            "Plan modu etkin değil — onaylanacak veya reddedilecek bir şey yok."
+    no_plan:               "Henüz bir plan dosyası yazılmadı."
+    show:                  "📝 Plan dosyası: {path}"
+    approved:              "✅ Plan onaylandı — yürütme bir sonraki turda açılır."
+    rejected:              "↩ Plan modunda kalıyorum. Planı geliştirmeye devam edin."
+    rejected_feedback:     "↩ Plan modunda kalıyorum. Geri bildirim: {feedback}"
+    exited:                "Plan modu kapalı — bekleyen plan atıldı (onaylanmadı). Değişiklik yapan araçların engeli kaldırıldı."
+
   help:
     header:                "📖 **Hermes Komutları**\n"
     skill_header:          "\n⚡ **Skill Komutları** ({count} aktif):"

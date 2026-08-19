@@ -146,6 +146,18 @@ gateway:
     invalid:               "Ongeldige doelwit: {error}"
     set:                   "⊙ Doelwit gestel ({budget}-beurt-begroting): {goal}\nEk sal aanhou werk totdat die doelwit klaar is, jy dit pouseer/verwyder, of die begroting opgebruik is.\nBeheer: /goal status · /goal pause · /goal resume · /goal clear"
 
+  plan:
+    unavailable:           "Beplanmodus is nie beskikbaar in hierdie sessie nie."
+    entered:               "📝 Beplanmodus aan. Ek beplan net — wysigende gereedskap is geblokkeer totdat jy goedkeur. Ek skryf die plan onder .hermes/plans/ en vra dan om goedkeuring.\nBeheer: /plan status · /plan show · /plan approve · /plan reject <feedback> · /plan exit"
+    "off":                 "Beplanmodus is af. Betree dit met /plan."
+    not_active:            "Beplanmodus is nie aktief nie — daar is niks om goed te keur of te verwerp nie."
+    no_plan:               "Daar is nog geen planlêer geskryf nie."
+    show:                  "📝 Planlêer: {path}"
+    approved:              "✅ Plan goedgekeur — uitvoering ontsluit met die volgende beurt."
+    rejected:              "↩ Bly in beplanmodus. Verfyn die plan verder."
+    rejected_feedback:     "↩ Bly in beplanmodus. Terugvoer: {feedback}"
+    exited:                "Beplanmodus af — die hangende plan is weggegooi (nie goedgekeur nie). Wysigende gereedskap is ontsluit."
+
   help:
     header:                "📖 **Hermes-opdragte**\n"
     skill_header:          "\n⚡ **Vaardigheidsopdragte** ({count} aktief):"

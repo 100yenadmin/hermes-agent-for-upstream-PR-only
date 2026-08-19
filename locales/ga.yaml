@@ -150,6 +150,18 @@ gateway:
     invalid:               "Sprioc neamhbhailí: {error}"
     set:                   "⊙ Sprioc socraithe (buiséad {budget} seal): {goal}\nLeanfaidh mé ag obair go dtí go bhfuil an sprioc críochnaithe, go gcuirfidh tú ar sos / go nglanfaidh tú í, nó go n-úsáidfear an buiséad.\nSmacht: /goal status · /goal pause · /goal resume · /goal clear"
 
+  plan:
+    unavailable:           "Níl an mód pleanála ar fáil sa seisiún seo."
+    entered:               "📝 Mód pleanála ar siúl. Ní dhéanfaidh mé ach pleanáil — tá uirlisí a athraíonn rudaí bactha go dtí go gceadóidh tú é. Scríobhfaidh mé an plean faoi .hermes/plans/ agus iarrfaidh mé cead ansin.\nSmacht: /plan status · /plan show · /plan approve · /plan reject <feedback> · /plan exit"
+    "off":                 "Tá an mód pleanála múchta. Cuir tús leis le /plan."
+    not_active:            "Níl an mód pleanála gníomhach — níl aon rud le ceadú ná le diúltú."
+    no_plan:               "Níor scríobhadh aon chomhad plean go fóill."
+    show:                  "📝 Comhad plean: {path}"
+    approved:              "✅ Plean ceadaithe — díghlasálfar an rith ag an gcéad seal eile."
+    rejected:              "↩ Ag fanacht sa mhód pleanála. Lean ort ag mionchoigeartú an phlean."
+    rejected_feedback:     "↩ Ag fanacht sa mhód pleanála. Aiseolas: {feedback}"
+    exited:                "Mód pleanála múchta — caitheadh an plean atá ar feitheamh i leataobh (níor ceadaíodh é). Tá na huirlisí a athraíonn rudaí díghlasáilte."
+
   help:
     header:                "📖 **Orduithe Hermes**\n"
     skill_header:          "\n⚡ **Orduithe Scileanna** ({count} gníomhach):"

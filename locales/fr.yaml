@@ -146,6 +146,18 @@ gateway:
     invalid:               "Objectif invalide : {error}"
     set:                   "⊙ Objectif défini (budget de {budget} tours) : {goal}\nJe continuerai jusqu'à ce que l'objectif soit terminé, que vous le mettiez en pause/effaciez, ou que le budget soit épuisé.\nContrôles : /goal status · /goal pause · /goal resume · /goal clear"
 
+  plan:
+    unavailable:           "Le mode planification n'est pas disponible dans cette session."
+    entered:               "📝 Mode planification activé. Je me contente de planifier — les outils qui modifient sont bloqués jusqu'à votre approbation. J'écrirai le plan dans .hermes/plans/ puis demanderai votre approbation.\nContrôles : /plan status · /plan show · /plan approve · /plan reject <feedback> · /plan exit"
+    "off":                 "Le mode planification est désactivé. Activez-le avec /plan."
+    not_active:            "Le mode planification n'est pas actif — rien à approuver ni à rejeter."
+    no_plan:               "Aucun fichier de plan n'a encore été écrit."
+    show:                  "📝 Fichier de plan : {path}"
+    approved:              "✅ Plan approuvé — l'exécution se débloque au tour suivant."
+    rejected:              "↩ Je reste en mode planification. Continuez à affiner le plan."
+    rejected_feedback:     "↩ Je reste en mode planification. Retour : {feedback}"
+    exited:                "Mode planification désactivé — le plan en attente a été abandonné (non approuvé). Les outils qui modifient sont débloqués."
+
   help:
     header:                "📖 **Commandes Hermes**\n"
     skill_header:          "\n⚡ **Commandes de skill** ({count} actives) :"

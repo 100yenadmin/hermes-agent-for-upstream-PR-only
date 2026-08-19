@@ -7074,6 +7074,27 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
+
+    # Plan mode: materialise the `plan_mode: always` default for a fresh
+    # session, then fold any active restriction into the toolset selection —
+    # the same policy the CLI and messaging gateway apply at their build sites.
+    # Adding the `plan` toolset to enabled_toolsets also busts the agent-cache
+    # signature so the restricted agent rebuilds. The hard enforcement is the
+    # dispatch guard in agent/tool_executor; this hides mutating tools from the
+    # model's view for defense in depth.
+    _plan_enabled = _load_enabled_toolsets(_resolve_agent_platform(platform_override))
+    _plan_disabled = None
+    try:
+        from hermes_cli import plan_mode as _plan_mode
+
+        _eff_sid = session_id or key
+        _plan_mode.ensure_default_for_session(_eff_sid or "")
+        _plan_enabled, _plan_disabled = _plan_mode.apply_session_toolset_policy(
+            _eff_sid or "", _plan_enabled, _plan_disabled,
+        )
+    except Exception as _plan_exc:
+        logger.debug("plan-mode toolset policy skipped: %s", _plan_exc)
+
     return AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
@@ -7100,7 +7121,8 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
-        enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
+        enabled_toolsets=_plan_enabled,
+        disabled_toolsets=_plan_disabled,
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
@@ -7121,6 +7143,62 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+
+
+def _plan_session_id(session) -> str:
+    """The session id the plan-mode dispatch guard keys on.
+
+    Mirrors ``agent/tool_executor``'s guard lookup — the agent's
+    ``session_id`` (falling back to ``session_key``) — so a PlanManager write
+    here lands under the same key the guard reads, and enforcement holds
+    regardless of which process runs the turn.
+    """
+    if not session:
+        return ""
+    agent = session.get("agent")
+    if agent is not None:
+        sid = getattr(agent, "session_id", None)
+        if sid:
+            return str(sid)
+    return str(session.get("session_key", "") or "")
+
+
+def _refresh_agent_for_plan(session) -> None:
+    """Re-apply the plan-mode toolset policy to a session's live cached agent.
+
+    Lets an ``/plan`` enter/approve/exit take effect this session without
+    ``/new`` (which discards history), mirroring the CLI's ``self.agent = None``
+    rebuild non-destructively. No-op when no agent is built yet (the next
+    ``_make_agent`` build folds the policy in) or while a turn is running (the
+    tool snapshot must not be swapped mid-turn — the dispatch guard still
+    enforces on every call regardless).
+    """
+    if not session:
+        return
+    if session.get("running"):
+        return
+    agent = session.get("agent")
+    if agent is None:
+        return
+    try:
+        from hermes_cli import plan_mode as _plan_mode
+        from tools.mcp_tool import refresh_agent_mcp_tools
+
+        eff_sid = getattr(agent, "session_id", None) or session.get("session_key", "")
+        # Base = the build-time selection (TUI passes no disabled_toolsets); the
+        # policy adds to it when restricted and returns it unchanged when not,
+        # so exit cleanly restores the mutating toolsets.
+        enabled, disabled = _plan_mode.apply_session_toolset_policy(
+            eff_sid or "", _load_enabled_toolsets(), None,
+        )
+        refresh_agent_mcp_tools(
+            agent,
+            enabled_override=enabled,
+            disabled_override=disabled,
+            quiet_mode=True,
+        )
+    except Exception as exc:
+        logger.debug("plan-mode live agent refresh skipped: %s", exc)
 
 
 def _init_session(

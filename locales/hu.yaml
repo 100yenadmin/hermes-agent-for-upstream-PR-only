@@ -146,6 +146,18 @@ gateway:
     invalid:               "Érvénytelen cél: {error}"
     set:                   "⊙ Cél beállítva ({budget} körös keret): {goal}\nDolgozni fogok rajta, amíg a cél el nem készül, te nem szünetelteted/törlöd, vagy a keret ki nem merül.\nVezérlés: /goal status · /goal pause · /goal resume · /goal clear"
 
+  plan:
+    unavailable:           "A tervezési mód nem érhető el ebben a munkamenetben."
+    entered:               "📝 Tervezési mód bekapcsolva. Csak tervezek — a módosító eszközök zárolva vannak, amíg jóvá nem hagyod. A tervet a .hermes/plans/ könyvtárba írom, majd jóváhagyást kérek.\nVezérlés: /plan status · /plan show · /plan approve · /plan reject <feedback> · /plan exit"
+    "off":                 "A tervezési mód ki van kapcsolva. A /plan paranccsal kapcsolhatod be."
+    not_active:            "A tervezési mód nem aktív — nincs mit jóváhagyni vagy elutasítani."
+    no_plan:               "Még nem készült tervfájl."
+    show:                  "📝 Tervfájl: {path}"
+    approved:              "✅ A terv jóváhagyva — a végrehajtás a következő körben feloldódik."
+    rejected:              "↩ Tervezési módban maradok. Finomítsd tovább a tervet."
+    rejected_feedback:     "↩ Tervezési módban maradok. Visszajelzés: {feedback}"
+    exited:                "Tervezési mód kikapcsolva — a függőben lévő tervet elvetettem (nem lett jóváhagyva). A módosító eszközök feloldva."
+
   help:
     header:                "📖 **Hermes parancsok**\n"
     skill_header:          "\n⚡ **Készségparancsok** ({count} aktív):"

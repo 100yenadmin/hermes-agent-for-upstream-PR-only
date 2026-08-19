@@ -146,6 +146,18 @@ gateway:
     invalid:               "Objetivo no válido: {error}"
     set:                   "⊙ Objetivo establecido (presupuesto de {budget} turnos): {goal}\nSeguiré trabajando hasta que el objetivo se complete, lo pauses/elimines o se agote el presupuesto.\nControles: /goal status · /goal pause · /goal resume · /goal clear"
 
+  plan:
+    unavailable:           "El modo de planificación no está disponible en esta sesión."
+    entered:               "📝 Modo de planificación activado. Solo planificaré — las herramientas que modifican están bloqueadas hasta que lo apruebes. Escribiré el plan en .hermes/plans/ y pediré tu aprobación.\nControles: /plan status · /plan show · /plan approve · /plan reject <feedback> · /plan exit"
+    "off":                 "El modo de planificación está desactivado. Actívalo con /plan."
+    not_active:            "El modo de planificación no está activo — no hay nada que aprobar ni rechazar."
+    no_plan:               "Todavía no se ha escrito ningún archivo de plan."
+    show:                  "📝 Archivo de plan: {path}"
+    approved:              "✅ Plan aprobado — la ejecución se desbloquea en el próximo turno."
+    rejected:              "↩ Sigo en modo de planificación. Continúa refinando el plan."
+    rejected_feedback:     "↩ Sigo en modo de planificación. Comentarios: {feedback}"
+    exited:                "Modo de planificación desactivado — el plan pendiente se descartó (no aprobado). Las herramientas que modifican están desbloqueadas."
+
   help:
     header:                "📖 **Comandos de Hermes**\n"
     skill_header:          "\n⚡ **Comandos de skill** ({count} activos):"

@@ -215,6 +215,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("proactive",),
                args_hint="[interval] <prompt> [--times N] [--until <condition>] | status | pause | resume | stop",
                busy_policy="dispatch", busy_handler="loop"),
+    CommandDef("plan", "Enter code-enforced plan mode (mutations blocked until you approve the plan)", "Session",
+               args_hint="[status | show | approve | reject <feedback> | exit]",
+               subcommands=("status", "show", "approve", "reject", "exit"),
+               busy_policy="dispatch"),
     CommandDef("moa", "Run one prompt through the default Mixture of Agents preset, then restore your model", "Session",
                args_hint="<prompt>", busy_policy="reject", busy_handler="moa"),
     CommandDef("subgoal", "Add or manage extra criteria on the active goal", "Session",
@@ -1346,7 +1350,9 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "whoami", "platform"})
+#   - plan: code-enforced plan mode is a coding/CLI-centric control surface;
+#     reached via /hermes plan on Slack to stay under the 50-command cap.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "whoami", "platform", "plan"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

@@ -2317,6 +2317,7 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("session_search", {"query": "needle"}),
         ("memory", {"action": "view", "target": "memory"}),
         ("clarify", {"question": "Continue?"}),
+        ("plan_ready", {"plan_path": ".hermes/plans/plan.md", "summary": "Ship it"}),
         ("read_terminal", {}),
         ("read_preview", {}),
         ("read_window_below", {}),
@@ -2355,6 +2356,10 @@ class TestAgentRuntimePostHookOwnershipSync:
         )
         monkeypatch.setattr(
             "tools.clarify_tool.clarify_tool",
+            lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.plan_ready_tool.plan_ready_tool",
             lambda **kwargs: '{"ok":true}',
         )
         monkeypatch.setattr(
