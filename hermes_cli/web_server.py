@@ -11602,10 +11602,13 @@ def _codex_full_login_worker(session_id: str) -> None:
     ``authorization_code`` + ``code_verifier`` that get exchanged at
     CODEX_OAUTH_TOKEN_URL with grant_type=authorization_code.
 
-    The flow is replicated inline (rather than calling
-    _codex_device_code_login) because that helper prints/blocks/polls in a
-    single function — we need to surface the user_code to the dashboard the
-    moment we receive it, well before polling completes.
+    The transport is replicated inline (rather than calling
+    _codex_device_code_login) because this worker must also abort mid-poll
+    when the dashboard cancels the session, and because it rewords the
+    device-authorization start failure for a browser audience. Persistence is
+    NOT replicated: it goes through the shared
+    ``append_codex_pool_credential`` seam so a dashboard login lands as its
+    own pooled account like the terminal and gateway paths.
     """
     try:
         import httpx
@@ -11705,7 +11708,7 @@ def _codex_full_login_worker(session_id: str) -> None:
         if not access_token:
             raise RuntimeError("token exchange did not return access_token")
 
-        from hermes_cli.auth import _save_codex_tokens
+        from hermes_cli.auth import append_codex_pool_credential
 
         # The cancellation check and the save must be one atomic critical
         # section under the same lock cancel_oauth_session() uses. Checking
@@ -11720,7 +11723,7 @@ def _codex_full_login_worker(session_id: str) -> None:
                 _log.info("oauth/device: openai-codex login cancelled before token save (session=%s)", session_id)
                 return
             with _profile_scope(session_profile):
-                _save_codex_tokens({
+                append_codex_pool_credential({
                     "access_token": access_token,
                     "refresh_token": refresh_token,
                 })

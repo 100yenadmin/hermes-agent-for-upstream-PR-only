@@ -273,7 +273,9 @@ def test_codex_dashboard_worker_stops_polling_after_cancel(tmp_path, monkeypatch
     saved = []
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(httpx, "Client", _Client)
-    monkeypatch.setattr(auth_mod, "_save_codex_tokens", lambda tokens: saved.append(tokens))
+    monkeypatch.setattr(
+        auth_mod, "append_codex_pool_credential", lambda tokens: saved.append(tokens)
+    )
 
     sid, _ = ws._new_oauth_session("openai-codex", "device_code", profile="coder")
 
@@ -298,7 +300,7 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
     """The final cancellation check and the token save must be one atomic
     section under `_oauth_sessions_lock`.
 
-    Regression: checking `cancelled` and calling `_save_codex_tokens()` used
+    Regression: checking `cancelled` and calling the pooled append used
     to be two separate steps with no lock held across them, so a DELETE
     landing in that gap flipped the flag too late for the worker to see it
     and the tokens were saved anyway. This drives a real DELETE from another
@@ -372,7 +374,7 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
         client.delete(f"/api/providers/oauth/sessions/{sid}", headers=HEADERS)
         delete_finished.set()
 
-    monkeypatch.setattr(auth_mod, "_save_codex_tokens", fake_save)
+    monkeypatch.setattr(auth_mod, "append_codex_pool_credential", fake_save)
     monkeypatch.setattr(ws.time, "sleep", lambda *_a, **_k: None)
 
     sid, _ = ws._new_oauth_session("openai-codex", "device_code", profile="coder")

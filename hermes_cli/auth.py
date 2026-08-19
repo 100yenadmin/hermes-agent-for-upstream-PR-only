@@ -225,6 +225,15 @@ def normalize_actual_base_url(base_url: str) -> str:
     return url
 
 
+@dataclass(frozen=True)
+class CodexDeviceCodePrompt:
+    """Token-free Codex verification details for non-terminal callers."""
+
+    verification_url: str
+    user_code: str
+    expires_in_seconds: int
+
+
 # =============================================================================
 # Provider Registry
 # =============================================================================
@@ -8201,7 +8210,9 @@ def _xai_oauth_device_code_login(
     }
 
 
-def _codex_device_code_login() -> Dict[str, Any]:
+def _codex_device_code_login(
+    on_verification: Optional[Callable[[CodexDeviceCodePrompt], None]] = None,
+) -> Dict[str, Any]:
     """Run the OpenAI device code login flow and return credentials dict."""
     import time as _time
 
@@ -8270,6 +8281,10 @@ def _codex_device_code_login() -> Dict[str, Any]:
     user_code = device_data.get("user_code", "")
     device_auth_id = device_data.get("device_auth_id", "")
     poll_interval = max(3, int(device_data.get("interval", "5")))
+    try:
+        expires_in_seconds = max(1, int(device_data.get("expires_in") or 15 * 60))
+    except (TypeError, ValueError):
+        expires_in_seconds = 15 * 60
 
     if not user_code or not device_auth_id:
         raise AuthError(
@@ -8277,13 +8292,23 @@ def _codex_device_code_login() -> Dict[str, Any]:
             provider="openai-codex", code="device_code_incomplete",
         )
 
-    # Step 2: Show user the code
-    print("To continue, follow these steps:\n")
-    print("  1. Open this URL in your browser:")
-    print(f"     \033[94m{issuer}/codex/device\033[0m\n")
-    print("  2. Enter this code:")
-    print(f"     \033[94m{user_code}\033[0m\n")
-    print("Waiting for sign-in... (press Ctrl+C to cancel)")
+    # Step 2: Show the user the code. Non-terminal callers receive only this
+    # token-free prompt and must deliver it over their private response path
+    # before this function begins polling.
+    prompt = CodexDeviceCodePrompt(
+        verification_url=f"{issuer}/codex/device",
+        user_code=user_code,
+        expires_in_seconds=expires_in_seconds,
+    )
+    if on_verification is not None:
+        on_verification(prompt)
+    else:
+        print("To continue, follow these steps:\n")
+        print("  1. Open this URL in your browser:")
+        print(f"     \033[94m{prompt.verification_url}\033[0m\n")
+        print("  2. Enter this code:")
+        print(f"     \033[94m{prompt.user_code}\033[0m\n")
+        print("Waiting for sign-in... (press Ctrl+C to cancel)")
 
     # Step 3: Poll for authorization code
     max_wait = 15 * 60  # 15 minutes
@@ -8398,6 +8423,99 @@ def _codex_device_code_login() -> Dict[str, Any]:
         "auth_mode": "chatgpt",
         "source": "device-code",
     }
+
+
+def append_codex_pool_credential(
+    tokens: Dict[str, Any],
+    *,
+    base_url: Optional[str] = None,
+    last_refresh: Optional[str] = None,
+    label: Optional[str] = None,
+):
+    """Append one freshly authenticated Codex account to this profile's pool.
+
+    The shared persistence seam for every Codex device-code entry point —
+    terminal ``hermes auth add``, the gateway ``/login`` command, and the
+    dashboard login worker. It intentionally does not write the legacy
+    singleton provider state, so a second account cannot overwrite an
+    existing account's token pair (#39236); the dashboard used to save
+    through ``_save_codex_tokens`` and collapsed every account it added
+    into the latest login.
+
+    Reads and rewrites only the rows this store OWNS. ``load_pool`` hydrates
+    the global-root fallback into memory when the profile slice is empty
+    (see ``read_credential_pool``), and persisting that in-memory list would
+    copy the root account's tokens into the profile's ``auth.json`` — turning
+    a read-only fallback into a silent credential copy. The append therefore
+    goes through the raw profile slice, never the merged view.
+    """
+    from agent.credential_pool import (
+        AUTH_TYPE_OAUTH,
+        SOURCE_MANUAL_DEVICE_CODE,
+        PooledCredential,
+        _next_priority,
+        label_from_token,
+    )
+
+    owned_pool = _load_auth_store().get("credential_pool")
+    raw_owned = owned_pool.get("openai-codex") if isinstance(owned_pool, dict) else None
+    owned_rows = [row for row in (raw_owned or []) if isinstance(row, dict)]
+    access_token = tokens["access_token"]
+    entry_label = (label or "").strip() or label_from_token(
+        access_token,
+        f"openai-codex-oauth-{len(owned_rows) + 1}",
+    )
+    entry = PooledCredential(
+        provider="openai-codex",
+        id=uuid.uuid4().hex[:6],
+        label=entry_label,
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=_next_priority(
+            [PooledCredential.from_dict("openai-codex", row) for row in owned_rows]
+        ),
+        source=SOURCE_MANUAL_DEVICE_CODE,
+        access_token=access_token,
+        refresh_token=tokens.get("refresh_token"),
+        base_url=base_url or (
+            os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+            or DEFAULT_CODEX_BASE_URL
+        ),
+        last_refresh=last_refresh or (
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        ),
+    )
+    write_credential_pool("openai-codex", owned_rows + [entry.to_dict()])
+    unsuppress_credential_source("openai-codex", SOURCE_MANUAL_DEVICE_CODE)
+    # Adding the first Codex credential should make it the active provider
+    # (the old singleton save path did this implicitly via
+    # _save_provider_state). Subsequent adds leave the active provider as-is.
+    if not owned_rows:
+        mark_provider_active_if_unset("openai-codex")
+    return entry
+
+
+def login_openai_codex_to_pool(
+    on_verification: Optional[Callable[[CodexDeviceCodePrompt], None]] = None,
+    *,
+    label: Optional[str] = None,
+):
+    """Authenticate one Codex account and append a distinct pooled credential.
+
+    Terminal and gateway device login share this entry point.
+    ``on_verification`` lets a non-terminal caller deliver the pairing code
+    over its own private response path instead of printing it to a console.
+    """
+    creds = (
+        _codex_device_code_login(on_verification=on_verification)
+        if on_verification is not None
+        else _codex_device_code_login()
+    )
+    return append_codex_pool_credential(
+        creds["tokens"],
+        base_url=creds.get("base_url"),
+        last_refresh=creds.get("last_refresh"),
+        label=label,
+    )
 
 
 # ==================== MiniMax Portal OAuth ====================

@@ -200,6 +200,63 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
     assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new"]
 
 
+def test_codex_pool_append_never_copies_global_rows_into_profile(
+    profile_env, monkeypatch
+):
+    """A profile login must not clone the root account into the profile.
+
+    ``read_credential_pool`` hydrates the global-root rows whenever the
+    profile slice is empty, so a persistence path that rewrites its whole
+    in-memory pool copies the root's tokens into the profile's auth.json.
+    That silently forks the root credential: the copy refreshes and gets
+    exhausted independently, and removing the account at the root leaves a
+    live duplicate behind in every profile that ever logged in.
+    """
+    import hermes_cli.auth as auth
+
+    global_auth = profile_env["global"] / "auth.json"
+    _write(global_auth, _make_auth_store(pool={
+        "openai-codex": [{
+            "id": "glob-codex",
+            "label": "root-account",
+            "auth_type": "oauth",
+            "priority": 0,
+            "source": "manual:device_code",
+            "access_token": "root-access",
+            "refresh_token": "root-refresh",
+        }],
+    }))
+    global_bytes = global_auth.read_bytes()
+
+    # The profile sees the root account through the read-only fallback.
+    assert [e["id"] for e in auth.read_credential_pool("openai-codex")] == [
+        "glob-codex"
+    ]
+
+    monkeypatch.setattr(auth, "_codex_device_code_login", lambda **_kwargs: {
+        "tokens": {
+            "access_token": "profile-access",
+            "refresh_token": "profile-refresh",
+        },
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "last_refresh": "2026-02-26T00:00:00Z",
+    })
+
+    entry = auth.login_openai_codex_to_pool()
+
+    profile_rows = json.loads(
+        (profile_env["profile"] / "auth.json").read_text()
+    )["credential_pool"]["openai-codex"]
+    assert [row["id"] for row in profile_rows] == [entry.id]
+    assert [row["access_token"] for row in profile_rows] == ["profile-access"]
+    assert not any(
+        row.get("refresh_token") == "root-refresh" for row in profile_rows
+    )
+
+    # The root store is a read-only fallback: the login must not touch it.
+    assert global_auth.read_bytes() == global_bytes
+
+
 
 
 def test_auth_lock_reentrancy_is_scoped_after_profile_context_switch(profile_env):
