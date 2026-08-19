@@ -197,6 +197,75 @@ def test_ws_ready_advertises_heartbeat_and_ping_is_inline(monkeypatch):
     }
 
 
+def test_session_activate_refuses_to_steal_recent_live_ws_transport():
+    class FakeTransport:
+        def __init__(self):
+            self.closed = False
+            self.last_inbound_at = time.monotonic()
+
+        def write(self, obj):
+            return True
+
+        def close(self):
+            self.closed = True
+
+    owner = FakeTransport()
+    contender = FakeTransport()
+    session = {
+        "history_lock": threading.Lock(),
+        "transport": owner,
+    }
+    server._sessions.clear()
+    server._live_transports.clear()
+    server._sessions["sid"] = session
+    server.register_live_transport(owner)
+    try:
+        response = server.dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": "activate-1",
+                "method": "session.activate",
+                "params": {"session_id": "sid"},
+            },
+            contender,
+        )
+
+        assert response["error"]["code"] == 4091
+        assert session["transport"] is owner
+    finally:
+        server.unregister_live_transport(owner)
+        server._sessions.clear()
+        server._live_transports.clear()
+
+
+def test_expired_ws_transport_can_be_rebound():
+    class FakeTransport:
+        def __init__(self, last_inbound_at):
+            self.closed = False
+            self.last_inbound_at = last_inbound_at
+
+        def write(self, obj):
+            return True
+
+        def close(self):
+            self.closed = True
+
+    owner = FakeTransport(time.monotonic() - 46)
+    contender = FakeTransport(time.monotonic())
+    session = {
+        "history_lock": threading.Lock(),
+        "transport": owner,
+    }
+    server._live_transports.clear()
+    server.register_live_transport(owner)
+    try:
+        assert server._bind_session_transport(session, contender) is True
+        assert session["transport"] is contender
+    finally:
+        server.unregister_live_transport(owner)
+        server._live_transports.clear()
+
+
 def test_ws_transport_serializes_concurrent_sends():
     active_sends = 0
     max_active_sends = 0
