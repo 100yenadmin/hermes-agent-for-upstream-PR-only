@@ -41,6 +41,9 @@ class TestClaudeAgentSdkDefaults:
         assert block["setting_sources"] == []
         # null = no per-query budget cap (current behavior).
         assert block["max_budget_usd"] is None
+        # null = the transport's 10 MiB NDJSON message limit. The explicit
+        # config key keeps the operator override in the canonical schema.
+        assert block["max_buffer_size"] is None
         # null = the built-in 600s soft budget; the value itself lives in the
         # transport (activity-aware — see claude_agent_sdk_session.run_turn).
         assert block["turn_timeout"] is None

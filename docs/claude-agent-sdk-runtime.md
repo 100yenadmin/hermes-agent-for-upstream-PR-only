@@ -38,6 +38,7 @@ All keys live under `agent.claude_agent_sdk` in `config.yaml`.
 | `allow_metered_key` | bool | false | Explicit "bill me metered" opt-in. Disables the credential scrub and the child-reported API-key/Extra-Usage refusal (§5). |
 | `deliver_background_results` | bool | false | Deliver results produced by background work. |
 | `max_budget_usd` | float | *(none)* | Forwarded to the SDK's `max_budget_usd`; the query stops with `error_max_budget_usd` once exceeded. Non-numeric, non-positive, and boolean values are ignored with a warning — a `0` cap would fail every turn instantly, and YAML `true` would `float()` to a nonsense `1.0`. |
+| `max_buffer_size` | int | 10 MiB | Maximum size of one CLI NDJSON message. Hermes sets this explicitly because the SDK's 1 MiB default can terminate a turn on a large tool result. Positive integer overrides are accepted; invalid values warn and fall back to 10 MiB. The pinned SDK currently measures Unicode code points despite documenting bytes. |
 | `env` | mapping | `{}` | Arbitrary environment passed to the CLI subprocess (§3). |
 
 ---

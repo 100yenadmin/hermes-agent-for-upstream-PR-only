@@ -60,6 +60,7 @@ All keys live under `agent.claude_agent_sdk` in `config.yaml` (see `cli-config.y
 | `env` | `{}` | Extra environment for the spawned Claude CLI. Values are stringified; metered-billing vectors are rejected unless `allow_metered_key` is true. |
 | `setting_sources` | `[]` | Filesystem settings sources (`user`, `project`, `local`). Empty keeps the SDK isolated from ambient Claude settings and `CLAUDE.md`. |
 | `max_budget_usd` | `null` | Per-query USD cap forwarded to the SDK; the turn ends with `error_max_budget_usd` when exceeded. `null` = no budget. |
+| `max_buffer_size` | `null` | Maximum size of one CLI NDJSON message. `null` uses Hermes' 10 MiB limit rather than the SDK's 1 MiB default, which can terminate a turn on a large tool result. Positive integer overrides are accepted; invalid values warn and fall back. The pinned SDK currently measures Unicode code points despite documenting bytes. |
 | `turn_timeout` | `null` | Activity-aware soft turn budget in seconds. `null` uses 600; active tools, approvals, and stream output suspend the idle verdict. |
 | `post_tool_quiet_timeout` | `null` | Post-tool silence watchdog. `null` uses 90 seconds with streaming enabled and disables it without streaming; `0` disables it explicitly. |
 | `deliver_background_results` | `false` | Proactively deliver completed background Agent-task answers through the gateway completion lane. |

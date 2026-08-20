@@ -986,6 +986,11 @@ agent:
   #   # (default) = no budget. Non-numeric / non-positive values are ignored
   #   # with a warning.
   #   max_budget_usd: null
+  #   # Maximum size of one NDJSON message read from the Claude CLI. null
+  #   # (default) uses Hermes' 10 MiB limit rather than the SDK's 1 MiB
+  #   # default, which can kill a turn on a large tool result. Positive
+  #   # integer overrides are accepted; invalid values warn and fall back.
+  #   max_buffer_size: null
   #   # Soft turn budget in seconds. null (default) = 600. Activity-aware:
   #   # fires only when no tool call is outstanding, no approval prompt is
   #   # awaiting a human, AND the SDK stream has also been quiet for

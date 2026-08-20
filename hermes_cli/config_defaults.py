@@ -367,6 +367,13 @@ DEFAULT_CONFIG = {
             # budget. Non-numeric / non-positive values are ignored with a
             # warning.
             "max_budget_usd": None,
+            # Maximum size of one NDJSON message read from the Claude CLI.
+            # null (the default) uses Hermes' built-in 10 MiB limit instead
+            # of the SDK's 1 MiB default, which can kill a turn on a large
+            # tool result. Positive integer overrides are accepted; invalid
+            # values warn and fall back to 10 MiB rather than disabling the
+            # OOM backstop.
+            "max_buffer_size": None,
             # Deliver finished background Agent-task answers proactively via
             # the gateway's async-delegation completion pipeline. false (the
             # upstream-conservative default) = the historical behavior: the
