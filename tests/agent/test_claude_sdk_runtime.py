@@ -2959,7 +2959,7 @@ class TestSystemPromptAppend:
     # shims. Deliberate pin updates from W1 are annotated inline.
 
     @staticmethod
-    def _home(tmp_path, monkeypatch, *, soul=None, memory=None, user=None):
+    def _home(tmp_path, monkeypatch, *, soul=None, memory=None, user=None, budget=None):
         hermes_home = tmp_path / "hermes"
         memories = hermes_home / "memories"
         memories.mkdir(parents=True)
@@ -2978,12 +2978,15 @@ class TestSystemPromptAppend:
         # (agent.claude_agent_sdk.append_file); the old env var is gone.
         # Patching unconditionally also isolates the suite from a developer's
         # real config.yaml, which would otherwise leak a live append_file in.
+        sdk_cfg = {"append_file": append_file}
+        # Only inject the budget key when a test asks for one: absent must stay
+        # distinguishable from present-but-invalid, which take different paths.
+        if budget is not None:
+            sdk_cfg["append_total_max_chars"] = budget
         monkeypatch.setattr(
             cfg,
             "load_config_readonly",
-            lambda *a, **k: {
-                "agent": {"claude_agent_sdk": {"append_file": append_file}}
-            },
+            lambda *a, **k: {"agent": {"claude_agent_sdk": sdk_cfg}},
         )
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         return hermes_home
@@ -3382,6 +3385,117 @@ class TestSystemPromptAppend:
         assert "yyyyyyyyyy" not in out  # oversized memory block skipped whole
         assert "session_search" in out  # later block survived
         assert len(out) <= _APPEND_TOTAL_MAX_CHARS
+
+    def test_budget_eviction_warns_and_names_the_block(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # An eviction deletes standing instructions the operator believes are
+        # in force, so it must be audible. This was DEBUG — which is how the
+        # identity fix could have silently traded SOUL.md in for the
+        # MCP-inspection block with nothing in the log to say so.
+        import logging
+
+        from agent.claude_sdk_runtime import (
+            _APPEND_TOTAL_MAX_CHARS,
+            build_system_prompt_append,
+        )
+
+        oversized = "# Hand-edited memory\n" + "y" * (_APPEND_TOTAL_MAX_CHARS + 5000)
+        self._home(tmp_path, monkeypatch, memory=oversized)
+        with caplog.at_level(logging.WARNING):
+            out = build_system_prompt_append()
+
+        assert "yyyyyyyyyy" not in out
+        evictions = [
+            r for r in caplog.records
+            if "append budget" in r.getMessage() and r.levelno >= logging.WARNING
+        ]
+        assert evictions, "an evicted block must be reported above DEBUG"
+        message = evictions[0].getMessage()
+        # Named by the store's own header, so the loss is actionable...
+        assert "MEMORY" in message
+        # ...but header ONLY: the body must never reach the log.
+        assert "yyyyyyyyyy" not in message
+
+    def test_budget_override_seats_a_block_the_default_evicts(
+        self, tmp_path, monkeypatch
+    ):
+        # The ceiling is a per-box cost decision, so it must be reachable from
+        # config without a code edit.
+        from agent.claude_sdk_runtime import (
+            _APPEND_TOTAL_MAX_CHARS,
+            build_system_prompt_append,
+        )
+
+        # Separate homes: _home() is not re-entrant on one tmp_path, and the
+        # two halves must differ ONLY in the configured ceiling.
+        big = "# Big memory\n" + "y" * (_APPEND_TOTAL_MAX_CHARS + 5000)
+        self._home(tmp_path / "default", monkeypatch, memory=big)
+        assert "yyyyyyyyyy" not in build_system_prompt_append()  # evicted at default
+
+        self._home(
+            tmp_path / "raised",
+            monkeypatch,
+            memory=big,
+            budget=_APPEND_TOTAL_MAX_CHARS * 3,
+        )
+        assert "yyyyyyyyyy" in build_system_prompt_append()  # seated when raised
+
+    @pytest.mark.parametrize("bad", ["not-a-number", 0, -5, True])
+    def test_invalid_budget_override_falls_back_to_default_with_warning(
+        self, tmp_path, monkeypatch, caplog, bad
+    ):
+        # A typo'd or zero ceiling must never become a silent behaviour
+        # change: 0 would strip the entire append, identity included.
+        import logging
+
+        from agent.claude_sdk_runtime import (
+            _APPEND_TOTAL_MAX_CHARS,
+            _append_total_max_chars,
+        )
+
+        self._home(tmp_path, monkeypatch, budget=bad)
+        with caplog.at_level(logging.WARNING):
+            assert _append_total_max_chars() == _APPEND_TOTAL_MAX_CHARS
+        assert any(
+            "append_total_max_chars" in r.getMessage() for r in caplog.records
+        )
+
+    def test_restoring_identity_does_not_evict_a_previously_seated_block(
+        self, tmp_path, monkeypatch
+    ):
+        # The regression the independent review caught, stated as the
+        # relationship it actually is: seating SOUL.md must not be paid for by
+        # silently dropping a block that fit without it. Sizes are calibrated
+        # (memory 8400) so the identity block genuinely pushes the total past
+        # the historical 20000 ceiling — at 20000 this test is RED, which is
+        # the whole point of the raised default.
+        from agent.claude_sdk_runtime import (
+            _MCP_INSPECTION_PREFERENCE,
+            build_system_prompt_append,
+        )
+
+        mcp = _MCP_INSPECTION_PREFERENCE.strip()
+        common = dict(user="u" * 4921, memory="m" * 8400)
+
+        # Baseline: no append_file, no hand-written identity file (native
+        # load_soul_md() scaffolds a short default), historical ceiling —
+        # MCP block fits.
+        self._home(tmp_path / "no-soul", monkeypatch, budget=20000, **common)
+        assert mcp in build_system_prompt_append()
+
+        # Same load, at the shipped default, with a real identity file
+        # written straight into $HERMES_HOME (append_file stays unset, so
+        # this exercises the native load_soul_md() path): identity seated
+        # AND the MCP block survives. (At budget=20000 the MCP block is
+        # evicted — calibrated and verified 2026-08-18 on Main.)
+        home = self._home(tmp_path / "with-soul", monkeypatch, **common)
+        (home / "SOUL.md").write_text("I am the agent.\n" + "s" * 3200)
+        out = build_system_prompt_append()
+
+        assert "I am the agent." in out  # identity seated
+        assert "m" * 100 in out and "u" * 100 in out  # memory + profile seated
+        assert mcp in out  # ...and NOT paid for with this one
 
     def test_skills_index_wiring(self, tmp_path, monkeypatch):
         # The index rides the NATIVE builder; we pin OUR wiring — called
