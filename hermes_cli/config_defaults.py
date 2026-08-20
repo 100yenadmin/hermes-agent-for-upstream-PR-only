@@ -347,6 +347,12 @@ DEFAULT_CONFIG = {
             # Optional operator persona/soul file appended to the system prompt
             # ("" = none).
             "append_file": "",
+            # Whole SDK system-prompt append budget in characters. null uses
+            # the built-in 22000-character ceiling. Blocks are packed whole;
+            # evictions warn with an internal, content-free block label.
+            # Positive integer overrides are accepted; invalid values warn
+            # and fall back rather than disabling the budget.
+            "append_total_max_chars": None,
             # SDK permission mode, taken VERBATIM as a claude-agent-sdk
             # permission_mode literal: default | acceptEdits | plan |
             # bypassPermissions | dontAsk | auto (note: "auto" is the SDK's

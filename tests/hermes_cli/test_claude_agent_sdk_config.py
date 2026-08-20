@@ -31,6 +31,8 @@ class TestClaudeAgentSdkDefaults:
         assert block["allow_metered_key"] is False
         # No persona file appended by default.
         assert block["append_file"] == ""
+        # null = the built-in 22000-character whole-append budget.
+        assert block["append_total_max_chars"] is None
         # "" = current behavior: the HERMES_TERMINAL_SECURITY_MODE mapping
         # stands; a non-empty value is an SDK permission_mode literal.
         assert block["permission_mode"] == ""

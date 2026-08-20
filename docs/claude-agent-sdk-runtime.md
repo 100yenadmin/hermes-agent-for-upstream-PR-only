@@ -35,6 +35,7 @@ All keys live under `agent.claude_agent_sdk` in `config.yaml`.
 | `permission_mode` | str | *(SDK default)* | Passed to the SDK **verbatim**; validated against the installed SDK's literals (`default`, `acceptEdits`, `plan`, `bypassPermissions`, `dontAsk`, `auto`). An invalid value is rejected rather than guessed. |
 | `setting_sources` | list | *(none)* | Which on-disk setting sources the CLI may read. Empty by default — opt in explicitly with `["user"]`. Unknown entries are dropped with a warning. |
 | `append_file` | path | *(none)* | Operator persona/guidance file appended to the system prompt. Set-but-unreadable warns rather than silently continuing. |
+| `append_total_max_chars` | int | 22,000 | Whole system-prompt append budget in characters. Blocks are packed whole; evictions warn with internal content-free labels. Positive integer overrides are accepted, while invalid values fall back to 22,000. |
 | `allow_metered_key` | bool | false | Explicit "bill me metered" opt-in. Disables the credential scrub and the child-reported API-key/Extra-Usage refusal (§5). |
 | `deliver_background_results` | bool | false | Deliver results produced by background work. |
 | `max_budget_usd` | float | *(none)* | Forwarded to the SDK's `max_budget_usd`; the query stops with `error_max_budget_usd` once exceeded. Non-numeric, non-positive, and boolean values are ignored with a warning — a `0` cap would fail every turn instantly, and YAML `true` would `float()` to a nonsense `1.0`. |

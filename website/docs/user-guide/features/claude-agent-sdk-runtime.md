@@ -56,6 +56,7 @@ All keys live under `agent.claude_agent_sdk` in `config.yaml` (see `cli-config.y
 | `streaming` | `false` | Emit the SDK's partial-message deltas into the gateway streaming pipeline. |
 | `allow_metered_key` | `false` | Explicit metered-billing opt-in. Allows API-key sources and subscription Extra Usage reported by the child, and disables the env scrub/guard that would otherwise refuse them. |
 | `append_file` | `""` | Operator persona/soul file appended to the system prompt. |
+| `append_total_max_chars` | `null` | Whole SDK system-prompt append budget in characters. `null` uses 22,000. Blocks are packed whole; evictions warn with internal content-free labels. Positive integer overrides are accepted, while invalid values fall back. |
 | `permission_mode` | `""` | An SDK permission mode literal (`default`, `acceptEdits`, `plan`, `bypassPermissions`, `dontAsk`, `auto`). Empty keeps the `HERMES_TERMINAL_SECURITY_MODE` mapping (`auto` maps to the fail-closed SDK `default` mode). |
 | `env` | `{}` | Extra environment for the spawned Claude CLI. Values are stringified; metered-billing vectors are rejected unless `allow_metered_key` is true. |
 | `setting_sources` | `[]` | Filesystem settings sources (`user`, `project`, `local`). Empty keeps the SDK isolated from ambient Claude settings and `CLAUDE.md`. |

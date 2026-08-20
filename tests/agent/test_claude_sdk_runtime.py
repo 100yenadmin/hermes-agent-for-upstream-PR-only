@@ -942,7 +942,7 @@ class TestSession:
         session, _ = _make_session(script=[ResultMessage(result="ok")])
         assert session.build_option_fields()["max_buffer_size"] == 4194304
 
-    @pytest.mark.parametrize("bad", [True, "big", 0, -1, None])
+    @pytest.mark.parametrize("bad", [True, "big", 0, -1, None, 1.5, float("inf")])
     def test_invalid_max_buffer_size_falls_back(self, monkeypatch, bad):
         # A typo must not disable the only backstop against an unterminated
         # line growing until the host OOMs, nor silently drop to 1 MiB.
@@ -3441,7 +3441,9 @@ class TestSystemPromptAppend:
         )
         assert "yyyyyyyyyy" in build_system_prompt_append()  # seated when raised
 
-    @pytest.mark.parametrize("bad", ["not-a-number", 0, -5, True])
+    @pytest.mark.parametrize(
+        "bad", ["not-a-number", 0, -5, True, 1.5, float("inf")]
+    )
     def test_invalid_budget_override_falls_back_to_default_with_warning(
         self, tmp_path, monkeypatch, caplog, bad
     ):
@@ -3496,6 +3498,29 @@ class TestSystemPromptAppend:
         assert "I am the agent." in out  # identity seated
         assert "m" * 100 in out and "u" * 100 in out  # memory + profile seated
         assert mcp in out  # ...and NOT paid for with this one
+
+    def test_eviction_warning_never_derives_label_from_block_content(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import logging
+
+        import agent.prompt_builder as pb
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        secret = "private skill detail that must never reach logs"
+        self._home(tmp_path, monkeypatch, budget=1000)
+        monkeypatch.setattr(
+            pb,
+            "build_skills_system_prompt",
+            lambda **_kwargs: secret + "x" * 5000,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            build_system_prompt_append()
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("skills index" in message for message in messages)
+        assert all(secret not in message for message in messages)
 
     def test_skills_index_wiring(self, tmp_path, monkeypatch):
         # The index rides the NATIVE builder; we pin OUR wiring — called

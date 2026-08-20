@@ -252,10 +252,16 @@ def _configured_max_buffer_size() -> int:
         return _DEFAULT_MAX_BUFFER_SIZE
     try:
         value = int(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         logger.warning(
             "agent.claude_agent_sdk.max_buffer_size=%r is not a number — "
             "ignoring it (using the built-in default).", raw,
+        )
+        return _DEFAULT_MAX_BUFFER_SIZE
+    if isinstance(raw, float) and not raw.is_integer():
+        logger.warning(
+            "agent.claude_agent_sdk.max_buffer_size=%r is not a whole number "
+            "— ignoring it (using the built-in default).", raw,
         )
         return _DEFAULT_MAX_BUFFER_SIZE
     if value <= 0:

@@ -198,10 +198,16 @@ def _append_total_max_chars() -> int:
         return _APPEND_TOTAL_MAX_CHARS
     try:
         value = int(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         logger.warning(
             "agent.claude_agent_sdk.append_total_max_chars=%r is not a number "
             "— using the default %d.", raw, _APPEND_TOTAL_MAX_CHARS,
+        )
+        return _APPEND_TOTAL_MAX_CHARS
+    if isinstance(raw, float) and not raw.is_integer():
+        logger.warning(
+            "agent.claude_agent_sdk.append_total_max_chars=%r is not a whole "
+            "number — using the default %d.", raw, _APPEND_TOTAL_MAX_CHARS,
         )
         return _APPEND_TOTAL_MAX_CHARS
     if value <= 0:
@@ -211,21 +217,6 @@ def _append_total_max_chars() -> int:
         )
         return _APPEND_TOTAL_MAX_CHARS
     return value
-
-
-def _block_label(block: str) -> str:
-    """A short, log-safe identifier for a prompt block.
-
-    First line carrying a letter or digit, stripped of the box-drawing rules
-    the profile/memory headers are wrapped in. Header only — never the body —
-    so an eviction can be named in logs without spilling memory or profile
-    content into them.
-    """
-    for line in block.splitlines():
-        stripped = line.strip("═─-=# \t")
-        if any(ch.isalnum() for ch in stripped):
-            return stripped[:60]
-    return "<unlabelled>"
 
 
 def build_system_prompt_append(
@@ -260,7 +251,11 @@ def build_system_prompt_append(
     or gateway restart), not mid-session — the same snapshot invariant the
     native composer keeps for prefix-cache stability.
     """
-    blocks: list[str] = []
+    # Labels are internal constants, never derived from prompt content. An
+    # evicted custom identity or workspace block may begin with private text;
+    # logging its first line would turn an observability fix into a content
+    # leak.
+    blocks: list[tuple[str, str]] = []
 
     # Lazy import: keeps this module free of an import cycle with the session
     # module while reusing its single reader for the provider config block.
@@ -270,7 +265,7 @@ def build_system_prompt_append(
     if soul_path:
         soul = _read_capped(soul_path)
         if soul:
-            blocks.append(soul)
+            blocks.append(("identity", soul))
         else:
             # Deliberately NO SOUL.md fallback here: a set-but-unreadable
             # append_file is operator intent gone wrong — warn, don't guess.
@@ -288,7 +283,7 @@ def build_system_prompt_append(
 
             soul = load_soul_md()
             if soul:
-                blocks.append(soul)
+                blocks.append(("identity", soul))
         except Exception:  # pragma: no cover - never block session creation
             logger.debug("native SOUL.md load failed", exc_info=True)
 
@@ -305,7 +300,7 @@ def build_system_prompt_append(
         if model:
             session_line += f"\nModel: {model}"
         session_line += "\nProvider: claude-agent-sdk (Claude subscription)"
-        blocks.append(session_line)
+        blocks.append(("session metadata", session_line))
     except Exception:  # pragma: no cover - never block session creation
         logger.debug("session line composition failed", exc_info=True)
 
@@ -315,7 +310,7 @@ def build_system_prompt_append(
 
             hint = PLATFORM_HINTS.get(str(platform).lower().strip())
             if hint:
-                blocks.append(hint.strip())
+                blocks.append(("platform guidance", hint.strip()))
         except Exception:  # pragma: no cover
             logger.debug("platform hint lookup failed", exc_info=True)
 
@@ -390,7 +385,7 @@ def build_system_prompt_append(
         if part
     )
     if workspace_context:
-        blocks.append(workspace_context)
+        blocks.append(("workspace context", workspace_context))
 
     # Memory is gated by TWO predicates, mirroring the registration site
     # (hermes_tools_mcp_server._stateless_shim_defs): the store BLOCKS ride
@@ -420,18 +415,20 @@ def build_system_prompt_append(
             for target in ("user", "memory"):
                 block = store.format_for_system_prompt(target)
                 if block:
-                    blocks.append(block)
+                    label = "USER PROFILE" if target == "user" else "MEMORY"
+                    blocks.append((label, block))
         except Exception:
             logger.debug("memory block composition failed", exc_info=True)
     if memory_tool_exposed:
         try:
             from agent.prompt_builder import MEMORY_GUIDANCE
 
-            blocks.append(
+            blocks.append((
+                "memory guidance",
                 _strip_uncallable_tool_guidance(MEMORY_GUIDANCE)
                 + "\n"
-                + _MEMORY_TOOL_DISAMBIGUATION
-            )
+                + _MEMORY_TOOL_DISAMBIGUATION,
+            ))
         except Exception:  # pragma: no cover
             logger.debug("memory guidance unavailable", exc_info=True)
 
@@ -440,13 +437,16 @@ def build_system_prompt_append(
     try:
         from agent.prompt_builder import SESSION_SEARCH_GUIDANCE
 
-        blocks.append(SESSION_SEARCH_GUIDANCE + "\n" + _SEARCH_QUERY_ADDENDUM)
+        blocks.append((
+            "session-search guidance",
+            SESSION_SEARCH_GUIDANCE + "\n" + _SEARCH_QUERY_ADDENDUM,
+        ))
     except Exception:  # pragma: no cover
         logger.debug("session_search guidance unavailable", exc_info=True)
 
     # SDK-specific capability preference follows general memory/search guidance
     # and stays small enough that it cannot crowd out the skills index.
-    blocks.append(_MCP_INSPECTION_PREFERENCE)
+    blocks.append(("SDK inspection guidance", _MCP_INSPECTION_PREFERENCE))
 
     # Skills index for the read-side tools, filtered to the honest
     # MCP-exposed surface. `memory` joins only when the shim is actually
@@ -464,7 +464,7 @@ def build_system_prompt_append(
             available_tools=advertised,
         )
         if index:
-            blocks.append(_strip_uncallable_tool_guidance(index))
+            blocks.append(("skills index", _strip_uncallable_tool_guidance(index)))
     except Exception:  # pragma: no cover
         logger.debug("skills index composition failed", exc_info=True)
 
@@ -473,7 +473,7 @@ def build_system_prompt_append(
     out_parts: list[str] = []
     used = 0
     budget = _append_total_max_chars()
-    for block in blocks:
+    for label, block in blocks:
         block = block.strip()
         if not block:
             continue
@@ -487,7 +487,7 @@ def build_system_prompt_append(
             logger.warning(
                 "append budget: dropped block %r (%d chars; %d/%d used). "
                 "Raise agent.claude_agent_sdk.append_total_max_chars to keep it.",
-                _block_label(block), len(block), used, budget,
+                label, len(block), used, budget,
             )
             continue
         out_parts.append(block)
