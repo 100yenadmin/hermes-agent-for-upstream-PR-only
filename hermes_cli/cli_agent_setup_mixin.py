@@ -219,6 +219,14 @@ class CLIAgentSetupMixin:
             return False
         if not isinstance(runtime, dict):
             return False
+        # External agent loops own their credential discovery and transport.
+        # Their resolved runtime intentionally has no HTTP base URL, and some
+        # valid credentials (for example a macOS Keychain-only Claude login)
+        # cannot be inspected structurally from Hermes.  Reaching this mode
+        # through the resolver is therefore the readiness boundary, matching
+        # _ensure_runtime_credentials() below.
+        if runtime.get("api_mode") in EXTERNAL_AGENT_LOOP_API_MODES:
+            return True
         api_key = runtime.get("api_key")
         base_url = runtime.get("base_url")
         if callable(api_key) and not isinstance(api_key, str):
