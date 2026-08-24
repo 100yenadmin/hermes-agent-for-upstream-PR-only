@@ -206,14 +206,16 @@ def build_models_payload(
 
     if explicit_only:
         rows = _filter_explicit_provider_rows(rows, ctx)
-        # Desktop chat pickers request the explicit subset without the full
-        # unconfigured provider universe. If the configured current provider
-        # has lost its credential, list_authenticated_providers() omits it;
-        # keep that one row visible so the UI can show the saved selection and
-        # a re-auth affordance instead of appearing to jump to another provider.
-        rows = list(rows) + _append_unconfigured_rows(
-            rows, ctx, current_only=True
-        )
+    # If the configured current provider is missing from the rows, keep one
+    # visible row for it so pickers show the saved selection (and, where the
+    # provider is re-authenticatable, a re-auth affordance) instead of
+    # appearing to jump to another provider. This must run for every payload,
+    # not just the explicit-only desktop subset: self-authenticating runtimes
+    # (auth_type "oauth_external", e.g. claude-agent-sdk on a Keychain-only
+    # login) hold no Hermes-inspectable credential by design, so
+    # list_authenticated_providers() omits them and the interactive TUI picker
+    # otherwise hides the very provider that is actively serving turns.
+    rows = list(rows) + _append_unconfigured_rows(rows, ctx, current_only=True)
 
     # --- Deduplicate: remove models from aggregators that overlap with
     # user-defined providers.  When a local proxy (e.g. litellm-proxy)
