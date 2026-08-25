@@ -216,3 +216,72 @@ class TestMain:
         monkeypatch.setattr(m, "_build_server", lambda: CrashingServer())
         rc = m.main([])
         assert rc == 1
+
+
+class TestMcpMajorFallback:
+    """`_build_server` works on both mcp majors (#65982).
+
+    `claude-agent-sdk<0.2.140` pins `mcp<2`, whose server class is
+    `mcp.server.FastMCP`; mcp 2.x renamed it `MCPServer`. The construction /
+    `add_tool` / `tool` call sites are signature-identical, so the wrapper
+    must fall back to `FastMCP` instead of dying at import and leaving the
+    SDK session with no `hermes-tools` server. The fakes below are injected
+    through ``sys.modules`` so neither mcp major needs to be installed.
+    """
+
+    class _FakeServer:
+        def __init__(self, name, instructions=None, **_kw):
+            self.name = name
+            self.instructions = instructions
+            self.registered: list[str] = []
+
+        def add_tool(self, fn, name=None, description=None, **_kw):
+            self.registered.append(name or fn.__name__)
+            return fn
+
+        def tool(self, name=None, description=None, **_kw):
+            def _decorate(fn):
+                self.registered.append(name or fn.__name__)
+                return fn
+
+            return _decorate
+
+    def _install_fake_mcp(self, monkeypatch, *, export: str):
+        import sys
+        import types
+
+        mcp_pkg = types.ModuleType("mcp")
+        server_mod = types.ModuleType("mcp.server")
+        setattr(server_mod, export, self._FakeServer)
+        mcp_pkg.server = server_mod  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "mcp", mcp_pkg)
+        monkeypatch.setitem(sys.modules, "mcp.server", server_mod)
+
+    def test_builds_on_mcp_1x_fastmcp(self, monkeypatch):
+        import agent.transports.hermes_tools_mcp_server as m
+
+        self._install_fake_mcp(monkeypatch, export="FastMCP")
+        server = m._build_server("claude-agent-sdk")
+
+        assert isinstance(server, self._FakeServer)
+        assert server.name == "hermes-tools"
+        assert "read_file" in server.registered
+        assert "search_files" in server.registered
+
+    def test_builds_on_mcp_2x_mcpserver(self, monkeypatch):
+        import agent.transports.hermes_tools_mcp_server as m
+
+        self._install_fake_mcp(monkeypatch, export="MCPServer")
+        server = m._build_server("claude-agent-sdk")
+
+        assert isinstance(server, self._FakeServer)
+        assert "read_file" in server.registered
+
+    def test_import_error_when_neither_export_exists(self, monkeypatch):
+        import pytest
+
+        import agent.transports.hermes_tools_mcp_server as m
+
+        self._install_fake_mcp(monkeypatch, export="SomethingElse")
+        with pytest.raises(ImportError, match="requires the 'mcp' package"):
+            m._build_server("claude-agent-sdk")

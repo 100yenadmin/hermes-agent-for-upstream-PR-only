@@ -430,10 +430,18 @@ def _build_server(profile: Optional[str] = None) -> Any:
         # mcp 2.0 removed `mcp.server.fastmcp`; `mcp.server.MCPServer` is the
         # same decorator/add_tool surface under the new name.
         from mcp.server import MCPServer
-    except ImportError as exc:  # pragma: no cover - install hint
-        raise ImportError(
-            f"hermes-tools MCP server requires the 'mcp' package: {exc}"
-        ) from exc
+    except ImportError:
+        # mcp 1.x (what `claude-agent-sdk<0.2.140` pins) exports the same
+        # surface as `FastMCP`: the `MCPServer(name, instructions=)`,
+        # `add_tool`, `tool` and `run` call sites below are signature-identical
+        # on both majors, so an install that resolved the older SDK still gets
+        # a working stdio server instead of a dead wrapper. (#65982)
+        try:
+            from mcp.server import FastMCP as MCPServer
+        except ImportError as exc:  # pragma: no cover - install hint
+            raise ImportError(
+                f"hermes-tools MCP server requires the 'mcp' package: {exc}"
+            ) from exc
 
     # Discover Hermes tools so dispatch works.
     from model_tools import (
