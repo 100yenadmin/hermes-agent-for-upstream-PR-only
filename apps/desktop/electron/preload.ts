@@ -8,6 +8,8 @@ import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron'
 // "Desktop IPC bridge is unavailable"). No reply means no glass, which degrades
 // to an ordinary opaque window rather than a page thinned over nothing.
 const translucencySupport = ipcRenderer.sendSync('hermes:translucency:support')
+const hudWindowing = ipcRenderer.sendSync('hermes:hud:windowing')
+const hudNativeDrag = hudWindowing?.nativeDrag === true
 
 contextBridge.exposeInMainWorld('hermesDesktop', {
   glassSupported: translucencySupport?.glass === true,
@@ -70,12 +72,24 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   // sized as a floating bar, so it mounts the real composer. Main owns the
   // window; `onChanged` keeps every window's toggle truthful.
   hud: {
+    nativeDrag: hudNativeDrag,
+    windowing: {
+      clientPlacement: hudWindowing?.clientPlacement !== false,
+      controlDrag: hudWindowing?.controlDrag === true,
+      nativeDrag: hudNativeDrag,
+      workspaceTransfer: hudWindowing?.workspaceTransfer === true
+    },
     open: request => ipcRenderer.invoke('hermes:hud:open', request),
     close: () => ipcRenderer.invoke('hermes:hud:close'),
     setIgnoreMouse: ignore => ipcRenderer.send('hermes:hud:ignore-mouse', ignore),
     moveBy: delta => ipcRenderer.send('hermes:hud:move-by', delta),
+    setWorkspaceTransfer: transferring => ipcRenderer.send('hermes:hud:workspace-transfer', transferring),
     setBounds: bounds => ipcRenderer.send('hermes:hud:set-bounds', bounds),
-    setVibrancy: on => ipcRenderer.invoke('hermes:hud:vibrancy', on),
+    resetLayout: () => ipcRenderer.invoke('hermes:hud:reset-layout'),
+    // Whether the band covers the window below the bar. Main pairs it with the
+    // user's translucency setting to decide the native frost (macOS vibrancy /
+    // Windows 11 DWM backdrop) — see hudFrostFor.
+    setFrost: showing => ipcRenderer.invoke('hermes:hud:frost', showing),
     // The HUD tells main which session it is on; main hands that back to the
     // app window when the HUD closes, so the app can re-home onto it.
     setSession: sessionId => ipcRenderer.send('hermes:hud:session', sessionId),
@@ -100,6 +114,15 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
       ipcRenderer.on('hermes:hud:cursor', listener)
 
       return () => ipcRenderer.removeListener('hermes:hud:cursor', listener)
+    },
+    // Main's game-overlay watch: whether a fullscreen app (a game) is under
+    // the HUD, so the renderer can step back to the low-opacity overlay
+    // treatment while one owns the screen.
+    onGameOverlay: callback => {
+      const listener = (_event, state) => callback(state)
+      ipcRenderer.on('hermes:hud:game-overlay', listener)
+
+      return () => ipcRenderer.removeListener('hermes:hud:game-overlay', listener)
     }
   },
   // Quick Entry: the global-hotkey mini composer window. Main owns the OS
@@ -152,7 +175,8 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     setLastUsed: id => ipcRenderer.invoke('hermes:connections:set-last-used', id),
     test: id => ipcRenderer.invoke('hermes:connections:test', id),
     // Fan out `hermes update` to every eligible registered connection.
-    updateAll: () => ipcRenderer.invoke('hermes:connections:update-all'),
+    // Optional excludeIds skips rows the caller updates through another path.
+    updateAll: options => ipcRenderer.invoke('hermes:connections:update-all', options),
     // Registry lifecycle push (main → renderer): a connection was removed or
     // materially edited, so secondaries scoped to it must be disposed (and,
     // for edits, re-dialed at the new target).
@@ -192,6 +216,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     set: maxMb => ipcRenderer.invoke('hermes:data-url-read-max:set', maxMb)
   },
   readFileText: filePath => ipcRenderer.invoke('hermes:readFileText', filePath),
+  readPluginSource: (filePath: string) => ipcRenderer.invoke('hermes:readPluginSource', filePath),
   selectPaths: options => ipcRenderer.invoke('hermes:selectPaths', options),
   selectSavePath: options => ipcRenderer.invoke('hermes:selectSavePath', options),
   writeClipboard: text => ipcRenderer.invoke('hermes:writeClipboard', text),
@@ -232,6 +257,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   openPreviewInBrowser: url => ipcRenderer.invoke('hermes:openPreviewInBrowser', url),
   reachPreviewUrl: url => ipcRenderer.invoke('hermes:preview:reach', url),
   fetchLinkTitle: url => ipcRenderer.invoke('hermes:fetchLinkTitle', url),
+  resolveFavicon: url => ipcRenderer.invoke('hermes:resolveFavicon', url),
   sanitizeWorkspaceCwd: cwd => ipcRenderer.invoke('hermes:workspace:sanitize', cwd),
   settings: {
     getDefaultProjectDir: () => ipcRenderer.invoke('hermes:setting:defaultProjectDir:get'),
@@ -264,6 +290,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   revealPath: targetPath => ipcRenderer.invoke('hermes:fs:reveal', targetPath),
   openDir: dirPath => ipcRenderer.invoke('hermes:fs:openDir', dirPath),
   desktopPluginsRoot: () => ipcRenderer.invoke('hermes:fs:desktopPluginsRoot'),
+  logsRoot: () => ipcRenderer.invoke('hermes:fs:logsRoot'),
   agentPluginsRoot: () => ipcRenderer.invoke('hermes:fs:agentPluginsRoot'),
   renamePath: (targetPath, newName) => ipcRenderer.invoke('hermes:fs:rename', targetPath, newName),
   writeTextFile: (filePath, content) => ipcRenderer.invoke('hermes:fs:writeText', filePath, content),
