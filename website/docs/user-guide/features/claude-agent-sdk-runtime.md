@@ -32,6 +32,8 @@ The Python package is an opt-in extra that lazy-installs at first use, or explic
 pip install 'hermes-agent[claude-agent-sdk]'
 ```
 
+The extra pins `claude-agent-sdk>=0.2.140` together with `mcp` 2.x, so it installs alongside `[mcp]`, `[dev]` and `[all]` on one `mcp` major. (Earlier SDK releases pinned `mcp<2` and could not share a venv with the `hermes-tools` stdio server.)
+
 ### Authentication-policy boundary
 
 Anthropic's current [authentication and credential-use policy](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use) and [Agent SDK overview](https://code.claude.com/docs/en/agent-sdk/overview#get-started) direct third-party products and services to API-key authentication unless previously approved, and prohibit offering Claude.ai login or routing subscription credentials on users' behalf.
@@ -71,6 +73,8 @@ All keys live under `agent.claude_agent_sdk` in `config.yaml` (see `cli-config.y
 ### Permission posture, honestly
 
 The default mapping (`HERMES_TERMINAL_SECURITY_MODE=auto`) selects the SDK's `default` mode and installs Hermes' approval callback. The fixed bounded `mcp__hermes-tools__read_file` and `search_files` identities bypass the approval round-trip because their handlers retain Hermes' protected-path checks; shell and mutation tools still require normal approval. Operators can explicitly select another SDK mode, including `acceptEdits`, through `permission_mode`.
+
+Headless runs (`hermes chat -q`, cron) have no approver to answer that round-trip: only `read_file` and `search_files` are exempt, so any other `hermes-tools` call — `session_search` included — waits for an approval that never arrives and times out. Allow-list what a headless job needs, or keep it to the exempt inspection tools.
 
 Ambient Claude settings are isolated: the runtime pins the SDK's `setting_sources` to the empty list, so `~/.claude/settings.json` and project `.claude/settings*.json` cannot re-permission tools or add hooks underneath the configured posture. (This also means `CLAUDE.md` files are not loaded — this runtime composes its own system-prompt append from Hermes' memory, skills index, and your `append_file`.)
 

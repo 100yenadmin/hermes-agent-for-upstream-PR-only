@@ -29,6 +29,11 @@ Two modules matter:
 
 All keys live under `agent.claude_agent_sdk` in `config.yaml`.
 
+Dependency floor: the `[claude-agent-sdk]` extra pins `claude-agent-sdk>=0.2.140` — the first release
+whose `mcp` range admits 2.x — together with the same `mcp==2.0.0` the `[mcp]` extra pins, so the
+`hermes-tools` stdio server (`mcp.server.MCPServer`) and the SDK share one `mcp` major in every extra
+combination. The stdio server also falls back to mcp 1.x's `FastMCP` so an older resolution still starts.
+
 | Key | Type | Default | Effect |
 |---|---|---|---|
 | `streaming` | bool | off | Stream partial output rather than delivering at turn end. |
