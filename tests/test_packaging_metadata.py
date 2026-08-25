@@ -378,3 +378,45 @@ def test_security_pins_present_in_mirrored_lazy_features():
         "pyproject extras — the lazy install path would not enforce the "
         "CVE-patched floor:\n  " + "\n  ".join(problems)
     )
+
+
+# ---------------------------------------------------------------------------
+# Transitive-pin consistency: the locked `mcp` must satisfy what the locked
+# `claude-agent-sdk` itself requires.
+#
+# The direct-pin checks above compare `name==version` strings across extras
+# and cannot see a TRANSITIVE contradiction: `claude-agent-sdk` declares its
+# own `mcp` range, and a lock that pins `mcp` outside that range is
+# unreproducible (`uv lock` refuses to regenerate it) while `uv lock --check`
+# still passes because nothing re-resolves. That is exactly how the
+# `[claude-agent-sdk]` extra shipped with an SDK that pinned `mcp<2` next to
+# the `mcp==2.0.0` the stdio server needs (#65982). The SDK's requirement is
+# read from the installed distribution, so this test is hermetic and skips
+# where the extra is not installed.
+# ---------------------------------------------------------------------------
+
+
+def test_locked_mcp_satisfies_claude_agent_sdk_requirement():
+    from importlib import metadata
+
+    try:
+        requires = metadata.requires("claude-agent-sdk") or []
+    except metadata.PackageNotFoundError:
+        pytest.skip("claude-agent-sdk extra is not installed in this environment")
+
+    from packaging.requirements import Requirement
+
+    mcp_req = next(
+        (Requirement(r) for r in requires if Requirement(r).name.lower() == "mcp"),
+        None,
+    )
+    assert mcp_req is not None, "claude-agent-sdk no longer declares an mcp requirement"
+
+    locked = _locked_versions("mcp")
+    assert len(locked) == 1, f"uv.lock must pin exactly one mcp, found {sorted(locked)}"
+    locked_version = next(iter(locked))
+    assert mcp_req.specifier.contains(locked_version, prereleases=True), (
+        f"uv.lock pins mcp=={locked_version} but the locked claude-agent-sdk "
+        f"requires mcp{mcp_req.specifier} — the lock is unreproducible; bump the "
+        f"claude-agent-sdk pin (>=0.2.140 accepts mcp 2.x) and run `uv lock`."
+    )
