@@ -420,3 +420,32 @@ def test_locked_mcp_satisfies_claude_agent_sdk_requirement():
         f"requires mcp{mcp_req.specifier} — the lock is unreproducible; bump the "
         f"claude-agent-sdk pin (>=0.2.140 accepts mcp 2.x) and run `uv lock`."
     )
+
+
+def test_claude_agent_sdk_pin_accepts_the_mcp_major_the_extra_pins():
+    """Hermetic floor for the transitive check above.
+
+    CI does not install the `[claude-agent-sdk]` extra, so the
+    importlib-based test skips there. Encode the fact that makes the extra
+    resolvable at all: `claude-agent-sdk` first admitted `mcp` 2.x in
+    0.2.140 (`mcp>=1.23.0,<3.0.0`; 0.2.120–0.2.139 pinned `mcp<2`). If the
+    extra pins an `mcp` 2.x alongside an SDK older than that floor, `uv
+    lock` cannot resolve it and `pip install '.[claude-agent-sdk]'` breaks
+    the hermes-tools stdio server (#65982).
+    """
+    from packaging.version import Version
+
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    extra = data["project"]["optional-dependencies"]["claude-agent-sdk"]
+    pins = _pins_from_specs(extra)
+    sdk = pins.get(_canonical("claude-agent-sdk"))
+    mcp = pins.get(_canonical("mcp"))
+    assert sdk and len(sdk) == 1, "claude-agent-sdk must be exact-pinned in its extra"
+    assert mcp and len(mcp) == 1, "the claude-agent-sdk extra must exact-pin mcp"
+    sdk_version = Version(next(iter(sdk)))
+    mcp_version = Version(next(iter(mcp)))
+    if mcp_version.major >= 2:
+        assert sdk_version >= Version("0.2.140"), (
+            f"claude-agent-sdk=={sdk_version} pins mcp<2, but the extra pins "
+            f"mcp=={mcp_version}; the first SDK admitting mcp 2.x is 0.2.140."
+        )
