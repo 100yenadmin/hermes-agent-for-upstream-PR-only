@@ -3058,6 +3058,9 @@ def is_trusted_sdk_gateway_approval_callback(callback: object) -> bool:
         _trusted_sdk_gateway_approval_callbacks[:] = live_refs
         return trusted
 
+_MAX_SDK_APPROVAL_CONTEXT_FIELDS = 8
+
+
 def build_sdk_gateway_approval_callback(context_provider=None):
     """Approval callback for external agent-loop runtimes (claude-agent-sdk)
     running under the gateway: bridges the SDK's per-tool permission request
@@ -3171,7 +3174,12 @@ def build_sdk_gateway_approval_callback(context_provider=None):
         elif context_provider is not None:
             try:
                 ctx = context_provider()
-                if type(ctx) is not dict or set(ctx) != {"gateway", "session_key"}:
+                if (
+                    type(ctx) is not dict
+                    or len(ctx) > _MAX_SDK_APPROVAL_CONTEXT_FIELDS
+                    or "gateway" not in ctx
+                    or "session_key" not in ctx
+                ):
                     raise TypeError("malformed SDK approval context")
                 session_key = ctx["session_key"]
                 gateway = ctx["gateway"]

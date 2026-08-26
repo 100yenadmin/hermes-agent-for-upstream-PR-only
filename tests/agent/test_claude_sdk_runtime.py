@@ -4319,6 +4319,7 @@ class TestGatewayApprovalBridge:
                 selected_calls.append((command, description, allow_permanent))
                 return "once"
         elif surface == "acp":
+            pytest.importorskip("acp")
             from acp_adapter.permissions import make_approval_callback
 
             async def request_permission(**_kwargs):
@@ -4793,6 +4794,66 @@ class TestGatewayApprovalBridge:
             assert seen[0]["command"] == "Bash(command=uname)"
         finally:
             approval_mod.unregister_gateway_notify(sk)
+
+    def test_context_provider_allows_bounded_additive_fields(self, monkeypatch):
+        """Internal context evolution must not disable an otherwise valid approver."""
+        from tools import approval as approval_mod
+
+        sk = "sess-additive-context"
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+        callback = approval_mod.build_sdk_gateway_approval_callback(
+            context_provider=lambda: {
+                "gateway": True,
+                "session_key": sk,
+                "turn_kind": "interactive",
+            },
+        )
+        notify, seen = self._resolve_with(approval_mod, sk, "once")
+        approval_mod.register_gateway_notify(sk, notify)
+        try:
+            out = {}
+            thread = threading.Thread(
+                target=lambda: out.update(result=self._call_gateway(callback, "uname"))
+            )
+            thread.start()
+            thread.join(timeout=10)
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+
+        assert out.get("result") == "once"
+        assert [item["command"] for item in seen] == ["Bash(command=uname)"]
+
+    def test_context_provider_rejects_oversized_additive_state(
+        self, monkeypatch, caplog,
+    ):
+        """Additive compatibility remains bounded and payload-safe."""
+        from tools import approval as approval_mod
+
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+        marker = "OVERSIZED_CONTEXT_SECRET"
+        provided = {"gateway": True, "session_key": "sess-oversized-context"}
+        provided.update({f"extra_{index}": marker for index in range(7)})
+        callback = approval_mod.build_sdk_gateway_approval_callback(
+            context_provider=lambda: provided,
+        )
+        notify, seen = self._resolve_with(
+            approval_mod, provided["session_key"], "once"
+        )
+        approval_mod.register_gateway_notify(provided["session_key"], notify)
+        try:
+            with caplog.at_level(logging.DEBUG, logger="tools.approval"):
+                result = self._call_gateway(callback, "uname")
+        finally:
+            approval_mod.unregister_gateway_notify(provided["session_key"])
+
+        assert result == {
+            "choice": "deny",
+            "reason": "no approver available (background context)",
+        }
+        assert seen == []
+        assert marker not in caplog.text
 
     def test_silent_denies_logged_with_tool_and_reason(
         self, monkeypatch, caplog,
