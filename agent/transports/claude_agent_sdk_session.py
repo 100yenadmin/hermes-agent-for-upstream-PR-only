@@ -25,13 +25,16 @@ client keeps stable loop affinity and ``run_turn`` stays blocking.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import os
 import re
 import sys
 import threading
 import time
 import traceback
+import unicodedata
 from typing import Any, Callable, Optional
 
 # TurnResult is the shared contract with the runtime glue — reused verbatim
@@ -44,6 +47,418 @@ from agent.transports.claude_sdk_event_projector import ClaudeSdkEventProjector
 logger = logging.getLogger(__name__)
 
 
+# SDK permission payloads are hostile Python objects.  Nothing derived from
+# them may reach an auto-allow, callback, log, observer, or card until the
+# complete request has crossed this exact-builtin, bounded JSON boundary.
+_SDK_CANONICAL_MAX_DEPTH = 64
+_SDK_CANONICAL_MAX_NODES = 10_000
+_SDK_CANONICAL_MAX_UTF8_BYTES = 64 * 1024
+_SDK_CANONICAL_MAX_INPUT_UTF8_BYTES = 64 * 1024
+_SDK_TOOL_USE_ID_MAX_UTF8_BYTES = 256
+_SDK_PRESENTATION_MAX_UTF8_BYTES = 512
+_SDK_CALLBACK_CHOICE_MAX_UTF8_BYTES = 16
+_SDK_CALLBACK_REASON_MAX_UTF8_BYTES = 512
+
+_SDK_PATH_TOOL_FIELDS = {
+    "Read": ("file_path", "path"),
+    "Write": ("file_path", "path"),
+    "Edit": ("file_path", "path"),
+    "MultiEdit": ("file_path", "path"),
+    "Glob": ("path",),
+    "Grep": ("path",),
+    "NotebookEdit": ("notebook_path", "file_path", "path"),
+}
+_SDK_FIXED_LOG_TOOL_IDENTITIES = frozenset({"Bash", *_SDK_PATH_TOOL_FIELDS})
+
+
+def _control_sanitized_text(value: str) -> str:
+    safe = "".join(
+        " " if unicodedata.category(char).startswith("C") else char
+        for char in value
+    )
+    return " ".join(safe.split())
+
+
+def _bounded_control_sanitized_text(value: str, max_utf8_bytes: int) -> str:
+    """Return one bounded display line from an already validated string."""
+    safe = _control_sanitized_text(value)
+    output: list[str] = []
+    used = 0
+    for char in safe:
+        encoded_size = len(char.encode("utf-8"))
+        if used + encoded_size > max_utf8_bytes:
+            break
+        output.append(char)
+        used += encoded_size
+    return "".join(output)
+
+
+def _bounded_control_sanitized_head_tail(value: str, max_utf8_bytes: int) -> str:
+    """Bound one line while disclosing both ends and explicit truncation."""
+    safe = _control_sanitized_text(value)
+    if len(safe.encode("utf-8")) <= max_utf8_bytes:
+        return safe
+    marker = " … [truncated] … "
+    marker_bytes = len(marker.encode("utf-8"))
+    if marker_bytes > max_utf8_bytes:
+        return _bounded_control_sanitized_text(marker, max_utf8_bytes)
+    remaining = max_utf8_bytes - marker_bytes
+    head_budget = remaining // 2
+    tail_budget = remaining - head_budget
+    head = _bounded_control_sanitized_text(safe, head_budget)
+    tail_chars: list[str] = []
+    used = 0
+    for char in reversed(safe):
+        encoded_size = len(char.encode("utf-8"))
+        if used + encoded_size > tail_budget:
+            break
+        tail_chars.append(char)
+        used += encoded_size
+    return f"{head}{marker}{''.join(reversed(tail_chars))}"
+
+
+def _safe_sdk_tool_identity(value: str) -> str:
+    """Preserve ordinary identity, but hide embedded credential patterns."""
+    bounded = _bounded_control_sanitized_text(value, 96)
+    if not bounded:
+        return "unknown"
+    redacted = redact_sensitive_text(bounded, force=True)
+    if redacted != bounded:
+        return "unknown"
+    # Generic redaction intentionally requires token boundaries. Unknown SDK
+    # tool identities may attach a credential prefix directly to punctuation
+    # (for example ``Odd-sk-...``), so expose every bounded suffix behind a
+    # boundary in one composite probe. Do not attempt to reconstruct a partly
+    # secret identity: any match collapses to one fixed, non-sensitive label.
+    suffix_probe = "\n".join(bounded[index:] for index in range(len(bounded)))
+    if redact_sensitive_text(suffix_probe, force=True) != suffix_probe:
+        return "unknown"
+    return bounded
+
+
+_INVALID_SDK_JSON = object()
+
+
+def _sdk_json_string_sizes(
+    value: str,
+    input_budget: int = _SDK_CANONICAL_MAX_INPUT_UTF8_BYTES,
+) -> tuple[int, int] | None:
+    """Count input/token UTF-8 incrementally and stop at the first cap."""
+    input_size = 0
+    token_size = 2  # surrounding quotes
+    try:
+        for char in value:
+            encoded_size = len(char.encode("utf-8"))
+            input_size += encoded_size
+            if input_size > input_budget:
+                return None
+            codepoint = ord(char)
+            if char in ('"', "\\") or char in "\b\f\n\r\t":
+                token_size += 2
+            elif codepoint < 0x20:
+                token_size += 6
+            else:
+                token_size += encoded_size
+            if token_size > _SDK_CANONICAL_MAX_UTF8_BYTES:
+                return None
+    except UnicodeError:
+        return None
+    return input_size, token_size
+
+def _sdk_json_string_token_utf8_size(value: str) -> int | None:
+    """Return the canonical token size without materializing encoded copies."""
+    sizes = _sdk_json_string_sizes(value)
+    return None if sizes is None else sizes[1]
+
+
+def _sdk_json_int_token_fits(value: int) -> bool:
+    """Conservatively bound decimal conversion without converting the integer."""
+    # 30103 / 100000 is a strict upper approximation of log10(2).
+    digits_upper_bound = (value.bit_length() * 30_103) // 100_000 + 1
+    token_bytes = digits_upper_bound + (1 if value < 0 else 0)
+    return token_bytes <= _SDK_CANONICAL_MAX_UTF8_BYTES
+
+
+def _freeze_bounded_plain_sdk_json(value: object) -> object:
+    """Validate and detach one bounded exact-builtin JSON graph in one pass."""
+    active: set[int] = set()
+    nodes = 0
+    input_utf8_bytes = 0
+
+    def freeze(current: object, depth: int) -> object:
+        nonlocal nodes, input_utf8_bytes
+        nodes += 1
+        if nodes > _SDK_CANONICAL_MAX_NODES or depth > _SDK_CANONICAL_MAX_DEPTH:
+            return _INVALID_SDK_JSON
+
+        kind = type(current)
+        if kind is str:
+            remaining = _SDK_CANONICAL_MAX_INPUT_UTF8_BYTES - input_utf8_bytes
+            sizes = _sdk_json_string_sizes(current, remaining)
+            if sizes is None:
+                return _INVALID_SDK_JSON
+            input_utf8_bytes += sizes[0]
+            return current
+        if current is None or kind is bool:
+            return current
+        if kind is int:
+            return current if _sdk_json_int_token_fits(current) else _INVALID_SDK_JSON
+        if kind is float:
+            return current if math.isfinite(current) else _INVALID_SDK_JSON
+        if kind not in (list, dict):
+            return _INVALID_SDK_JSON
+
+        identity = id(current)
+        if identity in active:
+            return _INVALID_SDK_JSON
+        active.add(identity)
+        try:
+            if kind is list:
+                frozen_list = []
+                for child in current:
+                    frozen_child = freeze(child, depth + 1)
+                    if frozen_child is _INVALID_SDK_JSON:
+                        return _INVALID_SDK_JSON
+                    frozen_list.append(frozen_child)
+                return frozen_list
+
+            frozen_dict = {}
+            for key, child in current.items():
+                if type(key) is not str:
+                    return _INVALID_SDK_JSON
+                frozen_key = freeze(key, depth + 1)
+                if frozen_key is _INVALID_SDK_JSON:
+                    return _INVALID_SDK_JSON
+                frozen_child = freeze(child, depth + 1)
+                if frozen_child is _INVALID_SDK_JSON:
+                    return _INVALID_SDK_JSON
+                frozen_dict[frozen_key] = frozen_child
+            return frozen_dict
+        except (RuntimeError, ValueError, TypeError):
+            return _INVALID_SDK_JSON
+        finally:
+            active.discard(identity)
+
+    return freeze(value, 0)
+
+
+def _is_bounded_plain_sdk_json(value: object) -> bool:
+    return _freeze_bounded_plain_sdk_json(value) is not _INVALID_SDK_JSON
+
+
+def _bounded_canonical_sdk_json(value: object) -> str | None:
+    """Encode deterministic JSON incrementally and stop at the byte cap."""
+    encoder = json.JSONEncoder(
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    chunks: list[str] = []
+    used = 0
+    try:
+        for chunk in encoder.iterencode(value):
+            encoded_size = len(chunk.encode("utf-8"))
+            if used + encoded_size > _SDK_CANONICAL_MAX_UTF8_BYTES:
+                return None
+            chunks.append(chunk)
+            used += encoded_size
+    except (
+        TypeError, ValueError, RuntimeError, RecursionError, OverflowError,
+        UnicodeError,
+    ):
+        return None
+    return "".join(chunks)
+
+
+def _bounded_utf8_size(value: str, max_bytes: int) -> int | None:
+    """Count UTF-8 bytes incrementally, stopping when the cap is crossed."""
+    if len(value) > max_bytes:
+        return None
+    used = 0
+    for start in range(0, len(value), 4096):
+        used += len(value[start:start + 4096].encode("utf-8"))
+        if used > max_bytes:
+            return None
+    return used
+
+def validate_canonical_sdk_request_serialization(
+    value: object,
+) -> tuple[str, dict] | None:
+    """Validate exact deterministic JSON for one bounded SDK tool request."""
+    if type(value) is not str:
+        return None
+    try:
+        if _bounded_utf8_size(value, _SDK_CANONICAL_MAX_UTF8_BYTES) is None:
+            return None
+        request = json.loads(value)
+    except (TypeError, ValueError, RecursionError, OverflowError, UnicodeError):
+        return None
+    frozen = _freeze_bounded_plain_sdk_json(request)
+    if (
+        frozen is _INVALID_SDK_JSON
+        or type(frozen) is not dict
+        or set(frozen) != {"tool_name", "tool_input"}
+        or type(frozen["tool_name"]) is not str
+        or type(frozen["tool_input"]) is not dict
+        or (
+            frozen["tool_name"] == "Bash"
+            and type(frozen["tool_input"].get("command")) is not str
+        )
+    ):
+        return None
+    canonical = _bounded_canonical_sdk_json(frozen)
+    if canonical is None or value != canonical:
+        return None
+    return canonical, frozen
+
+
+def _canonical_sdk_tool_request(tool_name: object, tool_input: object) -> str | None:
+    if type(tool_name) is not str or type(tool_input) is not dict:
+        return None
+    try:
+        frozen = _freeze_bounded_plain_sdk_json({
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+        })
+        if (
+            frozen is _INVALID_SDK_JSON
+            or type(frozen) is not dict
+            or type(frozen.get("tool_input")) is not dict
+            or (
+                tool_name == "Bash"
+                and type(frozen["tool_input"].get("command")) is not str
+            )
+        ):
+            return None
+        canonical = _bounded_canonical_sdk_json(frozen)
+    except (
+        TypeError, ValueError, RuntimeError, RecursionError, OverflowError,
+        UnicodeError,
+    ):
+        return None
+    if canonical is None:
+        return None
+    checked = validate_canonical_sdk_request_serialization(canonical)
+    return checked[0] if checked is not None else None
+
+
+def _is_bounded_sdk_callback_string(
+    value: object,
+    max_utf8_bytes: int,
+    *,
+    allow_space: bool,
+) -> bool:
+    """Validate callback text incrementally without encoding a hostile copy."""
+    if type(value) is not str:
+        return False
+    used = 0
+    for char in value:
+        codepoint = ord(char)
+        if unicodedata.category(char).startswith("C"):
+            return False
+        if char.isspace() and (char != " " or not allow_space):
+            return False
+        if codepoint <= 0x7F:
+            used += 1
+        elif codepoint <= 0x7FF:
+            used += 2
+        elif codepoint <= 0xFFFF:
+            used += 3
+        else:
+            used += 4
+        if used > max_utf8_bytes:
+            return False
+    return True
+
+
+def _safe_sdk_tool_use_id(context: object) -> str:
+    try:
+        value = getattr(context, "tool_use_id", "")
+    except Exception:
+        return ""
+    if type(value) is not str or not value:
+        return ""
+    utf8_bytes = 0
+    for char in value:
+        code_point = ord(char)
+        if code_point <= 0x7F:
+            utf8_bytes += 1
+        elif code_point <= 0x7FF:
+            utf8_bytes += 2
+        elif 0xD800 <= code_point <= 0xDFFF:
+            return ""
+        elif code_point <= 0xFFFF:
+            utf8_bytes += 3
+        else:
+            utf8_bytes += 4
+        if utf8_bytes > _SDK_TOOL_USE_ID_MAX_UTF8_BYTES:
+            return ""
+        if not char.isprintable() or char.isspace():
+            return ""
+    return value
+
+
+_UNVALIDATED_SDK_REQUEST = object()
+
+
+def safe_sdk_tool_presentation_from_canonical(
+    canonical_request: object,
+    *,
+    _validated_request: object = _UNVALIDATED_SDK_REQUEST,
+) -> tuple[str, str] | None:
+    """Build a bounded actionable card summary from validated request fields."""
+    checked = _validated_request
+    if checked is _UNVALIDATED_SDK_REQUEST:
+        checked = validate_canonical_sdk_request_serialization(canonical_request)
+    if checked is None:
+        return None
+    request = checked[1]
+    tool_name = request["tool_name"]
+    tool_input = request["tool_input"]
+    safe_name = _safe_sdk_tool_identity(tool_name)
+    if tool_name == "Bash":
+        command = redact_sensitive_text(tool_input["command"], force=True)
+        preview = _bounded_control_sanitized_head_tail(command, 480)
+        return (
+            _bounded_control_sanitized_text(
+                f"Bash(command={preview})", _SDK_PRESENTATION_MAX_UTF8_BYTES,
+            ),
+            "Claude requests SDK tool Bash",
+        )
+    path_fields = _SDK_PATH_TOOL_FIELDS.get(tool_name)
+    if path_fields is not None:
+        path = next(
+            (tool_input[field] for field in path_fields if type(tool_input.get(field)) is str),
+            "(unspecified)",
+        )
+        safe_path = _bounded_control_sanitized_head_tail(
+            redact_sensitive_text(path, force=True), 460,
+        )
+        return (
+            _bounded_control_sanitized_text(
+                f"{safe_name}(path={safe_path})", _SDK_PRESENTATION_MAX_UTF8_BYTES,
+            ),
+            f"Claude requests SDK tool {safe_name}",
+        )
+    return f"SDK tool {safe_name}", "Claude requests an SDK tool"
+
+
+_SAFE_SDK_DENY_LOG_REASONS = frozenset({
+    "approval callback failed",
+    "approval timed out — no operator response",
+    "approval expired (turn ended)",
+    "no approver available (background context)",
+    "approval request could not be delivered to the operator (notify failed)",
+})
+
+
+def _safe_sdk_deny_log_reason(reason: object) -> str:
+    if type(reason) is str and reason in _SAFE_SDK_DENY_LOG_REASONS:
+        return reason
+    return "non-operator denial"
+
+
 # HERMES_TERMINAL_SECURITY_MODE → SDK permission_mode, read at session
 # construction (default "auto"). Precedence: explicit constructor arg, then
 # the agent.claude_agent_sdk.permission_mode config key (an SDK mode literal
@@ -52,8 +467,10 @@ logger = logging.getLogger(__name__)
 # SDK default posture is intentionally stricter than generic terminal `auto`:
 # `default` preserves Hermes' per-tool approval bridge. Mapping `auto` to
 # `acceptEdits` skips that bridge entirely, so even the fixed bounded MCP read
-# surface is denied/unguarded depending on CLI state. Explicit operator choices
-# retain their SDK literals below.
+# surface is denied/unguarded depending on CLI state. Hermes YOLO requests are
+# represented internally as ``bypassPermissions`` but normalized back to
+# ``default`` before SDK option construction; the audited callback performs the
+# bypass only after immutable floors.
 _HERMES_TO_SDK_PERMISSION_MODE = {
     "auto": "default",
     "approval-required": "default",
@@ -138,9 +555,11 @@ def _sdk_env_overrides(
 def _configured_permission_mode() -> Optional[str]:
     """agent.claude_agent_sdk.permission_mode from config.yaml, validated.
 
-    Takes an SDK permission_mode literal VERBATIM (one of
+    Takes a validated SDK permission-mode intent (one of
     _SDK_PERMISSION_MODES — note "auto" here is the SDK's own mode, NOT the
-    HERMES_TERMINAL_SECURITY_MODE value of the same name). Empty/absent —
+    HERMES_TERMINAL_SECURITY_MODE value of the same name). The literal
+    ``bypassPermissions`` intent is emitted as callback-capable ``default`` and
+    emulated inside Hermes after immutable approval floors. Empty/absent —
     the default — keeps current behavior: the HERMES_TERMINAL_SECURITY_MODE
     mapping stands, so existing deployments harden without env archaeology
     only when they opt in. Unknown values are ignored with a warning:
@@ -165,11 +584,9 @@ def _configured_permission_mode() -> Optional[str]:
 # claude-agent-sdk 0.2.120 SettingSource type).
 _SDK_SETTING_SOURCES = ("user", "project", "local")
 
-# These are the only two filesystem-capable tools exposed by the fixed
-# ``claude-agent-sdk`` Hermes MCP profile. Their handlers retain the native
-# file safety/read-block checks; an exact identity check avoids treating a
-# generic MCP prefix or a lookalike server/tool as trusted.
-_SDK_AUTO_ALLOWED_MCP_INSPECTION_TOOLS = frozenset({
+# Exact names only: these are the SDK profile's two bounded readers. Never
+# widen this to an MCP/server wildcard or an unexposed mutation identity.
+_SDK_AUTO_ALLOWED_MCP_TOOLS = frozenset({
     "mcp__hermes-tools__read_file",
     "mcp__hermes-tools__search_files",
 })
@@ -929,6 +1346,7 @@ class ClaudeAgentSdkSession:
         permission_mode: Optional[str] = None,
         system_prompt_append: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
+        approval_bypass_provider: Optional[Callable[[], bool]] = None,
         on_tool_started: Optional[Callable[[str, str, dict], None]] = None,
         max_budget_usd: Optional[float] = None,
         client_factory: Optional[Callable[..., Any]] = None,
@@ -951,7 +1369,7 @@ class ClaudeAgentSdkSession:
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._model = model
-        self._permission_mode = (
+        requested_permission_mode = (
             permission_mode
             or _configured_permission_mode()
             or _HERMES_TO_SDK_PERMISSION_MODE.get(
@@ -959,8 +1377,22 @@ class ClaudeAgentSdkSession:
                 "default",
             )
         )
+        self._sdk_approval_bypass_requested = (
+            requested_permission_mode == "bypassPermissions"
+        )
+        # The SDK auto-approves before can_use_tool in bypassPermissions mode.
+        # Keep Hermes in callback-capable mode and carry the bypass intent into
+        # this mandatory session wrapper, where canonical validation and
+        # immutable hardline/sudo/user-deny floors run before every selected
+        # gateway, CLI, ACP, plugin, or custom callback.
+        self._permission_mode = (
+            "default"
+            if self._sdk_approval_bypass_requested
+            else requested_permission_mode
+        )
         self._system_prompt_append = system_prompt_append
         self._approval_callback = approval_callback
+        self._approval_bypass_provider = approval_bypass_provider
         self._on_tool_started = on_tool_started
         self._on_compaction = on_compaction
         self._on_compact_boundary = on_compact_boundary
@@ -2360,12 +2792,13 @@ class ClaudeAgentSdkSession:
                 "append": self._system_prompt_append,
             }
 
-        can_use_tool = None
-        if (
-            self._approval_callback is not None
-            and self._permission_mode == "default"
-        ):
-            can_use_tool = self._make_can_use_tool()
+        # This wrapper is Hermes' mandatory permission-policy owner, including
+        # when runtime callback selection legitimately produced no downstream
+        # callback.  Callbackless non-bypass sessions intentionally fail closed
+        # here instead of falling through to SDK-native prompting/permission
+        # behavior; bounded readers and trusted bypass still resolve only after
+        # canonical validation, correlation validation, and immutable floors.
+        can_use_tool = self._make_can_use_tool()
 
         # Metered-vector scrub for the spawned CLI (see _METERED_ENV_DENYLIST).
         # agent.claude_agent_sdk.allow_metered_key: true is the operator's
@@ -2433,6 +2866,25 @@ class ClaudeAgentSdkSession:
 
         return ClaudeSDKClient(options=ClaudeAgentOptions(**fields))
 
+    def _sdk_approval_bypass_active(self) -> bool:
+        """Resolve only trusted session/process/config bypass intent."""
+        if self._sdk_approval_bypass_requested:
+            return True
+        provider = self._approval_bypass_provider
+        if provider is not None:
+            try:
+                return provider() is True
+            except Exception:
+                return False
+        try:
+            from tools.approval import is_approval_bypass_active_for_session
+
+            return is_approval_bypass_active_for_session(
+                self._hermes_session_id or "",
+            )
+        except Exception:
+            return False
+
     def _make_can_use_tool(self) -> Any:
         """Bridge SDK permission requests onto Hermes' approval callback.
         Fail-closed: any callback failure denies.
@@ -2492,32 +2944,84 @@ class ClaudeAgentSdkSession:
         PermissionResultAllow: Any,
         PermissionResultDeny: Any,
     ) -> Any:
-        if tool_name in _SDK_AUTO_ALLOWED_MCP_INSPECTION_TOOLS:
-            return PermissionResultAllow()
+        try:
+            canonical_tool_input = _canonical_sdk_tool_request(tool_name, tool_input)
+            checked_request = validate_canonical_sdk_request_serialization(
+                canonical_tool_input,
+            )
+            presentation = safe_sdk_tool_presentation_from_canonical(
+                canonical_tool_input,
+            )
+        except Exception:
+            checked_request = None
+            presentation = None
+        if checked_request is None or presentation is None:
+            return PermissionResultDeny(message="canonical request is unassessable")
+        frozen_tool_input = checked_request[1]["tool_input"]
+        # Validate correlation metadata before every policy decision. Legacy
+        # callbacks retain their exact ABI, but no floor or bypass decision can
+        # be made from callback markers or callback-controlled text.
+        safe_tool_use_id = _safe_sdk_tool_use_id(context)
+        callback_command, callback_description = presentation
+        log_tool_identity = (
+            tool_name if tool_name in _SDK_FIXED_LOG_TOOL_IDENTITIES else "sdk-tool"
+        )
+        # Native Read remains unavailable even if this callback is invoked
+        # directly despite the SDK disallowed_tools option.
+        if tool_name == "Read":
+            return PermissionResultDeny(message="native SDK Read is disallowed")
+        if tool_name == "Bash":
+            try:
+                from tools.approval import sdk_bash_immutable_floor_reason
+
+                floor_reason = sdk_bash_immutable_floor_reason(
+                    frozen_tool_input.get("command"),
+                )
+            except Exception:
+                floor_reason = "canonical request is unassessable"
+            if floor_reason is not None:
+                return PermissionResultDeny(message="approval denied by callback")
+        if tool_name in _SDK_AUTO_ALLOWED_MCP_TOOLS:
+            return PermissionResultAllow(updated_input=frozen_tool_input)
+        if self._sdk_approval_bypass_active():
+            return PermissionResultAllow(updated_input=frozen_tool_input)
+        if approval_callback is None:
+            logger.info(
+                "claude-agent-sdk: silent deny (no operator choice): "
+                "tool=%s reason=%s",
+                log_tool_identity, "approval callback unavailable",
+            )
+            return PermissionResultDeny(message="approval callback unavailable")
         try:
             kwargs: dict = {"allow_permanent": False}
-            # tool_use_id correlation (P2.a): the SDK guarantees a
-            # non-empty context.tool_use_id — thread it through so a
-            # button tap resolves THIS prompt, not queue[0]. Opt-in via
-            # marker attribute: the CLI thread-local callback keeps its
-            # exact signature (same additive philosophy as the widened
-            # return channel).
-            if getattr(approval_callback, "_accepts_tool_use_id", False):
-                kwargs["tool_use_id"] = (
-                    getattr(context, "tool_use_id", "") or ""
+            try:
+                from tools.approval import (
+                    is_trusted_sdk_gateway_approval_callback,
                 )
+
+                trusted_gateway_callback = (
+                    is_trusted_sdk_gateway_approval_callback(approval_callback)
+                )
+            except Exception:
+                trusted_gateway_callback = False
+            # Correlation and canonical JSON are additive only for callbacks
+            # that explicitly advertise the corresponding SDK ABI extension.
+            if getattr(approval_callback, "_accepts_tool_use_id", False):
+                kwargs["tool_use_id"] = safe_tool_use_id
+            if getattr(approval_callback, "_accepts_canonical_tool_input", False):
+                kwargs["canonical_tool_input"] = canonical_tool_input
             result = await asyncio.to_thread(
                 approval_callback,
-                f"{tool_name}({_tool_preview(tool_name, tool_input)})",
-                f"Claude requests tool {tool_name}",
+                callback_command,
+                callback_description,
                 **kwargs,
             )
         except Exception:
-            logger.exception("approval_callback raised on SDK permission")
+            logger.warning("SDK approval callback failed at protected boundary")
             logger.info(
                 "claude-agent-sdk: silent deny (no operator choice): "
-                "tool=%s reason=%s session=%s",
-                tool_name, "approval callback failed", hermes_session_id,
+                "tool=%s reason=%s",
+                log_tool_identity, "approval callback failed",
             )
             return PermissionResultDeny(message="approval callback failed")
         # Widened callback contract: a plain choice string, or a dict
@@ -2525,24 +3029,92 @@ class ClaudeAgentSdkSession:
         # (no-approver / timeout / notify-failure / teardown-expiry).
         # "denied by user" is reserved for a real human deny — a
         # reason-bearing deny must never be attributed to the user.
-        reason = None
-        choice = result
-        if isinstance(result, dict):
-            reason = result.get("reason")
-            choice = result.get("choice")
-        if choice in ("once", "session", "always"):
-            return PermissionResultAllow()
-        if choice == "timeout" and not reason:
-            # The CLI thread-local callback surfaces its prompt timeout
-            # as a bare string; mapping it to the user-deny default
-            # would fabricate attribution for a prompt nobody answered.
-            reason = "approval timed out — no operator response"
-        message = reason or "denied by user"
-        if not message.startswith("denied by user"):
+        try:
+            reason = None
+            operator_denied = False
+            reason_shape = False
+            operator_denial_shape = False
+            choice = result
+            if type(result) is dict:
+                # The callback result is untrusted. Protocol dicts have exactly
+                # one of three tiny widths; reject all others before collecting,
+                # copying, hashing, or otherwise traversing callback keys:
+                # {choice}, {choice, reason}, or the trusted gateway-only
+                # {choice, operator_denial, reason} structural denial.
+                width = len(result)
+                if width == 1 and "choice" in result:
+                    choice = result["choice"]
+                elif width == 2 and "choice" in result and "reason" in result:
+                    choice = result["choice"]
+                    reason = result["reason"]
+                    reason_shape = True
+                elif (
+                    width == 3
+                    and "choice" in result
+                    and "operator_denial" in result
+                    and "reason" in result
+                ):
+                    choice = result["choice"]
+                    reason = result["reason"]
+                    reason_shape = True
+                    operator_denial_shape = True
+                else:
+                    raise ValueError("malformed callback result shape")
+            elif type(result) is not str:
+                raise TypeError("unsupported callback result")
+            if not _is_bounded_sdk_callback_string(
+                choice,
+                _SDK_CALLBACK_CHOICE_MAX_UTF8_BYTES,
+                allow_space=False,
+            ) or (
+                reason is not None
+                and not _is_bounded_sdk_callback_string(
+                    reason,
+                    _SDK_CALLBACK_REASON_MAX_UTF8_BYTES,
+                    allow_space=True,
+                )
+            ):
+                raise TypeError("malformed callback result")
+            if reason_shape and choice != "deny":
+                raise ValueError("reason is valid only for deny")
+            if operator_denial_shape:
+                operator_denied = (
+                    choice == "deny"
+                    and result["operator_denial"] is True
+                    and trusted_gateway_callback
+                )
+                if not operator_denied:
+                    raise ValueError("untrusted operator-denial result")
+            if choice not in {"once", "session", "always", "deny", "timeout"}:
+                raise ValueError("unknown callback choice")
+        except Exception:
+            logger.warning("SDK approval callback failed at protected boundary")
             logger.info(
                 "claude-agent-sdk: silent deny (no operator choice): "
-                "tool=%s reason=%s session=%s",
-                tool_name, message, hermes_session_id,
+                "tool=%s reason=%s",
+                log_tool_identity, "approval callback failed",
+            )
+            return PermissionResultDeny(message="approval callback failed")
+        if choice in ("once", "session", "always"):
+            return PermissionResultAllow(updated_input=frozen_tool_input)
+        if operator_denied:
+            message = "denied by user"
+            if reason:
+                message = f"{message}: {reason}"
+        elif choice == "timeout":
+            message = "approval timed out — no operator response"
+        else:
+            safe_reason = _safe_sdk_deny_log_reason(reason)
+            message = (
+                safe_reason
+                if safe_reason != "non-operator denial"
+                else "approval denied by callback"
+            )
+        if not operator_denied:
+            logger.info(
+                "claude-agent-sdk: silent deny (no operator choice): "
+                "tool=%s reason=%s",
+                log_tool_identity, _safe_sdk_deny_log_reason(message),
             )
         return PermissionResultDeny(message=message)
 

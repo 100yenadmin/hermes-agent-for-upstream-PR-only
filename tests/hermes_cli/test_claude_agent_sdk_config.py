@@ -9,8 +9,11 @@ real config options for default-driven config tooling.
 
 from __future__ import annotations
 
+import inspect
+
 
 from hermes_cli.config import DEFAULT_CONFIG
+from hermes_cli import config_defaults
 
 
 class TestClaudeAgentSdkDefaults:
@@ -66,6 +69,17 @@ class TestClaudeAgentSdkDefaults:
         # truthy is a behavior change and needs its own explicit pin here.
         for key, value in block.items():
             assert not value, f"default for {key!r} must be conservative/falsy"
+
+    def test_bypass_permissions_contract_documents_audited_emulation(self):
+        source = inspect.getsource(config_defaults)
+        permission_comment = source[
+            source.index("# SDK permission mode"):
+            source.index('"permission_mode": ""')
+        ]
+        assert "bypassPermissions" in permission_comment
+        assert "not forwarded verbatim" in permission_comment
+        assert "immutable" in permission_comment
+        assert "audited" in permission_comment
 
 
 class TestUserConfigMerge:

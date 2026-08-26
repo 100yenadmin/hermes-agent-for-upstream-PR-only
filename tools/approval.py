@@ -23,6 +23,7 @@ import threading
 import time
 import unicodedata
 import uuid
+import weakref
 from typing import Optional
 from hermes_cli.config import cfg_get
 
@@ -124,12 +125,10 @@ def _fire_approval_hook(hook_name: str, **kwargs) -> None:
     try:
         kwargs.setdefault("turn_id", _approval_turn_id.get())
         kwargs.setdefault("tool_call_id", _approval_tool_call_id.get())
-        # Forward the Hermes session id so observer plugins parent approval
-        # marks to the real session scope instead of a synthetic "default"
-        # session (whose scope never closes → marks never export).
-        _session_id = _approval_session_id.get()
-        if _session_id:
-            kwargs.setdefault("session_id", _session_id)
+        # Generic approval observers retain the bound Hermes session id.
+        session_id = _approval_session_id.get()
+        if session_id:
+            kwargs.setdefault("session_id", session_id)
         invoke_hook(hook_name, **kwargs)
     except Exception as exc:
         # invoke_hook() already swallows per-callback errors, so reaching here
@@ -145,6 +144,7 @@ def _prepare_smart_approval_observer(
     pattern_key: str,
     pattern_keys: list[str],
     session_key: str,
+    _fixed_failure_log: bool = False,
 ) -> dict | None:
     """Redact and emit the pre-decision smart approval observer hook.
 
@@ -152,37 +152,79 @@ def _prepare_smart_approval_observer(
     it fails, skip all observability rather than leaking raw data or preventing
     the auxiliary LLM from making its decision.
     """
-    try:
-        from agent.redact import redact_sensitive_text
+    from contextlib import nullcontext
 
-        hook_command = redact_sensitive_text(command, force=True)
-        hook_description = redact_sensitive_text(description, force=True)
-    except Exception as exc:
-        logger.debug("Smart approval hook redaction failed: %s", exc)
-        return
+    fixed_log = (
+        "SDK Smart pre-approval observer dispatch failed"
+        if _fixed_failure_log
+        else None
+    )
+    if fixed_log is not None:
+        from hermes_cli.lifecycle import observer_failure_log
 
-    payload = {
-        "command": hook_command,
-        "description": hook_description,
-        "pattern_key": pattern_key,
-        "pattern_keys": list(pattern_keys),
-        "session_key": session_key,
-        "surface": "smart",
-    }
-    _fire_approval_hook("pre_approval_request", **payload)
-    return payload
+        failure_scope = observer_failure_log(fixed_log)
+    else:
+        failure_scope = nullcontext()
+
+    with failure_scope:
+        try:
+            from agent.redact import redact_sensitive_text
+
+            hook_command = redact_sensitive_text(command, force=True)
+            hook_description = redact_sensitive_text(description, force=True)
+        except Exception as exc:
+            if fixed_log is not None:
+                logger.debug("%s", fixed_log)
+            else:
+                logger.debug("Smart approval hook redaction failed: %s", exc)
+            return
+
+        payload = {
+            "command": hook_command,
+            "description": hook_description,
+            "pattern_key": pattern_key,
+            "pattern_keys": list(pattern_keys),
+            "session_key": session_key,
+            "surface": "smart",
+        }
+        _fire_approval_hook(
+            "pre_approval_request",
+            _fixed_failure_log=fixed_log,
+            **payload,
+        )
+        return payload
 
 
-def _observe_smart_approval_verdict(payload: dict | None, verdict: str) -> None:
+def _observe_smart_approval_verdict(
+    payload: dict | None,
+    verdict: str,
+    *,
+    _fixed_failure_log: bool = False,
+) -> None:
     """Emit a smart verdict after the auxiliary LLM decision, if safe."""
     if payload is None or verdict not in {"approve", "deny"}:
         return
-    _fire_approval_hook(
-        "post_approval_response",
-        **payload,
-        choice=f"smart_{verdict}",
-        decided_by="aux_llm",
+    from contextlib import nullcontext
+
+    fixed_log = (
+        "SDK Smart post-approval observer dispatch failed"
+        if _fixed_failure_log
+        else None
     )
+    if fixed_log is not None:
+        from hermes_cli.lifecycle import observer_failure_log
+
+        failure_scope = observer_failure_log(fixed_log)
+    else:
+        failure_scope = nullcontext()
+    with failure_scope:
+        _fire_approval_hook(
+            "post_approval_response",
+            _fixed_failure_log=fixed_log,
+            **payload,
+            choice=f"smart_{verdict}",
+            decided_by="aux_llm",
+        )
 
 
 
@@ -2889,6 +2931,114 @@ def current_approval_turn_context() -> dict:
     }
 
 
+def _normalize_sdk_tool_use_id(value: object) -> str:
+    """Keep opted-in SDK correlation metadata exact, meaningful, and bounded."""
+    if type(value) is not str or not value:
+        return ""
+    utf8_bytes = 0
+    for char in value:
+        code_point = ord(char)
+        if code_point <= 0x7F:
+            utf8_bytes += 1
+        elif code_point <= 0x7FF:
+            utf8_bytes += 2
+        elif 0xD800 <= code_point <= 0xDFFF:
+            return ""
+        elif code_point <= 0xFFFF:
+            utf8_bytes += 3
+        else:
+            utf8_bytes += 4
+        if utf8_bytes > 256:
+            return ""
+        if not char.isprintable() or char.isspace():
+            return ""
+    return value
+
+
+def sdk_bash_immutable_floor_reason(command: object) -> str | None:
+    """Return a side-effect-free immutable SDK Bash denial, if any.
+
+    This is the single policy owner shared by the mandatory SDK session wrapper.
+    It performs no warning, tally, observer, queue, or card side effects.
+    """
+    if type(command) is not str:
+        return "canonical request is unassessable"
+    hardline, hardline_description = detect_hardline_command(command)
+    if hardline:
+        return (
+            f"BLOCKED (hardline): {hardline_description}. This SDK request is on "
+            "the unconditional blocklist and cannot be executed via the agent."
+        )
+    sudo_guess, sudo_description = _check_sudo_stdin_guard(command)
+    if sudo_guess:
+        return _sudo_stdin_block_result(sudo_description)["message"]
+    denied_by = _match_user_deny_rule(command)
+    if denied_by is not None:
+        return _user_deny_block_result(denied_by)["message"]
+    return None
+
+
+_trusted_sdk_gateway_approval_callbacks: list[weakref.ReferenceType] = []
+
+
+def _discard_dead_trusted_sdk_gateway_approval_callback(
+    dead_ref: weakref.ReferenceType,
+) -> None:
+    """Remove a finalized callback without invoking referent equality or hashing."""
+    with _lock:
+        _trusted_sdk_gateway_approval_callbacks[:] = [
+            callback_ref
+            for callback_ref in _trusted_sdk_gateway_approval_callbacks
+            if callback_ref is not dead_ref and callback_ref() is not None
+        ]
+
+
+def _register_trusted_sdk_gateway_approval_callback(callback: object) -> bool:
+    """Register a weakly representable callable by exact object identity."""
+    if callback is None or not callable(callback):
+        return False
+    try:
+        callback_ref = weakref.ref(
+            callback,
+            _discard_dead_trusted_sdk_gateway_approval_callback,
+        )
+    except TypeError:
+        # Trust must not require a strong reference or an equality/hash keyed
+        # fallback. The production gateway closure is weak-referenceable.
+        return False
+    with _lock:
+        live_refs = []
+        already_registered = False
+        for registered_ref in _trusted_sdk_gateway_approval_callbacks:
+            registered_callback = registered_ref()
+            if registered_callback is None:
+                continue
+            live_refs.append(registered_ref)
+            if registered_callback is callback:
+                already_registered = True
+        if not already_registered:
+            live_refs.append(callback_ref)
+        _trusted_sdk_gateway_approval_callbacks[:] = live_refs
+    return True
+
+
+def is_trusted_sdk_gateway_approval_callback(callback: object) -> bool:
+    """Return whether the exact callback object was built by the SDK bridge."""
+    if callback is None or not callable(callback):
+        return False
+    with _lock:
+        live_refs = []
+        trusted = False
+        for callback_ref in _trusted_sdk_gateway_approval_callbacks:
+            registered_callback = callback_ref()
+            if registered_callback is None:
+                continue
+            live_refs.append(callback_ref)
+            if registered_callback is callback:
+                trusted = True
+        _trusted_sdk_gateway_approval_callbacks[:] = live_refs
+        return trusted
+
 def build_sdk_gateway_approval_callback(context_provider=None):
     """Approval callback for external agent-loop runtimes (claude-agent-sdk)
     running under the gateway: bridges the SDK's per-tool permission request
@@ -2954,7 +3104,8 @@ def build_sdk_gateway_approval_callback(context_provider=None):
 
     def _sdk_gateway_approval(command: str, description: str, *,
                               allow_permanent: bool = False,
-                              tool_use_id: str = ""):
+                              tool_use_id: str = "",
+                              canonical_tool_input: str | None = None):
         # Widened return channel (plan-of-record): a plain choice string
         # ("once"/"deny") for the classic outcomes, or a dict
         # {"choice": str, "reason": str} when the deny needs an HONEST
@@ -2964,6 +3115,31 @@ def build_sdk_gateway_approval_callback(context_provider=None):
         # reason (the model used to hear "denied by user" for prompts no
         # user ever saw — 2026-08-06 incident).
         #
+        # Validate the SDK-owned canonical serialization before context
+        # providers, logs, queue/card state, or any approval extension. The
+        # positional presentation arguments remain ABI-only and are untrusted.
+        try:
+            from agent.transports.claude_agent_sdk_session import (
+                safe_sdk_tool_presentation_from_canonical,
+                validate_canonical_sdk_request_serialization,
+            )
+
+            canonical_request = validate_canonical_sdk_request_serialization(
+                canonical_tool_input,
+            )
+            safe_presentation = safe_sdk_tool_presentation_from_canonical(
+                canonical_tool_input,
+                _validated_request=canonical_request,
+            )
+        except Exception:
+            canonical_request = None
+            safe_presentation = None
+        if canonical_request is None or safe_presentation is None:
+            return {"choice": "deny", "reason": "canonical request is unassessable"}
+        canonical_tool_input, request = canonical_request
+        safe_command, safe_description = safe_presentation
+        tool_name = request["tool_name"]
+
         # Per-call context resolution (P1.b). The discriminator is the LIVE
         # KEY, not the live gateway check: on a TUI SDK-thread call the
         # process-level HERMES_GATEWAY_SESSION env is visible while the key
@@ -2975,14 +3151,17 @@ def build_sdk_gateway_approval_callback(context_provider=None):
             gateway = _is_gateway_approval_context()
         elif context_provider is not None:
             try:
-                ctx = context_provider() or {}
+                ctx = context_provider()
+                if type(ctx) is not dict or set(ctx) != {"gateway", "session_key"}:
+                    raise TypeError("malformed SDK approval context")
+                session_key = ctx["session_key"]
+                gateway = ctx["gateway"]
+                if type(session_key) is not str or type(gateway) is not bool:
+                    raise TypeError("malformed SDK approval context fields")
             except Exception:
-                logger.debug(
-                    "SDK approval context_provider raised", exc_info=True,
-                )
-                ctx = {}
-            session_key = str(ctx.get("session_key") or "")
-            gateway = bool(ctx.get("gateway"))
+                logger.debug("SDK approval context_provider failed at protected boundary")
+                session_key = ""
+                gateway = False
         else:
             session_key = _build_key
             gateway = _build_gateway
@@ -3001,20 +3180,46 @@ def build_sdk_gateway_approval_callback(context_provider=None):
             # registration, or gateway tearing down): fail closed, but say
             # so honestly — never attribute this deny to the user.
             logger.warning(
-                "SDK approval request has NO approver available "
-                "(background context): tool=%s session=%s — denying "
-                "without user attribution",
-                command, session_key,
+                "SDK approval request has no approver available; denying "
+                "without user attribution"
             )
             return {
                 "choice": "deny",
                 "reason": "no approver available (background context)",
             }
+        # Preserve the existing Smart decision seam after the canonical
+        # request and approver context have both validated. The evaluator sees
+        # the bounded canonical SDK bytes; observers and cards see only the
+        # bounded canonical-derived presentation.
+        smart_denied = False
+        if _get_approval_mode() == "smart":
+            observer = _prepare_smart_approval_observer(
+                command=safe_command,
+                description=safe_description,
+                pattern_key="claude_sdk_tool",
+                pattern_keys=["claude_sdk_tool"],
+                session_key=session_key,
+                _fixed_failure_log=True,
+            )
+            verdict = _smart_approve(
+                canonical_tool_input,
+                safe_description,
+                _fixed_failure_log=True,
+            )
+            _observe_smart_approval_verdict(
+                observer, verdict, _fixed_failure_log=True,
+            )
+            if verdict == "approve":
+                _reset_denials(session_key)
+                return "once"
+            if verdict == "deny":
+                _record_denial(session_key)
+                smart_denied = True
         approval_data = {
-            "command": command,
+            "command": safe_command,
             "pattern_key": "claude_sdk_tool",
             "pattern_keys": ["claude_sdk_tool"],
-            "description": description,
+            "description": safe_description,
             # One-tap "once" grants only: durable grants for SDK tools
             # belong in the operator's settings.json (setting_sources),
             # where they are auditable — not in chat-tap persistence.
@@ -3023,10 +3228,25 @@ def build_sdk_gateway_approval_callback(context_provider=None):
             # P2.a correlator: rides onto the pending _ApprovalEntry
             # (entry.data IS this dict) so a button tap can resolve the
             # MATCHING prompt instead of queue[0].
-            "tool_use_id": tool_use_id or "",
+            "tool_use_id": _normalize_sdk_tool_use_id(tool_use_id),
+            # SDK cards carry per-request correlation and one-shot consent.
+            # They must remain distinct even when their bounded summaries are
+            # identical; generic gateway prompts continue to coalesce.
+            "no_coalesce": True,
         }
+        if smart_denied:
+            approval_data["smart_denied"] = True
+        def _sdk_safe_notify(data):
+            try:
+                notify_cb(data)
+            except Exception:
+                # The shared waiter logs exception text for legacy surfaces.
+                # Replace only this SDK callback's hostile exception with a
+                # fixed message, preserving generic fallback/log semantics.
+                raise RuntimeError("SDK approval notification failed") from None
+
         decision = _await_gateway_decision(
-            session_key, notify_cb, approval_data, surface="claude_sdk"
+            session_key, _sdk_safe_notify, approval_data, surface="claude_sdk"
         )
         if decision.get("notify_failed"):
             return {
@@ -3054,20 +3274,29 @@ def build_sdk_gateway_approval_callback(context_provider=None):
             }
         if choice == "deny":
             reason = decision.get("reason")
-            if reason:
-                # /deny <reason>: still a real user deny — attribute it,
-                # and relay the operator's words.
-                return {"choice": "deny", "reason": f"denied by user: {reason}"}
-            return "deny"
+            # Human attribution is a structural field emitted only by this
+            # registered bridge; callback-controlled reason prefixes are never
+            # trusted by the SDK session layer.
+            return {
+                "choice": "deny",
+                "operator_denial": True,
+                "reason": reason if type(reason) is str else "",
+            }
         # Clamp durable choices to one-shot: an older client button can
         # still send "session"/"always"; the grant must not outlive the
         # single SDK permission request it answered.
+        _reset_denials(session_key)
         return "once"
 
     # Marker for the SDK session layer: this callback accepts the
     # tool_use_id kwarg (the CLI thread-local callback does not — the
     # session only passes the correlator to callbacks that opt in).
     _sdk_gateway_approval._accepts_tool_use_id = True
+    _sdk_gateway_approval._accepts_canonical_tool_input = True
+    if not _register_trusted_sdk_gateway_approval_callback(_sdk_gateway_approval):
+        # A builder-owned Python closure is weak-referenceable. Keep an
+        # unexpected runtime that cannot represent identity out of trust.
+        logger.warning("SDK gateway callback could not be registered as trusted")
     return _sdk_gateway_approval
 
 
@@ -3811,7 +4040,12 @@ def _get_smart_policy() -> str:
     return policy.strip()
 
 
-def _smart_approve(command: str, description: str) -> str:
+def _smart_approve(
+    command: str,
+    description: str,
+    *,
+    _fixed_failure_log: bool = False,
+) -> str:
     """Use the auxiliary LLM to assess risk and decide approval.
 
     Returns 'approve' if the LLM determines the command is safe,
@@ -3900,7 +4134,10 @@ def _smart_approve(command: str, description: str) -> str:
             return "escalate"
 
     except Exception as e:
-        logger.debug("Smart approvals: LLM call failed (%s), escalating", e)
+        if _fixed_failure_log:
+            logger.debug("Smart approvals: LLM call failed, escalating")
+        else:
+            logger.debug("Smart approvals: LLM call failed (%s), escalating", e)
         return "escalate"
 
 
@@ -4698,41 +4935,39 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
+    pre_failure_log = (
+        "SDK Smart pre-approval observer dispatch failed"
+        if surface == "claude_sdk"
+        else None
+    )
+    post_failure_log = (
+        "SDK Smart post-approval observer dispatch failed"
+        if surface == "claude_sdk"
+        else None
+    )
 
-    # ── Coalesce identical concurrent approvals (one prompt, one answer) ──
-    # Parallel tool calls (a parallel terminal batch, execute_code RPC
-    # handlers) can hit the same dangerous-command gate at the same time.
-    # Without coalescing, every thread enqueues its own entry and fires its
-    # own notify_cb — the user gets N identical prompts and must /approve N
-    # times while the agent sits wedged. Follow anomalyco/opencode#40869's
-    # shape: followers wait on the leader's decision and re-check after it
-    # lands instead of prompting again.
-    #
-    # Adoption rules keep the consent contract strict:
-    #   session / always → adopt approved (the persistence layer would
-    #     auto-pass an identical re-check anyway once the leader persisted).
-    #   deny / timeout   → adopt the refusal (immediately re-asking the exact
-    #     command the user just declined is prompt spam and an evasion path).
-    #   once             → single-use consent; it covers ONLY the leader's
-    #     execution, so the follower falls through to a fresh prompt.
+    # Generic gateway prompts preserve the established de-duplication
+    # contract. Correlated SDK requests opt out explicitly because one answer
+    # must never authorize a distinct SDK tool_use_id.
     leader = None
-    with _lock:
-        for existing in _gateway_queues.get(session_key, []):
-            data = existing.data
-            if (
-                data.get("command") == approval_data.get("command")
-                and list(data.get("pattern_keys") or [])
-                == list(approval_data.get("pattern_keys") or [])
-            ):
-                leader = existing
-                break
+    if not approval_data.get("no_coalesce"):
+        with _lock:
+            for existing in _gateway_queues.get(session_key, []):
+                data = existing.data
+                if (
+                    data.get("command") == approval_data.get("command")
+                    and list(data.get("pattern_keys") or [])
+                    == list(approval_data.get("pattern_keys") or [])
+                ):
+                    leader = existing
+                    break
     if leader is not None:
         adopted = _await_coalesced_leader(
             session_key, leader, approval_data, surface=surface
         )
         if adopted is not None:
             return adopted
-        # Leader resolved "once" — fall through to a fresh prompt below.
+        # Leader resolved "once" — single-use consent requires a fresh card.
 
     entry = _ApprovalEntry(approval_data)
     with _lock:
@@ -4750,6 +4985,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     # gateway notify callback so observers get the event in real time.
     _fire_approval_hook(
         "pre_approval_request",
+        _fixed_failure_log=pre_failure_log,
         command=command,
         description=description,
         pattern_key=primary_key,
@@ -4760,12 +4996,16 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
     # Notify the user (bridges sync agent thread → async gateway)
     try:
+        # The entry owns the canonical queued copy and adds request_id. Never
+        # expose the caller's pre-entry dict, which is neither replayable nor
+        # correlatable by request id.
         notify_cb(dict(entry.data))
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
         _drop_entry()
         _fire_approval_hook(
             "post_approval_response",
+            _fixed_failure_log=post_failure_log,
             command=command,
             description=description,
             pattern_key=primary_key,
@@ -4853,6 +5093,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     _outcome = "timeout" if not resolved else (choice if choice else "timeout")
     _fire_approval_hook(
         "post_approval_response",
+        _fixed_failure_log=post_failure_log,
         command=command,
         description=description,
         pattern_key=primary_key,

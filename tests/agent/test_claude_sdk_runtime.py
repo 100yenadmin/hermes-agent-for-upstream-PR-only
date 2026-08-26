@@ -15,6 +15,7 @@ import logging
 import sys
 import threading
 import time
+import tracemalloc
 from collections import deque
 from dataclasses import dataclass, field
 from types import ModuleType, SimpleNamespace
@@ -3873,6 +3874,31 @@ class TestSdkBoundedMcpInspectionPermissions:
         assert type(result).__name__ == "PermissionResultAllow"
         assert calls == []
 
+    def test_auto_allowed_mcp_tools_match_claude_profile_readers_exactly(self):
+        from agent.transports.claude_agent_sdk_session import (
+            _SDK_AUTO_ALLOWED_MCP_TOOLS,
+        )
+        from agent.transports.hermes_tools_mcp_server import (
+            _CLAUDE_AGENT_SDK_INSPECTION_TOOLS,
+            exposed_tools_for_profile,
+        )
+
+        expected = {
+            "mcp__hermes-tools__read_file",
+            "mcp__hermes-tools__search_files",
+        }
+        exposed = {
+            f"mcp__hermes-tools__{name}"
+            for name in exposed_tools_for_profile("claude-agent-sdk")
+        }
+        profile_inspection = {
+            f"mcp__hermes-tools__{name}"
+            for name in _CLAUDE_AGENT_SDK_INSPECTION_TOOLS
+        }
+        assert _SDK_AUTO_ALLOWED_MCP_TOOLS == expected
+        assert profile_inspection == expected
+        assert _SDK_AUTO_ALLOWED_MCP_TOOLS <= exposed
+
     @pytest.mark.parametrize("tool_name", [
         "mcp__hermes-tools__write_file",
         "mcp__hermes-tools__read_file_evil",
@@ -3903,6 +3929,27 @@ class TestGatewayApprovalBridge:
         token = approval_mod.set_current_session_key(session_key)
         return approval_mod, token
 
+    @staticmethod
+    def _call_gateway(
+        callback, command="true", *, tool_name="Bash", tool_input=None, **kwargs,
+    ):
+        import json
+
+        if tool_input is None:
+            tool_input = {"command": command}
+        canonical = json.dumps(
+            {"tool_name": tool_name, "tool_input": tool_input},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return callback(
+            "untrusted legacy presentation",
+            "untrusted legacy description",
+            canonical_tool_input=canonical,
+            **kwargs,
+        )
+
     def test_builder_returns_none_outside_gateway_context(self, monkeypatch):
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
@@ -3928,7 +3975,7 @@ class TestGatewayApprovalBridge:
 
         cb = approval_mod.build_sdk_gateway_approval_callback()
         assert cb is not None  # gateway-shaped: no more cron-born freeze
-        result = cb("Bash(ls)", "Claude requests tool Bash")
+        result = self._call_gateway(cb, "ls")
         assert result == {
             "choice": "deny",
             "reason": "no approver available (background context)",
@@ -3950,6 +3997,556 @@ class TestGatewayApprovalBridge:
         finally:
             approval_mod.reset_current_session_key(token)
 
+    @pytest.mark.parametrize(
+        "bypass_source",
+        [
+            "terminal-yolo",
+            "terminal-unrestricted",
+            "configured-bypassPermissions",
+            "explicit-bypassPermissions",
+            "approval-off",
+        ],
+    )
+    def test_sdk_yolo_options_keep_callback_floors_and_autoallow_benign(
+        self, monkeypatch, bypass_source,
+    ):
+        import hermes_cli.config as cfg
+
+        sk = f"sess-sdk-options-{bypass_source}"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        try:
+            monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+            monkeypatch.delenv("HERMES_TERMINAL_SECURITY_MODE", raising=False)
+            provider_config = {}
+            explicit_mode = None
+            approval_mode = "manual"
+            if bypass_source == "terminal-yolo":
+                monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "yolo")
+            elif bypass_source == "terminal-unrestricted":
+                monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "unrestricted")
+            elif bypass_source == "configured-bypassPermissions":
+                provider_config = {"permission_mode": "bypassPermissions"}
+            elif bypass_source == "explicit-bypassPermissions":
+                explicit_mode = "bypassPermissions"
+            else:
+                approval_mode = "off"
+            monkeypatch.setattr(
+                cfg,
+                "load_config_readonly",
+                lambda *a, **k: {
+                    "agent": {"claude_agent_sdk": provider_config},
+                },
+                raising=False,
+            )
+            monkeypatch.setattr(
+                approval_mod,
+                "_get_approval_config",
+                lambda: {
+                    "mode": approval_mode,
+                    "deny": ["git push --force*"],
+                },
+            )
+            approval_mod.register_gateway_notify(
+                sk, lambda _data: pytest.fail("SDK YOLO reached an approval card")
+            )
+            callback = approval_mod.build_sdk_gateway_approval_callback()
+            session_kwargs = {
+                "approval_callback": callback,
+                "hermes_session_id": sk,
+            }
+            if explicit_mode is not None:
+                session_kwargs["permission_mode"] = explicit_mode
+            session, _ = _make_session(**session_kwargs)
+            fields = session.build_option_fields()
+
+            assert fields["permission_mode"] == "default"
+            assert callable(fields["can_use_tool"])
+            can_use_tool = fields["can_use_tool"]
+            floor_requests = [
+                ("rm -rf /", "BLOCKED (hardline)"),
+                ("sudo -S whoami", "sudo password guessing"),
+                ("git push --force origin main", "user deny rule"),
+            ]
+            for index, (command, _reason) in enumerate(floor_requests):
+                result = asyncio.run(can_use_tool(
+                    "Bash",
+                    {"command": command},
+                    SimpleNamespace(tool_use_id=f"toolu-floor-{index}"),
+                ))
+                assert type(result).__name__ == "PermissionResultDeny"
+                assert result.message == "approval denied by callback"
+
+            original = {
+                "command": "printf safe",
+                "nested": {"detached": True},
+            }
+            result = asyncio.run(can_use_tool(
+                "Bash", original, SimpleNamespace(tool_use_id="toolu-benign")
+            ))
+            assert type(result).__name__ == "PermissionResultAllow"
+            assert result.updated_input == original
+            assert result.updated_input is not original
+            assert result.updated_input["nested"] is not original["nested"]
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+            approval_mod.reset_current_session_key(token)
+
+    @pytest.mark.parametrize(
+        "bypass_source",
+        [
+            "terminal-yolo",
+            "terminal-unrestricted",
+            "configured-bypassPermissions",
+            "approval-off",
+        ],
+    )
+    def test_runtime_callbackless_bypass_keeps_mandatory_sdk_wrapper(
+        self, monkeypatch, bypass_source,
+    ):
+        """The real bare-runtime factory must retain Hermes policy ownership."""
+        import hermes_cli.config as cfg
+        from agent.transports import claude_agent_sdk_session as session_mod
+        from tools import approval as approval_mod
+        from tools import terminal_tool
+
+        monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+        monkeypatch.delenv("HERMES_TERMINAL_SECURITY_MODE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+        provider_config = {}
+        if bypass_source == "configured-bypassPermissions":
+            provider_config["permission_mode"] = "bypassPermissions"
+        elif bypass_source.startswith("terminal-"):
+            monkeypatch.setenv(
+                "HERMES_TERMINAL_SECURITY_MODE",
+                bypass_source.removeprefix("terminal-"),
+            )
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {"agent": {"claude_agent_sdk": provider_config}},
+            raising=False,
+        )
+        monkeypatch.setattr(
+            approval_mod,
+            "_get_approval_config",
+            lambda: {
+                "mode": "off" if bypass_source == "approval-off" else "manual",
+                "deny": ["git push --force*"],
+            },
+        )
+        terminal_tool.set_approval_callback(None)
+        real_session = session_mod.ClaudeAgentSdkSession
+        exercised = []
+
+        class _ExercisingSession(real_session):
+            def run_turn(self, user_input=None, **_kwargs):
+                fields = self.build_option_fields()
+                callback = fields["can_use_tool"]
+                outcomes = []
+                for index, command in enumerate((
+                    "rm -rf /", "sudo -S whoami", "git push --force origin main",
+                )):
+                    outcomes.append(asyncio.run(callback(
+                        "Bash", {"command": command},
+                        SimpleNamespace(tool_use_id=f"toolu-floor-{index}"),
+                    )))
+                benign = {"command": "printf safe", "nested": {"detached": True}}
+                outcomes.append(asyncio.run(callback(
+                    "Bash", benign, SimpleNamespace(tool_use_id="toolu-benign"),
+                )))
+                outcomes.append(asyncio.run(callback(
+                    "Read", {"file_path": "/tmp/native"},
+                    SimpleNamespace(tool_use_id="toolu-read"),
+                )))
+                exercised.append((fields, outcomes, benign, self._approval_callback))
+                return _make_turn()
+
+        try:
+            monkeypatch.setattr(session_mod, "ClaudeAgentSdkSession", _ExercisingSession)
+            agent = _make_agent()
+            agent._claude_sdk_session = None
+            agent.session_id = f"callbackless-{bypass_source}"
+            run_claude_agent_sdk_turn(
+                agent,
+                user_message="hi",
+                original_user_message="hi",
+                messages=[{"role": "user", "content": "hi"}],
+                effective_task_id="task-1",
+            )
+        finally:
+            terminal_tool.set_approval_callback(None)
+
+        fields, outcomes, benign, selected_callback = exercised[0]
+        assert selected_callback is None
+        assert fields["permission_mode"] == "default"
+        assert callable(fields["can_use_tool"])
+        assert fields["disallowed_tools"] == ["AskUserQuestion", "Read"]
+        assert all(type(result).__name__ == "PermissionResultDeny" for result in outcomes[:3])
+        assert type(outcomes[3]).__name__ == "PermissionResultAllow"
+        assert outcomes[3].updated_input == benign
+        assert outcomes[3].updated_input is not benign
+        assert outcomes[3].updated_input["nested"] is not benign["nested"]
+        assert type(outcomes[4]).__name__ == "PermissionResultDeny"
+
+    @pytest.mark.parametrize("approval_mode", ["default", "manual", "smart"])
+    def test_runtime_callbackless_non_bypass_fails_closed_after_bounded_mcp(
+        self, monkeypatch, caplog, approval_mode,
+    ):
+        """Mandatory callbackless policy changes native prompting to fail-closed."""
+        import hermes_cli.config as cfg
+        from agent.transports import claude_agent_sdk_session as session_mod
+        from tools import approval as approval_mod
+        from tools import terminal_tool
+
+        marker = f"raw-{approval_mode}-input-must-not-leak"
+        session_marker = f"raw-{approval_mode}-session-must-not-leak"
+        monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "approval-required")
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {"agent": {"claude_agent_sdk": {}}},
+            raising=False,
+        )
+        monkeypatch.setattr(
+            approval_mod,
+            "_get_approval_config",
+            lambda: {
+                "mode": "manual" if approval_mode == "default" else approval_mode,
+                "deny": [],
+            },
+        )
+        terminal_tool.set_approval_callback(None)
+        real_session = session_mod.ClaudeAgentSdkSession
+        exercised = []
+
+        class _ExercisingSession(real_session):
+            def run_turn(self, user_input=None, **_kwargs):
+                fields = self.build_option_fields()
+                callback = fields["can_use_tool"]
+                outcomes = [
+                    asyncio.run(callback(
+                        "mcp__hermes-tools__read_file",
+                        {"path": "/tmp/example"},
+                        SimpleNamespace(tool_use_id="toolu-reader"),
+                    )),
+                    asyncio.run(callback(
+                        "mcp__hermes-tools__search_files",
+                        {"pattern": "*.py"},
+                        SimpleNamespace(tool_use_id="toolu-search"),
+                    )),
+                    asyncio.run(callback(
+                        "mcp__hermes-tools__unknown_reader",
+                        {"payload": marker},
+                        SimpleNamespace(tool_use_id="toolu-unknown"),
+                    )),
+                    asyncio.run(callback(
+                        "Bash", {"command": f"printf {marker}"},
+                        SimpleNamespace(tool_use_id="toolu-bash"),
+                    )),
+                ]
+                exercised.append((fields, outcomes, self._approval_callback))
+                return _make_turn()
+
+        try:
+            monkeypatch.setattr(session_mod, "ClaudeAgentSdkSession", _ExercisingSession)
+            agent = _make_agent()
+            agent._claude_sdk_session = None
+            agent.session_id = session_marker
+            with caplog.at_level("INFO"):
+                run_claude_agent_sdk_turn(
+                    agent,
+                    user_message="hi",
+                    original_user_message="hi",
+                    messages=[{"role": "user", "content": "hi"}],
+                    effective_task_id="task-1",
+                )
+        finally:
+            terminal_tool.set_approval_callback(None)
+
+        fields, outcomes, selected_callback = exercised[0]
+        assert selected_callback is None
+        assert fields["permission_mode"] == "default"
+        assert callable(fields["can_use_tool"])
+        assert all(type(result).__name__ == "PermissionResultAllow" for result in outcomes[:2])
+        assert all(type(result).__name__ == "PermissionResultDeny" for result in outcomes[2:])
+        assert all(result.message == "approval callback unavailable" for result in outcomes[2:])
+        assert marker not in caplog.text
+        assert session_marker not in caplog.text
+
+    @pytest.mark.parametrize("surface", ["cli", "acp", "gateway"])
+    @pytest.mark.parametrize(
+        "bypass_source",
+        ["terminal-yolo", "terminal-unrestricted", "configured-bypassPermissions"],
+    )
+    def test_runtime_selected_callbacks_share_sdk_floors_and_yolo_emulation(
+        self, monkeypatch, surface, bypass_source,
+    ):
+        """Exercise the real runtime session factory and selected callback path."""
+        import hermes_cli.config as cfg
+        from agent.transports import claude_agent_sdk_session as session_mod
+        from tools import approval as approval_mod
+        from tools import terminal_tool
+
+        monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+        monkeypatch.delenv("HERMES_TERMINAL_SECURITY_MODE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        provider_config = {}
+        if bypass_source == "configured-bypassPermissions":
+            provider_config["permission_mode"] = "bypassPermissions"
+        else:
+            monkeypatch.setenv(
+                "HERMES_TERMINAL_SECURITY_MODE",
+                "yolo" if bypass_source == "terminal-yolo" else "unrestricted",
+            )
+        monkeypatch.setattr(
+            cfg,
+            "load_config_readonly",
+            lambda *a, **k: {"agent": {"claude_agent_sdk": provider_config}},
+            raising=False,
+        )
+        monkeypatch.setattr(
+            approval_mod,
+            "_get_approval_config",
+            lambda: {"mode": "manual", "deny": ["git push --force*"]},
+        )
+
+        selected_calls = []
+        if surface == "cli":
+            def selected_callback(command, description, *, allow_permanent=False):
+                selected_calls.append((command, description, allow_permanent))
+                return "once"
+        elif surface == "acp":
+            from acp_adapter.permissions import make_approval_callback
+
+            async def request_permission(**_kwargs):
+                selected_calls.append("acp-request")
+                raise AssertionError("YOLO must not prompt through ACP")
+
+            selected_callback = make_approval_callback(
+                request_permission, asyncio.new_event_loop(), "acp-session", timeout=0,
+            )
+        else:
+            selected_callback = None
+            monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+
+        terminal_tool.set_approval_callback(selected_callback)
+        session_key = f"sdk-runtime-{surface}-{bypass_source}"
+        token = approval_mod.set_current_session_key(session_key)
+        real_session = session_mod.ClaudeAgentSdkSession
+        exercised = []
+
+        class _ExercisingSession(real_session):
+            def run_turn(self, user_input=None, **_kwargs):
+                fields = self.build_option_fields()
+                callback = fields["can_use_tool"]
+                outcomes = []
+                for index, command in enumerate((
+                    "rm -rf /", "sudo -S whoami", "git push --force origin main",
+                )):
+                    outcomes.append(asyncio.run(callback(
+                        "Bash", {"command": command},
+                        SimpleNamespace(tool_use_id=f"toolu-floor-{index}"),
+                    )))
+                benign = {"command": "printf safe", "nested": {"detached": True}}
+                outcomes.append(asyncio.run(callback(
+                    "Bash", benign, SimpleNamespace(tool_use_id="toolu-benign"),
+                )))
+                outcomes.append(asyncio.run(callback(
+                    "Read", {"file_path": "/tmp/native"},
+                    SimpleNamespace(tool_use_id="toolu-read"),
+                )))
+                exercised.append((fields, outcomes, benign))
+                return _make_turn()
+
+        try:
+            if surface == "gateway":
+                approval_mod.register_gateway_notify(
+                    session_key,
+                    lambda _data: pytest.fail("SDK YOLO reached a gateway card"),
+                )
+            monkeypatch.setattr(session_mod, "ClaudeAgentSdkSession", _ExercisingSession)
+            agent = _make_agent()
+            agent._claude_sdk_session = None
+            agent.session_id = session_key
+            run_claude_agent_sdk_turn(
+                agent,
+                user_message="hi",
+                original_user_message="hi",
+                messages=[{"role": "user", "content": "hi"}],
+                effective_task_id="task-1",
+            )
+        finally:
+            terminal_tool.set_approval_callback(None)
+            if surface == "gateway":
+                approval_mod.unregister_gateway_notify(session_key)
+            approval_mod.reset_current_session_key(token)
+
+        fields, outcomes, benign = exercised[0]
+        assert fields["permission_mode"] == "default"
+        assert callable(fields["can_use_tool"])
+        assert fields["disallowed_tools"] == ["AskUserQuestion", "Read"]
+        assert all(type(result).__name__ == "PermissionResultDeny" for result in outcomes[:3])
+        assert type(outcomes[3]).__name__ == "PermissionResultAllow"
+        assert outcomes[3].updated_input == benign
+        assert outcomes[3].updated_input is not benign
+        assert outcomes[3].updated_input["nested"] is not benign["nested"]
+        assert type(outcomes[4]).__name__ == "PermissionResultDeny"
+        assert selected_calls == []
+
+    @pytest.mark.parametrize("surface", ["cli", "acp", "gateway"])
+    @pytest.mark.parametrize("choice", ["once", "deny"])
+    def test_runtime_non_yolo_delegates_once_to_selected_callback(
+        self, monkeypatch, surface, choice,
+    ):
+        from agent.transports import claude_agent_sdk_session as session_mod
+        from tools import approval as approval_mod
+        from tools import terminal_tool
+
+        monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "approval-required")
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        calls = []
+
+        def selected_callback(command, description, *, allow_permanent=False, **_kwargs):
+            calls.append((command, description, allow_permanent))
+            return choice
+
+        if surface == "gateway":
+            monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+            monkeypatch.setattr(
+                approval_mod,
+                "build_sdk_gateway_approval_callback",
+                lambda **_kwargs: selected_callback,
+            )
+            terminal_tool.set_approval_callback(None)
+        else:
+            terminal_tool.set_approval_callback(selected_callback)
+
+        real_session = session_mod.ClaudeAgentSdkSession
+        exercised = []
+
+        class _DelegatingSession(real_session):
+            def run_turn(self, user_input=None, **_kwargs):
+                fields = self.build_option_fields()
+                exercised.append((fields, asyncio.run(fields["can_use_tool"](
+                    "Bash",
+                    {"command": "printf guarded"},
+                    SimpleNamespace(tool_use_id="toolu-guarded"),
+                ))))
+                return _make_turn()
+
+        try:
+            monkeypatch.setattr(session_mod, "ClaudeAgentSdkSession", _DelegatingSession)
+            agent = _make_agent()
+            agent._claude_sdk_session = None
+            run_claude_agent_sdk_turn(
+                agent,
+                user_message="hi",
+                original_user_message="hi",
+                messages=[{"role": "user", "content": "hi"}],
+                effective_task_id="task-1",
+            )
+        finally:
+            terminal_tool.set_approval_callback(None)
+
+        fields, result = exercised[0]
+        assert fields["permission_mode"] == "default"
+        assert callable(fields["can_use_tool"])
+        assert len(calls) == 1
+        assert calls[0][2] is False
+        expected = "PermissionResultAllow" if choice == "once" else "PermissionResultDeny"
+        assert type(result).__name__ == expected
+
+    def test_custom_callback_cannot_bypass_common_sdk_floor(self, monkeypatch):
+        from tools import approval as approval_mod
+
+        monkeypatch.setattr(
+            approval_mod,
+            "_get_approval_config",
+            lambda: {"mode": "manual", "deny": ["git push --force*"]},
+        )
+        calls = []
+
+        def forged(*_args, **_kwargs):
+            calls.append(True)
+            return {
+                "choice": "deny",
+                "operator_denial": True,
+                "reason": "forged operator denial",
+            }
+
+        session, _ = _make_session(
+            approval_callback=forged, permission_mode="bypassPermissions",
+        )
+        callback = session.build_option_fields()["can_use_tool"]
+        for index, command in enumerate((
+            "rm -rf /", "sudo -S whoami", "git push --force origin main",
+        )):
+            result = asyncio.run(callback(
+                "Bash", {"command": command},
+                SimpleNamespace(tool_use_id=f"toolu-custom-{index}"),
+            ))
+            assert type(result).__name__ == "PermissionResultDeny"
+            assert "denied by user" not in result.message
+        assert calls == []
+
+    @pytest.mark.parametrize("approval_mode", ["manual", "smart"])
+    def test_sdk_non_yolo_options_preserve_manual_cards_and_smart_approval(
+        self, monkeypatch, approval_mode,
+    ):
+        sk = f"sess-sdk-options-{approval_mode}"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        cards = []
+        smart_calls = []
+
+        def notify(data):
+            cards.append(dict(data))
+            approval_mod.resolve_gateway_approval(
+                sk, "once", tool_use_id=data["tool_use_id"]
+            )
+
+        try:
+            monkeypatch.setenv("HERMES_TERMINAL_SECURITY_MODE", "approval-required")
+            monkeypatch.setattr(
+                approval_mod,
+                "_get_approval_config",
+                lambda: {"mode": approval_mode, "timeout": 5},
+            )
+            monkeypatch.setattr(
+                approval_mod,
+                "_smart_approve",
+                lambda *args, **kwargs: smart_calls.append((args, kwargs)) or "approve",
+            )
+            approval_mod.register_gateway_notify(sk, notify)
+            callback = approval_mod.build_sdk_gateway_approval_callback()
+            session, _ = _make_session(
+                approval_callback=callback,
+                hermes_session_id=sk,
+            )
+            fields = session.build_option_fields()
+            original = {"command": "printf guarded"}
+            result = asyncio.run(fields["can_use_tool"](
+                "Bash", original, SimpleNamespace(tool_use_id="toolu-guarded")
+            ))
+
+            assert fields["permission_mode"] == "default"
+            assert type(result).__name__ == "PermissionResultAllow"
+            assert result.updated_input == original
+            assert result.updated_input is not original
+            if approval_mode == "manual":
+                assert smart_calls == []
+                assert len(cards) == 1
+                assert cards[0]["tool_use_id"] == "toolu-guarded"
+                assert cards[0]["no_coalesce"] is True
+            else:
+                assert len(smart_calls) == 1
+                assert cards == []
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+            approval_mod.reset_current_session_key(token)
+
     def test_no_registered_notify_denies(self, monkeypatch, caplog):
         # UPDATED (W8): this test used to pin the bare-"deny" return — which
         # the SDK layer translated to "denied by user" for a prompt no user
@@ -3960,17 +4557,18 @@ class TestGatewayApprovalBridge:
         try:
             cb = approval_mod.build_sdk_gateway_approval_callback()
             with caplog.at_level(logging.WARNING, logger="tools.approval"):
-                result = cb("Bash(ls)", "Claude requests tool Bash")
+                result = self._call_gateway(cb, "ls")
             assert result == {
                 "choice": "deny",
                 "reason": "no approver available (background context)",
             }
-            assert any(
-                "NO approver available" in r.getMessage()
-                and "Bash(ls)" in r.getMessage()
-                and "sess-no-notify" in r.getMessage()
-                for r in caplog.records
-            ), "the silent deny must not stay silent"
+            messages = [record.getMessage() for record in caplog.records]
+            assert messages == [
+                "SDK approval request has no approver available; denying "
+                "without user attribution"
+            ]
+            assert "Bash(command=ls)" not in caplog.text
+            assert "sess-no-notify" not in caplog.text
         finally:
             approval_mod.reset_current_session_key(token)
 
@@ -3991,9 +4589,9 @@ class TestGatewayApprovalBridge:
             approval_mod.unregister_gateway_notify(sk)
             try:
                 cb = approval_mod.build_sdk_gateway_approval_callback()
-                assert cb("Bash(ls)", "Claude requests tool Bash") == "once"
+                assert self._call_gateway(cb, "ls") == "once"
                 assert len(seen) == 1  # the operator WAS paged
-                assert seen[0]["command"] == "Bash(ls)"
+                assert seen[0]["command"] == "Bash(command=ls)"
             finally:
                 approval_mod.unregister_session_notify(sk)
         finally:
@@ -4004,7 +4602,8 @@ class TestGatewayApprovalBridge:
     ):
         # End to end across the widened channel: bridge (no approver) →
         # _make_can_use_tool → PermissionResultDeny carrying the honest
-        # reason. "denied by user" is reserved for the plain user-deny path.
+        # reason. "denied by user" is reserved for the trusted bridge's
+        # structural operator-denial result.
         approval_mod, token = self._gateway_ctx(monkeypatch, "sess-bg-honest")
         try:
             cb = approval_mod.build_sdk_gateway_approval_callback()
@@ -4018,22 +4617,32 @@ class TestGatewayApprovalBridge:
             assert res.message == "no approver available (background context)"
             assert "denied by user" not in res.message
             assert any(
-                "NO approver available" in r.getMessage()
+                r.getMessage() == (
+                    "SDK approval request has no approver available; denying "
+                    "without user attribution"
+                )
                 for r in caplog.records
             )
+            assert "sess-bg-honest" not in caplog.text
+            assert "Bash(command=ls)" not in caplog.text
 
-            # Back-compat: plain string returns keep their classic mapping.
+            # Plain callback denies are not trusted operator attribution. The
+            # structural marker is accepted only from the registered bridge.
             session2, _ = _make_session(
                 approval_callback=lambda *a, **k: "deny",
                 permission_mode="default",
             )
-            res2 = asyncio.run(session2._make_can_use_tool()("Bash", {}, None))
-            assert res2.message == "denied by user"
+            res2 = asyncio.run(session2._make_can_use_tool()(
+                "Bash", {"command": "true"}, None,
+            ))
+            assert res2.message == "approval denied by callback"
             session3, _ = _make_session(
                 approval_callback=lambda *a, **k: "once",
                 permission_mode="default",
             )
-            res3 = asyncio.run(session3._make_can_use_tool()("Bash", {}, None))
+            res3 = asyncio.run(session3._make_can_use_tool()(
+                "Bash", {"command": "true"}, None,
+            ))
             assert type(res3).__name__ == "PermissionResultAllow"
         finally:
             approval_mod.reset_current_session_key(token)
@@ -4064,7 +4673,7 @@ class TestGatewayApprovalBridge:
             approval_mod.clear_session(sk)
             assert sk not in approval_mod._session_notify_cbs
             cb = approval_mod.build_sdk_gateway_approval_callback()
-            result = cb("Bash(ls)", "desc")
+            result = self._call_gateway(cb, "ls")
             assert result["reason"] == "no approver available (background context)"
 
             # Unknown-key unregister is a no-op; clear-all empties.
@@ -4093,7 +4702,7 @@ class TestGatewayApprovalBridge:
             )
             paged = []
             approval_mod.register_session_notify(sk, paged.append)
-            result = cb("Bash(sleep)", "desc")
+            result = self._call_gateway(cb, "sleep")
             assert result == {
                 "choice": "deny",
                 "reason": "approval timed out — no operator response",
@@ -4105,7 +4714,7 @@ class TestGatewayApprovalBridge:
                 raise RuntimeError("adapter send failed")
 
             approval_mod.register_session_notify(sk, broken)
-            result = cb("Bash(x)", "desc")
+            result = self._call_gateway(cb, "x")
             assert result["choice"] == "deny"
             assert "notify failed" in result["reason"]
             assert "denied by user" not in result["reason"]
@@ -4123,9 +4732,11 @@ class TestGatewayApprovalBridge:
                 )
 
             approval_mod.register_session_notify(sk, deny_with_reason)
-            result = cb("Bash(y)", "desc")
+            result = self._call_gateway(cb, "y")
             assert result == {
-                "choice": "deny", "reason": "denied by user: not now",
+                "choice": "deny",
+                "operator_denial": True,
+                "reason": "not now",
             }
         finally:
             approval_mod.unregister_session_notify(sk)
@@ -4158,7 +4769,7 @@ class TestGatewayApprovalBridge:
 
         # Prompt during the cron turn: immediate honest deny — no paging,
         # no blocking, posture preserved.
-        result = cb("Bash(ls)", "desc")
+        result = self._call_gateway(cb, "ls")
         assert result["reason"] == "no approver available (background context)"
 
         # Later INTERACTIVE turn on the SAME SDK session: the runtime's
@@ -4173,13 +4784,13 @@ class TestGatewayApprovalBridge:
             # contextvars invisible, so the holder must carry the context.
             out = {}
             t = threading.Thread(
-                target=lambda: out.update(r=cb("Bash(uname)", "desc"))
+                target=lambda: out.update(r=self._call_gateway(cb, "uname"))
             )
             t.start()
             t.join(timeout=10)
             assert out.get("r") == "once"
             assert len(seen) == 1
-            assert seen[0]["command"] == "Bash(uname)"
+            assert seen[0]["command"] == "Bash(command=uname)"
         finally:
             approval_mod.unregister_gateway_notify(sk)
 
@@ -4222,7 +4833,8 @@ class TestGatewayApprovalBridge:
             msg = recs[0].getMessage()
             assert "tool=Bash" in msg
             assert "no approver available" in msg
-            assert "session=sess-w13" in msg
+            assert "session=" not in msg
+            assert "sess-w13" not in msg
         finally:
             approval_mod.reset_current_session_key(token)
 
@@ -4261,15 +4873,17 @@ class TestGatewayApprovalBridge:
         assert res.message == "approval timed out — no operator response"
         assert len(_records(caplog)) == 1
 
-        # NEGATIVES — operator denies are NOT silent: no log line.
-        for operator_deny in (
+        # Callback-controlled deny strings are not trusted operator
+        # attribution, even when they carry the historical prefix.
+        for untrusted_deny in (
             lambda *a, **k: "deny",
             lambda *a, **k: {"choice": "deny", "reason": "denied by user: not now"},
         ):
             caplog.clear()
-            res = _deny_via(operator_deny, caplog)
-            assert res.message.startswith("denied by user")
-            assert _records(caplog) == []
+            res = _deny_via(untrusted_deny, caplog)
+            assert res.message == "approval denied by callback"
+            assert len(_records(caplog)) == 1
+            assert "denied by user" not in caplog.text
 
         # Allow path logs nothing either.
         caplog.clear()
@@ -4292,7 +4906,7 @@ class TestGatewayApprovalBridge:
             cb = approval_mod.build_sdk_gateway_approval_callback()
             out = {}
             t = threading.Thread(
-                target=lambda: out.update(r=cb("Bash(x)", "desc"))
+                target=lambda: out.update(r=self._call_gateway(cb, "x"))
             )
             t.start()
             deadline = time.monotonic() + 5
@@ -4326,7 +4940,7 @@ class TestGatewayApprovalBridge:
             try:
                 cb = approval_mod.build_sdk_gateway_approval_callback()
                 assert getattr(cb, "_accepts_tool_use_id", False) is True
-                assert cb("Bash(a)", "desc", tool_use_id="toolu_T") == "once"
+                assert self._call_gateway(cb, "a", tool_use_id="toolu_T") == "once"
                 assert seen[0]["tool_use_id"] == "toolu_T"
             finally:
                 approval_mod.unregister_gateway_notify("sess-correlate")
@@ -4363,7 +4977,9 @@ class TestGatewayApprovalBridge:
                 approval_callback=plain, permission_mode="default"
             )
             res2 = asyncio.run(
-                session2._make_can_use_tool()("Bash", {}, ctx_obj)
+                session2._make_can_use_tool()(
+                    "Bash", {"command": "true"}, ctx_obj,
+                )
             )
             assert calls["ok"] is True
             assert type(res2).__name__ == "PermissionResultDeny"
@@ -4386,7 +5002,9 @@ class TestGatewayApprovalBridge:
         out = {}
         with caplog.at_level(logging.WARNING, logger="tools.approval"):
             t = threading.Thread(
-                target=lambda: out.update(r=cb("Read(/x)", "desc"))
+                target=lambda: out.update(r=self._call_gateway(
+                    cb, tool_name="Read", tool_input={"file_path": "/x"},
+                ))
             )
             t.start()
             t.join(timeout=10)
@@ -4394,9 +5012,11 @@ class TestGatewayApprovalBridge:
             "choice": "deny",
             "reason": "no approver available (background context)",
         }
-        assert any(
-            "NO approver available" in r.getMessage() for r in caplog.records
-        )
+        assert [record.getMessage() for record in caplog.records] == [
+            "SDK approval request has no approver available; denying "
+            "without user attribution"
+        ]
+        assert "Read" not in caplog.text
 
     def test_turn_refreshes_sdk_approval_context_snapshot(self, monkeypatch):
         # Runtime seam: the holder is rewritten at the TOP of
@@ -4474,6 +5094,250 @@ class TestGatewayApprovalBridge:
 
         return notify, seen
 
+    def test_embedded_prefixed_secret_is_hidden_on_actual_sdk_gateway_card(
+        self, monkeypatch,
+    ):
+        session_key = "sess-embedded-tool-secret"
+        secret = "sk-1234567890ABCDEF"
+        approval_mod, token = self._gateway_ctx(monkeypatch, session_key)
+        try:
+            notify, seen = self._resolve_with(approval_mod, session_key, "once")
+            approval_mod.register_gateway_notify(session_key, notify)
+            try:
+                callback = approval_mod.build_sdk_gateway_approval_callback()
+                session, _ = _make_session(
+                    approval_callback=callback, permission_mode="default",
+                )
+                result = asyncio.run(session._make_can_use_tool()(
+                    f"Odd-{secret}", {"payload": "must-not-render"}, None,
+                ))
+            finally:
+                approval_mod.unregister_gateway_notify(session_key)
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+        assert type(result).__name__ == "PermissionResultAllow"
+        assert len(seen) == 1
+        rendered = " ".join(str(value) for value in seen[0].values())
+        assert secret not in rendered
+        assert "must-not-render" not in rendered
+        assert seen[0]["command"] == "SDK tool unknown"
+
+    def test_embedded_secret_guard_survives_global_redaction_opt_out(
+        self, monkeypatch,
+    ):
+        from agent import redact as redact_mod
+
+        monkeypatch.setattr(redact_mod, "_REDACT_ENABLED", False)
+        session_key = "sess-redaction-disabled"
+        secret = "sk-1234567890ABCDEF"
+        approval_mod, token = self._gateway_ctx(monkeypatch, session_key)
+        try:
+            notify, seen = self._resolve_with(approval_mod, session_key, "once")
+            approval_mod.register_gateway_notify(session_key, notify)
+            try:
+                callback = approval_mod.build_sdk_gateway_approval_callback()
+                session, _ = _make_session(
+                    approval_callback=callback, permission_mode="default",
+                )
+                result = asyncio.run(session._make_can_use_tool()(
+                    f"Odd-{secret}", {"payload": "must-not-render"}, None,
+                ))
+            finally:
+                approval_mod.unregister_gateway_notify(session_key)
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+        assert type(result).__name__ == "PermissionResultAllow"
+        rendered = " ".join(str(value) for value in seen[0].values())
+        assert secret not in rendered
+        assert seen[0]["command"] == "SDK tool unknown"
+
+    @pytest.mark.parametrize("redaction_enabled", [True, False])
+    def test_prefix_at_identity_offset_zero_always_collapses_to_unknown(
+        self, monkeypatch, redaction_enabled,
+    ):
+        from agent import redact as redact_mod
+
+        monkeypatch.setattr(redact_mod, "_REDACT_ENABLED", redaction_enabled)
+        session_key = f"sess-offset-zero-{redaction_enabled}"
+        secret = "sk-1234567890ABCDEF"
+        approval_mod, token = self._gateway_ctx(monkeypatch, session_key)
+        try:
+            notify, seen = self._resolve_with(approval_mod, session_key, "once")
+            approval_mod.register_gateway_notify(session_key, notify)
+            try:
+                callback = approval_mod.build_sdk_gateway_approval_callback()
+                session, _ = _make_session(
+                    approval_callback=callback, permission_mode="default",
+                )
+                result = asyncio.run(session._make_can_use_tool()(
+                    secret, {"payload": "must-not-render"}, None,
+                ))
+            finally:
+                approval_mod.unregister_gateway_notify(session_key)
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+        assert type(result).__name__ == "PermissionResultAllow"
+        assert seen[0]["command"] == "SDK tool unknown"
+        assert secret not in " ".join(str(value) for value in seen[0].values())
+
+    @pytest.mark.parametrize("hostile_kind", ["get", "str"])
+    def test_hostile_context_provider_result_is_fixed_fail_closed(
+        self, monkeypatch, caplog, hostile_kind,
+    ):
+        marker = f"CTX_RESULT_SECRET_{hostile_kind}"
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+
+        if hostile_kind == "get":
+            class HostileContext(dict):
+                def get(self, *_args, **_kwargs):
+                    raise RuntimeError(marker)
+
+            provided = HostileContext(gateway=True, session_key="safe")
+        else:
+            class HostileKey:
+                def __str__(self):
+                    return marker
+
+            provided = {"gateway": True, "session_key": HostileKey()}
+
+        from tools import approval as approval_mod
+
+        callback = approval_mod.build_sdk_gateway_approval_callback(
+            context_provider=lambda: provided,
+        )
+        with caplog.at_level(logging.DEBUG, logger="tools.approval"):
+            result = self._call_gateway(callback, "true")
+        assert result == {
+            "choice": "deny",
+            "reason": "no approver available (background context)",
+        }
+        assert marker not in caplog.text
+
+    def test_long_bash_card_discloses_truncation_and_dangerous_tail(
+        self, monkeypatch,
+    ):
+        session_key = "sess-long-bash-tail"
+        # Keep this below the immutable root-delete floor: this regression is
+        # about bounded manual-card presentation, not hardline authorization.
+        command = "printf safe " + ("A" * 1_000) + "; rm -rf ./build"
+        approval_mod, token = self._gateway_ctx(monkeypatch, session_key)
+        try:
+            notify, seen = self._resolve_with(approval_mod, session_key, "once")
+            approval_mod.register_gateway_notify(session_key, notify)
+            try:
+                callback = approval_mod.build_sdk_gateway_approval_callback()
+                session, _ = _make_session(
+                    approval_callback=callback, permission_mode="default",
+                )
+                result = asyncio.run(session._make_can_use_tool()(
+                    "Bash", {"command": command}, None,
+                ))
+            finally:
+                approval_mod.unregister_gateway_notify(session_key)
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+        assert type(result).__name__ == "PermissionResultAllow"
+        card_command = seen[0]["command"]
+        assert "[truncated]" in card_command
+        assert "; rm -rf ./build" in card_command
+        assert len(card_command.encode("utf-8")) <= 512
+
+    def test_long_path_card_discloses_truncation_and_target_tail(
+        self, monkeypatch,
+    ):
+        session_key = "sess-long-path-tail"
+        path = "/tmp/" + ("A" * 1_000) + "/dangerous-target"
+        approval_mod, token = self._gateway_ctx(monkeypatch, session_key)
+        try:
+            notify, seen = self._resolve_with(approval_mod, session_key, "once")
+            approval_mod.register_gateway_notify(session_key, notify)
+            try:
+                callback = approval_mod.build_sdk_gateway_approval_callback()
+                session, _ = _make_session(
+                    approval_callback=callback, permission_mode="default",
+                )
+                result = asyncio.run(session._make_can_use_tool()(
+                    "Write", {"file_path": path, "content": "must-not-render"}, None,
+                ))
+            finally:
+                approval_mod.unregister_gateway_notify(session_key)
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+        assert type(result).__name__ == "PermissionResultAllow"
+        card_command = seen[0]["command"]
+        assert "[truncated]" in card_command
+        assert "/dangerous-target" in card_command
+        assert "must-not-render" not in card_command
+        assert len(card_command.encode("utf-8")) <= 512
+
+    def test_redaction_expansion_does_not_discard_actual_bash_tail(
+        self, monkeypatch,
+    ):
+        session_key = "sess-redaction-expansion-tail"
+        # Exercise redaction expansion on the manual path without weakening
+        # the unconditional root-delete floor.
+        command = ("API_KEY=x " * 6_000) + "; rm -rf ./build"
+        assert len(command.encode("utf-8")) < 64 * 1024
+        approval_mod, token = self._gateway_ctx(monkeypatch, session_key)
+        try:
+            notify, seen = self._resolve_with(approval_mod, session_key, "once")
+            approval_mod.register_gateway_notify(session_key, notify)
+            try:
+                callback = approval_mod.build_sdk_gateway_approval_callback()
+                session, _ = _make_session(
+                    approval_callback=callback, permission_mode="default",
+                )
+                result = asyncio.run(session._make_can_use_tool()(
+                    "Bash", {"command": command}, None,
+                ))
+            finally:
+                approval_mod.unregister_gateway_notify(session_key)
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+        assert type(result).__name__ == "PermissionResultAllow"
+        card_command = seen[0]["command"]
+        assert "[truncated]" in card_command
+        assert "; rm -rf ./build" in card_command
+        assert "API_KEY=x" not in card_command
+        assert len(card_command.encode("utf-8")) <= 512
+
+    def test_redaction_expansion_does_not_discard_actual_path_tail(
+        self, monkeypatch,
+    ):
+        session_key = "sess-path-redaction-expansion-tail"
+        path = ("API_KEY=x " * 6_000) + "dangerous-target"
+        assert len(path.encode("utf-8")) < 64 * 1024
+        approval_mod, token = self._gateway_ctx(monkeypatch, session_key)
+        try:
+            notify, seen = self._resolve_with(approval_mod, session_key, "once")
+            approval_mod.register_gateway_notify(session_key, notify)
+            try:
+                callback = approval_mod.build_sdk_gateway_approval_callback()
+                session, _ = _make_session(
+                    approval_callback=callback, permission_mode="default",
+                )
+                result = asyncio.run(session._make_can_use_tool()(
+                    "Write", {"file_path": path, "content": "must-not-render"}, None,
+                ))
+            finally:
+                approval_mod.unregister_gateway_notify(session_key)
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+        assert type(result).__name__ == "PermissionResultAllow"
+        card_command = seen[0]["command"]
+        assert "[truncated]" in card_command
+        assert "dangerous-target" in card_command
+        assert "API_KEY=x" not in card_command
+        assert "must-not-render" not in card_command
+        assert len(card_command.encode("utf-8")) <= 512
+
     def test_approve_maps_to_once_and_clamps_durable_choices(self, monkeypatch):
         approval_mod, token = self._gateway_ctx(monkeypatch, "sess-mapped")
         try:
@@ -4483,12 +5347,12 @@ class TestGatewayApprovalBridge:
             approval_mod.register_gateway_notify("sess-mapped", notify)
             try:
                 cb = approval_mod.build_sdk_gateway_approval_callback()
-                assert cb("Bash(uname)", "Claude requests tool Bash") == "once"
+                assert self._call_gateway(cb, "uname") == "once"
             finally:
                 approval_mod.unregister_gateway_notify("sess-mapped")
             assert seen[0]["allow_permanent"] is False
             assert seen[0]["allow_session"] is False
-            assert seen[0]["command"] == "Bash(uname)"
+            assert seen[0]["command"] == "Bash(command=uname)"
         finally:
             approval_mod.reset_current_session_key(token)
 
@@ -4499,7 +5363,11 @@ class TestGatewayApprovalBridge:
             approval_mod.register_gateway_notify("sess-denied", notify)
             try:
                 cb = approval_mod.build_sdk_gateway_approval_callback()
-                assert cb("Bash(rm x)", "desc") == "deny"
+                assert self._call_gateway(cb, "rm x") == {
+                    "choice": "deny",
+                    "operator_denial": True,
+                    "reason": "",
+                }
             finally:
                 approval_mod.unregister_gateway_notify("sess-denied")
         finally:
@@ -4690,6 +5558,352 @@ class TestGatewayApprovalBridge:
             effective_task_id="task-1",
         )
         assert captured.get("approval_callback") is None
+
+
+    def test_smart_approved_sdk_read_skips_operator_card(self, monkeypatch):
+        import json
+
+        sk = "sess-smart-sdk-read"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        notified = []
+        smart_calls = []
+        prepared = []
+        observed = []
+        awaited = []
+        try:
+            approval_mod.register_gateway_notify(sk, notified.append)
+            monkeypatch.setattr(approval_mod, "_get_approval_mode", lambda: "smart")
+            monkeypatch.setattr(
+                approval_mod,
+                "_await_gateway_decision",
+                lambda *args, **kwargs: awaited.append((args, kwargs)) or {
+                    "resolved": True, "choice": "once",
+                },
+            )
+            monkeypatch.setattr(
+                approval_mod,
+                "_smart_approve",
+                lambda *args, **kwargs: smart_calls.append((args, kwargs)) or "approve",
+            )
+            monkeypatch.setattr(
+                approval_mod,
+                "_prepare_smart_approval_observer",
+                lambda **kwargs: prepared.append(kwargs) or {"safe": True},
+            )
+            monkeypatch.setattr(
+                approval_mod,
+                "_observe_smart_approval_verdict",
+                lambda payload, verdict, **kwargs: observed.append(
+                    (payload, verdict, kwargs)
+                ),
+            )
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+            assert cb is not None
+
+            result = self._call_gateway(
+                cb,
+                tool_name="Read",
+                tool_input={"file_path": "/opt/solar-monitor/src/backup.py"},
+            )
+
+            canonical = json.dumps(
+                {
+                    "tool_name": "Read",
+                    "tool_input": {"file_path": "/opt/solar-monitor/src/backup.py"},
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            assert result == "once"
+            assert smart_calls == [(
+                (canonical, "Claude requests SDK tool Read"),
+                {"_fixed_failure_log": True},
+            )]
+            assert prepared == [{
+                "command": "Read(path=/opt/solar-monitor/src/backup.py)",
+                "description": "Claude requests SDK tool Read",
+                "pattern_key": "claude_sdk_tool",
+                "pattern_keys": ["claude_sdk_tool"],
+                "session_key": sk,
+                "_fixed_failure_log": True,
+            }]
+            assert observed == [(
+                {"safe": True}, "approve", {"_fixed_failure_log": True},
+            )]
+            assert awaited == []
+            assert notified == []
+            with approval_mod._lock:
+                assert not approval_mod._gateway_queues.get(sk)
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+            approval_mod.reset_current_session_key(token)
+
+    def test_smart_denied_sdk_owner_override_card_is_one_shot_and_resets_tally(
+        self, monkeypatch,
+    ):
+        sk = "sess-smart-sdk-deny-owner-override"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        seen = []
+
+        def notify(data):
+            seen.append(dict(data))
+            approval_mod.resolve_gateway_approval(sk, "once")
+
+        try:
+            approval_mod._reset_denials(sk)
+            approval_mod.register_gateway_notify(sk, notify)
+            monkeypatch.setattr(approval_mod, "_get_approval_mode", lambda: "smart")
+            monkeypatch.setattr(approval_mod, "_smart_approve", lambda *_a, **_k: "deny")
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+
+            assert self._call_gateway(
+                cb,
+                tool_name="Read",
+                tool_input={"file_path": "/tmp/card-target"},
+                tool_use_id="toolu-card",
+            ) == "once"
+            assert len(seen) == 1
+            request_id = seen[0].pop("request_id")
+            assert type(request_id) is str and request_id
+            assert seen == [{
+                "command": "Read(path=/tmp/card-target)",
+                "pattern_key": "claude_sdk_tool",
+                "pattern_keys": ["claude_sdk_tool"],
+                "description": "Claude requests SDK tool Read",
+                "allow_permanent": False,
+                "allow_session": False,
+                "smart_denied": True,
+                "tool_use_id": "toolu-card",
+                "no_coalesce": True,
+            }]
+            with approval_mod._lock:
+                assert sk not in approval_mod._denial_tally
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+            approval_mod._reset_denials(sk)
+            approval_mod.reset_current_session_key(token)
+
+    def test_sdk_bash_hardline_denies_before_smart_or_card(self, monkeypatch):
+        sk = "sess-sdk-hardline"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        notified = []
+        smart_calls = []
+        try:
+            approval_mod.register_gateway_notify(sk, notified.append)
+            monkeypatch.setattr(approval_mod, "_get_approval_mode", lambda: "smart")
+            monkeypatch.setattr(
+                approval_mod,
+                "detect_hardline_command",
+                lambda command: (command == "dangerous-probe", "test hardline"),
+            )
+            monkeypatch.setattr(
+                approval_mod,
+                "_smart_approve",
+                lambda *args, **kwargs: smart_calls.append((args, kwargs)) or "approve",
+            )
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+            assert cb is not None
+            session, _ = _make_session(
+                approval_callback=cb,
+                permission_mode="default",
+                hermes_session_id=sk,
+            )
+
+            result = asyncio.run(session._make_can_use_tool()(
+                "Bash",
+                {"command": "dangerous-probe"},
+                SimpleNamespace(tool_use_id="toolu-hardline"),
+            ))
+
+            assert type(result).__name__ == "PermissionResultDeny"
+            assert result.message == "approval denied by callback"
+            assert smart_calls == []
+            assert notified == []
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+            approval_mod.reset_current_session_key(token)
+
+    def test_sdk_gateway_card_drops_mixed_control_tool_use_id(self, monkeypatch):
+        sk = "sess-sdk-hostile-id"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        try:
+            notify, seen = self._resolve_with(approval_mod, sk, "deny")
+            approval_mod.register_gateway_notify(sk, notify)
+            callback = approval_mod.build_sdk_gateway_approval_callback()
+            result = self._call_gateway(
+                callback, "true", tool_use_id="toolu_ok\x00\nINJECT",
+            )
+            assert result == {
+                "choice": "deny", "operator_denial": True, "reason": "",
+            }
+            assert seen[0]["tool_use_id"] == ""
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+            approval_mod.reset_current_session_key(token)
+
+    @pytest.mark.parametrize(
+        ("tool_use_id", "expected"),
+        [
+            ("x" * 256, "x" * 256),
+            ("x" * 257, ""),
+            ("é" * 128, "é" * 128),
+            (("é" * 128) + "x", ""),
+        ],
+    )
+    def test_gateway_tool_use_id_enforces_exact_utf8_byte_cap(
+        self, monkeypatch, tool_use_id, expected,
+    ):
+        session_key = "sess-sdk-id-byte-cap"
+        approval_mod, token = self._gateway_ctx(monkeypatch, session_key)
+        try:
+            notify, seen = self._resolve_with(approval_mod, session_key, "deny")
+            approval_mod.register_gateway_notify(session_key, notify)
+            try:
+                callback = approval_mod.build_sdk_gateway_approval_callback()
+                result = self._call_gateway(
+                    callback, "true", tool_use_id=tool_use_id,
+                )
+            finally:
+                approval_mod.unregister_gateway_notify(session_key)
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+        assert result == {
+            "choice": "deny", "operator_denial": True, "reason": "",
+        }
+        assert [card["tool_use_id"] for card in seen] == [expected]
+        if not expected:
+            assert tool_use_id not in [card["tool_use_id"] for card in seen]
+
+    def test_gateway_huge_multibyte_tool_use_id_has_bounded_peak_allocation(
+        self, monkeypatch,
+    ):
+        session_key = "sess-sdk-huge-id-allocation"
+        huge_id = "é" * (16 * 1024 * 1024)
+        approval_mod, token = self._gateway_ctx(monkeypatch, session_key)
+        try:
+            notify, seen = self._resolve_with(approval_mod, session_key, "deny")
+            approval_mod.register_gateway_notify(session_key, notify)
+            try:
+                callback = approval_mod.build_sdk_gateway_approval_callback()
+                self._call_gateway(callback, "true", tool_use_id="warmup")
+                seen.clear()
+                tracemalloc.start()
+                try:
+                    result = self._call_gateway(
+                        callback, "true", tool_use_id=huge_id,
+                    )
+                    _, peak = tracemalloc.get_traced_memory()
+                finally:
+                    tracemalloc.stop()
+            finally:
+                approval_mod.unregister_gateway_notify(session_key)
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+        assert result == {
+            "choice": "deny", "operator_denial": True, "reason": "",
+        }
+        assert [card["tool_use_id"] for card in seen] == [""]
+        assert huge_id not in [card["tool_use_id"] for card in seen]
+        assert peak < 2 * 1024 * 1024
+
+    @pytest.mark.parametrize("bypass_source", ["off", "process_yolo", "session_yolo"])
+    def test_sdk_bypass_sources_skip_approver_after_bash_floors(
+        self, monkeypatch, bypass_source,
+    ):
+        sk = f"sess-sdk-bypass-{bypass_source}"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        try:
+            if bypass_source == "off":
+                monkeypatch.setattr(approval_mod, "_get_approval_mode", lambda: "off")
+            elif bypass_source == "process_yolo":
+                monkeypatch.setattr(approval_mod, "_YOLO_MODE_FROZEN", True)
+            else:
+                monkeypatch.setattr(
+                    approval_mod, "is_session_yolo_enabled", lambda key: key == sk,
+                )
+            monkeypatch.setattr(
+                approval_mod,
+                "_await_gateway_decision",
+                lambda *_a, **_k: pytest.fail("bypass reached approval queue"),
+            )
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+            assert cb is not None
+            session, _ = _make_session(
+                approval_callback=cb,
+                permission_mode="default",
+                hermes_session_id=sk,
+            )
+            result = asyncio.run(session._make_can_use_tool()(
+                "Bash",
+                {"command": "printf safe"},
+                SimpleNamespace(tool_use_id="toolu-bypass"),
+            ))
+            assert type(result).__name__ == "PermissionResultAllow"
+            assert result.updated_input == {"command": "printf safe"}
+        finally:
+            approval_mod.reset_current_session_key(token)
+
+    def test_sdk_smart_evaluator_exception_uses_fixed_log(
+        self, monkeypatch, caplog,
+    ):
+        import json
+
+        sk = "sess-sdk-smart-exception"
+        marker = "SMART_EXCEPTION_SECRET_7b9"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        try:
+            approval_mod.register_gateway_notify(sk, lambda _data: None)
+            monkeypatch.setattr(approval_mod, "_get_approval_mode", lambda: "smart")
+            from agent import auxiliary_client
+            monkeypatch.setattr(
+                auxiliary_client, "call_llm",
+                lambda **_kwargs: (_ for _ in ()).throw(RuntimeError(marker)),
+            )
+            monkeypatch.setattr(
+                approval_mod,
+                "_await_gateway_decision",
+                lambda *_a, **_k: {"resolved": True, "choice": "deny"},
+            )
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+            canonical = json.dumps(
+                {"tool_name": "Read", "tool_input": {"file_path": "/tmp/x"}},
+                sort_keys=True, separators=(",", ":"),
+            )
+            with caplog.at_level(logging.DEBUG, logger="tools.approval"):
+                assert cb("untrusted", "untrusted", canonical_tool_input=canonical) == {
+                    "choice": "deny", "operator_denial": True, "reason": "",
+                }
+            assert marker not in caplog.text
+            assert "Smart approvals: LLM call failed, escalating" in caplog.text
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+            approval_mod.reset_current_session_key(token)
+
+    def test_hostile_exact_session_key_never_reaches_sdk_log(
+        self, monkeypatch, caplog,
+    ):
+        import json
+
+        marker = "CTX_SESSION_SECRET_7c91"
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        from tools import approval as approval_mod
+
+        cb = approval_mod.build_sdk_gateway_approval_callback(
+            context_provider=lambda: {"gateway": True, "session_key": marker},
+        )
+        canonical = json.dumps(
+            {"tool_name": "Bash", "tool_input": {"command": "true"}},
+            sort_keys=True, separators=(",", ":"),
+        )
+        with caplog.at_level(logging.WARNING, logger="tools.approval"):
+            result = cb("untrusted", "untrusted", canonical_tool_input=canonical)
+        assert result == {
+            "choice": "deny", "reason": "no approver available (background context)",
+        }
+        assert marker not in caplog.text
 
 
 class TestAnthropicTokenGuard:
@@ -5767,7 +6981,7 @@ class TestTurnLifetime:
             session._turn_watch = w1
             cb = session._make_can_use_tool()
             fut = asyncio.run_coroutine_threadsafe(
-                cb("Bash", {}, SimpleNamespace(tool_use_id="t1")),
+                cb("Bash", {"command": "true"}, SimpleNamespace(tool_use_id="t1")),
                 session._loop,
             )
             deadline = time.monotonic() + 5
@@ -5968,3 +7182,1132 @@ class TestTurnLifetimeConfig:
         clock["now"] += 500.0
         watch.rebaseline()
         assert watch.check(budget=60000.0, quiet=90.0) is None
+
+
+class TestSdkApprovalCanonicalizationHardening:
+    """Hostile SDK permission data is bounded before every approval sink."""
+
+    @pytest.fixture(autouse=True)
+    def _sdk_permission_results(self, monkeypatch):
+        _plant_claude_agent_sdk_stand_in(monkeypatch)
+
+    @pytest.mark.parametrize(
+        "tool_input_factory",
+        [
+            lambda: {"path": object()},
+            lambda: {"path": type("StrSubclass", (str,), {})("/tmp/x")},
+            lambda: {"path": "bad\ud800path"},
+            lambda: {"score": float("nan")},
+            lambda: {"nested": [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]},
+            lambda: {"nodes": [None] * 10_001},
+            lambda: {"path": "x" * (64 * 1024)},
+        ],
+    )
+    def test_malformed_autoallowed_request_denies_before_callback(
+        self, tool_input_factory,
+    ):
+        calls = []
+        session, _ = _make_session(
+            approval_callback=lambda *a, **k: calls.append((a, k)) or "once",
+            permission_mode="default",
+        )
+        tool_input = tool_input_factory()
+        if "nodes" not in tool_input:
+            tool_input["cycle"] = []
+            if type(tool_input.get("path")) is object:
+                tool_input.pop("cycle")
+        result = asyncio.run(session._make_can_use_tool()(
+            "mcp__hermes-tools__read_file", tool_input, None,
+        ))
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert result.message == "canonical request is unassessable"
+        assert calls == []
+
+    def test_cycle_denies_before_exact_mcp_autoallow(self):
+        calls = []
+        cyclic = {}
+        cyclic["self"] = cyclic
+        session, _ = _make_session(
+            approval_callback=lambda *a, **k: calls.append((a, k)) or "once",
+            permission_mode="default",
+        )
+        result = asyncio.run(session._make_can_use_tool()(
+            "mcp__hermes-tools__search_files", cyclic, None,
+        ))
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert calls == []
+
+    def test_canonical_serialization_is_deterministic_utf8_and_bounded(self):
+        from agent.transports.claude_agent_sdk_session import (
+            _canonical_sdk_tool_request,
+            validate_canonical_sdk_request_serialization,
+        )
+
+        canonical = _canonical_sdk_tool_request(
+            "Pathé工具", {"z": "🙂", "a": {"路径": "/tmp/é"}},
+        )
+        assert canonical == (
+            '{"tool_input":{"a":{"路径":"/tmp/é"},"z":"🙂"},'
+            '"tool_name":"Pathé工具"}'
+        )
+        assert validate_canonical_sdk_request_serialization(canonical) == (
+            canonical,
+            {"tool_input": {"a": {"路径": "/tmp/é"}, "z": "🙂"}, "tool_name": "Pathé工具"},
+        )
+        assert validate_canonical_sdk_request_serialization(canonical + " ") is None
+        assert validate_canonical_sdk_request_serialization(
+            '{"tool_input":{"path":"\\ud800"},"tool_name":"Read"}'
+        ) is None
+
+    def test_marker_aware_callback_receives_canonical_and_bounded_meaningful_id(self):
+        received = []
+
+        def marked(command, description, *, allow_permanent=False, tool_use_id="",
+                   canonical_tool_input=None):
+            received.append((command, description, allow_permanent, tool_use_id,
+                             canonical_tool_input))
+            return "once"
+
+        marked._accepts_tool_use_id = True
+        marked._accepts_canonical_tool_input = True
+        session, _ = _make_session(
+            approval_callback=marked, permission_mode="default",
+        )
+        result = asyncio.run(session._make_can_use_tool()(
+            "Bash", {"command": "printf safe"}, SimpleNamespace(tool_use_id="toolu_é"),
+        ))
+        assert type(result).__name__ == "PermissionResultAllow"
+        assert received == [(
+            "Bash(command=printf safe)", "Claude requests SDK tool Bash", False,
+            "toolu_é", '{"tool_input":{"command":"printf safe"},"tool_name":"Bash"}',
+        )]
+
+    @pytest.mark.parametrize(
+        ("tool_use_id", "expected"),
+        [
+            ("x" * 256, "x" * 256),
+            ("x" * 257, ""),
+            ("é" * 128, "é" * 128),
+            (("é" * 128) + "x", ""),
+        ],
+    )
+    def test_sdk_session_tool_use_id_enforces_exact_utf8_byte_cap(
+        self, tool_use_id, expected,
+    ):
+        received = []
+
+        def marked(command, description, *, allow_permanent=False, tool_use_id=""):
+            received.append(tool_use_id)
+            return "deny"
+
+        marked._accepts_tool_use_id = True
+        session, _ = _make_session(approval_callback=marked, permission_mode="default")
+        result = asyncio.run(session._make_can_use_tool()(
+            "Bash", {"command": "true"}, SimpleNamespace(tool_use_id=tool_use_id),
+        ))
+
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert received == [expected]
+        if not expected:
+            assert tool_use_id not in received
+
+    def test_sdk_session_huge_multibyte_tool_use_id_has_bounded_peak_allocation(self):
+        huge_id = "é" * (16 * 1024 * 1024)
+        received = []
+
+        def marked(command, description, *, allow_permanent=False, tool_use_id=""):
+            received.append(tool_use_id)
+            return "deny"
+
+        marked._accepts_tool_use_id = True
+        session, _ = _make_session(approval_callback=marked, permission_mode="default")
+        asyncio.run(session._make_can_use_tool()(
+            "Bash", {"command": "true"}, SimpleNamespace(tool_use_id="warmup"),
+        ))
+        received.clear()
+        tracemalloc.start()
+        try:
+            result = asyncio.run(session._make_can_use_tool()(
+                "Bash", {"command": "true"}, SimpleNamespace(tool_use_id=huge_id),
+            ))
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert received == [""]
+        assert huge_id not in received
+        assert peak < 2 * 1024 * 1024
+
+    @pytest.mark.parametrize(
+        "bad_id",
+        [None, 123, " \t\n", "\x00\x01", "bad\ud800", "x" * 257,
+         type("IdSubclass", (str,), {})("toolu_x")],
+    )
+    def test_opted_in_callback_receives_empty_malformed_tool_use_id(self, bad_id):
+        received = []
+
+        def marked(command, description, *, allow_permanent=False, tool_use_id=""):
+            received.append(tool_use_id)
+            return "deny"
+
+        marked._accepts_tool_use_id = True
+        session, _ = _make_session(approval_callback=marked, permission_mode="default")
+        asyncio.run(session._make_can_use_tool()(
+            "Bash", {"command": "true"}, SimpleNamespace(tool_use_id=bad_id),
+        ))
+        assert received == [""]
+
+    def test_markerless_callback_keeps_exact_abi_and_safe_actionable_presentations(
+        self, monkeypatch,
+    ):
+        from agent.transports import claude_agent_sdk_session as session_mod
+
+        monkeypatch.setattr(
+            session_mod, "redact_sensitive_text",
+            lambda value, **_kwargs: value.replace("SECRET", "[REDACTED]"),
+        )
+        received = []
+
+        def legacy(command, description, *, allow_permanent=False):
+            received.append((command, description, allow_permanent))
+            return "once"
+
+        session, _ = _make_session(approval_callback=legacy, permission_mode="default")
+        callback = session._make_can_use_tool()
+        for name, payload in (
+            ("Bash", {"command": "printf SECRET\nnext\x00line"}),
+            ("Write", {"file_path": "/tmp/demo\n.txt", "content": "SECRET_CONTENT"}),
+            ("Odd SECRET\x00Tool", {"payload": "SECRET_PAYLOAD"}),
+        ):
+            result = asyncio.run(callback(name, payload, SimpleNamespace(tool_use_id="hostile")))
+            assert type(result).__name__ == "PermissionResultAllow"
+
+        assert received[0] == (
+            "Bash(command=printf [REDACTED] next line)",
+            "Claude requests SDK tool Bash", False,
+        )
+        assert received[1] == (
+            "Write(path=/tmp/demo .txt)", "Claude requests SDK tool Write", False,
+        )
+        assert "CONTENT" not in received[1][0]
+        assert received[2] == (
+            "SDK tool unknown", "Claude requests an SDK tool", False,
+        )
+        assert "PAYLOAD" not in received[2][0]
+        assert all(len(command.encode("utf-8")) <= 512 for command, _, _ in received)
+
+    def test_malformed_bash_denies_before_markerless_callback(self):
+        calls = []
+        session, _ = _make_session(
+            approval_callback=lambda *a, **k: calls.append((a, k)) or "once",
+            permission_mode="default",
+        )
+        result = asyncio.run(session._make_can_use_tool()(
+            "Bash", {"command": ["rm", "-rf", "/"]}, None,
+        ))
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert result.message == "canonical request is unassessable"
+        assert calls == []
+
+    def test_hostile_callback_exception_and_sdk_metadata_never_reach_logs(
+        self, caplog,
+    ):
+        marker = "SDK_SECRET_EXCEPTION_91f"
+
+        def broken(*_args, **_kwargs):
+            raise RuntimeError(marker)
+
+        session, _ = _make_session(
+            approval_callback=broken, permission_mode="default",
+            hermes_session_id="safe-session",
+        )
+        with caplog.at_level(
+            logging.INFO, logger="agent.transports.claude_agent_sdk_session",
+        ):
+            result = asyncio.run(session._make_can_use_tool()(
+                f"Odd-{marker}", {"payload": marker}, None,
+            ))
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert result.message == "approval callback failed"
+        assert marker not in caplog.text
+        assert not any(record.exc_info for record in caplog.records)
+        assert any(
+            record.getMessage() == "SDK approval callback failed at protected boundary"
+            for record in caplog.records
+        )
+
+    def test_gateway_notify_exception_text_is_contained_at_sdk_boundary(
+        self, monkeypatch, caplog,
+    ):
+        import json
+
+        from tools import approval as approval_mod
+
+        marker = "SDK_NOTIFY_EXCEPTION_SECRET_4ab"
+        session_key = "sdk-notify-containment"
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        token = approval_mod.set_current_session_key(session_key)
+
+        def broken_notify(_approval_data):
+            raise RuntimeError(marker)
+
+        try:
+            approval_mod.register_session_notify(session_key, broken_notify)
+            callback = approval_mod.build_sdk_gateway_approval_callback()
+            canonical = json.dumps(
+                {"tool_name": "Bash", "tool_input": {"command": "true"}},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            with caplog.at_level(logging.WARNING, logger="tools.approval"):
+                result = callback(
+                    "hostile", "hostile", canonical_tool_input=canonical,
+                )
+            assert result == {
+                "choice": "deny",
+                "reason": (
+                    "approval request could not be delivered to the operator "
+                    "(notify failed)"
+                ),
+            }
+            assert marker not in caplog.text
+        finally:
+            approval_mod.unregister_session_notify(session_key)
+            approval_mod.reset_current_session_key(token)
+
+    def test_wide_request_rejects_without_width_sized_validator_allocation(self):
+        import tracemalloc
+
+        from agent.transports.claude_agent_sdk_session import (
+            _is_bounded_plain_sdk_json,
+        )
+
+        request = {"wide": [None] * 200_000}
+        tracemalloc.start()
+        try:
+            assert not _is_bounded_plain_sdk_json(request)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert peak < 2_000_000
+
+    def test_wide_dictionary_rejection_time_is_node_budget_bounded(self):
+        import time
+
+        from agent.transports.claude_agent_sdk_session import (
+            _is_bounded_plain_sdk_json,
+        )
+
+        smaller = {str(index): None for index in range(50_000)}
+        larger = {str(index): None for index in range(500_000)}
+
+        def fastest(value):
+            samples = []
+            for _ in range(3):
+                started = time.perf_counter()
+                assert not _is_bounded_plain_sdk_json(value)
+                samples.append(time.perf_counter() - started)
+            return min(samples)
+
+        smaller_time = fastest(smaller)
+        larger_time = fastest(larger)
+        assert larger_time < (smaller_time * 3) + 0.01
+
+    def test_canonicalization_runtime_error_denies_before_auto_allow(
+        self, monkeypatch,
+    ):
+        from agent.transports import claude_agent_sdk_session as session_mod
+
+        def mutation_failure(*_args, **_kwargs):
+            raise RuntimeError("dictionary changed size during iteration")
+
+        monkeypatch.setattr(
+            session_mod, "_canonical_sdk_tool_request", mutation_failure,
+        )
+        calls = []
+        session, _ = _make_session(
+            approval_callback=lambda *a, **k: calls.append((a, k)) or "once",
+            permission_mode="default",
+        )
+        result = asyncio.run(session._make_can_use_tool()(
+            "mcp__hermes-tools__read_file", {"path": "/tmp/demo"}, None,
+        ))
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert result.message == "canonical request is unassessable"
+        assert calls == []
+
+    def test_wide_exact_callback_result_rejects_before_width_sized_allocation(
+        self, caplog,
+    ):
+        import tracemalloc
+
+        marker = "SDK_WIDE_RESULT_SECRET_91c"
+        wide_result = {f"key-{index}": None for index in range(200_000)}
+        wide_result[marker] = None
+        session, _ = _make_session(
+            approval_callback=lambda *_a, **_k: wide_result,
+            permission_mode="default",
+        )
+        callback = session._make_can_use_tool()
+        asyncio.run(callback("Bash", {"command": "true"}, None))
+
+        caplog.clear()
+        tracemalloc.start()
+        try:
+            with caplog.at_level(
+                logging.INFO, logger="agent.transports.claude_agent_sdk_session",
+            ):
+                result = asyncio.run(callback("Bash", {"command": "true"}, None))
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert result.message == "approval callback failed"
+        assert peak < 1_000_000
+        assert marker not in caplog.text
+        assert not any(record.exc_info for record in caplog.records)
+
+    def test_overlong_multibyte_choice_rejects_without_full_copy_or_leak(
+        self, caplog, monkeypatch,
+    ):
+        import tracemalloc
+
+        from agent.transports import claude_agent_sdk_session as session_mod
+
+        marker = "SDK_CHOICE_RESULT_SECRET_27e"
+        huge_choice = marker + ("é" * (32 * 1024 * 1024))
+        current_result = ["bogus"]
+        session, _ = _make_session(
+            approval_callback=lambda *_a, **_k: current_result[0],
+            permission_mode="default",
+        )
+        callback = session._make_can_use_tool()
+        asyncio.run(callback("Bash", {"command": "true"}, None))
+        current_result[0] = huge_choice
+        category_calls = []
+        hostile_category_counts = []
+        original_category = session_mod.unicodedata.category
+        original_validator = session_mod._is_bounded_sdk_callback_string
+
+        def counted_category(char):
+            category_calls.append(char)
+            return original_category(char)
+
+        def counted_validator(value, max_utf8_bytes, *, allow_space):
+            before = len(category_calls)
+            valid = original_validator(
+                value, max_utf8_bytes, allow_space=allow_space,
+            )
+            if value is huge_choice:
+                hostile_category_counts.append(len(category_calls) - before)
+            return valid
+
+        monkeypatch.setattr(session_mod.unicodedata, "category", counted_category)
+        monkeypatch.setattr(
+            session_mod, "_is_bounded_sdk_callback_string", counted_validator,
+        )
+
+        caplog.clear()
+        tracemalloc.start()
+        try:
+            with caplog.at_level(
+                logging.INFO, logger="agent.transports.claude_agent_sdk_session",
+            ):
+                result = asyncio.run(callback("Bash", {"command": "true"}, None))
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert result.message == "approval callback failed"
+        assert peak < 1_000_000
+        assert hostile_category_counts == [17]
+        assert marker not in caplog.text
+        assert not any(record.exc_info for record in caplog.records)
+
+    def test_overlong_multibyte_reason_rejects_without_full_copy_or_leak(
+        self, caplog, monkeypatch,
+    ):
+        import tracemalloc
+
+        from agent.transports import claude_agent_sdk_session as session_mod
+
+        marker = "SDK_REASON_RESULT_SECRET_4af"
+        huge_reason = marker + ("é" * (16 * 1024 * 1024))
+        current_result = [{"choice": "deny", "reason": "ordinary denial"}]
+        session, _ = _make_session(
+            approval_callback=lambda *_a, **_k: current_result[0],
+            permission_mode="default",
+        )
+        callback = session._make_can_use_tool()
+        asyncio.run(callback("Bash", {"command": "true"}, None))
+        current_result[0] = {"choice": "deny", "reason": huge_reason}
+        category_calls = []
+        hostile_category_counts = []
+        original_category = session_mod.unicodedata.category
+        original_validator = session_mod._is_bounded_sdk_callback_string
+
+        def counted_category(char):
+            category_calls.append(char)
+            return original_category(char)
+
+        def counted_validator(value, max_utf8_bytes, *, allow_space):
+            before = len(category_calls)
+            valid = original_validator(
+                value, max_utf8_bytes, allow_space=allow_space,
+            )
+            if value is huge_reason:
+                hostile_category_counts.append(len(category_calls) - before)
+            return valid
+
+        monkeypatch.setattr(session_mod.unicodedata, "category", counted_category)
+        monkeypatch.setattr(
+            session_mod, "_is_bounded_sdk_callback_string", counted_validator,
+        )
+
+        caplog.clear()
+        tracemalloc.start()
+        try:
+            with caplog.at_level(
+                logging.INFO, logger="agent.transports.claude_agent_sdk_session",
+            ):
+                result = asyncio.run(callback("Bash", {"command": "true"}, None))
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert result.message == "approval callback failed"
+        assert peak < 1_000_000
+        assert hostile_category_counts == [271]
+        assert marker not in caplog.text
+        assert not any(record.exc_info for record in caplog.records)
+
+    def test_hostile_callback_result_mapping_fails_closed_without_leak(self, caplog):
+        marker = "SDK_RESULT_DECODE_SECRET_7d2"
+        override_calls = []
+
+        class HostileResult(dict):
+            def __len__(self):
+                override_calls.append("len")
+                raise RuntimeError(marker)
+
+            def __iter__(self):
+                override_calls.append("iter")
+                raise RuntimeError(marker)
+
+            def __contains__(self, _key):
+                override_calls.append("contains")
+                raise RuntimeError(marker)
+
+            def __getitem__(self, _key):
+                override_calls.append("getitem")
+                raise RuntimeError(marker)
+
+            def get(self, *_args, **_kwargs):
+                override_calls.append("get")
+                raise RuntimeError(marker)
+
+        session, _ = _make_session(
+            approval_callback=lambda *_a, **_k: HostileResult(choice="once"),
+            permission_mode="default",
+        )
+        with caplog.at_level(
+            logging.INFO, logger="agent.transports.claude_agent_sdk_session",
+        ):
+            result = asyncio.run(session._make_can_use_tool()(
+                "Bash", {"command": "true"}, None,
+            ))
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert result.message == "approval callback failed"
+        assert override_calls == []
+        assert marker not in caplog.text
+        assert not any(record.exc_info for record in caplog.records)
+
+    @pytest.mark.parametrize("callback_result", [
+        "bogus",
+        {"choice": "bogus"},
+    ])
+    def test_unknown_exact_callback_choice_is_protocol_failure(
+        self, callback_result, caplog,
+    ):
+        session, _ = _make_session(
+            approval_callback=lambda *_a, **_k: callback_result,
+            permission_mode="default",
+        )
+        with caplog.at_level(
+            logging.INFO, logger="agent.transports.claude_agent_sdk_session",
+        ):
+            result = asyncio.run(session._make_can_use_tool()(
+                "Bash", {"command": "true"}, None,
+            ))
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert result.message == "approval callback failed"
+        assert "denied by user" not in caplog.text
+
+    def test_callback_string_helper_enforces_exact_utf8_caps_and_text_contract(self):
+        from agent.transports.claude_agent_sdk_session import (
+            _is_bounded_sdk_callback_string,
+        )
+
+        class StringSubclass(str):
+            pass
+
+        assert _is_bounded_sdk_callback_string("é" * 256, 512, allow_space=True)
+        assert not _is_bounded_sdk_callback_string("é" * 257, 512, allow_space=True)
+        assert _is_bounded_sdk_callback_string("ordinary reason", 512, allow_space=True)
+        assert not _is_bounded_sdk_callback_string("line\nbreak", 512, allow_space=True)
+        assert not _is_bounded_sdk_callback_string("tab\tbreak", 512, allow_space=True)
+        assert not _is_bounded_sdk_callback_string("bad\ud800reason", 512, allow_space=True)
+        assert not _is_bounded_sdk_callback_string(
+            StringSubclass("once"), 16, allow_space=False,
+        )
+
+    @pytest.mark.parametrize("budget", [0, 1, 5, 20, 21])
+    def test_head_tail_helper_never_exceeds_supplied_budget(self, budget):
+        from agent.transports.claude_agent_sdk_session import (
+            _bounded_control_sanitized_head_tail,
+        )
+
+        rendered = _bounded_control_sanitized_head_tail("x" * 100, budget)
+        assert len(rendered.encode("utf-8")) <= budget
+
+    def test_head_tail_helper_preserves_multibyte_tail_within_budget(self):
+        from agent.transports.claude_agent_sdk_session import (
+            _bounded_control_sanitized_head_tail,
+        )
+
+        rendered = _bounded_control_sanitized_head_tail(
+            ("α" * 100) + "\nTAIL", 64,
+        )
+        assert "[truncated]" in rendered
+        assert rendered.endswith("TAIL")
+        assert "\n" not in rendered
+        assert len(rendered.encode("utf-8")) <= 64
+
+    def test_huge_integer_denies_before_encoder_entry_on_exact_mcp_path(
+        self, monkeypatch,
+    ):
+        import json
+        import sys
+
+        from agent.transports import claude_agent_sdk_session as session_mod
+
+        old_limit = sys.get_int_max_str_digits()
+        calls = []
+        original = json.JSONEncoder.iterencode
+
+        def observed_iterencode(encoder, value, *args, **kwargs):
+            calls.append(value)
+            return original(encoder, value, *args, **kwargs)
+
+        monkeypatch.setattr(json.JSONEncoder, "iterencode", observed_iterencode)
+        callback_calls = []
+        session, _ = _make_session(
+            approval_callback=lambda *a, **k: callback_calls.append((a, k)) or "once",
+            permission_mode="default",
+        )
+        try:
+            sys.set_int_max_str_digits(0)
+            huge = 10 ** 99_999
+            result = asyncio.run(session._make_can_use_tool()(
+                "mcp__hermes-tools__read_file",
+                {"path": "/tmp/x", "huge": huge},
+                None,
+            ))
+        finally:
+            sys.set_int_max_str_digits(old_limit)
+
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert result.message == "canonical request is unassessable"
+        assert callback_calls == []
+        assert calls == []
+
+    def test_post_validation_mutation_cannot_reach_encoder_or_allocate_width(
+        self, monkeypatch,
+    ):
+        import tracemalloc
+
+        from agent.transports import claude_agent_sdk_session as session_mod
+
+        payload = {"path": "/tmp/x", "nested": {"safe": True}}
+        wide = {f"k{i}": i for i in range(100_000)}
+        encoded_values = []
+        original = session_mod._bounded_canonical_sdk_json
+
+        def mutate_before_encoding(value):
+            payload["nested"] = wide
+            encoded_values.append(value)
+            return original(value)
+
+        monkeypatch.setattr(
+            session_mod, "_bounded_canonical_sdk_json", mutate_before_encoding,
+        )
+        callback_calls = []
+        session, _ = _make_session(
+            approval_callback=lambda *a, **k: callback_calls.append((a, k)) or "once",
+            permission_mode="default",
+        )
+        tracemalloc.start()
+        try:
+            result = asyncio.run(session._make_can_use_tool()(
+                "mcp__hermes-tools__read_file", payload, None,
+            ))
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert type(result).__name__ == "PermissionResultAllow"
+        assert callback_calls == []
+        assert encoded_values
+        assert all(
+            value["tool_input"].get("nested") is not wide
+            for value in encoded_values
+            if type(value) is dict and type(value.get("tool_input")) is dict
+        )
+        assert peak < 2_000_000
+
+    def test_alias_serialization_stops_near_canonical_byte_cap(self):
+        import tracemalloc
+
+        from agent.transports.claude_agent_sdk_session import (
+            _canonical_sdk_tool_request,
+        )
+
+        big = 10 ** 3_999
+        payload = {"path": "/tmp/x", "aliases": [big] * 9_000}
+        tracemalloc.start()
+        try:
+            assert _canonical_sdk_tool_request(
+                "mcp__hermes-tools__read_file", payload,
+            ) is None
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert peak < 2_000_000
+
+    @pytest.mark.parametrize(("callback_result", "expected_type", "expected_message"), [
+        ("once", "PermissionResultAllow", None),
+        ("session", "PermissionResultAllow", None),
+        ("always", "PermissionResultAllow", None),
+        ({"choice": "once"}, "PermissionResultAllow", None),
+        ("deny", "PermissionResultDeny", "approval denied by callback"),
+        ("timeout", "PermissionResultDeny", "approval timed out — no operator response"),
+        (
+            {"choice": "deny", "reason": "approval expired (turn ended)"},
+            "PermissionResultDeny",
+            "approval expired (turn ended)",
+        ),
+    ])
+    def test_callback_result_valid_shape_matrix_preserves_decision_and_input(
+        self, callback_result, expected_type, expected_message,
+    ):
+        original = {"command": "printf safe", "nested": {"value": 1}}
+        session, _ = _make_session(
+            approval_callback=lambda *_a, **_k: callback_result,
+            permission_mode="default",
+        )
+        result = asyncio.run(session._make_can_use_tool()(
+            "Bash", original, None,
+        ))
+
+        assert type(result).__name__ == expected_type
+        if expected_type == "PermissionResultAllow":
+            assert result.updated_input == original
+            assert result.updated_input is not original
+            assert result.updated_input["nested"] is not original["nested"]
+        else:
+            assert result.message == expected_message
+
+    def test_trusted_structural_operator_denial_preserves_reason_and_provenance(self):
+        from tools import approval as approval_mod
+
+        def trusted_callback(*_args, **_kwargs):
+            return {
+                "choice": "deny",
+                "operator_denial": True,
+                "reason": "not now",
+            }
+
+        assert approval_mod._register_trusted_sdk_gateway_approval_callback(
+            trusted_callback,
+        )
+        session, _ = _make_session(
+            approval_callback=trusted_callback,
+            permission_mode="default",
+        )
+        result = asyncio.run(session._make_can_use_tool()(
+            "Bash", {"command": "true"}, None,
+        ))
+
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert result.message == "denied by user: not now"
+
+    @pytest.mark.parametrize("callback_result", [
+        {"choice": "once", "extra": "malformed"},
+        {"choice": "once", "reason": "unused"},
+        {"choice": "timeout", "reason": "raw"},
+        {"choice": "deny", "extra": "malformed"},
+        {"choice": True},
+        {"choice": "deny", "reason": True},
+        {"choice": "deny", "operator_denial": False, "reason": ""},
+        {"choice": "deny", "operator_denial": 1, "reason": ""},
+        {"choice": "deny", "operator_denial": True, "reason": ""},
+        {"choice": "deny", "reason": "line\nbreak"},
+        {"choice": "deny", "reason": "bad\ud800reason"},
+    ])
+    def test_malformed_structured_callback_result_is_protocol_failure(
+        self, callback_result,
+    ):
+        session, _ = _make_session(
+            approval_callback=lambda *_a, **_k: callback_result,
+            permission_mode="default",
+        )
+        result = asyncio.run(session._make_can_use_tool()(
+            "Bash", {"command": "true"}, None,
+        ))
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert result.message == "approval callback failed"
+
+
+    def test_canonical_utf8_cap_and_cap_plus_one_are_exact(self):
+        from agent.transports.claude_agent_sdk_session import (
+            _SDK_CANONICAL_MAX_UTF8_BYTES,
+            validate_canonical_sdk_request_serialization,
+        )
+
+        prefix = '{"tool_input":{"path":"'
+        suffix = '"},"tool_name":"Read"}'
+        envelope_bytes = len((prefix + suffix).encode("utf-8"))
+        fill = "é" * ((_SDK_CANONICAL_MAX_UTF8_BYTES - envelope_bytes) // 2)
+        at_cap = prefix + fill + "a" + suffix
+        cap_plus_one = prefix + fill + "aa" + suffix
+
+        assert len(at_cap.encode("utf-8")) == _SDK_CANONICAL_MAX_UTF8_BYTES
+        assert len(cap_plus_one.encode("utf-8")) == _SDK_CANONICAL_MAX_UTF8_BYTES + 1
+        assert validate_canonical_sdk_request_serialization(at_cap) is not None
+        assert validate_canonical_sdk_request_serialization(cap_plus_one) is None
+
+    def test_oversized_multibyte_canonical_rejects_with_bounded_peak_allocation(
+        self,
+    ):
+        import time
+        import tracemalloc
+
+        from agent.transports.claude_agent_sdk_session import (
+            validate_canonical_sdk_request_serialization,
+        )
+
+        huge = "é" * (16 * 1024 * 1024)
+        tracemalloc.start()
+        started = time.perf_counter()
+        try:
+            assert validate_canonical_sdk_request_serialization(huge) is None
+            elapsed = time.perf_counter() - started
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert peak < 2_000_000
+        assert elapsed < 1.0
+
+    def test_gateway_validates_canonical_once_and_bounds_oversized_rejection(
+        self, monkeypatch,
+    ):
+        import json
+        import time
+        import tracemalloc
+
+        from agent.transports import claude_agent_sdk_session as session_mod
+        from tools import approval as approval_mod
+
+        sk = "sess-sdk-single-validation"
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        token = approval_mod.set_current_session_key(sk)
+        calls = []
+        original = session_mod.validate_canonical_sdk_request_serialization
+
+        def counted(value):
+            calls.append(value)
+            return original(value)
+
+        try:
+            approval_mod.register_gateway_notify(
+                sk,
+                lambda _data: approval_mod.resolve_gateway_approval(sk, "deny"),
+            )
+            monkeypatch.setattr(
+                session_mod, "validate_canonical_sdk_request_serialization", counted,
+            )
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+            canonical = json.dumps(
+                {"tool_name": "Read", "tool_input": {"file_path": "/tmp/x"}},
+                sort_keys=True, separators=(",", ":"),
+            )
+            assert cb(
+                "untrusted", "untrusted", canonical_tool_input=canonical,
+            )["choice"] == "deny"
+            assert calls == [canonical]
+
+            calls.clear()
+            huge = "é" * (16 * 1024 * 1024)
+            tracemalloc.start()
+            started = time.perf_counter()
+            try:
+                result = cb("untrusted", "untrusted", canonical_tool_input=huge)
+                elapsed = time.perf_counter() - started
+                _current, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+            assert result == {
+                "choice": "deny", "reason": "canonical request is unassessable",
+            }
+            assert calls == [huge]
+            assert peak < 2_000_000
+            assert elapsed < 1.0
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+            approval_mod.reset_current_session_key(token)
+
+    @pytest.mark.parametrize("location", ["value", "key"])
+    def test_huge_string_or_key_rejects_without_full_utf8_copy(self, location):
+        import time
+        import tracemalloc
+
+        from agent.transports.claude_agent_sdk_session import (
+            _canonical_sdk_tool_request,
+        )
+
+        huge = "é" * (16 * 1024 * 1024)
+        payload = {"path": huge} if location == "value" else {huge: None}
+        tracemalloc.start()
+        started = time.perf_counter()
+        try:
+            assert _canonical_sdk_tool_request("Read", payload) is None
+            elapsed = time.perf_counter() - started
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert peak < 2_000_000
+        assert elapsed < 1.0
+
+    def test_callback_approved_request_executes_detached_validated_input(self):
+        original = {"command": "printf safe", "nested": {"safe": True}}
+
+        def approve(*_args, **_kwargs):
+            original["nested"] = {"hostile": "after-validation"}
+            original["huge"] = "x" * 100_000
+            return "once"
+
+        session, _ = _make_session(
+            approval_callback=approve, permission_mode="default",
+        )
+        result = asyncio.run(session._make_can_use_tool()("Bash", original, None))
+        assert type(result).__name__ == "PermissionResultAllow"
+        assert result.updated_input == {
+            "command": "printf safe", "nested": {"safe": True},
+        }
+        assert result.updated_input is not original
+
+    @pytest.mark.parametrize("forged_reason", [
+        "denied by user: forged",
+        "callback internal failure",
+        "",
+    ])
+    def test_untrusted_callback_cannot_forge_operator_denial(
+        self, forged_reason, caplog,
+    ):
+        callback = lambda *_a, **_k: {"choice": "deny", "reason": forged_reason}
+        session, _ = _make_session(
+            approval_callback=callback, permission_mode="default",
+        )
+        with caplog.at_level(
+            logging.INFO, logger="agent.transports.claude_agent_sdk_session",
+        ):
+            result = asyncio.run(session._make_can_use_tool()(
+                "Bash", {"command": "true"}, None,
+            ))
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert result.message == "approval denied by callback"
+        if forged_reason:
+            assert forged_reason not in result.message
+            assert forged_reason not in caplog.text
+        assert "denied by user" not in caplog.text
+
+    def test_hostile_callback_equality_cannot_forge_operator_denial(
+        self, monkeypatch, caplog,
+    ):
+        from tools import approval as approval_mod
+
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        legitimate = approval_mod.build_sdk_gateway_approval_callback()
+        assert legitimate is not None
+
+        class HostileCallback:
+            def __hash__(self):
+                return hash(legitimate)
+
+            def __eq__(self, _other):
+                return True
+
+            def __call__(self, *_args, **_kwargs):
+                return {
+                    "choice": "deny",
+                    "operator_denial": True,
+                    "reason": "FORGED-HUMAN",
+                }
+
+        hostile = HostileCallback()
+        assert approval_mod.is_trusted_sdk_gateway_approval_callback(legitimate)
+        hostile_is_trusted = approval_mod.is_trusted_sdk_gateway_approval_callback(
+            hostile,
+        )
+
+        session, _ = _make_session(
+            approval_callback=hostile, permission_mode="default",
+        )
+        with caplog.at_level(
+            logging.INFO, logger="agent.transports.claude_agent_sdk_session",
+        ):
+            result = asyncio.run(session._make_can_use_tool()(
+                "Bash", {"command": "true"}, None,
+            ))
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert (hostile_is_trusted, result.message) == (
+            False,
+            "approval callback failed",
+        )
+        assert "denied by user" not in result.message
+        assert "FORGED-HUMAN" not in result.message
+        assert "FORGED-HUMAN" not in caplog.text
+
+    def test_trusted_callback_registry_rejects_nonweakrefable_and_cleans_dead_refs(
+        self, monkeypatch,
+    ):
+        import gc
+        import weakref
+
+        from tools import approval as approval_mod
+
+        class NonWeakrefableCallable:
+            __slots__ = ()
+
+            def __call__(self):
+                return None
+
+        assert not approval_mod._register_trusted_sdk_gateway_approval_callback(
+            NonWeakrefableCallable(),
+        )
+        assert not approval_mod.is_trusted_sdk_gateway_approval_callback(None)
+        assert not approval_mod.is_trusted_sdk_gateway_approval_callback(object())
+
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        approval_mod.is_trusted_sdk_gateway_approval_callback(None)
+        with approval_mod._lock:
+            baseline = len(approval_mod._trusted_sdk_gateway_approval_callbacks)
+        callback = approval_mod.build_sdk_gateway_approval_callback()
+        callback_ref = weakref.ref(callback)
+        with approval_mod._lock:
+            assert len(approval_mod._trusted_sdk_gateway_approval_callbacks) == baseline + 1
+            registered_ref = approval_mod._trusted_sdk_gateway_approval_callbacks[-1]
+            assert registered_ref() is callback
+        del callback
+        gc.collect()
+        assert callback_ref() is None
+        with approval_mod._lock:
+            assert all(
+                candidate_ref is not registered_ref
+                for candidate_ref in approval_mod._trusted_sdk_gateway_approval_callbacks
+            )
+
+    def test_trusted_callback_registry_concurrent_lookup_is_identity_exact(
+        self, monkeypatch,
+    ):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from tools import approval as approval_mod
+
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        legitimate = approval_mod.build_sdk_gateway_approval_callback()
+
+        class EqualProxy:
+            def __hash__(self):
+                return hash(legitimate)
+
+            def __eq__(self, _other):
+                return True
+
+            def __call__(self):
+                return None
+
+        proxy = EqualProxy()
+        callbacks = [legitimate, proxy, None, object()] * 64
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            results = list(executor.map(
+                approval_mod.is_trusted_sdk_gateway_approval_callback,
+                callbacks,
+            ))
+        assert results == [True, False, False, False] * 64
+
+    def test_trusted_gateway_operator_denial_is_structural(self, monkeypatch):
+        from tools import approval as approval_mod
+
+        sk = "sess-structural-operator-deny"
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        token = approval_mod.set_current_session_key(sk)
+        try:
+            approval_mod.register_gateway_notify(sk, lambda _data: None)
+            monkeypatch.setattr(
+                approval_mod,
+                "_await_gateway_decision",
+                lambda *_a, **_k: {
+                    "resolved": True, "choice": "deny", "reason": "operator note",
+                },
+            )
+            callback = approval_mod.build_sdk_gateway_approval_callback()
+            canonical = (
+                '{"tool_input":{"command":"true"},"tool_name":"Bash"}'
+            )
+            assert callback(
+                "untrusted", "untrusted", canonical_tool_input=canonical,
+            ) == {
+                "choice": "deny",
+                "operator_denial": True,
+                "reason": "operator note",
+            }
+            session, _ = _make_session(
+                approval_callback=callback, permission_mode="default",
+            )
+            result = asyncio.run(session._make_can_use_tool()(
+                "Bash", {"command": "true"}, None,
+            ))
+            assert result.message == "denied by user: operator note"
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+            approval_mod.reset_current_session_key(token)
+
+    def test_redactor_exception_is_fixed_fail_closed(self, monkeypatch, caplog):
+        from agent.transports import claude_agent_sdk_session as session_mod
+
+        marker = "REDACTOR_EXCEPTION_SECRET_a61"
+        monkeypatch.setattr(
+            session_mod,
+            "redact_sensitive_text",
+            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError(marker)),
+        )
+        callback_calls = []
+        session, _ = _make_session(
+            approval_callback=lambda *a, **k: callback_calls.append((a, k)) or "once",
+            permission_mode="default",
+        )
+        with caplog.at_level(
+            logging.WARNING, logger="agent.transports.claude_agent_sdk_session",
+        ):
+            result = asyncio.run(session._make_can_use_tool()(
+                "Read", {"file_path": "/tmp/x"}, None,
+            ))
+        assert type(result).__name__ == "PermissionResultDeny"
+        assert result.message == "canonical request is unassessable"
+        assert callback_calls == []
+        assert marker not in caplog.text

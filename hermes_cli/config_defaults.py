@@ -381,12 +381,14 @@ DEFAULT_CONFIG = {
             # Positive integer overrides are accepted; invalid values warn
             # and fall back rather than disabling the budget.
             "append_total_max_chars": None,
-            # SDK permission mode, taken VERBATIM as a claude-agent-sdk
-            # permission_mode literal: default | acceptEdits | plan |
+            # SDK permission mode literal: default | acceptEdits | plan |
             # bypassPermissions | dontAsk | auto (note: "auto" is the SDK's
             # own mode, not the HERMES_TERMINAL_SECURITY_MODE value of the
-            # same name). "" (the default) keeps current behavior — the
-            # HERMES_TERMINAL_SECURITY_MODE mapping stands. Set
+            # same name). bypassPermissions is not forwarded verbatim: Hermes
+            # emulates it through the common audited callback only after exact
+            # request validation and immutable Bash/user-deny floors. Other
+            # literals are forwarded unchanged. "" (the default) keeps current
+            # behavior — the HERMES_TERMINAL_SECURITY_MODE mapping stands. Set
             # "default" to route SDK tool permissions through Hermes'
             # approval flow without env archaeology. Invalid values are
             # ignored with a warning (never silently loosened).

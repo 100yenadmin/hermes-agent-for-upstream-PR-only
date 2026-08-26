@@ -1264,10 +1264,24 @@ def run_claude_agent_sdk_turn(
             except Exception:
                 logger.debug("failed to emit CLI compaction completion", exc_info=True)
 
+        def _approval_bypass_active() -> bool:
+            """Resolve live trusted bypass posture for the foreign SDK thread."""
+            try:
+                from tools.approval import is_approval_bypass_active_for_session
+
+                ctx = getattr(agent, "_sdk_approval_turn_ctx", None)
+                session_key = (
+                    ctx.get("session_key", "") if type(ctx) is dict else ""
+                )
+                return is_approval_bypass_active_for_session(session_key)
+            except Exception:
+                return False
+
         agent._claude_sdk_session = ClaudeAgentSdkSession(
             cwd=cwd,
             model=getattr(agent, "model", None) or None,
             approval_callback=approval_callback,
+            approval_bypass_provider=_approval_bypass_active,
             on_tool_started=_on_tool_started,
             system_prompt_append=append,
             hermes_session_id=getattr(agent, "session_id", None),
