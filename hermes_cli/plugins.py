@@ -5314,12 +5314,18 @@ class PluginManager:
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
-                logger.warning(
-                    "Hook '%s' callback %s raised: %s",
-                    hook_name,
-                    getattr(cb, "__name__", repr(cb)),
-                    exc,
-                )
+                from hermes_cli.lifecycle import current_observer_failure_log
+
+                fixed_log = current_observer_failure_log()
+                if fixed_log is not None:
+                    logger.debug("%s", fixed_log)
+                else:
+                    logger.warning(
+                        "Hook '%s' callback %s raised: %s",
+                        hook_name,
+                        getattr(cb, "__name__", repr(cb)),
+                        exc,
+                    )
         return results
 
     def _subscribe_event(

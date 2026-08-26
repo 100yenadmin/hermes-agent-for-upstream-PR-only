@@ -106,7 +106,12 @@ def _is_interactive_cli() -> bool:
     return env_var_enabled("HERMES_INTERACTIVE")
 
 
-def _fire_approval_hook(hook_name: str, **kwargs) -> None:
+def _fire_approval_hook(
+    hook_name: str,
+    *,
+    _fixed_failure_log: str | None = None,
+    **kwargs,
+) -> None:
     """Invoke a plugin lifecycle hook for the approval system.
 
     Lazy-imports the plugin manager to avoid circular imports (approval.py is
@@ -122,19 +127,33 @@ def _fire_approval_hook(hook_name: str, **kwargs) -> None:
         # Plugin system not available in this execution context
         # (e.g. bare tool-only imports, minimal test environments).
         return
+    from contextlib import nullcontext
+
+    if _fixed_failure_log is not None:
+        from hermes_cli.lifecycle import observer_failure_log
+
+        failure_scope = observer_failure_log(_fixed_failure_log)
+    else:
+        failure_scope = nullcontext()
     try:
-        kwargs.setdefault("turn_id", _approval_turn_id.get())
-        kwargs.setdefault("tool_call_id", _approval_tool_call_id.get())
-        # Generic approval observers retain the bound Hermes session id.
-        session_id = _approval_session_id.get()
-        if session_id:
-            kwargs.setdefault("session_id", session_id)
-        invoke_hook(hook_name, **kwargs)
+        with failure_scope:
+            kwargs.setdefault("turn_id", _approval_turn_id.get())
+            kwargs.setdefault("tool_call_id", _approval_tool_call_id.get())
+            # Generic approval observers retain the bound Hermes session id.
+            # SDK-safe scopes control failure logging, not observer payload
+            # compatibility; SDK callers already provide bounded data here.
+            session_id = _approval_session_id.get()
+            if session_id:
+                kwargs.setdefault("session_id", session_id)
+            invoke_hook(hook_name, **kwargs)
     except Exception as exc:
         # invoke_hook() already swallows per-callback errors, so reaching here
         # means the dispatch layer itself failed. Log and move on -- approval
         # flow is safety-critical, plugin observability is not.
-        logger.debug("Approval hook %s dispatch failed: %s", hook_name, exc)
+        if _fixed_failure_log is not None:
+            logger.debug("%s", _fixed_failure_log)
+        else:
+            logger.debug("Approval hook %s dispatch failed: %s", hook_name, exc)
 
 
 def _prepare_smart_approval_observer(

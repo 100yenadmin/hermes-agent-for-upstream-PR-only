@@ -5603,13 +5603,13 @@ class TestGatewayApprovalBridge:
             result = self._call_gateway(
                 cb,
                 tool_name="Read",
-                tool_input={"file_path": "/opt/solar-monitor/src/backup.py"},
+                tool_input={"file_path": "/srv/example-app/src/backup.py"},
             )
 
             canonical = json.dumps(
                 {
                     "tool_name": "Read",
-                    "tool_input": {"file_path": "/opt/solar-monitor/src/backup.py"},
+                    "tool_input": {"file_path": "/srv/example-app/src/backup.py"},
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -5621,7 +5621,7 @@ class TestGatewayApprovalBridge:
                 {"_fixed_failure_log": True},
             )]
             assert prepared == [{
-                "command": "Read(path=/opt/solar-monitor/src/backup.py)",
+                "command": "Read(path=/srv/example-app/src/backup.py)",
                 "description": "Claude requests SDK tool Read",
                 "pattern_key": "claude_sdk_tool",
                 "pattern_keys": ["claude_sdk_tool"],
@@ -5904,6 +5904,384 @@ class TestGatewayApprovalBridge:
             "choice": "deny", "reason": "no approver available (background context)",
         }
         assert marker not in caplog.text
+
+
+    def test_sdk_smart_observer_dispatch_exceptions_use_fixed_stage_logs(
+        self, monkeypatch, caplog,
+    ):
+        import json
+
+        from hermes_cli import lifecycle
+
+        sk = "SDK_SESSION_SECRET_65982"
+        marker = "SDK_OBSERVER_EXCEPTION_SECRET_65982"
+        presentation = "Read(path=/tmp/visible-path)"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+
+        def broken_dispatch(hook_name, **kwargs):
+            raise RuntimeError(
+                f"{marker} stage={hook_name} session={kwargs['session_key']} "
+                f"command={kwargs['command']}"
+            )
+
+        try:
+            approval_mod.register_gateway_notify(sk, lambda _data: None)
+            monkeypatch.setattr(approval_mod, "_get_approval_mode", lambda: "smart")
+            monkeypatch.setattr(approval_mod, "_smart_approve", lambda *_a, **_k: "approve")
+            monkeypatch.setattr(lifecycle, "invoke_hook", broken_dispatch)
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+            canonical = json.dumps(
+                {"tool_name": "Read", "tool_input": {"file_path": "/tmp/visible-path"}},
+                sort_keys=True, separators=(",", ":"),
+            )
+            with caplog.at_level(logging.DEBUG, logger="tools.approval"):
+                assert cb("untrusted", "untrusted", canonical_tool_input=canonical) == "once"
+
+            assert marker not in caplog.text
+            assert sk not in caplog.text
+            assert presentation not in caplog.text
+            assert not any(record.exc_info for record in caplog.records)
+            assert [record.getMessage() for record in caplog.records] == [
+                "SDK Smart pre-approval observer dispatch failed",
+                "SDK Smart post-approval observer dispatch failed",
+            ]
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+            approval_mod.reset_current_session_key(token)
+
+    def test_sdk_smart_builtin_observer_failure_is_contained_at_inner_sink(
+        self, monkeypatch, caplog,
+    ):
+        from agent import relay_runtime
+        from hermes_cli import plugins
+        from hermes_cli.observability import relay_shared_metrics
+
+        sk = "SDK_BUILTIN_SESSION_SECRET_65982"
+        marker = "SDK_BUILTIN_OBSERVER_SECRET_65982"
+        path = "/tmp/SDK_BUILTIN_PATH_SECRET_65982"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+
+        class BrokenRuntime:
+            def record_approval(self, kwargs):
+                raise RuntimeError(f"{marker} payload={kwargs!r}")
+
+        try:
+            approval_mod.register_gateway_notify(sk, lambda _data: None)
+            monkeypatch.setattr(approval_mod, "_get_approval_mode", lambda: "smart")
+            monkeypatch.setattr(approval_mod, "_smart_approve", lambda *_a, **_k: "approve")
+            monkeypatch.setattr(relay_shared_metrics, "handles_hook", lambda _name: True)
+            monkeypatch.setattr(
+                relay_runtime, "relay_instrumentation_enabled", lambda: True,
+            )
+            monkeypatch.setattr(relay_shared_metrics, "_get_runtime", lambda: BrokenRuntime())
+            monkeypatch.setattr(plugins, "get_plugin_manager", lambda: plugins.PluginManager())
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+            with caplog.at_level(logging.DEBUG):
+                assert self._call_gateway(
+                    cb, tool_name="Read", tool_input={"file_path": path},
+                ) == "once"
+
+            assert marker not in caplog.text
+            assert sk not in caplog.text
+            assert path not in caplog.text
+            assert not any(record.exc_info for record in caplog.records)
+            assert [
+                record.getMessage() for record in caplog.records
+                if "SDK Smart" in record.getMessage()
+            ] == ["SDK Smart post-approval observer dispatch failed"]
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+            approval_mod.reset_current_session_key(token)
+
+    @pytest.mark.parametrize(
+        ("verdict", "expected", "expected_logs"),
+        [
+            ("approve", "once", [
+                "SDK Smart pre-approval observer dispatch failed",
+                "SDK Smart post-approval observer dispatch failed",
+            ]),
+            ("deny", {"choice": "deny", "operator_denial": True, "reason": ""}, [
+                "SDK Smart pre-approval observer dispatch failed",
+                "SDK Smart post-approval observer dispatch failed",
+                "SDK Smart pre-approval observer dispatch failed",
+                "SDK Smart post-approval observer dispatch failed",
+            ]),
+        ],
+    )
+    def test_sdk_smart_real_plugin_callbacks_contain_inner_runtime_failure(
+        self, monkeypatch, caplog, verdict, expected, expected_logs,
+    ):
+        from hermes_cli import plugins
+        from hermes_cli.observability import relay_shared_metrics
+
+        sk = "SDK_PLUGIN_SESSION_SECRET_65982"
+        marker = "SDK_PLUGIN_OBSERVER_SECRET_65982"
+        path = "/tmp/SDK_PLUGIN_PATH_SECRET_65982"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        manager = plugins.PluginManager()
+
+        def broken_plugin(**kwargs):
+            raise RuntimeError(f"{marker} payload={kwargs!r}")
+
+        manager._hooks["pre_approval_request"] = [broken_plugin]
+        manager._hooks["post_approval_response"] = [broken_plugin]
+        try:
+            approval_mod.register_gateway_notify(
+                sk,
+                lambda data: approval_mod.resolve_gateway_approval(
+                    sk, "deny", tool_use_id=data["tool_use_id"],
+                ),
+            )
+            monkeypatch.setattr(approval_mod, "_get_approval_mode", lambda: "smart")
+            monkeypatch.setattr(approval_mod, "_smart_approve", lambda *_a, **_k: verdict)
+            monkeypatch.setattr(relay_shared_metrics, "observe_lifecycle", lambda *_a, **_k: None)
+            monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+            with caplog.at_level(logging.DEBUG):
+                assert self._call_gateway(
+                    cb, tool_name="Read", tool_input={"file_path": path},
+                    tool_use_id="toolu-plugin",
+                ) == expected
+
+            assert marker not in caplog.text
+            assert sk not in caplog.text
+            assert path not in caplog.text
+            assert not any(record.exc_info for record in caplog.records)
+            assert [
+                record.getMessage() for record in caplog.records
+                if "SDK Smart" in record.getMessage()
+            ] == expected_logs
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+            approval_mod.reset_current_session_key(token)
+
+    def test_sdk_smart_observer_redactor_failure_uses_fixed_pre_stage_log(
+        self, monkeypatch, caplog,
+    ):
+        from agent import redact
+
+        sk = "SDK_REDACTOR_SESSION_SECRET_65982"
+        marker = "SDK_REDACTOR_EXCEPTION_SECRET_65982"
+        path = "/tmp/SDK_REDACTOR_PATH_SECRET_65982"
+        presentation = f"Read(path={path})"
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        real_redact = redact.redact_sensitive_text
+
+        def selective_redactor(value, *args, **kwargs):
+            if value == presentation and kwargs.get("force") is True:
+                raise RuntimeError(f"{marker} value={value}")
+            return real_redact(value, *args, **kwargs)
+
+        try:
+            approval_mod.register_gateway_notify(sk, lambda _data: None)
+            monkeypatch.setattr(approval_mod, "_get_approval_mode", lambda: "smart")
+            monkeypatch.setattr(approval_mod, "_smart_approve", lambda *_a, **_k: "approve")
+            monkeypatch.setattr(redact, "redact_sensitive_text", selective_redactor)
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+            with caplog.at_level(logging.DEBUG):
+                assert self._call_gateway(
+                    cb, tool_name="Read", tool_input={"file_path": path},
+                ) == "once"
+
+            assert marker not in caplog.text
+            assert sk not in caplog.text
+            assert path not in caplog.text
+            assert not any(record.exc_info for record in caplog.records)
+            assert [
+                record.getMessage() for record in caplog.records
+                if "SDK Smart" in record.getMessage()
+            ] == ["SDK Smart pre-approval observer dispatch failed"]
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+            approval_mod.reset_current_session_key(token)
+
+    def test_generic_observer_failures_keep_legacy_raw_logging(
+        self, monkeypatch, caplog,
+    ):
+        from agent import redact
+        from hermes_cli import observability, plugins
+
+        builtin_marker = "GENERIC_BUILTIN_RAW_COMPAT_65982"
+        plugin_marker = "GENERIC_PLUGIN_RAW_COMPAT_65982"
+        redactor_marker = "GENERIC_REDACTOR_RAW_COMPAT_65982"
+        manager = plugins.PluginManager()
+
+        def broken_plugin(**_kwargs):
+            raise RuntimeError(plugin_marker)
+
+        manager._hooks["pre_approval_request"] = [broken_plugin]
+        monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+        with caplog.at_level(logging.DEBUG):
+            observability._safe_observe(
+                lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError(builtin_marker)),
+                "pre_approval_request",
+                {"session_key": "generic-session"},
+            )
+            manager.invoke_hook("pre_approval_request", session_key="generic-session")
+            monkeypatch.setattr(
+                redact,
+                "redact_sensitive_text",
+                lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError(redactor_marker)),
+            )
+            from tools import approval as approval_mod
+            assert approval_mod._prepare_smart_approval_observer(
+                command="generic command",
+                description="generic description",
+                pattern_key="generic",
+                pattern_keys=["generic"],
+                session_key="generic-session",
+            ) is None
+
+        assert builtin_marker in caplog.text
+        assert plugin_marker in caplog.text
+        assert redactor_marker in caplog.text
+        assert any(record.exc_info for record in caplog.records)
+        assert "SDK Smart" not in caplog.text
+
+    def test_generic_shared_metrics_sink_keeps_legacy_raw_logging(
+        self, monkeypatch, caplog,
+    ):
+        from agent import relay_runtime
+        from hermes_cli.observability import relay_shared_metrics
+
+        shared_marker = "GENERIC_SHARED_METRICS_RAW_COMPAT_65982"
+
+        class BrokenSharedRuntime:
+            def record_approval(self, kwargs):
+                raise RuntimeError(f"{shared_marker} payload={kwargs!r}")
+
+        monkeypatch.setattr(relay_shared_metrics, "handles_hook", lambda _name: True)
+        monkeypatch.setattr(relay_runtime, "relay_instrumentation_enabled", lambda: True)
+        monkeypatch.setattr(
+            relay_shared_metrics, "_get_runtime", lambda: BrokenSharedRuntime(),
+        )
+        with caplog.at_level(logging.DEBUG):
+            relay_shared_metrics.observe_lifecycle(
+                "post_approval_response", session_key="generic-shared-session",
+            )
+
+        assert shared_marker in caplog.text
+        assert any(record.exc_info for record in caplog.records)
+        assert "SDK Smart" not in caplog.text
+
+    def test_sdk_safe_and_generic_observer_dispatches_do_not_bleed_between_threads(
+        self, monkeypatch, caplog,
+    ):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+
+        from hermes_cli import plugins
+        from hermes_cli.observability import relay_shared_metrics
+        from tools import approval as approval_mod
+
+        sdk_session = "SDK_CONCURRENT_SESSION_SECRET_65982"
+        sdk_path = "/tmp/SDK_CONCURRENT_PATH_SECRET_65982"
+        sdk_marker = "SDK_CONCURRENT_EXCEPTION_SECRET_65982"
+        generic_session = "GENERIC_CONCURRENT_SESSION_COMPAT_65982"
+        generic_marker = "GENERIC_CONCURRENT_EXCEPTION_COMPAT_65982"
+        barrier = threading.Barrier(2)
+        manager = plugins.PluginManager()
+
+        def broken_plugin(**kwargs):
+            barrier.wait(timeout=5)
+            marker = sdk_marker if kwargs["session_key"] == sdk_session else generic_marker
+            raise RuntimeError(f"{marker} payload={kwargs!r}")
+
+        manager._hooks["pre_approval_request"] = [broken_plugin]
+        manager._hooks["post_approval_response"] = [broken_plugin]
+        monkeypatch.setattr(relay_shared_metrics, "observe_lifecycle", lambda *_a, **_k: None)
+        monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+
+        def dispatch(session_key, command, fixed):
+            payload = approval_mod._prepare_smart_approval_observer(
+                command=command,
+                description="bounded description",
+                pattern_key="claude_sdk_tool" if fixed else "generic",
+                pattern_keys=["claude_sdk_tool" if fixed else "generic"],
+                session_key=session_key,
+                _fixed_failure_log=fixed,
+            )
+            approval_mod._observe_smart_approval_verdict(
+                payload, "approve", _fixed_failure_log=fixed,
+            )
+
+        with caplog.at_level(logging.DEBUG), ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(dispatch, sdk_session, f"Read(path={sdk_path})", True),
+                pool.submit(dispatch, generic_session, "generic command", False),
+            ]
+            for future in futures:
+                future.result(timeout=10)
+
+        assert sdk_marker not in caplog.text
+        assert sdk_session not in caplog.text
+        assert sdk_path not in caplog.text
+        assert generic_marker in caplog.text
+        assert generic_session in caplog.text
+        assert [
+            record.getMessage() for record in caplog.records
+            if "SDK Smart" in record.getMessage()
+        ] == [
+            "SDK Smart pre-approval observer dispatch failed",
+            "SDK Smart post-approval observer dispatch failed",
+        ]
+
+    @pytest.mark.parametrize(
+        ("verdict", "expected"),
+        [
+            ("approve", "once"),
+            ("deny", {"choice": "deny", "operator_denial": True, "reason": ""}),
+            ("escalate", {"choice": "deny", "operator_denial": True, "reason": ""}),
+        ],
+    )
+    def test_successful_real_sdk_observer_gets_bounded_fields_without_changing_decision(
+        self, monkeypatch, verdict, expected,
+    ):
+        from hermes_cli import plugins
+        from hermes_cli.observability import relay_shared_metrics
+
+        sk = f"sdk-success-{verdict}"
+        path = "/tmp/sdk-success-path"
+        seen = []
+        manager = plugins.PluginManager()
+        manager._hooks["pre_approval_request"] = [
+            lambda **kwargs: seen.append(("pre", kwargs))
+        ]
+        manager._hooks["post_approval_response"] = [
+            lambda **kwargs: seen.append(("post", kwargs))
+        ]
+        approval_mod, token = self._gateway_ctx(monkeypatch, sk)
+        try:
+            approval_mod.register_gateway_notify(
+                sk,
+                lambda _data: approval_mod.resolve_gateway_approval(sk, "deny"),
+            )
+            monkeypatch.setattr(approval_mod, "_get_approval_mode", lambda: "smart")
+            monkeypatch.setattr(approval_mod, "_smart_approve", lambda *_a, **_k: verdict)
+            monkeypatch.setattr(relay_shared_metrics, "observe_lifecycle", lambda *_a, **_k: None)
+            monkeypatch.setattr(plugins, "get_plugin_manager", lambda: manager)
+            cb = approval_mod.build_sdk_gateway_approval_callback()
+            assert self._call_gateway(
+                cb, tool_name="Read", tool_input={"file_path": path},
+            ) == expected
+
+            smart_seen = [item for item in seen if item[1].get("surface") == "smart"]
+            expected_stages = ["pre"] if verdict == "escalate" else ["pre", "post"]
+            assert [stage for stage, _kwargs in smart_seen] == expected_stages
+            pre = smart_seen[0][1]
+            assert pre["command"] == f"Read(path={path})"
+            assert pre["description"] == "Claude requests SDK tool Read"
+            assert pre["pattern_key"] == "claude_sdk_tool"
+            assert pre["pattern_keys"] == ["claude_sdk_tool"]
+            assert pre["session_key"] == sk
+            assert pre["surface"] == "smart"
+            assert {"turn_id", "tool_call_id", "telemetry_schema_version"} <= pre.keys()
+            if verdict != "escalate":
+                assert smart_seen[1][1]["choice"] == f"smart_{verdict}"
+                assert smart_seen[1][1]["decided_by"] == "aux_llm"
+        finally:
+            approval_mod.unregister_gateway_notify(sk)
+            approval_mod.reset_current_session_key(token)
 
 
 class TestAnthropicTokenGuard:
