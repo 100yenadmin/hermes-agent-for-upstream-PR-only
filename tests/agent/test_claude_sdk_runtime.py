@@ -3793,15 +3793,15 @@ class TestFatalReason:
         assert result["failure_reason"] == "startup"
         assert result["partial"] is True
 
-    def test_runtime_glue_transient_error_stays_unfailed(self):
-        # A retire without fatal_reason (timeout, transient turn error) keeps
-        # today's contract: partial, no "failed" key — gateway/CLI treat it
-        # as a recoverable turn, not a dead run.
+    def test_runtime_glue_exposes_clean_transient_error_for_fallback(self):
+        # A transient SDK timeout with no output or tool effects is a failed
+        # provider attempt that the shared dispatcher may continue elsewhere.
         agent = _make_agent()
         agent._claude_sdk_session.run_turn.return_value = _make_turn(
             should_retire=True,
             error="turn timed out after 600s",
             projected_messages=[],
+            tool_iterations=0,
             final_text="",
             token_usage_last=None,
         )
@@ -3812,8 +3812,142 @@ class TestFatalReason:
             messages=[{"role": "user", "content": "hi"}],
             effective_task_id="task-1",
         )
-        assert not result.get("failed")
-        assert "failure_reason" not in result
+        assert result["failed"] is True
+        assert result["failover_reason"] == "timeout"
+
+
+class TestReplaySafeProviderFailureOutcome:
+    def _run_failure(self, agent, *, messages=None, **turn_overrides):
+        turn_kwargs = {
+            "projected_messages": [],
+            "final_text": "",
+            "token_usage_last": None,
+            "api_call_made": True,
+            "tool_iterations": 0,
+            **turn_overrides,
+        }
+        agent._claude_sdk_session.run_turn.return_value = _make_turn(**turn_kwargs)
+        return run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=messages if messages is not None else [{"role": "user", "content": "hi"}],
+            effective_task_id="task-failure",
+        )
+
+    @pytest.mark.parametrize(
+        ("error", "expected"),
+        [
+            ("API Error: 401 OAuth access token expired", "auth"),
+            ("HTTP 429 rate limit exceeded", "rate_limit"),
+            ("HTTP 503 service overloaded", "overloaded"),
+            ("HTTP 500 internal server error", "server_error"),
+            ("request timed out while contacting provider", "timeout"),
+        ],
+    )
+    def test_canonical_provider_failures_expose_validated_handoff(self, error, expected):
+        agent = _make_agent()
+
+        result = self._run_failure(agent, error=error, should_retire=False)
+
+        assert result["failed"] is True
+        assert result["failover_reason"] == expected
+        assert agent._claude_sdk_session is None
+
+    @pytest.mark.parametrize(
+        ("error", "fatal_reason"),
+        [
+            ("unexpected local startup failure", "startup"),
+            ("ANTHROPIC_API_KEY is present; refusing unsafe metered billing", "startup"),
+            ("unrecognized SDK result failure", None),
+            ("HTTP 400 invalid local configuration", None),
+        ],
+    )
+    def test_local_unknown_and_billing_safety_failures_remain_terminal(
+        self, error, fatal_reason
+    ):
+        agent = _make_agent()
+
+        result = self._run_failure(
+            agent,
+            error=error,
+            fatal_reason=fatal_reason,
+            should_retire=True,
+            api_call_made=False,
+        )
+
+        assert "failover_reason" not in result
+
+    @pytest.mark.parametrize(
+        "effect",
+        ["tool", "projected", "streamed", "interrupted"],
+    )
+    def test_provider_failure_after_an_observable_effect_is_not_replayable(self, effect):
+        agent = _make_agent()
+        messages = [{"role": "user", "content": "hi"}]
+        overrides = {
+            "error": "HTTP 429 rate limit exceeded",
+            "should_retire": True,
+            "tool_iterations": 1 if effect == "tool" else 0,
+            "projected_messages": (
+                [{"role": "assistant", "content": "partial"}]
+                if effect == "projected"
+                else []
+            ),
+            "interrupted": effect == "interrupted",
+        }
+        if effect == "streamed":
+            def streamed_failure(user_input):
+                agent._current_streamed_assistant_text = "partial"
+                return _make_turn(
+                    final_text="",
+                    token_usage_last=None,
+                    api_call_made=True,
+                    **overrides,
+                )
+            agent._claude_sdk_session.run_turn.side_effect = streamed_failure
+            result = run_claude_agent_sdk_turn(
+                agent,
+                user_message="hi",
+                original_user_message="hi",
+                messages=messages,
+                effective_task_id="task-streamed",
+            )
+        else:
+            result = self._run_failure(agent, messages=messages, **overrides)
+
+        assert "failover_reason" not in result
+        assert result["sdk_effects"][effect] is True
+        if effect == "projected":
+            assert messages[-1]["content"] == "partial"
+
+    def test_stream_replay_ledger_is_reset_before_each_sdk_turn(self):
+        agent = _make_agent()
+        agent._current_streamed_assistant_text = "completed prior turn"
+
+        result = self._run_failure(
+            agent,
+            error="HTTP 429 rate limit exceeded",
+            should_retire=True,
+        )
+
+        assert result["sdk_effects"]["streamed"] is False
+        assert result["failover_reason"] == "rate_limit"
+
+    def test_authoritative_startup_auth_failure_is_zero_call_and_handoff_eligible(self):
+        agent = _make_agent()
+
+        result = self._run_failure(
+            agent,
+            error="Not signed in to Claude; run `claude auth login`.",
+            fatal_reason="auth",
+            should_retire=True,
+            api_call_made=False,
+        )
+
+        assert result["api_calls"] == 0
+        assert result["failover_reason"] == "auth"
+        assert "claude auth login" in result["error"]
 
 
 # ---------- SDK permission-result stand-ins (planted as the module) ----------

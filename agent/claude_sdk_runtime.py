@@ -14,15 +14,94 @@ issue #25267.
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 import os
+import re
 import threading
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ClaudeSdkTurnEffects:
+    """Replay-safety ledger for one SDK provider attempt."""
+
+    tool: bool = False
+    streamed: bool = False
+    projected: bool = False
+    interrupted: bool = False
+    mutated: bool = False
+
+    @property
+    def replay_safe(self) -> bool:
+        return not any(asdict(self).values())
+
+    def as_result_dict(self) -> Dict[str, bool]:
+        return asdict(self)
+
+
+_SDK_PROVIDER_FAILOVER_REASONS = frozenset(
+    {
+        "auth",
+        "auth_permanent",
+        "rate_limit",
+        "upstream_rate_limit",
+        "overloaded",
+        "server_error",
+        "timeout",
+    }
+)
+
+
+def _sdk_provider_failover_reason(agent, error: str, fatal_reason: Optional[str]):
+    """Return one canonical provider handoff reason, or ``None``.
+
+    SDK failures are serialized into result text, so recover a status code when
+    present and delegate classification to the shared API error taxonomy.  The
+    explicit allowlist is intentionally narrower than ``should_fallback``:
+    local/configuration errors, request-shape failures, policy refusals, and
+    billing-safety guards must remain terminal on this runtime.
+    """
+    from agent.error_classifier import FailoverReason, classify_api_error
+
+    if fatal_reason:
+        try:
+            reason = FailoverReason(str(fatal_reason))
+        except ValueError:
+            return None
+        return reason if reason.value in _SDK_PROVIDER_FAILOVER_REASONS else None
+
+    text = str(error or "").strip()
+    if not text:
+        return None
+
+    class _SerializedSdkProviderError(RuntimeError):
+        status_code: Optional[int] = None
+
+    exc = _SerializedSdkProviderError(text)
+    match = re.search(
+        r"(?:api\s+error|status(?:_code)?|http)\s*[:=]?\s*(\d{3})\b",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        exc.status_code = int(match.group(1))
+    classified = classify_api_error(
+        exc,
+        provider=str(getattr(agent, "provider", "") or ""),
+        model=str(getattr(agent, "model", "") or ""),
+    )
+    return (
+        classified.reason
+        if classified.reason.value in _SDK_PROVIDER_FAILOVER_REASONS
+        else None
+    )
 
 # Cap per persona/memory source so the append can't blow the context budget
 # (Hermes' native files are hard-capped anyway; the soul file is ours).
@@ -1369,6 +1448,12 @@ def run_claude_agent_sdk_turn(
             "agent_persisted": True,
         }
 
+    # Stream/replay state belongs to this SDK attempt, never to the cached
+    # gateway agent.  Reset before session startup too: an authoritative auth
+    # failure may happen before a model call and must not inherit prior output.
+    agent._current_streamed_assistant_text = ""
+    _messages_before_sdk_attempt = copy.deepcopy(messages)
+
     on_interim_assistant, on_tool_iteration = _make_visibility_callbacks()
     live_session = getattr(agent, "_claude_sdk_session", None)
     if live_session is not None:
@@ -1468,6 +1553,33 @@ def run_claude_agent_sdk_turn(
                 resumed = False
                 continue
         break
+
+    _sdk_effects = ClaudeSdkTurnEffects(
+        tool=int(getattr(turn, "tool_iterations", 0) or 0) > 0,
+        streamed=bool(getattr(agent, "_current_streamed_assistant_text", "")),
+        projected=bool(getattr(turn, "projected_messages", None)),
+        interrupted=bool(
+            getattr(turn, "interrupted", False)
+            or getattr(agent, "_interrupt_requested", False)
+        ),
+        mutated=messages != _messages_before_sdk_attempt,
+    )
+    _sdk_failover_reason = None
+    if getattr(turn, "error", None) and _sdk_effects.replay_safe:
+        _sdk_failover_reason = _sdk_provider_failover_reason(
+            agent,
+            str(turn.error),
+            getattr(turn, "fatal_reason", None),
+        )
+        if _sdk_failover_reason is not None and agent._claude_sdk_session is not None:
+            # A provider switch must never retain transport/session state from
+            # the failed SDK backend.
+            try:
+                agent._claude_sdk_session.close()
+            except Exception:
+                pass
+            agent._claude_sdk_session = None
+            _store_sdk_session_id(agent, None)
 
     # FALLBACK ONLY. _on_compact_boundary above is the real terminal edge and
     # normally clears the flag mid-turn; reaching here means the CLI started a
@@ -1624,8 +1736,15 @@ def run_claude_agent_sdk_turn(
         "api_calls": int(getattr(turn, "api_call_made", True)),
         "completed": not turn.interrupted and turn.error is None,
         "partial": turn.interrupted or turn.error is not None,
+        "failed": bool(turn.error) and not _sdk_effects.interrupted,
         "error": redact_sensitive_text(str(turn.error or ""), force=True) if turn.error else None,
         "interrupted": _user_interrupted,
+        "sdk_effects": _sdk_effects.as_result_dict(),
+        **(
+            {"failover_reason": _sdk_failover_reason.value}
+            if _sdk_failover_reason is not None
+            else {}
+        ),
         # Same persistence contract as the codex app-server path: we flushed
         # the projected rows ourselves, so the gateway must not re-write the
         # user turn (append_message has no dedup).
