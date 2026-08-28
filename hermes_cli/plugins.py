@@ -242,7 +242,7 @@ VALID_HOOKS: Set[str] = {
     #
     # Kwargs for pre_approval_request:
     #   command: str, description: str, pattern_key: str, pattern_keys: list[str],
-    #   session_key: str, surface: "cli" | "gateway" | "smart"
+    #   session_key: str, surface: "cli" | "gateway" | "smart" | "claude_sdk"
     # Kwargs for post_approval_response: same as above plus
     #   choice: "once" | "session" | "always" | "deny" | "timeout"
     #           | "smart_approve" | "smart_deny"
@@ -5690,12 +5690,18 @@ class PluginManager:
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
-                logger.warning(
-                    "Hook '%s' callback %s raised: %s",
-                    hook_name,
-                    callback_name,
-                    exc,
-                )
+                from hermes_cli.lifecycle import current_observer_failure_log
+
+                fixed_log = current_observer_failure_log()
+                if fixed_log is not None:
+                    logger.debug("%s", fixed_log)
+                else:
+                    logger.warning(
+                        "Hook '%s' callback %s raised: %s",
+                        hook_name,
+                        callback_name,
+                        exc,
+                    )
         return results
 
     def _subscribe_event(

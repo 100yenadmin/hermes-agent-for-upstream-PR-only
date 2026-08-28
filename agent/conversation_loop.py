@@ -894,6 +894,46 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     (which constructs a fresh ``AIAgent`` per turn and depends on this
     DB roundtrip).
     """
+    # LOCAL DIVERGENCE (2026-08-14) -- claude-agent-sdk lane only.
+    #
+    # On this lane the stored snapshot is NOT Hermes' native composed prompt:
+    # claude_sdk_runtime.py (~line 793) deliberately overwrites it with
+    # "[claude_code preset]\n\n" + the --append-system-prompt blob, so the audit
+    # trail records the EFFECTIVE prompt the CLI actually sends.
+    #
+    # That snapshot can never satisfy _stored_prompt_matches_runtime(): the SDK
+    # composer hardcodes "Provider: claude-agent-sdk (Claude subscription)"
+    # (claude_sdk_runtime.py:180) while system_prompt.py:677 emits the bare
+    # `agent.provider` ("claude-agent-sdk"), and the comparison is exact string
+    # equality. Verified against state.db: every SDK session stores the
+    # decorated label, so the check returned False on EVERY turn, forever.
+    #
+    # Two consequences, both fixed by short-circuiting here:
+    #   1. A WARNING/INFO claiming "prefix cache will miss ... quota drain" fired
+    #      every turn. Misleading on this lane -- the CLI owns the wire prompt
+    #      (preset + append, byte-stable per session), so rebuilding Hermes'
+    #      _cached_system_prompt costs local CPU, not tokens. The noise masked
+    #      genuine cache misses on lanes where reuse DOES matter.
+    #   2. Continuations fell through to the brand-new-session path below,
+    #      re-firing the on_session_start plugin hook and the cold-start credits
+    #      seed on every turn instead of once per session.
+    #
+    # Gated on `conversation_history` so a genuine first turn still takes the
+    # full path (hook + credits seed). Reuse is deliberately NOT attempted: the
+    # sentinel is not a native prompt and must never become
+    # _cached_system_prompt. Equally important, the freshly built native prompt
+    # is NOT written back here: a long-lived SDK session does not re-enter the
+    # runtime's session-creation path, so that write would permanently replace
+    # the effective-prompt audit snapshot after turn one.
+    if conversation_history and getattr(agent, "api_mode", None) == "claude_agent_sdk":
+        logger.debug(
+            "claude-agent-sdk lane: skipping stored-prompt reuse for session %s "
+            "(runtime owns the wire prompt; snapshot is an audit record).",
+            agent.session_id,
+        )
+        agent._cached_system_prompt = agent._build_system_prompt(system_message)
+        return
+
     stored_prompt = None
     stored_state = "missing"
     if conversation_history and agent._session_db:
@@ -1824,6 +1864,60 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def _sdk_result_failover_reason(result: Dict[str, Any]) -> Optional[FailoverReason]:
+    """Return a validated replay-safe provider failure from an SDK result."""
+    reason_value = result.get("failover_reason")
+    if not reason_value or not result.get("failed") or result.get("interrupted"):
+        return None
+
+    effects = result.get("sdk_effects")
+    if isinstance(effects, dict) and any(bool(value) for value in effects.values()):
+        logger.warning(
+            "claude_agent_sdk declined provider handoff after observable turn effects"
+        )
+        return None
+    try:
+        return (
+            reason_value
+            if isinstance(reason_value, FailoverReason)
+            else FailoverReason(str(reason_value))
+        )
+    except (TypeError, ValueError):
+        logger.warning(
+            "claude_agent_sdk returned unknown failover reason %r; "
+            "not crossing provider boundary",
+            reason_value,
+        )
+        return None
+
+
+def _sdk_handoff_is_at_untouched_user_boundary(
+    agent,
+    messages: List[Dict[str, Any]],
+    current_turn_user_idx: int,
+) -> bool:
+    """Return whether entering the SDK cannot replay output or side effects."""
+    return (
+        0 <= current_turn_user_idx == len(messages) - 1
+        and isinstance(messages[-1], dict)
+        and messages[-1].get("role") == "user"
+        and not bool(getattr(agent, "_current_streamed_assistant_text", ""))
+    )
+
+
+def _with_runtime_attempt_provenance(
+    agent,
+    result: Dict[str, Any],
+    api_calls: int,
+) -> Dict[str, Any]:
+    """Attach cumulative accounting and the runtime that produced the result."""
+    enriched = dict(result)
+    enriched["api_calls"] = api_calls
+    enriched["model"] = agent.model
+    enriched["provider"] = agent.provider
+    return enriched
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -1952,6 +2046,9 @@ def run_conversation(
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
+    # Provider-fallback retries retain the pre-existing logical iteration
+    # refund while this offset preserves cumulative real-call reporting.
+    _provider_fallback_call_refunds = 0
     final_response = None
     interrupted = False
     failed = False
@@ -2005,19 +2102,77 @@ def run_conversation(
     # stale prior turn's usage.
     agent._last_turn_usage = None
 
-    # Optional opt-in runtime: if api_mode == codex_app_server, hand the
-    # turn to the codex app-server subprocess (terminal/file ops/patching
-    # all run inside Codex). Default Hermes path is bypassed entirely.
-    # See agent/transports/codex_app_server_session.py for the adapter
-    # and references/codex-app-server-runtime.md for the rationale.
-    if agent.api_mode == "codex_app_server":
-        return agent._run_codex_app_server_turn(
+    # Whole-turn runtimes normally bypass the generic provider loop. Claude's
+    # SDK is the exception on a validated, replay-safe provider failure: advance
+    # the shared fallback chain and redispatch the same already-appended user
+    # row without duplicating it.
+    _whole_turn_api_calls = 0
+    _first_actionable_sdk_result = None
+
+    def _sdk_exhaustion_result(current_result):
+        if (
+            _first_actionable_sdk_result is None
+            or _sdk_result_failover_reason(current_result) is None
+        ):
+            return current_result
+        preserved = dict(current_result)
+        preserved["error"] = _first_actionable_sdk_result.get("error")
+        preserved["final_response"] = _first_actionable_sdk_result.get(
+            "final_response"
+        )
+        return preserved
+
+    while agent.api_mode in {"codex_app_server", "claude_agent_sdk"}:
+        if agent.api_mode == "codex_app_server":
+            _whole_turn_result = agent._run_codex_app_server_turn(
+                user_message=user_message,
+                original_user_message=original_user_message,
+                messages=messages,
+                effective_task_id=effective_task_id,
+                should_review_memory=_should_review_memory,
+            )
+            return _with_runtime_attempt_provenance(
+                agent,
+                _whole_turn_result,
+                _whole_turn_api_calls
+                + int(_whole_turn_result.get("api_calls", 0) or 0),
+            )
+
+        _sdk_result = agent._run_claude_agent_sdk_turn(
             user_message=user_message,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
         )
+        _sdk_calls = int(_sdk_result.get("api_calls", 0) or 0)
+        _whole_turn_api_calls += _sdk_calls
+        for _ in range(_sdk_calls):
+            agent.iteration_budget.consume()
+        agent._api_call_count = _whole_turn_api_calls
+        _sdk_reason = _sdk_result_failover_reason(_sdk_result)
+        if _sdk_reason is not None and _first_actionable_sdk_result is None:
+            _first_actionable_sdk_result = _sdk_result
+        if _sdk_reason is not None and (
+            _whole_turn_api_calls >= agent.max_iterations
+            or agent.iteration_budget.remaining <= 0
+        ):
+            return _with_runtime_attempt_provenance(
+                agent, _sdk_exhaustion_result(_sdk_result), _whole_turn_api_calls
+            )
+        if _sdk_reason is not None:
+            if agent._try_activate_fallback(_sdk_reason):
+                active_system_prompt = _sync_failover_system_message(
+                    agent, [], active_system_prompt
+                )
+                continue
+        return _with_runtime_attempt_provenance(
+            agent, _sdk_exhaustion_result(_sdk_result), _whole_turn_api_calls
+        )
+
+    # A failed whole-turn SDK attempt may have handed off to a generic runtime.
+    # Carry its real call count into the common finalizer.
+    api_call_count = _whole_turn_api_calls
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
@@ -2055,6 +2210,66 @@ def run_conversation(
                     f"the review tool loop before the next provider call."
                 )
             break
+
+        # A generic failure can activate Claude's whole-turn SDK. Enter only at
+        # the untouched current-user boundary. Skipped SDK entries consume no
+        # iteration/API budget; advance to the next safe provider instead.
+        if agent.api_mode == "claude_agent_sdk":
+            if not _sdk_handoff_is_at_untouched_user_boundary(
+                agent, messages, current_turn_user_idx
+            ):
+                agent._buffer_status(
+                    "⚠️ Skipping Claude SDK fallback after turn output or tool "
+                    "effects to avoid replaying the current user request..."
+                )
+                if agent._try_activate_fallback():
+                    active_system_prompt = _sync_failover_system_message(
+                        agent, [], active_system_prompt
+                    )
+                    continue
+                failed = True
+                _turn_exit_reason = "sdk_fallback_blocked_after_turn_effects"
+                final_response = (
+                    "The current provider failed after producing output or tool "
+                    "effects, so the SDK fallback was not replayed."
+                )
+                break
+
+            _sdk_result = agent._run_claude_agent_sdk_turn(
+                user_message=user_message,
+                original_user_message=original_user_message,
+                messages=messages,
+                effective_task_id=effective_task_id,
+                should_review_memory=_should_review_memory,
+            )
+            _sdk_calls = int(_sdk_result.get("api_calls", 0) or 0)
+            for _ in range(_sdk_calls):
+                agent.iteration_budget.consume()
+            api_call_count += _sdk_calls
+            agent._api_call_count = api_call_count
+            _sdk_reason = _sdk_result_failover_reason(_sdk_result)
+            if _sdk_reason is not None and _first_actionable_sdk_result is None:
+                _first_actionable_sdk_result = _sdk_result
+            if _sdk_reason is not None and (
+                api_call_count >= agent.max_iterations
+                or agent.iteration_budget.remaining <= 0
+            ):
+                return _with_runtime_attempt_provenance(
+                    agent,
+                    _sdk_exhaustion_result(_sdk_result),
+                    api_call_count + _provider_fallback_call_refunds,
+                )
+            if _sdk_reason is not None:
+                if agent._try_activate_fallback(_sdk_reason):
+                    active_system_prompt = _sync_failover_system_message(
+                        agent, [], active_system_prompt
+                    )
+                    continue
+            return _with_runtime_attempt_provenance(
+                agent,
+                _sdk_exhaustion_result(_sdk_result),
+                api_call_count + _provider_fallback_call_refunds,
+            )
         
         api_call_count += 1
         agent._api_call_count = api_call_count
@@ -2099,10 +2314,9 @@ def run_conversation(
             except Exception as _step_err:
                 logger.debug("step_callback error (iteration %s): %s", api_call_count, _step_err)
 
-        # Track tool-calling iterations for skill nudge.
-        # Counter resets whenever skill_manage is actually used.
-        if (agent._skill_nudge_interval > 0
-                and "skill_manage" in agent.valid_tool_names):
+        # Track tool-calling iterations for review cadence. It is independent
+        # of foreground skill_manage: a routed review runtime owns writes.
+        if agent._skill_nudge_interval > 0:
             agent._iters_since_skill += 1
         
         # ── Pre-API-call /steer drain ──────────────────────────────────
@@ -6752,12 +6966,13 @@ def run_conversation(
             continue
 
         if _retry.restart_with_rebuilt_messages:
-            # A stream stall or provider failure was escalated to the
-            # fallback chain (10 activation sites in the retry loop set this
-            # flag and break here).  Re-issue the API call against the
-            # now-active fallback provider.  Refund the budget/count for the
-            # stalled attempt so the fallback gets a fair turn.
+            # A stream stall or provider failure was escalated to the fallback
+            # chain (activation sites in the retry loop set this flag and break
+            # here). Preserve the generic loop's pre-existing logical budget and
+            # count refund so the fallback receives a fair provider attempt; the
+            # separate offset keeps the failed request in cumulative reporting.
             api_call_count -= 1
+            _provider_fallback_call_refunds += 1
             agent.iteration_budget.refund()
             _retry.restart_with_rebuilt_messages = False
             # Failover shrank the compressor's context window to the
@@ -8630,7 +8845,7 @@ def run_conversation(
     return finalize_turn(
         agent,
         final_response=final_response,
-        api_call_count=api_call_count,
+        api_call_count=api_call_count + _provider_fallback_call_refunds,
         interrupted=interrupted,
         failed=failed,
         messages=messages,

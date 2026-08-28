@@ -2630,6 +2630,7 @@ def list_authenticated_providers(
         OPENROUTER_MODELS, _PROVIDER_MODELS,
         _MODELS_DEV_PREFERRED, _merge_with_models_dev, cached_provider_model_ids,
         clear_provider_models_cache, get_curated_nous_model_ids,
+        _PROVIDER_CATALOG_DELEGATES,
     )
 
     # Explicit refresh: drop every provider's cached model-id list so the
@@ -3099,10 +3100,17 @@ def list_authenticated_providers(
         else:
             # Unified pathway — see Section 1 rationale. Fall back to the
             # curated dict (with models.dev merge for preferred providers)
-            # when the live fetcher comes up empty.
+            # when the live fetcher comes up empty. The curated lookup goes
+            # through _PROVIDER_CATALOG_DELEGATES: subscription runtimes with
+            # no curated list of their own (claude-agent-sdk) serve their
+            # delegate's catalog, matching _provider_catalog_names and the
+            # inventory fallback row — otherwise an authenticated runtime
+            # renders a 1-model row (just the saved model) while the same
+            # provider unauthenticated shows the full delegate catalog.
             model_ids = cached_provider_model_ids(hermes_slug)
             if not model_ids:
-                model_ids = curated.get(hermes_slug, []) or curated.get(pid, [])
+                _cat_slug = _PROVIDER_CATALOG_DELEGATES.get(hermes_slug, hermes_slug)
+                model_ids = curated.get(_cat_slug, []) or curated.get(pid, [])
                 if hermes_slug in _MODELS_DEV_PREFERRED:
                     model_ids = _merge_with_models_dev(hermes_slug, model_ids)
         total = len(model_ids)
@@ -3179,10 +3187,13 @@ def list_authenticated_providers(
             except Exception:
                 _cp_model_ids = curated.get(_cp.slug, [])
         else:
-            # Unified pathway — same as sections 1 and 2.
+            # Unified pathway — same as sections 1 and 2 (including the
+            # catalog-delegate lookup for subscription runtimes).
             _cp_model_ids = cached_provider_model_ids(_cp.slug)
             if not _cp_model_ids:
-                _cp_model_ids = curated.get(_cp.slug, [])
+                _cp_model_ids = curated.get(
+                    _PROVIDER_CATALOG_DELEGATES.get(_cp.slug, _cp.slug), []
+                )
         _cp_total = len(_cp_model_ids)
         _cp_top = _cp_model_ids[:max_models] if max_models is not None else _cp_model_ids
 

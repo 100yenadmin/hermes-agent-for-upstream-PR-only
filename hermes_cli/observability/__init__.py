@@ -26,6 +26,12 @@ def _safe_observe(callback: Any, hook_name: str, kwargs: dict[str, Any]) -> None
     try:
         callback(hook_name, **kwargs)
     except Exception:
-        logger.warning(
-            "Built-in observability hook failed: %s", hook_name, exc_info=True
-        )
+        from hermes_cli.lifecycle import current_observer_failure_log
+
+        fixed_log = current_observer_failure_log()
+        if fixed_log is not None:
+            logger.debug("%s", fixed_log)
+        else:
+            logger.warning(
+                "Built-in observability hook failed: %s", hook_name, exc_info=True
+            )
