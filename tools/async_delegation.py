@@ -1209,6 +1209,12 @@ def _push_batch_completion_event(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
     }
+    # Explicit routed batches carry safe aggregate metadata from the normal
+    # delegate_task result. Leave legacy batches byte-compatible.
+    if "mixed_routes" in combined:
+        evt["mixed_routes"] = combined.get("mixed_routes")
+        evt["provider"] = combined.get("provider")
+        evt["model"] = combined.get("model")
     # Routing origin captured at dispatch (see _capture_routing_origin).
     for _k in ("scope_id", "user_id", "user_name"):
         if event_record.get(_k):

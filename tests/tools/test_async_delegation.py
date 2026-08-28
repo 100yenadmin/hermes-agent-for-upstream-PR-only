@@ -897,3 +897,46 @@ def test_batch_truncation_banner_marks_only_truncated_task():
     # The header banner for task 2 appears after task 1's summary.
     assert banner_pos > clean_pos
 
+
+def test_routed_batch_completion_preserves_safe_receipts(monkeypatch):
+    monkeypatch.setattr(ad, "_persist_completion", lambda event, result: None)
+    combined = {
+        "results": [
+            {"task_index": 0, "status": "completed", "summary": "safe one",
+             "route": "codex-fast", "provider": "openai-codex",
+             "model": "gpt-5.2-codex", "billing_mode": "subscription_included",
+             "cost_status": "estimated"},
+            {"task_index": 1, "status": "completed", "summary": "safe two",
+             "route": "paid", "provider": "openrouter", "model": "provider/model",
+             "billing_mode": "official_models_api", "cost_status": "estimated"},
+        ],
+        "total_duration_seconds": 2.0, "mixed_routes": True,
+        "provider": None, "model": None,
+    }
+    ad._push_batch_completion_event(
+        {"delegation_id": "deleg_receipt", "session_key": "owner",
+         "goals": ["one", "two"], "dispatched_at": 1000.0,
+         "completed_at": 1002.0}, combined, "completed"
+    )
+    evt = _drain_one()
+    assert evt["mixed_routes"] is True and evt["provider"] is None and evt["model"] is None
+    text = format_process_notification(evt)
+    assert "Route aggregate: mixed_routes=True provider=null model=null" in text
+    assert "Route receipt: route=codex-fast provider=openai-codex model=gpt-5.2-codex billing_mode=subscription_included cost_status=estimated" in text
+    assert "Route receipt: route=paid provider=openrouter model=provider/model billing_mode=official_models_api cost_status=estimated" in text
+    assert "api_key" not in text and "base_url" not in text and "fallback" not in text
+
+
+def test_legacy_batch_completion_has_no_route_metadata(monkeypatch):
+    monkeypatch.setattr(ad, "_persist_completion", lambda event, result: None)
+    ad._push_batch_completion_event(
+        {"delegation_id": "deleg_legacy", "session_key": "owner",
+         "goals": ["one", "two"], "dispatched_at": 1000.0,
+         "completed_at": 1002.0},
+        {"results": [{"task_index": 0, "status": "completed", "summary": "safe"}],
+         "total_duration_seconds": 2.0}, "completed"
+    )
+    evt = _drain_one()
+    assert all(key not in evt for key in ("mixed_routes", "provider"))
+    text = format_process_notification(evt)
+    assert "Route aggregate:" not in text and "Route receipt:" not in text
