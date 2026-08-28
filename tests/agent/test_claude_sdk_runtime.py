@@ -25,7 +25,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.claude_sdk_runtime import run_claude_agent_sdk_turn
-from agent.conversation_loop import _handle_claude_sdk_turn_with_fallback
+from agent.conversation_loop import _sdk_result_failover_reason
 from agent.transports.claude_agent_sdk_session import (
     ClaudeAgentSdkSession,
     classify_auth_failure,
@@ -162,24 +162,21 @@ class ResultMessage:
 
 
 class TestClaudeSdkFallbackBridge:
-    def test_quota_error_activates_configured_fallback(self):
-        class Agent:
-            def __init__(self):
-                self.reason, self.status = None, []
-            def _run_claude_agent_sdk_turn(self, **kwargs):
-                return {"error": "SDK result error (HTTP 429): You've hit your session limit"}
-            def _try_activate_fallback(self, reason=None):
-                self.reason = reason
-                return True
-            def _buffer_status(self, text):
-                self.status.append(text)
-        agent = Agent()
-        assert _handle_claude_sdk_turn_with_fallback(
-            agent, user_message="continue", original_user_message="continue",
-            messages=[], effective_task_id="test", should_review_memory=False,
-        ) is None
-        assert agent.reason.value == "rate_limit"
-        assert agent.status == ["⚠️ Claude session limit reached — switching to fallback provider..."]
+    def test_validated_quota_outcome_maps_to_canonical_reason(self):
+        result = {
+            "failed": True,
+            "interrupted": False,
+            "failover_reason": "rate_limit",
+            "sdk_effects": {
+                "tool": False,
+                "streamed": False,
+                "projected": False,
+                "interrupted": False,
+                "mutated": False,
+            },
+        }
+
+        assert _sdk_result_failover_reason(result).value == "rate_limit"
 
 
 # ---------- projector ----------
@@ -2661,6 +2658,33 @@ class TestContinuity:
         )
         db.update_claude_sdk_session_id.assert_called_with("sess-1", None)
 
+    def test_eligible_handoff_keeps_failed_session_id_durably_cleared(
+        self, monkeypatch
+    ):
+        agent, db = self._db_agent(persisted_sdk_id="sdk-failed-8")
+        self._spy_sessions(monkeypatch, [_make_turn(
+            thread_id="sdk-failed-8",
+            should_retire=False,
+            error="HTTP 503 service overloaded",
+            projected_messages=[],
+            tool_iterations=0,
+            final_text="",
+            token_usage_last=None,
+        )])
+
+        result = run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="t",
+        )
+
+        assert result["failover_reason"] == "overloaded"
+        writes = db.update_claude_sdk_session_id.call_args_list
+        assert writes[-1].args == ("sess-1", None)
+        assert all(call.args != ("sess-1", "sdk-failed-8") for call in writes)
+
     def test_digest_prepended_on_fresh_session_with_history(self, monkeypatch):
         agent, _db = self._db_agent(persisted_sdk_id=None)
         instances = self._spy_sessions(monkeypatch, [_make_turn()])
@@ -3920,6 +3944,119 @@ class TestReplaySafeProviderFailureOutcome:
         assert result["sdk_effects"][effect] is True
         if effect == "projected":
             assert messages[-1]["content"] == "partial"
+
+    def test_stream_relay_records_delivery_before_display_callback(self, monkeypatch):
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        agent._stream_callback = None
+
+        def record(text):
+            agent._current_streamed_assistant_text += text
+
+        agent._record_streamed_assistant_text.side_effect = record
+
+        def display(text):
+            assert agent._current_streamed_assistant_text == text
+            raise RuntimeError("display sink failed after delivery")
+
+        agent.stream_delta_callback = display
+
+        class SpySession:
+            def __init__(self, **kwargs):
+                self.on_stream_delta = kwargs["on_stream_delta"]
+
+            def run_turn(self, user_input):
+                self.on_stream_delta("visible partial")
+                return _make_turn(
+                    error="HTTP 429 rate limit exceeded",
+                    should_retire=True,
+                    projected_messages=[],
+                    tool_iterations=0,
+                    final_text="",
+                    token_usage_last=None,
+                )
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(sdk_session_mod, "ClaudeAgentSdkSession", SpySession)
+
+        result = run_claude_agent_sdk_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[{"role": "user", "content": "hi"}],
+            effective_task_id="task-stream-relay",
+        )
+
+        agent._record_streamed_assistant_text.assert_called_once_with("visible partial")
+        assert result["sdk_effects"]["streamed"] is True
+        assert "failover_reason" not in result
+
+    def test_issued_tool_ledger_is_turn_local_and_precedes_progress_callback(
+        self, monkeypatch
+    ):
+        import agent.transports.claude_agent_sdk_session as sdk_session_mod
+
+        agent = _make_agent()
+        agent._claude_sdk_session = None
+        agent._sdk_issued_tool_effect = True
+        agent._stream_callback = None
+        agent.stream_delta_callback = None
+        creation_count = 0
+
+        class SpySession:
+            def __init__(self, **kwargs):
+                nonlocal creation_count
+                creation_count += 1
+                self.on_tool_started = kwargs["on_tool_started"]
+                self.issue_tool = creation_count == 2
+
+            def run_turn(self, user_input):
+                if self.issue_tool:
+                    self.on_tool_started("write_file", "writing", {"path": "/tmp/x"})
+                return _make_turn(
+                    error="HTTP 503 service overloaded",
+                    should_retire=True,
+                    projected_messages=[],
+                    tool_iterations=0,
+                    final_text="",
+                    token_usage_last=None,
+                )
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(sdk_session_mod, "ClaudeAgentSdkSession", SpySession)
+
+        stale_result = run_claude_agent_sdk_turn(
+            agent,
+            user_message="first",
+            original_user_message="first",
+            messages=[{"role": "user", "content": "first"}],
+            effective_task_id="task-no-tool",
+        )
+        assert agent._sdk_issued_tool_effect is False
+        assert stale_result["sdk_effects"]["tool"] is False
+        assert stale_result["failover_reason"] == "overloaded"
+
+        def progress(*_args):
+            assert agent._sdk_issued_tool_effect is True
+            raise RuntimeError("progress sink failed after tool issue")
+
+        agent.tool_progress_callback = progress
+        issued_result = run_claude_agent_sdk_turn(
+            agent,
+            user_message="second",
+            original_user_message="second",
+            messages=[{"role": "user", "content": "second"}],
+            effective_task_id="task-issued-tool",
+        )
+
+        assert issued_result["sdk_effects"]["tool"] is True
+        assert "failover_reason" not in issued_result
 
     def test_stream_replay_ledger_is_reset_before_each_sdk_turn(self):
         agent = _make_agent()

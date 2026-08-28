@@ -1156,6 +1156,7 @@ def run_claude_agent_sdk_turn(
             # get_activity_summary(), which derives its useful current action
             # from these fields; without this, an active SDK turn remains
             # stuck at its initial "initializing" state.
+            agent._sdk_issued_tool_effect = True
             agent._current_tool = tool_name
             try:
                 agent._touch_activity(f"executing tool: {tool_name}")
@@ -1190,6 +1191,9 @@ def run_claude_agent_sdk_turn(
                 )
                 if cb is not None
             ]
+            if not callbacks:
+                return
+            agent._record_streamed_assistant_text(text)
             for cb in callbacks:
                 try:
                     cb(text)
@@ -1452,6 +1456,7 @@ def run_claude_agent_sdk_turn(
     # gateway agent.  Reset before session startup too: an authoritative auth
     # failure may happen before a model call and must not inherit prior output.
     agent._current_streamed_assistant_text = ""
+    agent._sdk_issued_tool_effect = False
     _messages_before_sdk_attempt = copy.deepcopy(messages)
 
     on_interim_assistant, on_tool_iteration = _make_visibility_callbacks()
@@ -1555,7 +1560,10 @@ def run_claude_agent_sdk_turn(
         break
 
     _sdk_effects = ClaudeSdkTurnEffects(
-        tool=int(getattr(turn, "tool_iterations", 0) or 0) > 0,
+        tool=(
+            bool(getattr(agent, "_sdk_issued_tool_effect", False))
+            or int(getattr(turn, "tool_iterations", 0) or 0) > 0
+        ),
         streamed=bool(getattr(agent, "_current_streamed_assistant_text", "")),
         projected=bool(getattr(turn, "projected_messages", None)),
         interrupted=bool(
@@ -1643,7 +1651,7 @@ def run_claude_agent_sdk_turn(
                     "claude-sdk projected-message flush failed", exc_info=True
                 )
 
-    if not getattr(turn, "should_retire", False):
+    if not getattr(turn, "should_retire", False) and _sdk_failover_reason is None:
         # Persist the SDK session id for restart/eviction/interrupt resume.
         # AFTER the flush on purpose: the flush's _ensure_db_session retry is
         # what (re)creates the session row when turn-start persistence hit a
