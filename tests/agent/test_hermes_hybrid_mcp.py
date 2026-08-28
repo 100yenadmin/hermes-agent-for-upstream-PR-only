@@ -120,6 +120,20 @@ class _StubAgent:
         self.task_id = "stub-task"
 
 
+class _InvokingAgent(_StubAgent):
+    """Minimal live dispatch seam for the bridge invocation test."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.session_id = "synthetic-session"
+        self._memory_manager = None
+        self.delegate_calls: list[dict] = []
+
+    def _dispatch_delegate_task(self, args: dict) -> str:
+        self.delegate_calls.append(args)
+        return '{"results":[{"task_index":0,"status":"completed"}]}'
+
+
 # ---- normalize_tool_spec -------------------------------------------------
 
 
@@ -361,6 +375,38 @@ class TestHybridServerBuild:
         )
         names = [entry.name for entry in fake_sdk["recorded"]]
         assert names == ["mcp__proton__list_messages"]
+
+
+class TestHybridServerInvocation:
+    @pytest.mark.asyncio
+    async def test_delegate_task_reaches_real_agent_dispatch(self, fake_sdk):
+        """Invoke the decorated bridge handler, not just its registration.
+
+        This runs through the production ``invoke_tool`` agent-level branch
+        and proves opaque per-task fields survive the MCP bridge unchanged.
+        The child execution itself is represented by the agent dispatch seam
+        so the test remains deterministic and never calls a provider.
+        """
+        from agent.transports.hermes_hybrid_mcp import build_hybrid_mcp_server
+
+        agent = _InvokingAgent()
+        args = {
+            "tasks": [
+                {
+                    "goal": "Return one synthetic worker result",
+                    "route": "codex-luna",
+                }
+            ]
+        }
+        build_hybrid_mcp_server(agent, [_openai_spec("delegate_task")])
+
+        decorated = fake_sdk["recorded"][0]
+        result = await decorated.handler(args)
+
+        assert agent.delegate_calls == [args], result
+        assert result["is_error"] is False
+        assert result["content"][0]["type"] == "text"
+        assert '"status":"completed"' in result["content"][0]["text"]
 
 
 # ---- _configured_hybrid_exclude -----------------------------------------
