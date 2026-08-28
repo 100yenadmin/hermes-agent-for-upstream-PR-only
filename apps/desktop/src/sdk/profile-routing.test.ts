@@ -65,6 +65,7 @@ vi.mock('@/store/profile', async () => {
   return {
     $activeGatewayProfile: atom('remote-worker'),
     $gatewaySwapTarget: atom(null),
+    $hydrationSyncProfile: atom(null),
     $profiles: profiles,
     ensureGatewayAgent: vi.fn(),
     ensureGatewayProfile: vi.fn(),
@@ -103,7 +104,8 @@ vi.mock('@/store/gateway', async () => {
   }
 })
 
-const { host } = await import('./index')
+const { BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS, DEFAULT_SESSION_HYDRATION_TIMEOUT_MS, host } = await import('./index')
+
 const { openSession: openSessionCore } = await import('@/app/open-session')
 const { deleteProfile, hermesApi } = await import('@/hermes')
 
@@ -119,6 +121,7 @@ const {
 const {
   $activeGatewayProfile,
   $gatewaySwapTarget,
+  $hydrationSyncProfile,
   $profiles,
   ensureGatewayProfile,
   refreshProfiles,
@@ -156,6 +159,7 @@ afterEach(() => {
   vi.mocked(activeGatewayConnectionId).mockReturnValue('local')
   $activeGatewayProfile.set('remote-worker')
   $gatewaySwapTarget.set(null)
+  setMockAtom($hydrationSyncProfile, null)
   setMockAtom($focusedRuntimeId, null)
   setMockAtom($focusedStoredSessionId, null)
   setMockAtom($focusedSessionState, null)
@@ -831,6 +835,65 @@ describe('profile-aware plugin session opens', () => {
     expect($gatewaySwapTarget.get()).toBeNull()
   })
 
+  it('keeps the ordinary session hydration default at 20 seconds', async () => {
+    vi.useFakeTimers()
+
+    try {
+      expect(DEFAULT_SESSION_HYDRATION_TIMEOUT_MS).toBe(20_000)
+      $activeGatewayProfile.set('hyoseob')
+
+      const outcome = host
+        .openSession('slow-bot-chat', {
+          profile: 'hyoseob',
+          awaitHydration: true,
+          expectHistory: true
+        })
+        .then(
+          () => 'resolved',
+          error => String(error)
+        )
+
+      await vi.advanceTimersByTimeAsync(19_999)
+      expect(setResumeExhaustedSessionId).not.toHaveBeenCalled()
+
+      await vi.advanceTimersByTimeAsync(1)
+      expect(await outcome).toMatch(/timed out loading/i)
+      expect(setResumeExhaustedSessionId).toHaveBeenCalledWith('slow-bot-chat')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('honors the exported 60-second Bot Chat hydration override', async () => {
+    vi.useFakeTimers()
+
+    try {
+      expect(BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS).toBe(60_000)
+      $activeGatewayProfile.set('hyoseob')
+
+      const outcome = host
+        .openSession('slow-bot-chat', {
+          profile: 'hyoseob',
+          awaitHydration: true,
+          expectHistory: true,
+          hydrationTimeoutMs: BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS
+        })
+        .then(
+          () => 'resolved',
+          error => String(error)
+        )
+
+      await vi.advanceTimersByTimeAsync(BOT_CHAT_SESSION_HYDRATION_TIMEOUT_MS - 1)
+      expect(setResumeExhaustedSessionId).not.toHaveBeenCalled()
+
+      await vi.advanceTimersByTimeAsync(1)
+      expect(await outcome).toMatch(/timed out loading/i)
+      expect(setResumeExhaustedSessionId).toHaveBeenCalledWith('slow-bot-chat')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('retries a Bot Chat hydration timeout once without ever arming the Retry surface (#89617)', async () => {
     $activeGatewayProfile.set('hyoseob')
 
@@ -1151,5 +1214,100 @@ describe('profile-aware plugin session opens', () => {
 
     expect(settled).toBe('pending')
     expect(setResumeExhaustedSessionId).not.toHaveBeenCalled()
+  })
+})
+
+describe('shared-remote hydration gate (#89843)', () => {
+  it('paints stored history immediately instead of holding the wake on an unsatisfiable profile gate', async () => {
+    $activeGatewayProfile.set('default')
+    // Shared-remote: every profile is served through the primary socket, so
+    // the dial resolves but $activeGatewayProfile NEVER moves to the bot's
+    // profile — the old profileMatches gate could not be satisfied and the
+    // wake burned the whole 20s budget with the transcript already painted.
+    vi.mocked(ensureGatewayProfile).mockImplementationOnce(async () => undefined)
+
+    const opening = host.openSession('shared-remote-bot', {
+      awaitHydration: true,
+      expectHistory: true,
+      hydrationTimeoutMs: 250,
+      keepAllProfilesScope: false,
+      profile: 'shadow'
+    })
+
+    await Promise.resolve()
+    setMockAtom($selectedStoredSessionId, 'shared-remote-bot')
+    setMockAtom($activeSessionId, 'runtime-shared-remote')
+    setMockAtom($messages, [{ id: 'stored-history', parts: [], role: 'assistant' }] as never)
+
+    // Must resolve on the painted transcript, well inside the budget.
+    await opening
+    expect(setResumeExhaustedSessionId).not.toHaveBeenCalled()
+
+    // The wake resolved paint-first, so the subtle syncing affordance is up…
+    expect($hydrationSyncProfile.get()).toBe('shadow')
+
+    // …and clears itself when the profile gate finally catches up.
+    $activeGatewayProfile.set('shadow')
+    expect($hydrationSyncProfile.get()).toBeNull()
+  })
+
+  it('still fails closed for an expected-empty chat when the profile gate stays unsatisfied', async () => {
+    $activeGatewayProfile.set('default')
+    vi.mocked(ensureGatewayProfile).mockImplementationOnce(async () => undefined)
+
+    // No transcript to paint: a bound runtime on the WRONG profile is not
+    // proof of a real surface, so the paint-first bypass must not fire.
+    setMockAtom($selectedStoredSessionId, 'shared-remote-empty')
+    setMockAtom($activeSessionId, 'runtime-empty')
+
+    await expect(
+      host.openSession('shared-remote-empty', {
+        awaitHydration: true,
+        expectHistory: false,
+        hydrationTimeoutMs: 40,
+        keepAllProfilesScope: false,
+        profile: 'shadow'
+      })
+    ).rejects.toThrow(/timed out loading/i)
+
+    expect($hydrationSyncProfile.get()).toBeNull()
+  })
+
+  it('never paint-first resolves a superseded wake (fail closed on conflicting concurrent hydration)', async () => {
+    $activeGatewayProfile.set('default')
+    vi.mocked(ensureGatewayProfile).mockImplementation(async () => undefined)
+
+    const firstOutcome = host
+      .openSession('conflict-a', {
+        awaitHydration: true,
+        expectHistory: true,
+        hydrationTimeoutMs: 1_000,
+        keepAllProfilesScope: false,
+        profile: 'shadow'
+      })
+      .then(
+        () => 'resolved',
+        error => String(error)
+      )
+
+    await Promise.resolve()
+
+    const second = host.openSession('conflict-b', {
+      awaitHydration: true,
+      expectHistory: true,
+      hydrationTimeoutMs: 1_000,
+      keepAllProfilesScope: false,
+      profile: 'zephyr'
+    })
+
+    setMockAtom($selectedStoredSessionId, 'conflict-b')
+    setMockAtom($activeSessionId, 'runtime-conflict-b')
+    setMockAtom($messages, [{ id: 'history-conflict-b', parts: [], role: 'assistant' }] as never)
+
+    await second
+    expect(await firstOutcome).toMatch(/superseded/i)
+    // Only the CURRENT wake's profile is syncing — the superseded one never
+    // painted its badge over the winner.
+    expect($hydrationSyncProfile.get()).toBe('zephyr')
   })
 })
