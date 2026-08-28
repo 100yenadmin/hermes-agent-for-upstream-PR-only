@@ -2155,11 +2155,12 @@ def run_conversation(
             return _with_runtime_attempt_provenance(
                 agent, _sdk_exhaustion_result(_sdk_result), _whole_turn_api_calls
             )
-        if _sdk_reason is not None and agent._try_activate_fallback(_sdk_reason):
-            active_system_prompt = _sync_failover_system_message(
-                agent, [], active_system_prompt
-            )
-            continue
+        if _sdk_reason is not None:
+            if agent._try_activate_fallback(_sdk_reason):
+                active_system_prompt = _sync_failover_system_message(
+                    agent, [], active_system_prompt
+                )
+                continue
         return _with_runtime_attempt_provenance(
             agent, _sdk_exhaustion_result(_sdk_result), _whole_turn_api_calls
         )
@@ -2253,11 +2254,12 @@ def run_conversation(
                     _sdk_exhaustion_result(_sdk_result),
                     api_call_count + _provider_fallback_call_refunds,
                 )
-            if _sdk_reason is not None and agent._try_activate_fallback(_sdk_reason):
-                active_system_prompt = _sync_failover_system_message(
-                    agent, [], active_system_prompt
-                )
-                continue
+            if _sdk_reason is not None:
+                if agent._try_activate_fallback(_sdk_reason):
+                    active_system_prompt = _sync_failover_system_message(
+                        agent, [], active_system_prompt
+                    )
+                    continue
             return _with_runtime_attempt_provenance(
                 agent,
                 _sdk_exhaustion_result(_sdk_result),
