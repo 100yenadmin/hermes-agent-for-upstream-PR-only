@@ -231,6 +231,11 @@ async def _collect_text(
     system_prompt: str = _AUX_SYSTEM_GUARD,
 ) -> tuple[str, Any, str]:
     """Run a one-shot SDK query and return (text, usage, stop_reason)."""
+    from agent.auxiliary_client import (
+        AuxiliaryExplicitCancellation,
+        _aux_interrupt_cancel_requested,
+        _notify_aux_progress,
+    )
     from claude_agent_sdk import (
         AssistantMessage,
         ClaudeAgentOptions,
@@ -258,6 +263,7 @@ async def _collect_text(
         setting_sources=[],
         permission_mode="dontAsk",
         max_turns=1,
+        include_partial_messages=True,
         env=_sdk_env_overrides(metered_allowed=allow_metered),
     )
 
@@ -267,7 +273,17 @@ async def _collect_text(
     terminal_error: str | None = None
     saw_result = False
 
+    if _aux_interrupt_cancel_requested():
+        raise AuxiliaryExplicitCancellation()
+
     async for message in query(prompt=prompt, options=options):
+        if _aux_interrupt_cancel_requested():
+            raise AuxiliaryExplicitCancellation()
+        # The SDK query is internally streamed and therefore bypasses the
+        # generic OpenAI chunk aggregator. Pulse Hermes's existing progress
+        # hook for each consumed SDK message so long multi-call compression is
+        # not mistaken for an idle/hung provider.
+        _notify_aux_progress()
         billing_error = _aux_billing_guard_error(
             message,
             allow_metered=allow_metered,

@@ -222,6 +222,32 @@ def test_prompt_formatter_preserves_trusted_system_boundary():
     assert "Tool result:\ntool output" in prompt
 
 
+def test_sdk_aux_query_reports_progress_for_each_consumed_message(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+    messages = [
+        module.AssistantMessage([module.TextBlock("part one")]),
+        module.AssistantMessage([module.TextBlock("part two")]),
+        module.ResultMessage(usage={"input_tokens": 2}),
+    ]
+    monkeypatch.setattr(
+        module,
+        "query",
+        lambda **kwargs: _async_messages(messages, captured, kwargs),
+    )
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    pulses = []
+    monkeypatch.setattr(M, "_notify_aux_progress", lambda: pulses.append("progress"))
+
+    text, usage, _ = asyncio.run(
+        AUX._collect_text("prompt", model="claude-sonnet-5")
+    )
+
+    assert text == "part onepart two"
+    assert usage == {"input_tokens": 2}
+    assert len(pulses) == len(messages)
+    assert captured["include_partial_messages"] is True
+
+
 def test_one_shot_query_has_no_tools_and_scrubs_child_env(monkeypatch):
     module, captured = _plant_sdk(monkeypatch, [])
     messages = [
