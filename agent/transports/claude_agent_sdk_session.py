@@ -1449,6 +1449,8 @@ class ClaudeAgentSdkSession:
         # turn is in flight, which is what makes "unsolicited" decidable.
         self._reader_task: Any = None
         self._turn_inbox: Any = None
+        self._turn_claims: Any = None
+        self._turn_claim_requested = False
         self._unsolicited_results = 0
         self._stream_ended: Optional[_StreamEnd] = None
         # Delivery half of the stream-ownership fix (dasbrow-hermes-coder#2):
@@ -2299,12 +2301,26 @@ class ClaudeAgentSdkSession:
             out["api_call_made"] = False
             return out
         inbox: Any = asyncio.Queue()
-        # Claim the stream BEFORE query() — a fast first message must not land
-        # while no turn is claimed and get routed away as unsolicited.
-        self._turn_inbox = inbox
+        # Ask the sole reader to drain everything already ahead of this turn
+        # in the resumed client's FIFO, then atomically install our inbox.  A
+        # direct assignment here races an already-buffered background result:
+        # the reader can observe the new inbox before it observes that older
+        # result and mis-serve it as this query's answer.
+        claims = self._turn_claims
+        if claims is None:
+            out["error"] = "SDK message reader is not ready to claim this turn"
+            out["stream_ended"] = True
+            return out
+        claim_ack = asyncio.get_running_loop().create_future()
+        self._turn_claim_requested = True
+        claims.put_nowait(("claim", inbox, claim_ack))
         interrupted = False
         billing_guarded = False
         try:
+            try:
+                await claim_ack
+            finally:
+                self._turn_claim_requested = False
             query_input = (
                 _sdk_user_message_stream(prompt)
                 if isinstance(prompt, list)
@@ -2506,7 +2522,17 @@ class ClaudeAgentSdkSession:
                         out["error"] = f"SDK turn ended: {subtype}"
                     break
         finally:
-            self._turn_inbox = None
+            if self._turn_inbox is inbox:
+                # Relinquish ownership through the same reader arbiter.  It
+                # drains immediately buffered post-result residue into this
+                # inbox before acknowledging release, preserving the existing
+                # overlap/own-answer dedup handling below.
+                if self._stream_ended is None and self._turn_claims is not None:
+                    release_ack = asyncio.get_running_loop().create_future()
+                    self._turn_claims.put_nowait(("release", inbox, release_ack))
+                    await release_ack
+                else:
+                    self._turn_inbox = None
             # Anything the reader parked after our ResultMessage belongs to a
             # CLI-initiated turn that overlapped ours. Route it now — left in
             # a discarded queue it would be lost, and left in the stream it
@@ -2569,15 +2595,60 @@ class ClaudeAgentSdkSession:
         a message arriving while no turn is in flight is unsolicited BY
         DEFINITION, and gets routed away instead of poisoning the next turn."""
         end: _StreamEnd
+        iterator = self._client.receive_messages().__aiter__()
+        message_task = asyncio.ensure_future(iterator.__anext__())
+        claim_task = asyncio.ensure_future(self._turn_claims.get())
         try:
-            async for message in self._client.receive_messages():
-                self._observe_billing_evidence(message)
-                inbox = self._turn_inbox
-                if inbox is not None:
-                    inbox.put_nowait(message)
-                else:
-                    self._handle_unsolicited(message)
+            while True:
+                done, _pending = await asyncio.wait(
+                    (message_task, claim_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if message_task in done:
+                    try:
+                        message = message_task.result()
+                    except StopAsyncIteration:
+                        end = _StreamEnd(error=None)
+                        break
+                    self._observe_billing_evidence(message)
+                    inbox = self._turn_inbox
+                    if inbox is not None:
+                        inbox.put_nowait(message)
+                    else:
+                        self._handle_unsolicited(message)
+                    # Message wins ties with a claim. Re-arm first, then loop:
+                    # every immediately available pre-claim FIFO entry is
+                    # classified unsolicited before the claim is acknowledged.
+                    message_task = asyncio.ensure_future(iterator.__anext__())
+                    continue
+
+                operation, inbox, claim_ack = claim_task.result()
+                claim_task = asyncio.ensure_future(self._turn_claims.get())
+                if claim_ack.cancelled():
+                    continue
+                if operation == "claim":
+                    if self._turn_inbox is not None:
+                        claim_ack.set_exception(
+                            RuntimeError("SDK message stream already has a turn owner")
+                        )
+                        continue
+                    self._turn_inbox = inbox
+                elif operation == "release":
+                    if self._turn_inbox is not inbox:
+                        claim_ack.set_exception(
+                            RuntimeError("SDK message stream release owner mismatch")
+                        )
+                        continue
+                    self._turn_inbox = None
+                else:  # pragma: no cover - internal invariant
+                    claim_ack.set_exception(
+                        RuntimeError(f"unknown SDK stream ownership operation: {operation}")
+                    )
+                    continue
+                claim_ack.set_result(None)
         except asyncio.CancelledError:  # pragma: no cover - shutdown path
+            message_task.cancel()
+            claim_task.cancel()
             raise
         except Exception as exc:  # pragma: no cover - stream torn down
             logger.debug(
@@ -2585,8 +2656,11 @@ class ClaudeAgentSdkSession:
                 _safe_sdk_error_text(exc),
             )
             end = _StreamEnd(error=_safe_sdk_error_text(exc))
-        else:
-            end = _StreamEnd(error=None)
+        finally:
+            if not message_task.done():
+                message_task.cancel()
+            if not claim_task.done():
+                claim_task.cancel()
         # The stream is gone (CLI exited or transport died). Mark it for any
         # future turn and wake the in-flight one, so nobody waits out a full
         # turn_timeout against a dead stream.
@@ -2692,6 +2766,7 @@ class ClaudeAgentSdkSession:
             return
 
         async def _spawn() -> Any:
+            self._turn_claims = asyncio.Queue()
             return asyncio.ensure_future(self._reader_loop())
 
         self._reader_task = self._run_coro(_spawn(), timeout=10.0)
