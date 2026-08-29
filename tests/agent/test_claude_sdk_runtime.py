@@ -1776,6 +1776,76 @@ class TestStreamOwnership:
         assert turn.final_text == "fresh answer"
         assert getattr(session, "_unsolicited_results", None) == 1
 
+    def test_preloaded_stale_burst_is_drained_before_foreground_claim(self):
+        """A resumed client's already-buffered FIFO stays background-owned.
+
+        The stream reader is deliberately held until the foreground claimant
+        exists.  On the buggy claim-before-drain path, that makes the stale
+        ResultMessage the new query's answer deterministically.  A correct
+        reader-mediated claim drains the pre-claim burst as unsolicited first,
+        then permits exactly one query whose fast response owns the inbox.
+        """
+        holder = {}
+        delivered = []
+
+        class PreloadedResumeClient(_FakeClient):
+            async def receive_messages(self):
+                while True:
+                    session = holder.get("session")
+                    if session is not None and (
+                        session._turn_inbox is not None
+                        or getattr(session, "_turn_claim_requested", False)
+                    ):
+                        break
+                    await asyncio.sleep(0)
+                yield AssistantMessage(content=[TextBlock("stale background answer")])
+                yield ResultMessage(
+                    result="stale background answer",
+                    uuid="stale-preclaim",
+                    session_id="sdk-resume-kept",
+                )
+                async for message in super().receive_messages():
+                    yield message
+
+        def factory(options=None):
+            client = PreloadedResumeClient(
+                options=options,
+                script=[
+                    AssistantMessage(content=[TextBlock("fresh foreground answer")]),
+                    ResultMessage(
+                        result="fresh foreground answer",
+                        uuid="fresh-foreground",
+                        session_id="sdk-resume-kept",
+                    ),
+                ],
+            )
+            holder["client"] = client
+            return client
+
+        session = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            client_factory=factory,
+            resume_session_id="sdk-resume-kept",
+            on_unsolicited_result=delivered.append,
+        )
+        holder["session"] = session
+        started = time.monotonic()
+        try:
+            turn = session.run_turn("new foreground question", turn_timeout=15.0)
+            elapsed = time.monotonic() - started
+        finally:
+            session.close()
+
+        assert elapsed < 5.0, f"claim handshake delayed a fast response ({elapsed:.1f}s)"
+        assert turn.error is None
+        assert turn.final_text == "fresh foreground answer"
+        assert holder["client"].queried == ["new foreground question"]
+        assert holder["client"].options["resume"] == "sdk-resume-kept"
+        assert session._session_id == "sdk-resume-kept"
+        assert session._unsolicited_results == 1
+        assert session._unsolicited_delivered == {"stale-preclaim"}
+        assert delivered == [["stale background answer"]]
+
     def test_offset_does_not_accumulate_across_unsolicited_turns(self):
         # The live incident: 4 unsolicited turns -> every later reply answered
         # a question 4 back. N unsolicited results must be dropped, not queued.
