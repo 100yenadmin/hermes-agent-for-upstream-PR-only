@@ -102,9 +102,10 @@ def test_explicit_sdk_async_aux_provider_uses_subscription_facade(monkeypatch):
     assert model == "claude-sonnet-5"
     assert client.base_url == ""
 
-    async def _fake_collect(prompt, *, model):
+    async def _fake_collect(prompt, *, model, system_prompt):
         assert prompt
         assert model == "claude-sonnet-5"
+        assert AUX._AUX_SYSTEM_GUARD in system_prompt
         return "summary", {"input_tokens": 2}, "stop"
 
     monkeypatch.setattr(AUX, "_collect_text", _fake_collect)
@@ -202,25 +203,23 @@ def test_auto_sdk_async_failure_is_fail_closed_before_every_fallback(monkeypatch
         ))
 
 
-def test_prompt_formatter_preserves_roles_and_only_text_content():
-    prompt = AUX._messages_to_prompt(
+def test_prompt_formatter_preserves_trusted_system_boundary():
+    prompt, system_prompt = AUX._messages_to_sdk_inputs(
         [
             {"role": "system", "content": "Summarize precisely."},
             {
                 "role": "user",
-                "content": [
-                    {"type": "text", "text": "hello"},
-                    {"type": "image_url", "image_url": {"url": "secret-url"}},
-                ],
+                "content": [{"type": "text", "text": "hello"}],
             },
             {"role": "tool", "content": {"content": "tool output"}},
         ]
     )
 
-    assert "System:\nSummarize precisely." in prompt
+    assert "Summarize precisely." in system_prompt
+    assert "Summarize precisely." not in prompt
+    assert AUX._AUX_SYSTEM_GUARD in system_prompt
     assert "User:\nhello" in prompt
     assert "Tool result:\ntool output" in prompt
-    assert "secret-url" not in prompt
 
 
 def test_one_shot_query_has_no_tools_and_scrubs_child_env(monkeypatch):
@@ -239,7 +238,7 @@ def test_one_shot_query_has_no_tools_and_scrubs_child_env(monkeypatch):
     monkeypatch.setattr(
         SESSION,
         "_sdk_env_overrides",
-        lambda: {"ANTHROPIC_API_KEY": ""},
+        lambda **_kwargs: {"ANTHROPIC_API_KEY": ""},
     )
 
     text, usage, _ = asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
@@ -250,6 +249,110 @@ def test_one_shot_query_has_no_tools_and_scrubs_child_env(monkeypatch):
     assert captured["allowed_tools"] == []
     assert captured["mcp_servers"] == {}
     assert captured["env"] == {"ANTHROPIC_API_KEY": ""}
+    assert captured["system_prompt"] == AUX._AUX_SYSTEM_GUARD
+
+
+def test_aux_billing_guard_rejects_extra_usage_before_result(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+
+    class RateLimitInfo:
+        rate_limit_type = "five_hour"
+        overage_status = "allowed_warning"
+        raw = {"isUsingOverage": False}
+
+    class RateLimitEvent:
+        rate_limit_info = RateLimitInfo()
+
+    messages = [
+        RateLimitEvent(),
+        module.AssistantMessage([module.TextBlock("must not be accepted")]),
+        module.ResultMessage(),
+    ]
+    monkeypatch.setattr(
+        module,
+        "query",
+        lambda **kwargs: _async_messages(messages, captured, kwargs),
+    )
+    monkeypatch.setattr(SESSION, "_provider_flag", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
+
+    with pytest.raises(ClaudeSdkAuxError, match="Extra Usage is enabled"):
+        asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
+
+
+def test_aux_billing_guard_rejects_reported_api_key_source(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+
+    class SystemMessage:
+        subtype = "init"
+        data = {"apiKeySource": "ANTHROPIC_API_KEY"}
+
+    messages = [SystemMessage(), module.ResultMessage()]
+    monkeypatch.setattr(
+        module,
+        "query",
+        lambda **kwargs: _async_messages(messages, captured, kwargs),
+    )
+    monkeypatch.setattr(SESSION, "_provider_flag", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
+
+    with pytest.raises(ClaudeSdkAuxError, match="metered API-key source"):
+        asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
+
+
+def test_explicit_metered_opt_in_allows_reported_overage(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+
+    class RateLimitInfo:
+        rate_limit_type = "overage"
+        overage_status = "allowed"
+        raw = {"isUsingOverage": True}
+
+    class RateLimitEvent:
+        rate_limit_info = RateLimitInfo()
+
+    messages = [
+        RateLimitEvent(),
+        module.AssistantMessage([module.TextBlock("operator opted in")]),
+        module.ResultMessage(),
+    ]
+    monkeypatch.setattr(
+        module,
+        "query",
+        lambda **kwargs: _async_messages(messages, captured, kwargs),
+    )
+    monkeypatch.setattr(SESSION, "_provider_flag", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
+
+    text, _, _ = asyncio.run(
+        AUX._collect_text("prompt", model="claude-sonnet-5")
+    )
+
+    assert text == "operator opted in"
+
+
+def test_text_only_facade_rejects_image_before_sdk_call(monkeypatch):
+    async def _fail_if_collected(*_args, **_kwargs):
+        raise AssertionError("SDK query must not run for image/file content")
+
+    monkeypatch.setattr(AUX, "_collect_text", _fail_if_collected)
+    client = ClaudeSdkAuxClient()
+
+    with pytest.raises(ClaudeSdkAuxError, match="text-only"):
+        client.chat.completions.create(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe this"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.invalid/image.png"},
+                        },
+                    ],
+                }
+            ]
+        )
 
 
 async def _async_messages(messages, captured, kwargs):
@@ -277,7 +380,7 @@ def test_terminal_error_never_returns_partial_text(monkeypatch, result_kwargs):
         "query",
         lambda **kwargs: _async_messages(messages, captured, kwargs),
     )
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     with pytest.raises(ClaudeSdkAuxError):
         asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
@@ -292,7 +395,7 @@ def test_terminal_error_is_redacted(monkeypatch):
         "query",
         lambda **kwargs: _async_messages(messages, captured, kwargs),
     )
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     with pytest.raises(ClaudeSdkAuxError) as raised:
         asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
@@ -308,7 +411,7 @@ def test_stream_ending_without_result_is_not_partial_success(monkeypatch):
         "query",
         lambda **kwargs: _async_messages(messages, captured, kwargs),
     )
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     with pytest.raises(ClaudeSdkAuxError, match="without a terminal result"):
         asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
@@ -317,7 +420,7 @@ def test_stream_ending_without_result_is_not_partial_success(monkeypatch):
 def test_sdk_exception_is_redacted_at_openai_facade(monkeypatch):
     secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789"
 
-    async def _boom(prompt, *, model):
+    async def _boom(prompt, *, model, system_prompt):
         raise RuntimeError(f"transport exposed {secret}")
 
     monkeypatch.setattr(AUX, "_collect_text", _boom)
