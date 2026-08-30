@@ -3086,6 +3086,7 @@ def _run_single_child(
 
         summary = result.get("final_response") or ""
         completed = result.get("completed", False)
+        child_failed = bool(result.get("failed", False) or result.get("error"))
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
 
@@ -3098,6 +3099,12 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
+        elif child_failed:
+            # ``run_conversation`` may preserve a user-facing transport error
+            # in final_response while also stamping failed/error. A non-empty
+            # error explanation is not usable task output and must not turn a
+            # provider failure into a false-success delegation receipt.
+            status = "failed"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already
@@ -3147,6 +3154,8 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif child_failed:
+            exit_reason = "error"
         elif completed:
             exit_reason = "completed"
         else:
