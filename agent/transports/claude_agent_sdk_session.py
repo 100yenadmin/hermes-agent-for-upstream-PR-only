@@ -2454,6 +2454,17 @@ class ClaudeAgentSdkSession:
                     await release_ack
                 else:
                     self._turn_inbox = None
+                # Stream death can win the release handshake after the
+                # terminal ResultMessage was already delivered.  The reader's
+                # death path acknowledges queued operations so waiters wake,
+                # but it deliberately does not install/apply their ownership.
+                # Re-check after the acknowledgement: preserve the valid turn
+                # result while retiring the now-dead session, and never leave
+                # a between-turn inbox falsely claimed.
+                if self._stream_ended is not None:
+                    if self._turn_inbox is inbox:
+                        self._turn_inbox = None
+                    out["stream_ended"] = True
             # Anything the reader parked after our ResultMessage belongs to a
             # CLI-initiated turn that overlapped ours. Route it now — left in
             # a discarded queue it would be lost, and left in the stream it
