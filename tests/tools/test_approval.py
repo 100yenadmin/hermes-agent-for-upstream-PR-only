@@ -99,10 +99,13 @@ class TestDetectDangerousRm:
             assert "delete" in desc.lower()
 
 
-    def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self):
-        with mock_patch("tempfile.gettempdir", return_value="/tmp"):
+    def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self, tmp_path):
+        # Use a real, canonical temp directory. On macOS, /tmp resolves to
+        # /private/tmp; the production guard intentionally refuses a symlinked
+        # spelling and that behavior has its own test below.
+        with mock_patch("tempfile.gettempdir", return_value=str(tmp_path)):
             for prefix in ("hermes-verify-", "hermes-ad-hoc-"):
-                assert detect_dangerous_command(f"rm -f /tmp/{prefix}example.py") == (
+                assert detect_dangerous_command(f"rm -f {tmp_path / f'{prefix}example.py'}") == (
                     False,
                     None,
                     None,
