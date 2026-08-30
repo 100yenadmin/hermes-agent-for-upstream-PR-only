@@ -2049,6 +2049,62 @@ class TestStreamOwnership:
         assert session._unsolicited_delivered == {"stale-preclaim"}
         assert delivered == [["stale background answer"]]
 
+    @pytest.mark.parametrize("stream_error", [None, RuntimeError("reader exploded")])
+    def test_queued_claim_wakes_when_backlogged_stream_dies(self, stream_error):
+        """EOF/exception after backlog must wake a still-queued claim.
+
+        The reader deliberately sees both the backlog and foreground claim as
+        ready.  Backlog wins until the stream exits, leaving the claim queued
+        unless the death path explicitly resolves every pending acknowledgement.
+        """
+        holder = {}
+        delivered = []
+
+        class BacklogThenDeadClient(_FakeClient):
+            async def receive_messages(self):
+                while not holder["session"]._turn_claim_requested:
+                    await asyncio.sleep(0)
+                yield AssistantMessage(content=[TextBlock("background answer")])
+                yield ResultMessage(result="background answer", uuid="background-dead")
+                if stream_error is not None:
+                    raise stream_error
+
+        def factory(options=None):
+            client = BacklogThenDeadClient(options=options)
+            holder["client"] = client
+            return client
+
+        session = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            client_factory=factory,
+            on_unsolicited_result=delivered.append,
+        )
+        holder["session"] = session
+        future = None
+        try:
+            session.ensure_started()
+            started = time.monotonic()
+            future = asyncio.run_coroutine_threadsafe(
+                session._consume_turn("foreground question"), session._loop
+            )
+            result = future.result(timeout=2.0)
+            elapsed = time.monotonic() - started
+        finally:
+            if future is not None:
+                future.cancel()
+            session.close()
+
+        assert elapsed < 1.0
+        assert result["stream_ended"] is True
+        assert "SDK message stream ended before this turn" in result["error"]
+        if stream_error is not None:
+            assert "reader exploded" in result["error"]
+        assert holder["client"].queried == []
+        assert session._turn_inbox is None
+        assert session._unsolicited_results == 1
+        assert session._unsolicited_delivered == {"background-dead"}
+        assert delivered == [["background answer"]]
+
     def test_offset_does_not_accumulate_across_unsolicited_turns(self):
         # The live incident: 4 unsolicited turns -> every later reply answered
         # a question 4 back. N unsolicited results must be dropped, not queued.
