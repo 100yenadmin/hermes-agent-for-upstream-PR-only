@@ -120,8 +120,7 @@ jobs:
           status=0
           uv run --no-sync python -m pytest \
             "$@" \
-            -m "windows_only and not integration" \
-            --timeout-method=thread || status=$?
+            -m "windows_only and not integration" || status=$?
           if [ "$status" -eq 5 ]; then
             exit 1
           fi
