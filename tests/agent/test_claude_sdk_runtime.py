@@ -2105,6 +2105,47 @@ class TestStreamOwnership:
         assert session._unsolicited_delivered == {"background-dead"}
         assert delivered == [["background answer"]]
 
+    def test_stream_death_during_release_preserves_answer_and_retires(self):
+        """A terminal answer remains valid when the persistent stream then dies.
+
+        EOF races the reader-mediated release acknowledgement here.  The turn
+        must keep the answer, clear its foreground ownership, and retire the
+        dead session immediately rather than poisoning one later request.
+        """
+        holder = {}
+
+        class ResultThenDeadClient(_FakeClient):
+            async def receive_messages(self):
+                while not self.queried:
+                    await asyncio.sleep(0)
+                yield ResultMessage(
+                    result="answer before stream death",
+                    uuid="result-before-death",
+                    session_id="dead-after-result",
+                )
+
+        def factory(options=None):
+            client = ResultThenDeadClient(options=options)
+            holder["client"] = client
+            return client
+
+        session = ClaudeAgentSdkSession(cwd="/tmp", client_factory=factory)
+        try:
+            turn = session.run_turn(
+                "foreground question",
+                turn_timeout=2.0,
+                watch_poll_interval=0.01,
+            )
+        finally:
+            session.close()
+
+        assert turn.error is None
+        assert turn.final_text == "answer before stream death"
+        assert turn.should_retire is True
+        assert holder["client"].queried == ["foreground question"]
+        assert session._stream_ended is not None
+        assert session._turn_inbox is None
+
     def test_offset_does_not_accumulate_across_unsolicited_turns(self):
         # The live incident: 4 unsolicited turns -> every later reply answered
         # a question 4 back. N unsolicited results must be dropped, not queued.
