@@ -192,9 +192,9 @@ _APPEND_TOTAL_MAX_CHARS = 22000
 
 # Sentences that instruct the skill-WRITE tool — skill_manage is NOT exposed
 # through the MCP shims, and guidance must only describe callable tools.
-# Stripped as pure deletions (never rewording); the pin tests go red if
-# upstream rewords them. One lives in MEMORY_GUIDANCE, one in the skills
-# index boilerplate (caught live: the index ships it unconditionally).
+# Stripped as pure deletions (never rewording). The legacy memory sentence is
+# retained for compatibility with older prompt builders; current main no
+# longer emits it. The index sentence still ships unconditionally.
 _SKILL_TOOL_SENTENCE = (
     "If you've discovered a new way to do something, solved a problem that could be "
     "necessary later, save it as a skill with the skill tool.\n"
