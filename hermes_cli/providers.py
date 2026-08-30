@@ -293,6 +293,7 @@ class ProviderDef:
     auth_type: str = "api_key"
     doc: str = ""
     source: str = ""                      # "models.dev", "hermes", "user-config"
+    keyless: bool = False                 # explicitly served without credentials
 
 
 # -- Aliases ------------------------------------------------------------------
@@ -560,6 +561,7 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
             base_url_env_var=base_url_env,
             is_aggregator=is_agg,
             auth_type=auth,
+            keyless=bool(getattr(overlay, "keyless", False)),
             doc=mdev_info.doc,
             source="models.dev",
         )
@@ -575,6 +577,7 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
             base_url_env_var=overlay.base_url_env_var,
             is_aggregator=overlay.is_aggregator,
             auth_type=overlay.auth_type,
+            keyless=bool(getattr(overlay, "keyless", False)),
             source="hermes",
         )
 
@@ -604,6 +607,7 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
                 api_key_env_vars=tuple(_prof.env_vars or ()),
                 base_url=_prof.base_url or "",
                 auth_type=_prof.auth_type or "api_key",
+                keyless=bool(getattr(_prof, "keyless", False)),
                 source="plugin-profile",
             )
     except Exception:
@@ -844,6 +848,7 @@ def resolve_user_provider(name: str, user_config: Dict[str, Any]) -> Optional[Pr
         base_url=api_url,
         is_aggregator=False,
         auth_type="api_key",
+        keyless=bool(entry.get("keyless", False)),
         source="user-config",
     )
 

@@ -1689,6 +1689,7 @@ def test_resolve_runtime_provider_opencode_free_keyless_despite_exhausted_pool(m
     assert resolved["base_url"] == "https://opencode.ai/zen/v1"
     assert resolved["api_mode"] == "chat_completions"
     assert resolved["default_headers"]["Authorization"] == ""
+    assert resolved["keyless"] is True
 
 
 def test_resolve_runtime_provider_opencode_free_missing_env_still_resolves(monkeypatch):
@@ -1713,6 +1714,30 @@ def test_resolve_runtime_provider_opencode_free_missing_env_still_resolves(monke
     assert resolved["provider"] == "opencode-free"
     assert resolved["api_key"] == "opencode-zen-free-keyless"
     assert resolved["base_url"] == "https://opencode.ai/zen/v1"
+    assert resolved["keyless"] is True
+
+
+def test_runtime_provider_metadata_is_additive_and_safe(monkeypatch):
+    monkeypatch.setattr(
+        rp,
+        "_resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "base_url": "https://provider.invalid/v1",
+            "api_key": "synthetic-key",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.providers.get_provider",
+        lambda name, allow_network=False: SimpleNamespace(
+            auth_type="oauth_external", keyless=False
+        ),
+    )
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+    assert resolved["auth_type"] == "oauth_external"
+    assert resolved["keyless"] is False
+    assert resolved["api_key"] == "synthetic-key"
 
 
 def test_custom_provider_explicit_target_model_wins(monkeypatch):

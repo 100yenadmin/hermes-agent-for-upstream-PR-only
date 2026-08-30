@@ -175,7 +175,11 @@ def provider_catalog() -> list[ProviderDescriptor]:
                 # Keyless providers (e.g. opencode-free) are served
                 # anonymously: there is no credential to configure, so the
                 # GUI renders no key card and contract tests exempt them.
-                keyless=bool(getattr(overlay, "keyless", False)),
+                keyless=bool(
+                    getattr(cfg, "keyless", False)
+                    or getattr(prof, "keyless", False)
+                    or getattr(overlay, "keyless", False)
+                ),
             )
         )
     return out
