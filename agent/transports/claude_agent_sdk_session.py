@@ -2235,6 +2235,13 @@ class ClaudeAgentSdkSession:
                 await claim_ack
             finally:
                 self._turn_claim_requested = False
+            ended = self._stream_ended
+            if ended is not None:
+                out["error"] = "SDK message stream ended before this turn" + (
+                    f": {_safe_sdk_error_text(ended.error)}" if ended.error else ""
+                )
+                out["stream_ended"] = True
+                return out
             query_input = (
                 _sdk_user_message_stream(prompt)
                 if isinstance(prompt, list)
@@ -2575,10 +2582,28 @@ class ClaudeAgentSdkSession:
                 message_task.cancel()
             if not claim_task.done():
                 claim_task.cancel()
-        # The stream is gone (CLI exited or transport died). Mark it for any
-        # future turn and wake the in-flight one, so nobody waits out a full
-        # turn_timeout against a dead stream.
+        # The stream is gone (CLI exited or transport died). Mark it before
+        # acknowledging every queued ownership operation.  A foreground turn
+        # can pass its initial stream check, enqueue a claim behind buffered
+        # messages, and then lose the reader to EOF; resolving the claim makes
+        # it re-check this terminal state instead of waiting out turn_timeout.
         self._stream_ended = end
+        pending_claims = []
+        if claim_task.done() and not claim_task.cancelled():
+            try:
+                pending_claims.append(claim_task.result())
+            except Exception:  # pragma: no cover - queue task failed
+                pass
+        claims = self._turn_claims
+        if claims is not None:
+            while True:
+                try:
+                    pending_claims.append(claims.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+        for _operation, _owner, claim_ack in pending_claims:
+            if not claim_ack.done():
+                claim_ack.set_result(None)
         inbox = self._turn_inbox
         if inbox is not None:
             inbox.put_nowait(end)
