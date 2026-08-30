@@ -2582,6 +2582,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         fb_api_mode = "chat_completions"
         if fb_api_mode_explicit:
             fb_api_mode = str(fb.get("api_mode")).strip()
+        elif fb_provider == "claude-agent-sdk":
+            # This provider owns the complete turn through the Agent SDK. An
+            # explicit api_mode above still wins for intentional custom routes.
+            fb_api_mode = "claude_agent_sdk"
         elif fb_provider == "anthropic":
             # Provider-name check must not be gated on fb_base_url_hint:
             # an entry that names provider: anthropic without an explicit

@@ -182,6 +182,9 @@ dependencies = [
 # Native Anthropic provider — only needed when provider=anthropic (not via
 # OpenRouter or other aggregators).
 anthropic = ["anthropic==0.87.0"]  # CVE-2026-34450, CVE-2026-34452
+# Claude via the official Agent SDK (subscription OAuth) — only needed when
+# provider=claude-agent-sdk. The SDK bundles/locates the Claude Code CLI.
+claude-agent-sdk = ["claude-agent-sdk==0.2.144", "mcp==2.0.0", "httpx2==2.7.0", "starlette==1.3.1"]  # SDK >=0.2.140 accepts mcp 2.x; pin mcp with the [mcp] extra so every extra combination resolves (#65982)
 # Web search backends — each only loaded when the user picks it as their
 # search provider (configured via `hermes tools` or config.yaml).
 exa = ["exa-py==2.10.2"]
@@ -419,9 +422,10 @@ exclude-newer = "14 days"
 # risk — their newest releases are years old — and unbricks resolvers that
 # cannot see upload dates.
 #
-# setuptools, pillow, mcp: exact-pinned bricks (#78227, #75992, #76020). uv
-# applies exclude-newer to build-system.requires and core deps too; when a
-# resolver cannot see an upload date (old uv, mirror index, stale HTTP cache)
+# setuptools, pillow, mcp, claude-agent-sdk: exact-pinned bricks
+# (#78227, #75992, #76020). uv applies exclude-newer to build-system.requires
+# and core deps too; when a resolver cannot see an upload date (old uv, mirror
+# index, stale HTTP cache)
 # it filters the pinned version and the package cannot even BUILD
 # ("No solution found when resolving: setuptools==83.0.0"). These deps are
 # exact-pinned (==X.Y.Z), so exclude-newer adds zero float protection for
@@ -433,7 +437,7 @@ exclude-newer = "14 days"
 # firecrawl-anydoc: same exact-pin shape (==0.2.4, hosted-OCR wiring PR).
 # The pin bump WAS the review; exclude-newer adds zero float protection to
 # an exact pin and would only delay the reviewed version 14 days.
-exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, defusedxml = false, python-olm = false, unpaddedbase64 = false, setuptools = false, pillow = false, mcp = false, firecrawl-anydoc = false }
+exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, defusedxml = false, python-olm = false, unpaddedbase64 = false, setuptools = false, pillow = false, mcp = false, claude-agent-sdk = false, firecrawl-anydoc = false }
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's
