@@ -3437,12 +3437,12 @@ class TestSystemPromptAppend:
         assert "database client, process/service state, network operation" in out
         assert "Bash remains subject to normal approval" in out
 
-    def test_memory_guidance_present_skill_sentence_stripped(self, tmp_path, monkeypatch):
-        # MEMORY_GUIDANCE ships verbatim EXCEPT its one sentence instructing
-        # the skill tool (skill_manage is not exposed — checklist #3:
-        # guidance only for callable tools). The strip must be a pure
-        # deletion of a sentence that actually exists in the native constant
-        # — if upstream rewords it, this test goes red and we re-derive.
+    def test_consolidated_memory_guidance_is_preserved_verbatim(
+        self, tmp_path, monkeypatch
+    ):
+        # Upstream's consolidated MEMORY_GUIDANCE routes procedures to skills
+        # without instructing the unavailable skill_manage write tool. Keep it
+        # verbatim; the skills-index boilerplate is filtered separately below.
         from agent.claude_sdk_runtime import (
             _strip_uncallable_tool_guidance,
             build_system_prompt_append,
@@ -3451,13 +3451,12 @@ class TestSystemPromptAppend:
 
         self._home(tmp_path, monkeypatch, memory="uses trunk-based development")
         stripped = _strip_uncallable_tool_guidance(MEMORY_GUIDANCE)
-        assert stripped != MEMORY_GUIDANCE, "skill sentence not found — upstream reworded it"
-        assert "save it as a skill with the skill tool" not in stripped
+        assert stripped == MEMORY_GUIDANCE
+        assert "skill_manage" not in stripped
 
         out = build_system_prompt_append()
-        assert "You have persistent memory across sessions" in out
-        assert stripped in out
-        assert "save it as a skill with the skill tool" not in out
+        assert MEMORY_GUIDANCE in out
+        assert "skill_manage" not in out
         # Disambiguation addendum (caught live): the claude_code preset has
         # its own file-based memory convention; the append must pin the
         # hermes-tools memory tool as the ONLY durable store.
