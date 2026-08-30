@@ -3270,13 +3270,13 @@ class TestSystemPromptAppend:
         assert "database client, process/service state, network operation" in out
         assert "Bash remains subject to normal approval" in out
 
-    def test_memory_guidance_present_skill_sentence_stripped(self, tmp_path, monkeypatch):
-        # MEMORY_GUIDANCE ships verbatim EXCEPT its one sentence instructing
-        # the skill tool (skill_manage is not exposed — checklist #3:
-        # guidance only for callable tools). The strip must be a pure
-        # deletion of a sentence that actually exists in the native constant
-        # — if upstream rewords it, this test goes red and we re-derive.
+    def test_memory_guidance_present_without_uncallable_skill_tool(self, tmp_path, monkeypatch):
+        # Current main no longer emits the legacy skill-write sentence in
+        # MEMORY_GUIDANCE. Keep stripping it for older prompt builders while
+        # proving that current guidance is injected without dangling tool
+        # instructions (checklist #3: guidance only for callable tools).
         from agent.claude_sdk_runtime import (
+            _SKILL_TOOL_SENTENCE,
             _strip_uncallable_tool_guidance,
             build_system_prompt_append,
         )
@@ -3284,11 +3284,11 @@ class TestSystemPromptAppend:
 
         self._home(tmp_path, monkeypatch, memory="uses trunk-based development")
         stripped = _strip_uncallable_tool_guidance(MEMORY_GUIDANCE)
-        assert stripped != MEMORY_GUIDANCE, "skill sentence not found — upstream reworded it"
+        assert _strip_uncallable_tool_guidance(_SKILL_TOOL_SENTENCE + "keep") == "keep"
         assert "save it as a skill with the skill tool" not in stripped
+        assert "skill_manage" not in stripped
 
         out = build_system_prompt_append()
-        assert "You have persistent memory across sessions" in out
         assert stripped in out
         assert "save it as a skill with the skill tool" not in out
         # Disambiguation addendum (caught live): the claude_code preset has
