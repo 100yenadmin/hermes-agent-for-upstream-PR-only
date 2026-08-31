@@ -1112,9 +1112,15 @@ def dispatch_async_delegation_batch(
         status = "error"
         try:
             combined = runner() or {}
-            # Batch status: completed unless every child errored/was interrupted.
+            # Preserve a graceful all-child cancellation as ``interrupted``.
+            # Otherwise retain the legacy aggregate contract: any usable child
+            # result completes the batch, while an all-failure batch is error.
             child_results = combined.get("results") or []
             if child_results and all(
+                r.get("status") == "interrupted" for r in child_results
+            ):
+                status = "interrupted"
+            elif child_results and all(
                 (r.get("status") not in ("completed", "success"))
                 for r in child_results
             ):

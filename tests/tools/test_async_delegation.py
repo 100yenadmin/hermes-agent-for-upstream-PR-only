@@ -317,6 +317,82 @@ def test_interrupt_all_signals_running_children():
     assert evt["status"] == "interrupted"
 
 
+def test_interrupt_all_preserves_interrupted_batch_status():
+    released = threading.Event()
+
+    def runner():
+        released.wait(timeout=60)
+        return {
+            "results": [
+                {
+                    "task_index": 0,
+                    "status": "interrupted",
+                    "summary": None,
+                    "error": "cancelled",
+                }
+            ],
+            "total_duration_seconds": 0.1,
+        }
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["long batch task"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="batch-parent",
+        runner=runner,
+        interrupt_fn=released.set,
+        max_async_children=1,
+    )
+
+    assert ad.interrupt_all(reason="test batch") == 1
+    evt = _drain_for(res["delegation_id"])
+    assert evt is not None
+    assert evt["is_batch"] is True
+    assert evt["status"] == "interrupted"
+    assert evt["results"][0]["status"] == "interrupted"
+    durable = ad.get_durable_delegation(res["delegation_id"])
+    assert durable is not None
+    assert durable["state"] == "interrupted"
+
+
+@pytest.mark.parametrize(
+    ("child_statuses", "expected"),
+    [
+        (["interrupted", "error"], "error"),
+        (["completed", "interrupted"], "completed"),
+    ],
+)
+def test_batch_terminal_status_preserves_existing_mixed_outcomes(
+    child_statuses, expected
+):
+    res = ad.dispatch_async_delegation_batch(
+        goals=[f"task {index}" for index, _status in enumerate(child_statuses)],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="batch-parent",
+        runner=lambda: {
+            "results": [
+                {
+                    "task_index": index,
+                    "status": status,
+                    "summary": "usable" if status == "completed" else None,
+                }
+                for index, status in enumerate(child_statuses)
+            ],
+            "total_duration_seconds": 0.1,
+        },
+        max_async_children=1,
+    )
+
+    evt = _drain_for(res["delegation_id"])
+    assert evt is not None
+    assert evt["status"] == expected
+
+
 def _fast_stale_monitor(monkeypatch, *, idle=0.15, in_tool=0.3, grace=0.15):
     """Shrink the stale-monitor cadence so tests run in milliseconds."""
     monkeypatch.setattr(ad, "_STALE_CHECK_INTERVAL", 0.03)
