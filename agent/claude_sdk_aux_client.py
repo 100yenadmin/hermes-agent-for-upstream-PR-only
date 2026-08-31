@@ -167,6 +167,13 @@ async def _collect_text(
         _notify_aux_progress,
         aux_progress_hook,
     )
+    # Mirror the persistent session transport: make the SDK importable before
+    # importing it. On a cold install the main turn may still be lazy-installing
+    # claude-agent-sdk when an auxiliary task (title, compression) runs first;
+    # importing without this races the install and dies with ModuleNotFoundError.
+    from tools.lazy_deps import ensure as _lazy_ensure
+
+    _lazy_ensure("provider.claude_agent_sdk", prompt=False)
     from claude_agent_sdk import (
         AssistantMessage,
         ClaudeAgentOptions,
