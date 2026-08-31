@@ -11,6 +11,7 @@ retire the client rather than silently continue.
 """
 
 import asyncio
+import json
 import logging
 import sys
 import threading
@@ -241,6 +242,47 @@ class TestProjector:
             )
         )
         assert len(out.messages[0]["content"]) == 4000
+
+    def test_structured_tool_result_truncation_preserves_route_receipt(self):
+        p = ClaudeSdkEventProjector()
+        payload = {
+            "status": "completed",
+            "results": [
+                {
+                    "status": "completed",
+                    "summary": "worker output " * 1000,
+                    "route": "codex-luna",
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6-luna",
+                    "billing_mode": "subscription_included",
+                    "cost_status": "included",
+                }
+            ],
+            "mixed_routes": False,
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+        }
+        out = p.project(
+            UserMessage(
+                content=[
+                    ToolResultBlock(
+                        tool_use_id="t-route",
+                        content=json.dumps(payload),
+                    )
+                ]
+            )
+        )
+
+        projected = out.messages[0]["content"]
+        assert len(projected) <= 4000
+        decoded = json.loads(projected)
+        result = decoded["results"][0]
+        assert result["route"] == "codex-luna"
+        assert result["provider"] == "openai-codex"
+        assert result["model"] == "gpt-5.6-luna"
+        assert result["billing_mode"] == "subscription_included"
+        assert result["cost_status"] == "included"
+        assert result["summary"].endswith("...[truncated]")
 
     def test_result_message_sets_final_text(self):
         p = ClaudeSdkEventProjector()
