@@ -52,7 +52,7 @@ import concurrent.futures
 import logging
 import time
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable, cast
 
 from agent.redact import redact_sensitive_text
 
@@ -73,6 +73,9 @@ _UNSUPPORTED_BLOCK_TYPES = {
     "input_image",
 }
 _UNSUPPORTED_BLOCK_KEYS = {"file", "file_id", "image", "image_url"}
+# Advisory bound: asyncio's timeout cancellation must still be serviced by
+# aclose(), so a cancellation-hostile SDK teardown can exceed this interval.
+_QUERY_CLOSE_TIMEOUT = 5.0
 
 
 class ClaudeSdkAuxError(RuntimeError):
@@ -269,8 +272,9 @@ async def _collect_text(
     if cancel_check is None:
         cancel_requested = _aux_interrupt_cancel_requested
     else:
-        # This seam only unwinds the SDK query; it performs no destructive
-        # timeout cleanup, so generic attempt-outcome arbitration is unnecessary.
+        # A captured generic decision may latch cancellation here. That is the
+        # desired precedence, but this SDK seam performs no destructive timeout
+        # cleanup and therefore never calls begin_timeout_cleanup().
         cancel_requested = lambda: _captured_aux_cancel_requested(cancel_check)
 
     def notify_progress() -> None:
@@ -301,40 +305,107 @@ async def _collect_text(
     if cancel_requested():
         raise AuxiliaryExplicitCancellation()
 
-    async for message in query(prompt=prompt, options=options):
-        if cancel_requested():
-            raise AuxiliaryExplicitCancellation()
-        # The SDK query is internally streamed and therefore bypasses the
-        # generic OpenAI chunk aggregator. Pulse Hermes's existing progress
-        # hook for each consumed SDK message so long multi-call compression is
-        # not mistaken for an idle/hung provider.
-        notify_progress()
-        billing_error = _aux_billing_guard_error(
-            message,
-            allow_metered=allow_metered,
-        )
-        if billing_error is not None:
-            raise ClaudeSdkAuxError(billing_error)
-        if isinstance(message, AssistantMessage):
-            for block in getattr(message, "content", None) or []:
-                # ThinkingBlock and friends are deliberately skipped -- aux
-                # callers want the answer text, not the reasoning trace.
-                if isinstance(block, TextBlock):
-                    text = getattr(block, "text", "") or ""
-                    if text:
-                        parts.append(text)
-        elif isinstance(message, ResultMessage):
-            saw_result = True
-            usage = getattr(message, "usage", None)
-            subtype = str(getattr(message, "subtype", None) or "")
-            stop_reason = getattr(message, "stop_reason", None) or "stop"
-            if getattr(message, "is_error", False) or subtype not in ("", "success"):
-                errors = getattr(message, "errors", None) or []
-                detail = (
-                    "; ".join(str(error) for error in errors)
-                    or str(getattr(message, "result", None) or subtype or "unknown error")
+    stream = query(prompt=prompt, options=options)
+    pending_error: BaseException | None = None
+    try:
+        async for message in stream:
+            if cancel_requested():
+                raise AuxiliaryExplicitCancellation()
+            # The SDK query is internally streamed and therefore bypasses the
+            # generic OpenAI chunk aggregator. Pulse Hermes's existing progress
+            # hook for each consumed SDK message so long multi-call compression is
+            # not mistaken for an idle/hung provider.
+            notify_progress()
+            billing_error = _aux_billing_guard_error(
+                message,
+                allow_metered=allow_metered,
+            )
+            if billing_error is not None:
+                raise ClaudeSdkAuxError(billing_error)
+            if isinstance(message, AssistantMessage):
+                for block in getattr(message, "content", None) or []:
+                    # ThinkingBlock and friends are deliberately skipped -- aux
+                    # callers want the answer text, not the reasoning trace.
+                    if isinstance(block, TextBlock):
+                        text = getattr(block, "text", "") or ""
+                        if text:
+                            parts.append(text)
+            elif isinstance(message, ResultMessage):
+                saw_result = True
+                usage = getattr(message, "usage", None)
+                subtype = str(getattr(message, "subtype", None) or "")
+                stop_reason = getattr(message, "stop_reason", None) or "stop"
+                if getattr(message, "is_error", False) or subtype not in ("", "success"):
+                    errors = getattr(message, "errors", None) or []
+                    detail = (
+                        "; ".join(str(error) for error in errors)
+                        or str(
+                            getattr(message, "result", None)
+                            or subtype
+                            or "unknown error"
+                        )
+                    )
+                    terminal_error = redact_sensitive_text(detail, force=True)
+    except BaseException as exc:
+        pending_error = exc
+        raise
+    finally:
+        close_stream = getattr(stream, "aclose", None)
+        if callable(close_stream):
+            close_timeout = asyncio.timeout(_QUERY_CLOSE_TIMEOUT)
+            try:
+                async with close_timeout:
+                    await cast(Awaitable[Any], close_stream())
+            except (
+                AuxiliaryExplicitCancellation,
+                KeyboardInterrupt,
+                SystemExit,
+            ):
+                raise
+            except TimeoutError as exc:
+                if close_timeout.expired():
+                    logger.warning(
+                        "claude-agent-sdk auxiliary query close timed out "
+                        "(model=%s, timeout=%gs)",
+                        model,
+                        _QUERY_CLOSE_TIMEOUT,
+                    )
+                else:
+                    logger.warning(
+                        "claude-agent-sdk auxiliary query close failed "
+                        "(model=%s, error=%s)",
+                        model,
+                        type(exc).__name__,
+                    )
+            except asyncio.CancelledError:
+                # A standalone outer/task cancellation intentionally outranks an
+                # already recorded terminal SDK error; only an exception already
+                # propagating from this stream body retains precedence. Production
+                # callers always enter through _run_coro_blocking's wait_for wrapper;
+                # suppressing its teardown cancellation preserves the earlier hard
+                # cancel while the wrapper owns cancellation bookkeeping.
+                if pending_error is None:
+                    raise
+                logger.debug(
+                    "claude-agent-sdk auxiliary query close was cancelled",
+                    exc_info=True,
                 )
-                terminal_error = redact_sensitive_text(detail, force=True)
+            except Exception as exc:
+                logger.warning(
+                    "claude-agent-sdk auxiliary query close failed "
+                    "(model=%s, error=%s)",
+                    model,
+                    type(exc).__name__,
+                )
+            except BaseException as exc:
+                if pending_error is None and terminal_error is None:
+                    raise
+                logger.warning(
+                    "claude-agent-sdk auxiliary query close failed "
+                    "(model=%s, error=%s)",
+                    model,
+                    type(exc).__name__,
+                )
 
     if terminal_error is not None:
         # Fail closed even when partial assistant text preceded the terminal
@@ -466,8 +537,17 @@ class _AsyncAuxCompletions:
         )
 
         cancel_active = _aux_interrupt_protected()
+        # Canonical capture intentionally normalizes a cancel_event to its
+        # bound is_set method. Every current cancellation reader needs only a
+        # callable predicate; no worker mutates or waits on the Event object.
         cancel_check = _capture_aux_cancel_check()
         progress_hook = _capture_aux_progress_hook()
+
+        # These threading-local values must be captured before to_thread().
+        # This remains request-safe because production installers wrap a
+        # synchronous aux call; none holds this context across an await on a
+        # shared event-loop thread. A future async installer must use
+        # task-local context rather than extending this adapter convention.
 
         def _call_sync_create() -> SimpleNamespace:
             cancel_scope = (
