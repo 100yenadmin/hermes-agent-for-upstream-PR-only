@@ -3269,6 +3269,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
             current["agent"] = agent
+            _session_todo_state(current)
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
@@ -3921,9 +3922,15 @@ def _ensure_session_db_row(session: dict) -> None:
             parent_session_id=parent_session_id,
             cwd=_persisted_session_cwd(session),
             # Self-describing rows: aggregators that merge multiple profile DBs
-            # into one list can't rely on which file a row came from alone. NULL
-            # means the launch/default profile (matches run_agent's convention).
-            profile_name=Path(profile_home).name if profile_home else None,
+            # into one list can't rely on which file a row came from alone.
+            # Stamp the launch profile explicitly instead of leaving NULL —
+            # NULL is exactly what the #94724 legacy-owner backfill exists to
+            # repair, and rows minted AFTER that one-shot backfill ran stayed
+            # NULL forever: profile-keyed matching then drops them from the
+            # sidebar and deep links can't resolve them (#99222).
+            profile_name=(
+                Path(profile_home).name if profile_home else _current_profile_name()
+            ),
         )
         # A session can be born hidden (session.create hidden=true, or a
         # session.set_hidden that arrived before the row existed): apply the
@@ -4435,7 +4442,9 @@ def _save_cfg(cfg: dict):
 
     from utils import atomic_roundtrip_yaml_save
 
-    path = _hermes_home / "config.yaml"
+    override = get_hermes_home_override()
+    home = Path(override) if isinstance(override, str) and override else _hermes_home
+    path = Path(home) / "config.yaml"
     # Comment-, ordering-, and Unicode-preserving full-state write.
     # Replaces the previous `yaml.safe_dump(cfg, f)` (and later
     # `atomic_config_write`, which is not comment-preserving) which clobbered
@@ -6140,6 +6149,7 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             api_key=snapshot.get("api_key", ""),
             base_url=snapshot.get("base_url", ""),
             api_mode=snapshot.get("api_mode", ""),
+            capabilities=snapshot.get("capabilities"),
         )
 
 
@@ -6352,6 +6362,7 @@ def _apply_model_switch(
                 api_key=result.api_key,
                 base_url=result.base_url,
                 api_mode=result.api_mode,
+                capabilities=getattr(result, "runtime_capabilities", None),
             )
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
@@ -6651,7 +6662,8 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     acted only on PRESENT keys, leaving stale values active forever.
     """
     cfg = cfg if isinstance(cfg, dict) else {}
-    compression = cfg.get("compression") if isinstance(cfg.get("compression"), dict) else {}
+    compression_raw = cfg.get("compression")
+    compression = compression_raw if isinstance(compression_raw, dict) else {}
     model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
 
     enabled_raw = compression.get("enabled", True)
@@ -6659,6 +6671,27 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
         agent.compression_enabled = enabled_raw
     else:
         agent.compression_enabled = str(enabled_raw).lower() in {"true", "1", "yes"}
+
+    agent.codex_responses_native_compaction = is_truthy_value(
+        compression.get("codex_responses_native", False)
+    )
+    native_threshold_raw = compression.get(
+        "codex_responses_compact_threshold", 200_000
+    )
+    try:
+        if isinstance(native_threshold_raw, bool):
+            raise ValueError
+        native_threshold = int(native_threshold_raw)
+        if native_threshold <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid compression.codex_responses_compact_threshold=%r; "
+            "using 200000.",
+            native_threshold_raw,
+        )
+        native_threshold = 200_000
+    agent.codex_responses_compact_threshold = native_threshold
 
     # Absence restores the agent_init/config default (0 = disabled).
     idle_raw = compression.get("idle_compact_after_seconds", 0)
@@ -7161,6 +7194,39 @@ def _get_usage(agent) -> dict:
             usage["context_max"] = ctx_max
             usage["context_percent"] = max(0, min(100, round(last_prompt / ctx_max * 100)))
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
+    # Cache-hit ratio + rolling latency/throughput for the TUI status bar.
+    # Mirrors the classic CLI bar (cli.py _get_status_bar_snapshot / PR #98250):
+    #   hit = session_cache_read_tokens / session_prompt_tokens
+    #   (CanonicalUsage.prompt_tokens = input + cache_read + cache_write)
+    # latency/tps read the deque(maxlen=10) history maintained per API call in
+    # agent/conversation_loop.py. Values are omitted (not fabricated) when no
+    # data exists — e.g. Codex app-server reports no latency, and a session
+    # with zero cache reads shows no hit% rather than an alarming 0.
+    try:
+        _prompt_total = int(getattr(agent, "session_prompt_tokens", 0) or 0)
+        _cache_read = int(getattr(agent, "session_cache_read_tokens", 0) or 0)
+        if _prompt_total > 0 and _cache_read > 0:
+            usage["cache_hit_pct"] = max(0, min(100, round(_cache_read / _prompt_total * 100)))
+    except Exception:
+        pass
+    try:
+        _lhist = list(getattr(agent, "_api_latency_history", []) or [])
+        _ohist = list(getattr(agent, "_api_output_history", []) or [])
+        _n = min(len(_lhist), len(_ohist))
+        if _n:
+            _lhist = _lhist[-_n:]
+            _ohist = _ohist[-_n:]
+            _avg_lat = sum(_lhist) / _n
+            _total_lat = sum(_lhist)
+            _avg_vel = (sum(_ohist) / _total_lat) if _total_lat > 0 else None
+            # Guard NaN/negative/absurd values from odd provider timings.
+            if _avg_lat == _avg_lat and 0 < _avg_lat < 1e6:
+                usage["avg_latency_s"] = round(float(_avg_lat), 1)
+            if _avg_vel is not None and _avg_vel == _avg_vel and 0 < _avg_vel < 1e6:
+                usage["avg_tps"] = round(float(_avg_vel), 1)
+    except Exception:
+        # A status-bar readout must never break usage reporting.
+        pass
     # Live count of background/async subagents still running (delegate_task
     # batches + background single delegations). Mirrors the classic CLI status
     # bar's ⛓ indicator; sourced from the same async_delegation registry.
@@ -7609,6 +7675,101 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
     return f"{text}{suffix}" if text else None
 
 
+def _normalize_todo_state(value: object) -> dict | None:
+    """Return a client-safe full todo snapshot or ``None`` when malformed."""
+    if not isinstance(value, dict) or not isinstance(value.get("todos"), list):
+        return None
+    try:
+        revision = max(0, int(value.get("revision") or 0))
+    except (TypeError, ValueError):
+        return None
+    todos = list(value["todos"])
+    # Unused TodoStore snapshot() is {todos: [], revision: 0}. Attaching
+    # that on resume stamps a client watermark and blocks unversioned
+    # tool.start merges. An empty list at revision >= 1 is a real clear.
+    if not todos and revision == 0:
+        return None
+    return {"todos": todos, "revision": revision}
+
+
+def _session_todo_state(session: dict) -> dict | None:
+    """Return the newest live/cached todo snapshot for a runtime session."""
+    cached = _normalize_todo_state(session.get("todo_state"))
+    live = None
+    agent = session.get("agent")
+    store = getattr(agent, "_todo_store", None)
+    snapshot = getattr(store, "snapshot", None)
+    if callable(snapshot):
+        try:
+            live = _normalize_todo_state(snapshot())
+        except Exception:
+            logger.debug("failed to read live todo state", exc_info=True)
+
+    if live is not None and (
+        cached is None or live["revision"] >= cached["revision"]
+    ):
+        cached = live
+    if cached is not None:
+        session["todo_state"] = cached
+    return cached
+
+
+def _attach_todo_state(payload: dict, session: dict) -> dict:
+    """Attach the authoritative todo snapshot to a session response."""
+    state = _session_todo_state(session)
+    if state is not None:
+        payload["todo_state"] = state
+    return payload
+
+
+def _todo_state_from_history(history) -> dict | None:
+    """Derive the latest todo snapshot from an already-loaded transcript.
+
+    Used by resume paths that answer before an AIAgent (and its live
+    TodoStore) exists. The canonical todo tool results already persist in
+    conversation history as ordinary tool messages, so the latest one paired
+    with an assistant ``todo`` tool call IS the durable snapshot — no side
+    table and no extra transcript read (each resume path passes the history
+    it already loaded).
+    """
+    if not isinstance(history, list) or not history:
+        return None
+    try:
+        from tools.todo_tool import MAX_TODO_RESULT_CHARS
+
+        todo_call_ids: set[str] = set()
+        for msg in history:
+            if not isinstance(msg, dict):
+                continue
+            for call in msg.get("tool_calls") or []:
+                if (call.get("function") or {}).get("name") == "todo":
+                    cid = call.get("id")
+                    if cid:
+                        todo_call_ids.add(cid)
+        if not todo_call_ids:
+            return None
+        for msg in reversed(history):
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            if msg.get("tool_call_id") not in todo_call_ids:
+                continue
+            content = msg.get("content", "")
+            if (
+                not isinstance(content, str)
+                or len(content) > MAX_TODO_RESULT_CHARS
+                or '"todos"' not in content
+            ):
+                continue
+            try:
+                return _normalize_todo_state(json.loads(content))
+            except Exception:
+                continue
+        return None
+    except Exception:
+        logger.debug("failed to derive todo state from history", exc_info=True)
+        return None
+
+
 def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
     session = _sessions.get(sid)
     if session is not None:
@@ -7665,13 +7826,15 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         result_text = _tool_result_text(result)
         if result_text:
             payload["result_text"] = result_text
+    todo_state = None
     if name == "todo":
-        try:
-            data = json.loads(result)
-            if isinstance(data, dict) and isinstance(data.get("todos"), list):
-                payload["todos"] = data.get("todos")
-        except Exception:
-            pass
+        todo_state = _normalize_todo_state(payload.get("result"))
+        if todo_state is not None:
+            payload.update(todo_state)
+            if session is not None:
+                cached = _normalize_todo_state(session.get("todo_state"))
+                if cached is None or todo_state["revision"] >= cached["revision"]:
+                    session["todo_state"] = todo_state
     try:
         from agent.display import render_edit_diff_with_delta
 
@@ -7686,8 +7849,18 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
             payload["inline_diff"] = "\n".join(rendered)
     except Exception:
         pass
-    if _tool_progress_enabled(sid) or payload.get("inline_diff") or _tool_lifecycle_required_for_ui(name):
+    if (
+        _tool_progress_enabled(sid)
+        or payload.get("inline_diff")
+        or _tool_lifecycle_required_for_ui(name)
+        or name == "todo"
+    ):
         _emit("tool.complete", sid, payload)
+    # Task state is application data, not optional tool-progress chrome. A
+    # dedicated full-snapshot event lets every client reconcile immediately
+    # without interpreting provider text or partial merge arguments.
+    if todo_state is not None:
+        _emit("todo.updated", sid, todo_state)
 
 
 def _on_tool_progress(
@@ -8878,6 +9051,7 @@ def _init_session(
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
         }
+        _session_todo_state(_sessions[sid])
     _init_owns_db = False
     if session_db is not None:
         db = session_db
@@ -9641,6 +9815,12 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     same _run_prompt_submit machinery as every other synthesized turn — so
     the client that just resumed streams it live.
     """
+    # Hosted room turns are recovered by their durable task/lease state
+    # machine. Generic session auto-continue would bypass its execution
+    # generation and can duplicate work after a process restart.
+    if session.get("source") == "bot_room":
+        return None
+
     home = _session_home(session)
     marker = read_turn_marker(home, session_key)
     if marker is None:
@@ -10120,7 +10300,12 @@ def _inflight_snapshot(session: dict) -> dict | None:
 
 
 def _emit_terminal_turn_error(
-    sid: str, session: dict, error: Any, error_surface: Optional[dict] = None
+    sid: str,
+    session: dict,
+    error: Any,
+    error_surface: Optional[dict] = None,
+    *,
+    retire_marker: bool = True,
 ) -> None:
     """Close a failed turn with a terminal ``message.complete`` frame.
 
@@ -10173,7 +10358,8 @@ def _emit_terminal_turn_error(
         rendered = ""
     if rendered:
         payload["rendered"] = rendered
-    _retire_turn_marker(session)
+    if retire_marker:
+        _retire_turn_marker(session)
     _emit("message.complete", sid, payload)
 
 
@@ -10250,6 +10436,7 @@ def _deferred_session_record(
     lazy: bool = False,
     model_override=None,
     resume_runtime_overrides: dict | None = None,
+    todo_state: dict | None = None,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
@@ -10286,6 +10473,7 @@ def _deferred_session_record(
         "source": source,
         "tool_progress_mode": _load_tool_progress_mode(),
         "tool_started_at": {},
+        "todo_state": todo_state,
         "transport": current_transport() or _stdio_transport,
     }
 
@@ -10412,6 +10600,11 @@ def _schedule_resume_hydration(
                 session["display_history_prefix"] = prefix
                 session["resume_hydrating"] = False
                 session["resume_message_count"] = len(display_history)
+            # Deferred resumes answered before the transcript existed; cache
+            # the derived todo snapshot now so later payload attaches carry it.
+            todo_state = _todo_state_from_history(history)
+            if todo_state is not None and session.get("todo_state") is None:
+                session["todo_state"] = todo_state
             session["resume_history_ready"].set()
             _emit(
                 "session.resume_progress",
@@ -10715,7 +10908,7 @@ def _live_session_payload(
         payload["pending_approval"] = approval
     if clarify := _pending_clarify_request_payload(sid):
         payload["pending_clarify"] = clarify
-    return payload
+    return _attach_todo_state(payload, session)
 
 
 def _main_runtime_from_agent(agent) -> dict | None:
@@ -12412,6 +12605,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    terminal_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
@@ -12461,6 +12655,8 @@ def _run_prompt_submit(
     _emit("message.start", sid)
 
     def run():
+        terminal_receipt_attempted = False
+        terminal_receipt_committed = terminal_callback is None
         # The conversation runs on a fresh thread, so ContextVars from the RPC
         # dispatcher do not follow automatically. Rebind the exact transport
         # stored on this session generation before any tool can commission a
@@ -13001,7 +13197,26 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
                 if _error_surface:
                     payload["error_surface"] = _error_surface
-            _retire_turn_marker(session, marker_key)
+            if terminal_callback is not None:
+                terminal_receipt_attempted = True
+                terminal_callback(
+                    {
+                        "status": (
+                            "cancelled"
+                            if status == "interrupted"
+                            else "failed" if status == "error" else "settled"
+                        ),
+                        "text": raw if isinstance(raw, str) else str(raw),
+                        **(
+                            {"error": str(result.get("error") or raw)}
+                            if status == "error" and isinstance(result, dict)
+                            else {}
+                        ),
+                    }
+                )
+                terminal_receipt_committed = True
+            if terminal_receipt_committed:
+                _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
@@ -13181,11 +13396,25 @@ def _run_prompt_submit(
             # Keep the partial turn available to the next prompt; the durable
             # inflight record still carries the recoverable error state.
             _restore_agent_history_after_turn_error(session, agent)
+            if terminal_callback is not None and not terminal_receipt_attempted:
+                terminal_receipt_attempted = True
+                try:
+                    terminal_callback(
+                        {"status": "failed", "text": "", "error": str(e)}
+                    )
+                    terminal_receipt_committed = True
+                except Exception:
+                    logger.exception("hosted room terminal receipt commit failed")
             try:
                 # Close the turn with the same terminal error frame shape as
                 # the returned-error path (uniform client handling), retaining
                 # the failed turn for resume replay.
-                _emit_terminal_turn_error(sid, session, e)
+                _emit_terminal_turn_error(
+                    sid,
+                    session,
+                    e,
+                    retire_marker=terminal_receipt_committed,
+                )
                 turn_error_retained = True
             except Exception as emit_exc:
                 print(
@@ -13280,7 +13509,10 @@ def _run_prompt_submit(
             )
             # Backstop for turns that never reached a terminal frame (the
             # frame paths retire the marker as they emit).
-            _retire_turn_marker(session, marker_key)
+            if terminal_receipt_committed:
+                _retire_turn_marker(session, marker_key)
+                with session["history_lock"]:
+                    session.pop("_hosted_room_task", None)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, agent)
 
@@ -13701,6 +13933,7 @@ def _respond(rid, params, key, *, allow_expired=False):
 # opt/model-resolution-core PR touches its body; move it to methods_config.py
 # in a follow-up once that PR lands.
 @method("config.set")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
     session = _sessions.get(params.get("session_id", ""))

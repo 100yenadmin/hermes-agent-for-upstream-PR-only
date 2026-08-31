@@ -1776,6 +1776,173 @@ class TestStreamOwnership:
         assert turn.final_text == "fresh answer"
         assert getattr(session, "_unsolicited_results", None) == 1
 
+    def test_preloaded_stale_burst_is_drained_before_foreground_claim(self):
+        """A resumed client's already-buffered FIFO stays background-owned.
+
+        The stream reader is deliberately held until the foreground claimant
+        exists.  On the buggy claim-before-drain path, that makes the stale
+        ResultMessage the new query's answer deterministically.  A correct
+        reader-mediated claim drains the pre-claim burst as unsolicited first,
+        then permits exactly one query whose fast response owns the inbox.
+        """
+        holder = {}
+        delivered = []
+
+        class PreloadedResumeClient(_FakeClient):
+            async def receive_messages(self):
+                while True:
+                    session = holder.get("session")
+                    if session is not None and (
+                        session._turn_inbox is not None
+                        or getattr(session, "_turn_claim_requested", False)
+                    ):
+                        break
+                    await asyncio.sleep(0)
+                yield AssistantMessage(content=[TextBlock("stale background answer")])
+                yield ResultMessage(
+                    result="stale background answer",
+                    uuid="stale-preclaim",
+                    session_id="sdk-resume-kept",
+                )
+                async for message in super().receive_messages():
+                    yield message
+
+        def factory(options=None):
+            client = PreloadedResumeClient(
+                options=options,
+                script=[
+                    AssistantMessage(content=[TextBlock("fresh foreground answer")]),
+                    ResultMessage(
+                        result="fresh foreground answer",
+                        uuid="fresh-foreground",
+                        session_id="sdk-resume-kept",
+                    ),
+                ],
+            )
+            holder["client"] = client
+            return client
+
+        session = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            client_factory=factory,
+            resume_session_id="sdk-resume-kept",
+            on_unsolicited_result=delivered.append,
+        )
+        holder["session"] = session
+        started = time.monotonic()
+        try:
+            turn = session.run_turn("new foreground question", turn_timeout=15.0)
+            elapsed = time.monotonic() - started
+        finally:
+            session.close()
+
+        assert elapsed < 5.0, f"claim handshake delayed a fast response ({elapsed:.1f}s)"
+        assert turn.error is None
+        assert turn.final_text == "fresh foreground answer"
+        assert holder["client"].queried == ["new foreground question"]
+        assert holder["client"].options["resume"] == "sdk-resume-kept"
+        assert session._session_id == "sdk-resume-kept"
+        assert session._unsolicited_results == 1
+        assert session._unsolicited_delivered == {"stale-preclaim"}
+        assert delivered == [["stale background answer"]]
+
+    @pytest.mark.parametrize("stream_error", [None, RuntimeError("reader exploded")])
+    def test_queued_claim_wakes_when_backlogged_stream_dies(self, stream_error):
+        """EOF/exception after backlog must wake a still-queued claim.
+
+        The reader deliberately sees both the backlog and foreground claim as
+        ready.  Backlog wins until the stream exits, leaving the claim queued
+        unless the death path explicitly resolves every pending acknowledgement.
+        """
+        holder = {}
+        delivered = []
+
+        class BacklogThenDeadClient(_FakeClient):
+            async def receive_messages(self):
+                while not holder["session"]._turn_claim_requested:
+                    await asyncio.sleep(0)
+                yield AssistantMessage(content=[TextBlock("background answer")])
+                yield ResultMessage(result="background answer", uuid="background-dead")
+                if stream_error is not None:
+                    raise stream_error
+
+        def factory(options=None):
+            client = BacklogThenDeadClient(options=options)
+            holder["client"] = client
+            return client
+
+        session = ClaudeAgentSdkSession(
+            cwd="/tmp",
+            client_factory=factory,
+            on_unsolicited_result=delivered.append,
+        )
+        holder["session"] = session
+        future = None
+        try:
+            session.ensure_started()
+            started = time.monotonic()
+            future = asyncio.run_coroutine_threadsafe(
+                session._consume_turn("foreground question"), session._loop
+            )
+            result = future.result(timeout=2.0)
+            elapsed = time.monotonic() - started
+        finally:
+            if future is not None:
+                future.cancel()
+            session.close()
+
+        assert elapsed < 1.0
+        assert result["stream_ended"] is True
+        assert "SDK message stream ended before this turn" in result["error"]
+        if stream_error is not None:
+            assert "reader exploded" in result["error"]
+        assert holder["client"].queried == []
+        assert session._turn_inbox is None
+        assert session._unsolicited_results == 1
+        assert session._unsolicited_delivered == {"background-dead"}
+        assert delivered == [["background answer"]]
+
+    def test_stream_death_during_release_preserves_answer_and_retires(self):
+        """A terminal answer remains valid when the persistent stream then dies.
+
+        EOF races the reader-mediated release acknowledgement here.  The turn
+        must keep the answer, clear its foreground ownership, and retire the
+        dead session immediately rather than poisoning one later request.
+        """
+        holder = {}
+
+        class ResultThenDeadClient(_FakeClient):
+            async def receive_messages(self):
+                while not self.queried:
+                    await asyncio.sleep(0)
+                yield ResultMessage(
+                    result="answer before stream death",
+                    uuid="result-before-death",
+                    session_id="dead-after-result",
+                )
+
+        def factory(options=None):
+            client = ResultThenDeadClient(options=options)
+            holder["client"] = client
+            return client
+
+        session = ClaudeAgentSdkSession(cwd="/tmp", client_factory=factory)
+        try:
+            turn = session.run_turn(
+                "foreground question",
+                turn_timeout=2.0,
+                watch_poll_interval=0.01,
+            )
+        finally:
+            session.close()
+
+        assert turn.error is None
+        assert turn.final_text == "answer before stream death"
+        assert turn.should_retire is True
+        assert holder["client"].queried == ["foreground question"]
+        assert session._stream_ended is not None
+        assert session._turn_inbox is None
+
     def test_offset_does_not_accumulate_across_unsolicited_turns(self):
         # The live incident: 4 unsolicited turns -> every later reply answered
         # a question 4 back. N unsolicited results must be dropped, not queued.
@@ -3270,12 +3437,12 @@ class TestSystemPromptAppend:
         assert "database client, process/service state, network operation" in out
         assert "Bash remains subject to normal approval" in out
 
-    def test_memory_guidance_present_skill_sentence_stripped(self, tmp_path, monkeypatch):
-        # MEMORY_GUIDANCE ships verbatim EXCEPT its one sentence instructing
-        # the skill tool (skill_manage is not exposed — checklist #3:
-        # guidance only for callable tools). The strip must be a pure
-        # deletion of a sentence that actually exists in the native constant
-        # — if upstream rewords it, this test goes red and we re-derive.
+    def test_consolidated_memory_guidance_is_preserved_verbatim(
+        self, tmp_path, monkeypatch
+    ):
+        # Upstream's consolidated MEMORY_GUIDANCE routes procedures to skills
+        # without instructing the unavailable skill_manage write tool. Keep it
+        # verbatim; the skills-index boilerplate is filtered separately below.
         from agent.claude_sdk_runtime import (
             _strip_uncallable_tool_guidance,
             build_system_prompt_append,
@@ -3284,13 +3451,12 @@ class TestSystemPromptAppend:
 
         self._home(tmp_path, monkeypatch, memory="uses trunk-based development")
         stripped = _strip_uncallable_tool_guidance(MEMORY_GUIDANCE)
-        assert stripped != MEMORY_GUIDANCE, "skill sentence not found — upstream reworded it"
-        assert "save it as a skill with the skill tool" not in stripped
+        assert stripped == MEMORY_GUIDANCE
+        assert "skill_manage" not in stripped
 
         out = build_system_prompt_append()
-        assert "You have persistent memory across sessions" in out
-        assert stripped in out
-        assert "save it as a skill with the skill tool" not in out
+        assert MEMORY_GUIDANCE in out
+        assert "skill_manage" not in out
         # Disambiguation addendum (caught live): the claude_code preset has
         # its own file-based memory convention; the append must pin the
         # hermes-tools memory tool as the ONLY durable store.

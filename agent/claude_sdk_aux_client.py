@@ -52,7 +52,7 @@ import concurrent.futures
 import logging
 import time
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Awaitable, Callable, cast
 
 from agent.redact import redact_sensitive_text
 
@@ -73,6 +73,9 @@ _UNSUPPORTED_BLOCK_TYPES = {
     "input_image",
 }
 _UNSUPPORTED_BLOCK_KEYS = {"file", "file_id", "image", "image_url"}
+# Advisory bound: asyncio's timeout cancellation must still be serviced by
+# aclose(), so a cancellation-hostile SDK teardown can exceed this interval.
+_QUERY_CLOSE_TIMEOUT = 5.0
 
 
 class ClaudeSdkAuxError(RuntimeError):
@@ -224,13 +227,37 @@ def _run_coro_blocking(coro, timeout: float):
         ).result(timeout=timeout + 30)
 
 
+def _capture_aux_progress_hook() -> Callable[[], Any] | None:
+    """Capture the request thread's progress hook for worker dispatch."""
+    from agent import auxiliary_client
+
+    hook = getattr(auxiliary_client._aux_progress, "hook", None)
+    return hook if callable(hook) else None
+
+
 async def _collect_text(
     prompt: str,
     *,
     model: str,
     system_prompt: str = _AUX_SYSTEM_GUARD,
+    cancel_check: Callable[[], Any] | None = None,
+    progress_hook: Callable[[], Any] | None = None,
 ) -> tuple[str, Any, str]:
     """Run a one-shot SDK query and return (text, usage, stop_reason)."""
+    from agent.auxiliary_client import (
+        AuxiliaryExplicitCancellation,
+        _aux_interrupt_cancel_requested,
+        _captured_aux_cancel_requested,
+        _notify_aux_progress,
+        aux_progress_hook,
+    )
+    # Mirror the persistent session transport: make the SDK importable before
+    # importing it. On a cold install the main turn may still be lazy-installing
+    # claude-agent-sdk when an auxiliary task (title, compression) runs first;
+    # importing without this races the install and dies with ModuleNotFoundError.
+    from tools.lazy_deps import ensure as _lazy_ensure
+
+    _lazy_ensure("provider.claude_agent_sdk", prompt=False)
     from claude_agent_sdk import (
         AssistantMessage,
         ClaudeAgentOptions,
@@ -249,6 +276,20 @@ async def _collect_text(
 
     allow_metered = _provider_flag("allow_metered_key")
 
+    if cancel_check is None:
+        cancel_requested = _aux_interrupt_cancel_requested
+    else:
+        # A captured generic decision may latch cancellation here. That is the
+        # desired precedence, but this SDK seam performs no destructive timeout
+        # cleanup and therefore never calls begin_timeout_cleanup().
+        cancel_requested = lambda: _captured_aux_cancel_requested(cancel_check)
+
+    def notify_progress() -> None:
+        # Reinstall the owning request's hook in whichever worker consumes the
+        # SDK stream. A None hook preserves any hook already on this thread.
+        with aux_progress_hook(progress_hook):
+            _notify_aux_progress()
+
     options = ClaudeAgentOptions(
         model=model,
         system_prompt=system_prompt,
@@ -258,6 +299,7 @@ async def _collect_text(
         setting_sources=[],
         permission_mode="dontAsk",
         max_turns=1,
+        include_partial_messages=True,
         env=_sdk_env_overrides(metered_allowed=allow_metered),
     )
 
@@ -267,33 +309,110 @@ async def _collect_text(
     terminal_error: str | None = None
     saw_result = False
 
-    async for message in query(prompt=prompt, options=options):
-        billing_error = _aux_billing_guard_error(
-            message,
-            allow_metered=allow_metered,
-        )
-        if billing_error is not None:
-            raise ClaudeSdkAuxError(billing_error)
-        if isinstance(message, AssistantMessage):
-            for block in getattr(message, "content", None) or []:
-                # ThinkingBlock and friends are deliberately skipped -- aux
-                # callers want the answer text, not the reasoning trace.
-                if isinstance(block, TextBlock):
-                    text = getattr(block, "text", "") or ""
-                    if text:
-                        parts.append(text)
-        elif isinstance(message, ResultMessage):
-            saw_result = True
-            usage = getattr(message, "usage", None)
-            subtype = str(getattr(message, "subtype", None) or "")
-            stop_reason = getattr(message, "stop_reason", None) or "stop"
-            if getattr(message, "is_error", False) or subtype not in ("", "success"):
-                errors = getattr(message, "errors", None) or []
-                detail = (
-                    "; ".join(str(error) for error in errors)
-                    or str(getattr(message, "result", None) or subtype or "unknown error")
+    if cancel_requested():
+        raise AuxiliaryExplicitCancellation()
+
+    stream = query(prompt=prompt, options=options)
+    pending_error: BaseException | None = None
+    try:
+        async for message in stream:
+            if cancel_requested():
+                raise AuxiliaryExplicitCancellation()
+            # The SDK query is internally streamed and therefore bypasses the
+            # generic OpenAI chunk aggregator. Pulse Hermes's existing progress
+            # hook for each consumed SDK message so long multi-call compression is
+            # not mistaken for an idle/hung provider.
+            notify_progress()
+            billing_error = _aux_billing_guard_error(
+                message,
+                allow_metered=allow_metered,
+            )
+            if billing_error is not None:
+                raise ClaudeSdkAuxError(billing_error)
+            if isinstance(message, AssistantMessage):
+                for block in getattr(message, "content", None) or []:
+                    # ThinkingBlock and friends are deliberately skipped -- aux
+                    # callers want the answer text, not the reasoning trace.
+                    if isinstance(block, TextBlock):
+                        text = getattr(block, "text", "") or ""
+                        if text:
+                            parts.append(text)
+            elif isinstance(message, ResultMessage):
+                saw_result = True
+                usage = getattr(message, "usage", None)
+                subtype = str(getattr(message, "subtype", None) or "")
+                stop_reason = getattr(message, "stop_reason", None) or "stop"
+                if getattr(message, "is_error", False) or subtype not in ("", "success"):
+                    errors = getattr(message, "errors", None) or []
+                    detail = (
+                        "; ".join(str(error) for error in errors)
+                        or str(
+                            getattr(message, "result", None)
+                            or subtype
+                            or "unknown error"
+                        )
+                    )
+                    terminal_error = redact_sensitive_text(detail, force=True)
+    except BaseException as exc:
+        pending_error = exc
+        raise
+    finally:
+        close_stream = getattr(stream, "aclose", None)
+        if callable(close_stream):
+            close_timeout = asyncio.timeout(_QUERY_CLOSE_TIMEOUT)
+            try:
+                async with close_timeout:
+                    await cast(Awaitable[Any], close_stream())
+            except (
+                AuxiliaryExplicitCancellation,
+                KeyboardInterrupt,
+                SystemExit,
+            ):
+                raise
+            except TimeoutError as exc:
+                if close_timeout.expired():
+                    logger.warning(
+                        "claude-agent-sdk auxiliary query close timed out "
+                        "(model=%s, timeout=%gs)",
+                        model,
+                        _QUERY_CLOSE_TIMEOUT,
+                    )
+                else:
+                    logger.warning(
+                        "claude-agent-sdk auxiliary query close failed "
+                        "(model=%s, error=%s)",
+                        model,
+                        type(exc).__name__,
+                    )
+            except asyncio.CancelledError:
+                # A standalone outer/task cancellation intentionally outranks an
+                # already recorded terminal SDK error; only an exception already
+                # propagating from this stream body retains precedence. Production
+                # callers always enter through _run_coro_blocking's wait_for wrapper;
+                # suppressing its teardown cancellation preserves the earlier hard
+                # cancel while the wrapper owns cancellation bookkeeping.
+                if pending_error is None:
+                    raise
+                logger.debug(
+                    "claude-agent-sdk auxiliary query close was cancelled",
+                    exc_info=True,
                 )
-                terminal_error = redact_sensitive_text(detail, force=True)
+            except Exception as exc:
+                logger.warning(
+                    "claude-agent-sdk auxiliary query close failed "
+                    "(model=%s, error=%s)",
+                    model,
+                    type(exc).__name__,
+                )
+            except BaseException as exc:
+                if pending_error is None and terminal_error is None:
+                    raise
+                logger.warning(
+                    "claude-agent-sdk auxiliary query close failed "
+                    "(model=%s, error=%s)",
+                    model,
+                    type(exc).__name__,
+                )
 
     if terminal_error is not None:
         # Fail closed even when partial assistant text preceded the terminal
@@ -315,6 +434,23 @@ class _AuxCompletions:
         self._owner = owner
 
     def create(self, **kwargs: Any) -> SimpleNamespace:
+        from agent.auxiliary_client import _capture_aux_cancel_check
+
+        # Deliberately ungated: the predicate this replaces also reads an
+        # installed source without consulting the thread-local active flag.
+        return self._create(
+            kwargs,
+            cancel_check=_capture_aux_cancel_check(),
+            progress_hook=_capture_aux_progress_hook(),
+        )
+
+    def _create(
+        self,
+        kwargs: dict[str, Any],
+        *,
+        cancel_check: Callable[[], Any] | None,
+        progress_hook: Callable[[], Any] | None,
+    ) -> SimpleNamespace:
         model = str(kwargs.get("model") or self._owner.default_model or DEFAULT_MODEL)
         messages = kwargs.get("messages") or []
         timeout = float(kwargs.get("timeout") or self._owner.timeout)
@@ -354,6 +490,8 @@ class _AuxCompletions:
                     prompt,
                     model=model,
                     system_prompt=system_prompt,
+                    cancel_check=cancel_check,
+                    progress_hook=progress_hook,
                 ),
                 timeout,
             )
@@ -396,7 +534,43 @@ class _AsyncAuxCompletions:
         self._sync = sync_adapter
 
     async def create(self, **kwargs: Any) -> Any:
-        return await asyncio.to_thread(self._sync.create, **kwargs)
+        import contextlib
+
+        from agent.auxiliary_client import (
+            _aux_interrupt_protected,
+            _capture_aux_cancel_check,
+            aux_interrupt_protection,
+            aux_progress_hook,
+        )
+
+        cancel_active = _aux_interrupt_protected()
+        # Canonical capture intentionally normalizes a cancel_event to its
+        # bound is_set method. Every current cancellation reader needs only a
+        # callable predicate; no worker mutates or waits on the Event object.
+        cancel_check = _capture_aux_cancel_check()
+        progress_hook = _capture_aux_progress_hook()
+
+        # These threading-local values must be captured before to_thread().
+        # This remains request-safe because production installers wrap a
+        # synchronous aux call; none holds this context across an await on a
+        # shared event-loop thread. A future async installer must use
+        # task-local context rather than extending this adapter convention.
+
+        def _call_sync_create() -> SimpleNamespace:
+            cancel_scope = (
+                aux_interrupt_protection(
+                    active=cancel_active,
+                    cancel_check=cancel_check,
+                )
+                if cancel_active or callable(cancel_check)
+                else contextlib.nullcontext()
+            )
+            with aux_progress_hook(progress_hook), cancel_scope:
+                # Restore the request context before entering the public sync
+                # funnel so wrappers and future create-level logic still apply.
+                return self._sync.create(**kwargs)
+
+        return await asyncio.to_thread(_call_sync_create)
 
 
 class _AsyncAuxChat:

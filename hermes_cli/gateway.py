@@ -131,21 +131,27 @@ def _get_service_pids(all_profiles: bool = False) -> set:
     manual processes and killed.  Default-scope callers (``gateway status``,
     cron checks) keep seeing only the current profile's service; the orphan
     reaper passes all_profiles=True for the same friendly-fire reason.  The
-    systemd branch has always been fleet-wide (``hermes-gateway*``) and is
-    unaffected.
+    systemd branch mirrors this: default scope filters to the current
+    profile's exact unit name; ``all_profiles=True`` widens to the
+    ``hermes-gateway*`` fleet glob.
     """
     pids: set = set()
 
     # --- systemd (Linux): user and system scopes ---
-    # systemd always lists every hermes-gateway* unit regardless of scope.
+    # Default scope lists only this profile's unit (the unit name encodes the
+    # profile via get_service_name()); all_profiles widens to the fleet glob.
     if supports_systemd_services():
+        if all_profiles:
+            pattern = "hermes-gateway*"
+        else:
+            pattern = get_service_name()
         for scope_args in [["systemctl", "--user"], ["systemctl"]]:
             try:
                 result = subprocess.run(
                     scope_args
                     + [
                         "list-units",
-                        "hermes-gateway*",
+                        pattern,
                         "--plain",
                         "--no-legend",
                         "--no-pager",
@@ -1061,6 +1067,7 @@ def find_windows_gateway_services(
         if profile_processes is None:
             profile_processes = find_profile_gateway_processes(strict=True)
         service_names_by_pid: dict[int, set[str]] = {}
+        indeterminate_services_by_pid: dict[int, list[tuple[str, object]]] = {}
         for service in psutil_module.win_service_iter():
             try:
                 if all(
@@ -1086,9 +1093,11 @@ def find_windows_gateway_services(
             if service_status == "stopped":
                 continue
             if service_status != "running":
-                raise RuntimeError(
-                    f"SCM service {service_name} has indeterminate status: {service_status}"
-                )
+                if service_pid > 0:
+                    indeterminate_services_by_pid.setdefault(service_pid, []).append(
+                        (service_name, service_status)
+                    )
+                continue
             if service_pid <= 0:
                 raise RuntimeError(
                     f"Running SCM service {service_name} has no valid process ID"
@@ -1107,6 +1116,14 @@ def find_windows_gateway_services(
             ) > 0.001:
                 raise RuntimeError("Gateway process identity changed during SCM discovery")
             ancestor_pids = [int(parent.pid) for parent in gateway_process.parents()]
+            for pid in ancestor_pids:
+                indeterminate_services = indeterminate_services_by_pid.get(pid, [])
+                if indeterminate_services:
+                    service_name, service_status = indeterminate_services[0]
+                    raise RuntimeError(
+                        f"SCM service {service_name} has indeterminate status: "
+                        f"{service_status}"
+                    )
             shared_service_pids = [
                 pid
                 for pid in ancestor_pids

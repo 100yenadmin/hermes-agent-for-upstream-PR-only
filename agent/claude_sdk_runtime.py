@@ -190,15 +190,11 @@ def _snapshot_agent_tools_with_mcp_refresh(agent) -> Optional[List[Dict[str, Any
 # ``agent.claude_agent_sdk.append_total_max_chars``.
 _APPEND_TOTAL_MAX_CHARS = 22000
 
-# Sentences that instruct the skill-WRITE tool — skill_manage is NOT exposed
-# through the MCP shims, and guidance must only describe callable tools.
-# Stripped as pure deletions (never rewording); the pin tests go red if
-# upstream rewords them. One lives in MEMORY_GUIDANCE, one in the skills
-# index boilerplate (caught live: the index ships it unconditionally).
-_SKILL_TOOL_SENTENCE = (
-    "If you've discovered a new way to do something, solved a problem that could be "
-    "necessary later, save it as a skill with the skill tool.\n"
-)
+# The skills index instructs the skill-WRITE tool even when only its read-side
+# tools are exposed. skill_manage is NOT available through the SDK MCP shims,
+# so strip that sentence as a pure deletion (never rewording). Upstream's
+# consolidated MEMORY_GUIDANCE no longer instructs a skill write and can now
+# pass through verbatim.
 _SKILL_MANAGE_INDEX_SENTENCE = (
     "If a skill has issues, fix it with skill_manage(action='patch')."
 )
@@ -245,10 +241,7 @@ _SEARCH_QUERY_ADDENDUM = (
 
 
 def _strip_uncallable_tool_guidance(text: str) -> str:
-    return (
-        text.replace(_SKILL_TOOL_SENTENCE, "")
-        .replace(_SKILL_MANAGE_INDEX_SENTENCE, "")
-    )
+    return text.replace(_SKILL_MANAGE_INDEX_SENTENCE, "")
 
 
 def _append_total_max_chars() -> int:
@@ -319,9 +312,8 @@ def build_system_prompt_append(
       4. USER PROFILE + MEMORY blocks — MemoryStore.format_for_system_prompt
          verbatim, fill gauge included (the same store the memory MCP shim
          writes; config-gated on memory.memory_enabled).
-      5. MEMORY_GUIDANCE (minus its skill-tool sentence — skill_manage is
-         not exposed) + SESSION_SEARCH_GUIDANCE — the behavior contract for
-         the two shim tools.
+      5. MEMORY_GUIDANCE + SESSION_SEARCH_GUIDANCE — the behavior contract
+         for the two shim tools.
       6. The skills index (build_skills_system_prompt) for the read-side
          skill_view/skills_list tools. SKILLS_GUIDANCE is deliberately
          ABSENT (it instructs skill_manage).
