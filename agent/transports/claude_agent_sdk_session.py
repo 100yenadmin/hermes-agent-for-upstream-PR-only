@@ -716,6 +716,13 @@ _TURN_ABORT_GRACE = 15.0
 # stalled (swap/OOM descheduling on a memory-constrained host), not the turn
 # — re-baseline instead of tripping on time nobody was actually waiting.
 _POLL_STALL_FACTOR = 5.0
+# In streaming-client mode ``connect()`` can return before configured
+# in-process MCP servers have completed their handshake.  Sending the first
+# query in that window freezes Claude Code's deferred-tool catalog without the
+# Hermes servers for the lifetime of the session.  Bound the startup wait;
+# this is a local control request and never invokes the model.
+_SDK_MCP_READY_TIMEOUT_S = 15.0
+_SDK_MCP_READY_POLL_S = 0.1
 
 
 def _configured_timeout_seconds(key: str, *, allow_zero: bool) -> Optional[float]:
@@ -1459,6 +1466,7 @@ class ClaudeAgentSdkSession:
         self._allow_metered = _provider_flag("allow_metered_key")
         self._billing_evidence: dict[str, Any] = {}
         self._billing_guard_error: Optional[str] = None
+        self._sdk_mcp_server_names: tuple[str, ...] = ()
 
     def set_turn_visibility_callbacks(
         self,
@@ -1510,6 +1518,7 @@ class ClaudeAgentSdkSession:
         # — a None _client would skip disconnect and orphan it.
         self._client = client
         self._run_coro(client.connect(), timeout=60.0)
+        self._wait_for_sdk_mcp_ready()
         # From here on exactly ONE consumer owns the SDK stream (_reader_loop).
         # Started after connect so the client is live, before any turn so no
         # message can arrive unowned.
@@ -1521,6 +1530,83 @@ class ClaudeAgentSdkSession:
             self._cwd,
         )
         return self._session_id or "pending"
+
+    def _wait_for_sdk_mcp_ready(self) -> None:
+        """Wait until configured in-process MCP servers are connected.
+
+        The SDK's streaming client may report ``connect()`` before its MCP
+        handshakes finish.  The first query snapshots deferred tools, so
+        allowing that race makes an otherwise healthy Hermes hybrid server
+        invisible for every later turn.  Only SDK/in-process servers are
+        load-bearing here; remote HTTP/stdio entries keep their existing
+        independent failure behavior.
+        """
+        expected = set(self._sdk_mcp_server_names)
+        if not expected:
+            return
+        client = self._client
+        getter = getattr(client, "get_mcp_status", None)
+        if not callable(getter):
+            logger.warning(
+                "claude-agent-sdk MCP readiness unavailable; continuing "
+                "without a startup barrier for %d in-process server(s)",
+                len(expected),
+            )
+            return
+
+        deadline = time.monotonic() + _SDK_MCP_READY_TIMEOUT_S
+        last_states: dict[str, str] = {}
+        while time.monotonic() < deadline:
+            remaining = max(deadline - time.monotonic(), 0.01)
+            try:
+                status = self._run_coro(
+                    getter(), timeout=min(5.0, remaining)
+                )
+            except Exception:
+                status = None
+            servers = (
+                status.get("mcpServers")
+                if isinstance(status, dict)
+                else None
+            )
+            states: dict[str, str] = {}
+            if isinstance(servers, list):
+                for row in servers:
+                    if not isinstance(row, dict):
+                        continue
+                    name = row.get("name")
+                    state = row.get("status")
+                    if name in expected and isinstance(state, str):
+                        states[str(name)] = state
+            last_states = states
+            terminal = {
+                name: state
+                for name, state in states.items()
+                if state in {"failed", "needs-auth", "disabled"}
+            }
+            if terminal:
+                summary = ", ".join(
+                    f"{name}={terminal[name]}" for name in sorted(terminal)
+                )
+                raise RuntimeError(
+                    "claude-agent-sdk in-process MCP server failed to "
+                    f"initialize: {summary}"
+                )
+            if all(states.get(name) == "connected" for name in expected):
+                logger.info(
+                    "claude-agent-sdk in-process MCP ready: %d server(s)",
+                    len(expected),
+                )
+                return
+            time.sleep(_SDK_MCP_READY_POLL_S)
+
+        pending = ", ".join(
+            f"{name}={last_states.get(name, 'missing')}"
+            for name in sorted(expected)
+        )
+        raise RuntimeError(
+            "claude-agent-sdk in-process MCP readiness timed out: " + pending
+        )
 
     def close(self) -> None:
         if self._closed:
@@ -2860,6 +2946,17 @@ class ClaudeAgentSdkSession:
 
     def _build_client(self) -> Any:
         fields = self.build_option_fields()
+        configured = fields.get("mcp_servers")
+        if isinstance(configured, dict):
+            self._sdk_mcp_server_names = tuple(
+                sorted(
+                    str(name)
+                    for name, config in configured.items()
+                    if isinstance(config, dict) and config.get("type") == "sdk"
+                )
+            )
+        else:
+            self._sdk_mcp_server_names = ()
         if self._client_factory is not None:
             return self._client_factory(options=fields)
         from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
