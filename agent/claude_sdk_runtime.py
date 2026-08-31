@@ -297,6 +297,7 @@ def build_system_prompt_append(
     model: Optional[str] = None,
     cwd: Optional[str] = None,
     include_project_context: bool = True,
+    explicit_session_prompt: Optional[str] = None,
 ) -> Optional[str]:
     """Compose the system-prompt append for the SDK session.
 
@@ -306,15 +307,20 @@ def build_system_prompt_append(
       1. Operator persona/soul file — agent.claude_agent_sdk.append_file
          when set, else the native $HERMES_HOME/SOUL.md via load_soul_md
          (the same identity slot #1 the native composer fills).
-      2. Session line — the native volatile-tier format (date-only for
+      2. Explicit per-session prompt — including payloads requested through
+         ``--skills``. The native runtime calls this
+         ``ephemeral_system_prompt``; it is stable for the SDK session and is
+         never discovered from ambient Claude settings.
+      3. Session line — the native volatile-tier format (date-only for
          prefix-cache stability) + session id / model / provider.
-      3. Platform hint (native PLATFORM_HINTS, e.g. Telegram formatting).
-      4. USER PROFILE + MEMORY blocks — MemoryStore.format_for_system_prompt
+      4. Platform hint (native PLATFORM_HINTS, e.g. Telegram formatting).
+      5. USER PROFILE + MEMORY blocks — MemoryStore.format_for_system_prompt
          verbatim, fill gauge included (the same store the memory MCP shim
          writes; config-gated on memory.memory_enabled).
-      5. MEMORY_GUIDANCE + SESSION_SEARCH_GUIDANCE — the behavior contract
-         for the two shim tools.
-      6. The skills index (build_skills_system_prompt) for the read-side
+      6. MEMORY_GUIDANCE (minus its skill-tool sentence — skill_manage is
+         not exposed) + SESSION_SEARCH_GUIDANCE — the behavior contract for
+         the two shim tools.
+      7. The skills index (build_skills_system_prompt) for the read-side
          skill_view/skills_list tools. SKILLS_GUIDANCE is deliberately
          ABSENT (it instructs skill_manage).
 
@@ -357,6 +363,19 @@ def build_system_prompt_append(
                 blocks.append(("identity", soul))
         except Exception:  # pragma: no cover - never block session creation
             logger.debug("native SOUL.md load failed", exc_info=True)
+
+    # The native Hermes runtime appends ``ephemeral_system_prompt`` at call
+    # time.  Claude's whole-turn SDK bypasses that path, so explicitly loaded
+    # skills and operator-supplied per-session instructions used to disappear
+    # silently.  Seat the already-resolved payload near the front of the
+    # append: it is operator intent, stable for this SDK session, and remains
+    # subject to the same named whole-append budget and eviction warning as
+    # every other block.
+    if (
+        isinstance(explicit_session_prompt, str)
+        and explicit_session_prompt.strip()
+    ):
+        blocks.append(("explicit session prompt", explicit_session_prompt))
 
     # Session line — mirrors the native composer's volatile tier
     # (system_prompt.py): date-only so the append stays byte-stable all day.
@@ -1200,6 +1219,9 @@ def run_claude_agent_sdk_turn(
             cwd=str(context_cwd) if context_cwd is not None else None,
             include_project_context=not bool(
                 getattr(agent, "skip_context_files", False)
+            ),
+            explicit_session_prompt=getattr(
+                agent, "ephemeral_system_prompt", None
             ),
         )
 

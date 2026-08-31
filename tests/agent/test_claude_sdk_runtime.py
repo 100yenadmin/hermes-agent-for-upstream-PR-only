@@ -2297,6 +2297,7 @@ class TestHermesSessionIdPlumbing:
         agent.session_cwd = "/unvalidated-stale-workspace"
         agent.skip_context_files = True
         agent.platform = "telegram"
+        agent.ephemeral_system_prompt = "# Explicit session skill\nUse delegate_task."
         run_claude_agent_sdk_turn(
             agent,
             user_message="hi",
@@ -2312,6 +2313,9 @@ class TestHermesSessionIdPlumbing:
         assert captured["model"] == "claude-opus-4-8"
         assert captured["cwd"] is None
         assert captured["include_project_context"] is False
+        assert captured["explicit_session_prompt"] == (
+            "# Explicit session skill\nUse delegate_task."
+        )
         assert session_captured["cwd"] == "/resolved-workspace"
 
         # A validated, explicitly configured context cwd is forwarded as an
@@ -3197,6 +3201,23 @@ class TestSystemPromptAppend:
         assert out is not None
         assert out.startswith("# I am the persona under test")
         assert "The user prefers concise results" in out
+
+    def test_explicit_session_prompt_is_seated_after_identity(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.claude_sdk_runtime import build_system_prompt_append
+
+        self._home(
+            tmp_path,
+            monkeypatch,
+            soul="# SDK persona",
+        )
+        marker = "# Explicit session skill\nAlways use delegate_task."
+        out = build_system_prompt_append(explicit_session_prompt=marker)
+        assert out is not None
+        assert out.count(marker) == 1
+        assert out.index("# SDK persona") < out.index(marker)
+        assert out.index(marker) < out.index("Conversation started:")
 
     def test_native_soul_md_autoloads_when_append_file_unset(
         self, tmp_path, monkeypatch
