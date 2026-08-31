@@ -52,7 +52,7 @@ import concurrent.futures
 import logging
 import time
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 from agent.redact import redact_sensitive_text
 
@@ -141,12 +141,28 @@ def _run_coro_blocking(coro, timeout: float):
         ).result(timeout=timeout + 30)
 
 
-async def _collect_text(prompt: str, *, model: str) -> tuple[str, Any, str]:
+def _capture_aux_progress_hook() -> Callable[[], Any] | None:
+    """Capture the request thread's progress hook for worker dispatch."""
+    from agent import auxiliary_client
+
+    hook = getattr(auxiliary_client._aux_progress, "hook", None)
+    return hook if callable(hook) else None
+
+
+async def _collect_text(
+    prompt: str,
+    *,
+    model: str,
+    cancel_check: Callable[[], Any] | None = None,
+    progress_hook: Callable[[], Any] | None = None,
+) -> tuple[str, Any, str]:
     """Run a one-shot SDK query and return (text, usage, stop_reason)."""
     from agent.auxiliary_client import (
         AuxiliaryExplicitCancellation,
         _aux_interrupt_cancel_requested,
+        _captured_aux_cancel_requested,
         _notify_aux_progress,
+        aux_progress_hook,
     )
     from claude_agent_sdk import (
         AssistantMessage,
@@ -160,6 +176,19 @@ async def _collect_text(prompt: str, *, model: str) -> tuple[str, Any, str]:
     # optional SDK extra.  The same override builder as the persistent lane is
     # load-bearing here: query() also spawns a CLI inheriting the parent env.
     from agent.transports.claude_agent_sdk_session import _sdk_env_overrides
+
+    if cancel_check is None:
+        cancel_requested = _aux_interrupt_cancel_requested
+    else:
+        # This seam only unwinds the SDK query; it performs no destructive
+        # timeout cleanup, so generic attempt-outcome arbitration is unnecessary.
+        cancel_requested = lambda: _captured_aux_cancel_requested(cancel_check)
+
+    def notify_progress() -> None:
+        # Reinstall the owning request's hook in whichever worker consumes the
+        # SDK stream. A None hook preserves any hook already on this thread.
+        with aux_progress_hook(progress_hook):
+            _notify_aux_progress()
 
     options = ClaudeAgentOptions(
         model=model,
@@ -179,17 +208,17 @@ async def _collect_text(prompt: str, *, model: str) -> tuple[str, Any, str]:
     terminal_error: str | None = None
     saw_result = False
 
-    if _aux_interrupt_cancel_requested():
+    if cancel_requested():
         raise AuxiliaryExplicitCancellation()
 
     async for message in query(prompt=prompt, options=options):
-        if _aux_interrupt_cancel_requested():
+        if cancel_requested():
             raise AuxiliaryExplicitCancellation()
         # The SDK query is internally streamed and therefore bypasses the
         # generic OpenAI chunk aggregator. Pulse Hermes's existing progress
         # hook for each consumed SDK message so long multi-call compression is
         # not mistaken for an idle/hung provider.
-        _notify_aux_progress()
+        notify_progress()
         if isinstance(message, AssistantMessage):
             for block in getattr(message, "content", None) or []:
                 # ThinkingBlock and friends are deliberately skipped -- aux
@@ -231,6 +260,23 @@ class _AuxCompletions:
         self._owner = owner
 
     def create(self, **kwargs: Any) -> SimpleNamespace:
+        from agent.auxiliary_client import _capture_aux_cancel_check
+
+        # Deliberately ungated: the predicate this replaces also reads an
+        # installed source without consulting the thread-local active flag.
+        return self._create(
+            kwargs,
+            cancel_check=_capture_aux_cancel_check(),
+            progress_hook=_capture_aux_progress_hook(),
+        )
+
+    def _create(
+        self,
+        kwargs: dict[str, Any],
+        *,
+        cancel_check: Callable[[], Any] | None,
+        progress_hook: Callable[[], Any] | None,
+    ) -> SimpleNamespace:
         model = str(kwargs.get("model") or self._owner.default_model or DEFAULT_MODEL)
         messages = kwargs.get("messages") or []
         timeout = float(kwargs.get("timeout") or self._owner.timeout)
@@ -257,7 +303,13 @@ class _AuxCompletions:
 
         try:
             text, usage, stop_reason = _run_coro_blocking(
-                _collect_text(prompt, model=model), timeout
+                _collect_text(
+                    prompt,
+                    model=model,
+                    cancel_check=cancel_check,
+                    progress_hook=progress_hook,
+                ),
+                timeout,
             )
         except ClaudeSdkAuxError:
             raise
@@ -298,7 +350,34 @@ class _AsyncAuxCompletions:
         self._sync = sync_adapter
 
     async def create(self, **kwargs: Any) -> Any:
-        return await asyncio.to_thread(self._sync.create, **kwargs)
+        import contextlib
+
+        from agent.auxiliary_client import (
+            _aux_interrupt_protected,
+            _capture_aux_cancel_check,
+            aux_interrupt_protection,
+            aux_progress_hook,
+        )
+
+        cancel_active = _aux_interrupt_protected()
+        cancel_check = _capture_aux_cancel_check()
+        progress_hook = _capture_aux_progress_hook()
+
+        def _call_sync_create() -> SimpleNamespace:
+            cancel_scope = (
+                aux_interrupt_protection(
+                    active=cancel_active,
+                    cancel_check=cancel_check,
+                )
+                if cancel_active or callable(cancel_check)
+                else contextlib.nullcontext()
+            )
+            with aux_progress_hook(progress_hook), cancel_scope:
+                # Restore the request context before entering the public sync
+                # funnel so wrappers and future create-level logic still apply.
+                return self._sync.create(**kwargs)
+
+        return await asyncio.to_thread(_call_sync_create)
 
 
 class _AsyncAuxChat:
