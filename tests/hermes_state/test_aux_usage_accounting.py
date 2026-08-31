@@ -216,6 +216,33 @@ class TestAmbientAccountingContext:
         assert rows[0]["cost_source"] == "none"
         assert rows[0]["estimated_cost_usd"] == 0.0
 
+    def test_record_aux_usage_classifies_declared_keyless_route(self, db):
+        """Keyless provider metadata persists as non-metered and included."""
+        from agent.aux_accounting import (
+            record_aux_usage,
+            reset_accounting_context,
+            set_accounting_context,
+        )
+
+        db.create_session("s1", source="cli")
+        token = set_accounting_context(db, "s1")
+        try:
+            record_aux_usage(
+                _mk_response(model="mimo-v2.5-free"),
+                "title_generation",
+                provider="opencode-free",
+            )
+        finally:
+            reset_accounting_context(token)
+        rows = _usage_rows(db, "s1")
+        assert len(rows) == 1
+        assert rows[0]["task"] == "title_generation"
+        assert rows[0]["billing_provider"] == "opencode-free"
+        assert rows[0]["billing_mode"] == "non_metered"
+        assert rows[0]["cost_status"] == "included"
+        assert rows[0]["cost_source"] == "none"
+        assert rows[0]["estimated_cost_usd"] == 0.0
+
 
     def test_moa_tasks_excluded(self, db):
         """MoA advisor usage is already folded into the main-loop delta by

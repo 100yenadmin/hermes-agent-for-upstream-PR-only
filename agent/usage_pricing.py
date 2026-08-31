@@ -25,6 +25,8 @@ _SUBCENT_THRESHOLD = Decimal("0.01")
 # Attached to every CostResult with status="included" so consumers can
 # distinguish "free because subscription" from "free because $0 pricing".
 _INCLUDED_NOTE = "subscription-included; no provider invoice for usage"
+_NON_METERED_NOTE = "provider-declared keyless route; no metered usage"
+_ZERO_COST_BILLING_MODES = frozenset({"subscription_included", "non_metered"})
 
 
 def format_cost_label(amount: Decimal) -> str:
@@ -1089,6 +1091,28 @@ def resolve_billing_route(
             provider_name = inferred_provider
             model = bare_model
 
+    # Provider metadata is the authority for keyless billing.  Do not infer
+    # this from an empty API key, missing endpoint, or loopback URL: only a
+    # registered built-in/overlay/plugin provider with keyless=True earns the
+    # non-metered classification.  The lazy import avoids coupling provider
+    # registry startup to this module's import path.
+    if provider_name:
+        try:
+            from hermes_cli.providers import get_provider
+
+            provider_def = get_provider(provider_name, allow_network=False)
+        except Exception:
+            provider_def = None
+        if provider_def is not None and bool(
+            getattr(provider_def, "keyless", False)
+        ):
+            return BillingRoute(
+                provider=provider_name,
+                model=model,
+                base_url=base_url or "",
+                billing_mode="non_metered",
+            )
+
     if provider_name == "openai-codex":
         return BillingRoute(provider="openai-codex", model=model, base_url=base_url or "", billing_mode="subscription_included")
     # claude-agent-sdk is the subscription twin of openai-codex: the SDK
@@ -1273,14 +1297,18 @@ def get_pricing_entry(
     api_key: Optional[str] = None,
 ) -> Optional[PricingEntry]:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
-    if route.billing_mode == "subscription_included":
+    if route.billing_mode in _ZERO_COST_BILLING_MODES:
         return PricingEntry(
             input_cost_per_million=_ZERO,
             output_cost_per_million=_ZERO,
             cache_read_cost_per_million=_ZERO,
             cache_write_cost_per_million=_ZERO,
             source="none",
-            pricing_version="included-route",
+            pricing_version=(
+                "included-route"
+                if route.billing_mode == "subscription_included"
+                else "non-metered-route"
+            ),
         )
     if route.provider == "openrouter":
         return _openrouter_pricing_entry(route)
@@ -1460,14 +1488,22 @@ def estimate_usage_cost(
     api_key: Optional[str] = None,
 ) -> CostResult:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
-    if route.billing_mode == "subscription_included":
+    if route.billing_mode in _ZERO_COST_BILLING_MODES:
         return CostResult(
             amount_usd=_ZERO,
             status="included",
             source="none",
             label="included",
-            pricing_version="included-route",
-            notes=(_INCLUDED_NOTE,),
+            pricing_version=(
+                "included-route"
+                if route.billing_mode == "subscription_included"
+                else "non-metered-route"
+            ),
+            notes=(
+                _INCLUDED_NOTE
+                if route.billing_mode == "subscription_included"
+                else _NON_METERED_NOTE,
+            ),
         )
 
     entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
@@ -1562,7 +1598,7 @@ def has_known_pricing(
     pipeline — avoids creating dummy usage objects just to check status.
     """
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
-    if route.billing_mode == "subscription_included":
+    if route.billing_mode in _ZERO_COST_BILLING_MODES:
         return True
     entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
     return entry is not None

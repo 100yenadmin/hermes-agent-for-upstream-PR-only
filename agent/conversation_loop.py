@@ -100,7 +100,11 @@ from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import (
+    estimate_usage_cost,
+    normalize_usage,
+    resolve_billing_route,
+)
 from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
@@ -4617,6 +4621,11 @@ def run_conversation(
                         base_url=_agg_cost_base_url,
                         api_key=getattr(agent, "api_key", ""),
                     )
+                    _billing_route = resolve_billing_route(
+                        _agg_cost_model,
+                        provider=_agg_cost_provider,
+                        base_url=_agg_cost_base_url,
+                    )
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     # Add MoA advisor cost (already priced per-advisor at each
@@ -4675,8 +4684,11 @@ def run_conversation(
                                 cost_source=cost_result.source,
                                 billing_provider=agent.provider,
                                 billing_base_url=agent.base_url,
-                                billing_mode="subscription_included"
-                                if cost_result.status == "included" else None,
+                                billing_mode=(
+                                    _billing_route.billing_mode
+                                    if cost_result.status == "included"
+                                    else None
+                                ),
                                 model=agent.model,
                                 api_call_count=1,
                             )

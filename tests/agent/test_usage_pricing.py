@@ -98,6 +98,32 @@ def test_claude_agent_sdk_routes_as_subscription_included():
     assert float(result.amount_usd) == 0.0
 
 
+def test_provider_declared_keyless_route_is_non_metered_and_included():
+    """Only trusted provider metadata may classify a route as non-metered."""
+    from agent.usage_pricing import has_known_pricing, resolve_billing_route
+
+    route = resolve_billing_route(
+        "mimo-v2.5-free",
+        provider="opencode-free",
+    )
+    assert route.provider == "opencode-free"
+    assert route.billing_mode == "non_metered"
+
+    result = estimate_usage_cost(
+        "mimo-v2.5-free",
+        CanonicalUsage(input_tokens=1000, output_tokens=500),
+        provider="opencode-free",
+    )
+    assert result.status == "included"
+    assert float(result.amount_usd) == 0.0
+    assert result.pricing_version == "non-metered-route"
+    assert has_known_pricing("mimo-v2.5-free", provider="opencode-free") is True
+
+    # Missing credentials or a generic custom route never imply keyless.
+    unclassified = resolve_billing_route("model", provider="custom")
+    assert unclassified.billing_mode == "unknown"
+
+
 
 
 
