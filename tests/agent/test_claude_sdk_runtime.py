@@ -1119,6 +1119,8 @@ class TestRuntimeGlue:
         assert result["agent_persisted"] is True
         assert result["cost_status"] == "included"
         assert result["cost_source"] == "claude-subscription"
+        assert result["session_id"] == agent.session_id
+        assert result["session_id"] != result["claude_sdk_session_id"]
         # Projected messages spliced after the (pre-appended) user turn.
         assert messages[-1]["content"] == "SDK_ASSISTANT"
         # Skill-nudge counter parity with the codex path.

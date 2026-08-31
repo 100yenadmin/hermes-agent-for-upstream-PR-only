@@ -1052,6 +1052,7 @@ def run_claude_agent_sdk_turn(
             "error": rejection,
             "interrupted": False,
             "agent_persisted": True,
+            "session_id": getattr(agent, "session_id", None),
         }
 
     # P1.b: refresh the approval-context snapshot EVERY turn (including
@@ -1450,6 +1451,7 @@ def run_claude_agent_sdk_turn(
             "interrupted": True,
             "error": None,
             "agent_persisted": True,
+            "session_id": getattr(agent, "session_id", None),
         }
 
     # Stream/replay state belongs to this SDK attempt, never to the cached
@@ -1531,6 +1533,7 @@ def run_claude_agent_sdk_turn(
                 # (mirrors conversation_loop's generic non-retryable return).
                 "failed": True,
                 "error": safe_exc,
+                "session_id": getattr(agent, "session_id", None),
             }
 
         if getattr(turn, "should_retire", False):
@@ -1757,6 +1760,10 @@ def run_claude_agent_sdk_turn(
         # the projected rows ourselves, so the gateway must not re-write the
         # user turn (append_message has no dedup).
         "agent_persisted": True,
+        # The caller/evaluator needs the Hermes parent run identity. Keep it
+        # distinct from the SDK thread id below: delegated child work can be
+        # newer in SessionDB, but usage attribution belongs to this parent.
+        "session_id": getattr(agent, "session_id", None),
         "claude_sdk_session_id": turn.thread_id,
         **usage_result,
     }
