@@ -1701,6 +1701,165 @@ class TestMcpEnvMinimal:
         session.close()
         assert holder["client"].disconnected is True
 
+    def test_in_process_mcp_is_ready_before_reader_and_first_query(
+        self, monkeypatch
+    ):
+        from agent.transports import claude_agent_sdk_session as session_mod
+
+        events = []
+        holder = {}
+
+        class ReadinessClient(_FakeClient):
+            async def connect(self):
+                events.append("connect")
+
+            async def get_mcp_status(self):
+                events.append("status")
+                state = "pending" if events.count("status") == 1 else "connected"
+                return {
+                    "mcpServers": [
+                        {"name": "hermes-hybrid", "status": state},
+                        {"name": "remote", "status": "pending"},
+                    ]
+                }
+
+            async def receive_messages(self):
+                events.append("reader")
+                async for message in super().receive_messages():
+                    yield message
+
+        def factory(options=None):
+            holder["client"] = ReadinessClient(options=options)
+            return holder["client"]
+
+        session = ClaudeAgentSdkSession(cwd="/tmp", client_factory=factory)
+        monkeypatch.setattr(
+            session,
+            "build_option_fields",
+            lambda: {
+                "mcp_servers": {
+                    "hermes-hybrid": {"type": "sdk", "instance": object()},
+                    "remote": {"type": "http", "url": "https://mcp.test"},
+                }
+            },
+        )
+        monkeypatch.setattr(session_mod, "_SDK_MCP_READY_POLL_S", 0.0)
+        try:
+            session.ensure_started()
+            deadline = time.monotonic() + 5
+            while "reader" not in events and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            session.close()
+
+        assert session._sdk_mcp_server_names == ("hermes-hybrid",)
+        assert events[:3] == ["connect", "status", "status"]
+        assert "reader" in events
+        assert holder["client"].queried == []
+
+    def test_in_process_mcp_terminal_failure_aborts_before_reader_or_query(self):
+        holder = {}
+
+        class FailedReadinessClient(_FakeClient):
+            async def get_mcp_status(self):
+                return {
+                    "mcpServers": [
+                        {
+                            "name": "hermes-hybrid",
+                            "status": "failed",
+                            "error": "credential-shaped raw diagnostic",
+                        }
+                    ]
+                }
+
+        def factory(options=None):
+            holder["client"] = FailedReadinessClient(options=options)
+            return holder["client"]
+
+        session = ClaudeAgentSdkSession(cwd="/tmp", client_factory=factory)
+        session.build_option_fields = lambda: {
+            "mcp_servers": {
+                "hermes-hybrid": {"type": "sdk", "instance": object()}
+            }
+        }
+        try:
+            with pytest.raises(RuntimeError) as exc_info:
+                session.ensure_started()
+        finally:
+            session.close()
+
+        error = str(exc_info.value)
+        assert "hermes-hybrid=failed" in error
+        assert "credential-shaped" not in error
+        assert session._reader_task is None
+        assert holder["client"].queried == []
+        assert holder["client"].disconnected is True
+
+    def test_in_process_mcp_readiness_timeout_is_bounded_and_fail_closed(
+        self, monkeypatch
+    ):
+        from agent.transports import claude_agent_sdk_session as session_mod
+
+        holder = {}
+
+        class PendingReadinessClient(_FakeClient):
+            async def get_mcp_status(self):
+                return {
+                    "mcpServers": [
+                        {"name": "hermes-hybrid", "status": "pending"}
+                    ]
+                }
+
+        def factory(options=None):
+            holder["client"] = PendingReadinessClient(options=options)
+            return holder["client"]
+
+        session = ClaudeAgentSdkSession(cwd="/tmp", client_factory=factory)
+        session.build_option_fields = lambda: {
+            "mcp_servers": {
+                "hermes-hybrid": {"type": "sdk", "instance": object()}
+            }
+        }
+        monkeypatch.setattr(session_mod, "_SDK_MCP_READY_TIMEOUT_S", 0.03)
+        monkeypatch.setattr(session_mod, "_SDK_MCP_READY_POLL_S", 0.001)
+        started = time.monotonic()
+        try:
+            with pytest.raises(RuntimeError) as exc_info:
+                session.ensure_started()
+        finally:
+            session.close()
+
+        assert time.monotonic() - started < 1.0
+        assert "hermes-hybrid=pending" in str(exc_info.value)
+        assert session._reader_task is None
+        assert holder["client"].queried == []
+
+    def test_missing_mcp_status_control_preserves_older_sdk_compatibility(
+        self, caplog
+    ):
+        session, holder = _make_session()
+        session.build_option_fields = lambda: {
+            "mcp_servers": {
+                "hermes-hybrid": {"type": "sdk", "instance": object()}
+            }
+        }
+        try:
+            with caplog.at_level(
+                logging.WARNING,
+                logger="agent.transports.claude_agent_sdk_session",
+            ):
+                session.ensure_started()
+            reader_started = session._reader_task is not None
+        finally:
+            session.close()
+
+        assert reader_started is True
+        assert holder["client"].queried == []
+        assert any(
+            "MCP readiness unavailable" in record.getMessage()
+            for record in caplog.records
+        )
+
     def test_mid_stream_interrupt_breaks_and_discards_tail(self):
         # Validator HIGH test-gap: the /stop-arriving-DURING-streaming path
         # was never exercised at session level.
