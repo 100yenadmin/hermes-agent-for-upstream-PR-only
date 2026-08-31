@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import sys
+import threading
 from types import ModuleType
 
 import pytest
@@ -102,10 +104,19 @@ def test_explicit_sdk_async_aux_provider_uses_subscription_facade(monkeypatch):
     assert model == "claude-sonnet-5"
     assert client.base_url == ""
 
-    async def _fake_collect(prompt, *, model, system_prompt):
+    async def _fake_collect(
+        prompt,
+        *,
+        model,
+        system_prompt,
+        cancel_check=None,
+        progress_hook=None,
+    ):
         assert prompt
         assert model == "claude-sonnet-5"
         assert AUX._AUX_SYSTEM_GUARD in system_prompt
+        assert cancel_check is None
+        assert progress_hook is None
         return "summary", {"input_tokens": 2}, "stop"
 
     monkeypatch.setattr(AUX, "_collect_text", _fake_collect)
@@ -246,6 +257,328 @@ def test_sdk_aux_query_reports_progress_for_each_consumed_message(monkeypatch):
     assert usage == {"input_tokens": 2}
     assert len(pulses) == len(messages)
     assert captured["include_partial_messages"] is True
+
+
+def test_sdk_aux_query_honors_cancellation_before_stream_start(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+    messages = [module.ResultMessage(usage={"input_tokens": 2})]
+    monkeypatch.setattr(
+        module,
+        "query",
+        lambda **kwargs: _async_messages(messages, captured, kwargs),
+    )
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    checks = []
+    pulses = []
+    monkeypatch.setattr(
+        M,
+        "_aux_interrupt_cancel_requested",
+        lambda: checks.append("checked") or True,
+    )
+    monkeypatch.setattr(M, "_notify_aux_progress", lambda: pulses.append("progress"))
+
+    with pytest.raises(M.AuxiliaryExplicitCancellation) as raised:
+        asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
+
+    assert raised.value.cause == "explicit_host_cancel"
+    assert checks == ["checked"]
+    assert "prompt" not in captured
+    assert pulses == []
+
+
+def test_sdk_aux_query_honors_cancellation_after_message_arrives(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+    messages = [
+        module.AssistantMessage([module.TextBlock("message content")]),
+        module.ResultMessage(usage={"input_tokens": 2}),
+    ]
+    stream_state = []
+
+    async def _messages_after_start(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        captured["options"] = kwargs["options"]
+        for message in messages:
+            stream_state.append("message arrived")
+            yield message
+
+    monkeypatch.setattr(module, "query", _messages_after_start)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    pulses = []
+    monkeypatch.setattr(
+        M,
+        "_aux_interrupt_cancel_requested",
+        lambda: bool(stream_state),
+    )
+    monkeypatch.setattr(M, "_notify_aux_progress", lambda: pulses.append("progress"))
+
+    with pytest.raises(M.AuxiliaryExplicitCancellation) as raised:
+        asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
+
+    assert raised.value.cause == "explicit_host_cancel"
+    assert captured["prompt"] == "prompt"
+    assert stream_state == ["message arrived"]
+    # Progress is reported after the cancellation checkpoint, so an empty
+    # pulse list proves the arrived message was not processed.
+    assert pulses == []
+
+
+def test_sync_sdk_aux_facade_propagates_cancel_inside_running_loop(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+    messages = [
+        module.AssistantMessage([module.TextBlock("must not complete")]),
+        module.ResultMessage(usage={"input_tokens": 2}),
+    ]
+    cancel_event = threading.Event()
+    stream_started = threading.Event()
+
+    async def _messages_after_cancel(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        captured["options"] = kwargs["options"]
+        stream_started.set()
+        while not cancel_event.is_set():
+            await asyncio.sleep(0.01)
+        for message in messages:
+            yield message
+
+    monkeypatch.setattr(module, "query", _messages_after_cancel)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    client = ClaudeSdkAuxClient()
+    stream_started_in_time = []
+
+    def _cancel_after_stream_start():
+        stream_started_in_time.append(stream_started.wait(timeout=1))
+        cancel_event.set()
+
+    cancel_worker = threading.Thread(target=_cancel_after_stream_start)
+    cancel_worker.start()
+
+    async def _call_sync_facade():
+        with M.aux_interrupt_protection(cancel_event=cancel_event):
+            return client.chat.completions.create(
+                model="claude-sonnet-5",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+    try:
+        with pytest.raises(M.AuxiliaryExplicitCancellation):
+            asyncio.run(_call_sync_facade())
+    finally:
+        cancel_worker.join(timeout=1)
+
+    assert not cancel_worker.is_alive()
+    assert stream_started_in_time == [True]
+    assert captured["prompt"]
+
+
+def test_async_sdk_aux_facade_propagates_cancel_across_worker(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+    messages = [
+        module.AssistantMessage([module.TextBlock("must not complete")]),
+        module.ResultMessage(usage={"input_tokens": 2}),
+    ]
+    monkeypatch.setattr(
+        module,
+        "query",
+        lambda **kwargs: _async_messages(messages, captured, kwargs),
+    )
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    cancel_event = threading.Event()
+    cancel_event.set()
+    client = AUX.AsyncClaudeSdkAuxClient(ClaudeSdkAuxClient())
+
+    async def _call_async_facade():
+        with M.aux_interrupt_protection(cancel_check=cancel_event.is_set):
+            return await client.chat.completions.create(
+                model="claude-sonnet-5",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+    with pytest.raises(M.AuxiliaryExplicitCancellation):
+        asyncio.run(_call_async_facade())
+
+    assert "prompt" not in captured
+
+
+def test_async_sdk_aux_facade_preserves_cancel_identity_and_fails_open(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+    messages = [
+        module.AssistantMessage([module.TextBlock("summary")]),
+        module.ResultMessage(usage={"input_tokens": 2}),
+    ]
+    monkeypatch.setattr(
+        module,
+        "query",
+        lambda **kwargs: _async_messages(messages, captured, kwargs),
+    )
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+
+    class RaisingCancelCheck:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            raise RuntimeError("predicate failure must not escape")
+
+    cancel_check = RaisingCancelCheck()
+    evaluated_sources = []
+    original_evaluator = M._captured_aux_cancel_requested
+
+    def _record_source(source):
+        evaluated_sources.append(source)
+        return original_evaluator(source)
+
+    monkeypatch.setattr(M, "_captured_aux_cancel_requested", _record_source)
+    client = AUX.AsyncClaudeSdkAuxClient(ClaudeSdkAuxClient())
+
+    async def _call_async_facade():
+        with M.aux_interrupt_protection(cancel_check=cancel_check):
+            return await client.chat.completions.create(
+                model="claude-sonnet-5",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+    result = asyncio.run(_call_async_facade())
+
+    assert result.choices[0].message.content == "summary"
+    assert cancel_check.calls >= 1
+    assert evaluated_sources
+    assert all(source is cancel_check for source in evaluated_sources)
+
+
+@pytest.mark.parametrize("async_facade", [False, True])
+def test_sdk_aux_facade_propagates_progress_across_worker(
+    monkeypatch, async_facade
+):
+    module, captured = _plant_sdk(monkeypatch, [])
+    messages = [
+        module.AssistantMessage([module.TextBlock("summary")]),
+        module.ResultMessage(usage={"input_tokens": 2}),
+    ]
+    monkeypatch.setattr(
+        module,
+        "query",
+        lambda **kwargs: _async_messages(messages, captured, kwargs),
+    )
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    sync_client = ClaudeSdkAuxClient()
+    pulses = []
+
+    async def _call_facade():
+        with M.aux_progress_hook(lambda: pulses.append("pulse")):
+            if async_facade:
+                async_client = AUX.AsyncClaudeSdkAuxClient(sync_client)
+                return await async_client.chat.completions.create(
+                    model="claude-sonnet-5",
+                    messages=[{"role": "user", "content": "summarize"}],
+                )
+            return sync_client.chat.completions.create(
+                model="claude-sonnet-5",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+    result = asyncio.run(_call_facade())
+
+    assert result.choices[0].message.content == "summary"
+    assert pulses == ["pulse", "pulse"]
+
+
+def test_async_sdk_aux_facade_honors_public_sync_create_wrapper(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+    messages = [
+        module.AssistantMessage([module.TextBlock("summary")]),
+        module.ResultMessage(usage={"input_tokens": 2}),
+    ]
+    monkeypatch.setattr(
+        module,
+        "query",
+        lambda **kwargs: _async_messages(messages, captured, kwargs),
+    )
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    sync_client = ClaudeSdkAuxClient()
+    original_create = sync_client.chat.completions.create
+    calls = []
+
+    def _wrapped_create(**kwargs):
+        calls.append(kwargs)
+        return original_create(**kwargs)
+
+    sync_client.chat.completions.create = _wrapped_create
+    client = AUX.AsyncClaudeSdkAuxClient(sync_client)
+    result = asyncio.run(
+        client.chat.completions.create(
+            model="claude-sonnet-5",
+            messages=[{"role": "user", "content": "summarize"}],
+        )
+    )
+
+    assert result.choices[0].message.content == "summary"
+    assert len(calls) == 1
+
+
+def test_async_sdk_aux_worker_context_is_restored_between_calls(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+    messages = [
+        module.AssistantMessage([module.TextBlock("summary")]),
+        module.ResultMessage(usage={"input_tokens": 2}),
+    ]
+    observed = []
+
+    async def _query_with_worker_state(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        captured["options"] = kwargs["options"]
+        observed.append(
+            (
+                threading.get_ident(),
+                getattr(M._aux_progress, "hook", None),
+                getattr(M._aux_interrupt_protection, "cancel_check", None),
+                M._aux_interrupt_protected(),
+            )
+        )
+        for message in messages:
+            yield message
+
+    monkeypatch.setattr(module, "query", _query_with_worker_state)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    client = AUX.AsyncClaudeSdkAuxClient(ClaudeSdkAuxClient())
+    pulses = []
+
+    def _progress():
+        pulses.append("pulse")
+
+    def _never_cancel():
+        return False
+
+    async def _call_twice():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=1))
+        with (
+            M.aux_progress_hook(_progress),
+            M.aux_interrupt_protection(active=False, cancel_check=_never_cancel),
+        ):
+            first = await client.chat.completions.create(
+                model="claude-sonnet-5",
+                messages=[{"role": "user", "content": "first"}],
+            )
+        pulses_after_first = list(pulses)
+        second = await client.chat.completions.create(
+            model="claude-sonnet-5",
+            messages=[{"role": "user", "content": "second"}],
+        )
+        return first, second, pulses_after_first
+
+    first, second, pulses_after_first = asyncio.run(_call_twice())
+
+    assert first.choices[0].message.content == "summary"
+    assert second.choices[0].message.content == "summary"
+    assert pulses_after_first == ["pulse", "pulse"]
+    assert pulses == pulses_after_first
+    assert len(observed) == 2
+    assert observed[0][0] == observed[1][0]
+    assert observed[0][1] is _progress
+    assert observed[0][2] is _never_cancel
+    assert observed[0][3] is False
+    assert observed[1][1:] == (None, None, False)
 
 
 def test_one_shot_query_has_no_tools_and_scrubs_child_env(monkeypatch):
