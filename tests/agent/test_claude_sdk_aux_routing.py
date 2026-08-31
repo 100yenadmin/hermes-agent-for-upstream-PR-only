@@ -67,6 +67,31 @@ def _plant_sdk(monkeypatch, messages):
     return module, captured
 
 
+class _SequenceAsyncIterator:
+    """Minimal declared-shape AsyncIterator for SDK query contract tests."""
+
+    def __init__(self, messages):
+        self._messages = iter(messages)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._messages)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+
+class _FailingCloseAsyncIterator(_SequenceAsyncIterator):
+    def __init__(self, messages, close_error):
+        super().__init__(messages)
+        self._close_error = close_error
+
+    async def aclose(self):
+        raise self._close_error
+
+
 def test_auto_sdk_runtime_uses_one_shot_subscription_aux(monkeypatch):
     monkeypatch.setattr(
         M,
@@ -208,6 +233,43 @@ def test_auto_sdk_async_failure_is_fail_closed_before_every_fallback(monkeypatch
         ))
 
 
+def test_async_sdk_explicit_cancellation_bypasses_fallbacks(monkeypatch):
+    class Completions:
+        async def create(self, **_kwargs):
+            raise M.AuxiliaryExplicitCancellation()
+
+    client = type("AsyncSdkClient", (), {})()
+    client.base_url = ""
+    client._hermes_aux_effective_provider = "claude-agent-sdk"
+    client.chat = type("Chat", (), {"completions": Completions()})()
+
+    monkeypatch.setattr(
+        M,
+        "_resolve_task_provider_model",
+        lambda *_args, **_kwargs: ("auto", None, None, None, None),
+    )
+    monkeypatch.setattr(
+        M,
+        "_get_cached_client",
+        lambda *_args, **_kwargs: (client, "claude-sonnet-5"),
+    )
+    for helper in (
+        "_try_configured_fallback_chain",
+        "_try_main_fallback_chain",
+        "_try_payment_fallback",
+        "_try_main_agent_model_fallback",
+    ):
+        monkeypatch.setattr(M, helper, _fail_if_called)
+
+    with pytest.raises(M.AuxiliaryExplicitCancellation):
+        asyncio.run(
+            M.async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+        )
+
+
 def test_prompt_formatter_preserves_roles_and_only_text_content():
     prompt = AUX._messages_to_prompt(
         [
@@ -342,7 +404,7 @@ def test_sync_sdk_aux_facade_propagates_cancel_inside_running_loop(monkeypatch):
     stream_started_in_time = []
 
     def _cancel_after_stream_start():
-        stream_started_in_time.append(stream_started.wait(timeout=1))
+        stream_started_in_time.append(stream_started.wait(timeout=5))
         cancel_event.set()
 
     cancel_worker = threading.Thread(target=_cancel_after_stream_start)
@@ -359,7 +421,7 @@ def test_sync_sdk_aux_facade_propagates_cancel_inside_running_loop(monkeypatch):
         with pytest.raises(M.AuxiliaryExplicitCancellation):
             asyncio.run(_call_sync_facade())
     finally:
-        cancel_worker.join(timeout=1)
+        cancel_worker.join(timeout=5)
 
     assert not cancel_worker.is_alive()
     assert stream_started_in_time == [True]
@@ -393,6 +455,134 @@ def test_async_sdk_aux_facade_propagates_cancel_across_worker(monkeypatch):
         asyncio.run(_call_async_facade())
 
     assert "prompt" not in captured
+
+
+def test_async_sdk_aux_facade_propagates_cancel_event_across_worker(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+    messages = [module.ResultMessage(usage={"input_tokens": 2})]
+    monkeypatch.setattr(
+        module,
+        "query",
+        lambda **kwargs: _async_messages(messages, captured, kwargs),
+    )
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    cancel_event = threading.Event()
+    cancel_event.set()
+    client = AUX.AsyncClaudeSdkAuxClient(ClaudeSdkAuxClient())
+
+    async def _call_async_facade():
+        with M.aux_interrupt_protection(cancel_event=cancel_event):
+            return await client.chat.completions.create(
+                model="claude-sonnet-5",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+    with pytest.raises(M.AuxiliaryExplicitCancellation):
+        asyncio.run(_call_async_facade())
+
+    assert "prompt" not in captured
+
+
+def test_async_sdk_aux_cancel_event_precedes_cancel_check(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+    messages = [
+        module.AssistantMessage([module.TextBlock("summary")]),
+        module.ResultMessage(usage={"input_tokens": 2}),
+    ]
+    monkeypatch.setattr(
+        module,
+        "query",
+        lambda **kwargs: _async_messages(messages, captured, kwargs),
+    )
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    cancel_event = threading.Event()
+    check_calls = 0
+
+    def _cancel_check():
+        nonlocal check_calls
+        check_calls += 1
+        return True
+
+    client = AUX.AsyncClaudeSdkAuxClient(ClaudeSdkAuxClient())
+
+    async def _call_async_facade():
+        with M.aux_interrupt_protection(
+            cancel_check=_cancel_check,
+            cancel_event=cancel_event,
+        ):
+            return await client.chat.completions.create(
+                model="claude-sonnet-5",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+    result = asyncio.run(_call_async_facade())
+
+    assert result.choices[0].message.content == "summary"
+    assert check_calls == 0
+
+
+def test_async_sdk_aux_facade_inactive_with_source_still_cancels(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+    messages = [module.ResultMessage(usage={"input_tokens": 2})]
+    monkeypatch.setattr(
+        module,
+        "query",
+        lambda **kwargs: _async_messages(messages, captured, kwargs),
+    )
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    client = AUX.AsyncClaudeSdkAuxClient(ClaudeSdkAuxClient())
+
+    async def _call_async_facade():
+        with M.aux_interrupt_protection(
+            active=False,
+            cancel_check=lambda: True,
+        ):
+            return await client.chat.completions.create(
+                model="claude-sonnet-5",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+    with pytest.raises(M.AuxiliaryExplicitCancellation):
+        asyncio.run(_call_async_facade())
+
+    assert "prompt" not in captured
+
+
+def test_async_sdk_aux_facade_active_without_source_does_not_cancel(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+    messages = [
+        module.AssistantMessage([module.TextBlock("summary")]),
+        module.ResultMessage(usage={"input_tokens": 2}),
+    ]
+    observed = []
+
+    async def _query_with_state(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        captured["options"] = kwargs["options"]
+        observed.append(
+            (
+                M._aux_interrupt_protected(),
+                M._capture_aux_cancel_check(),
+            )
+        )
+        for message in messages:
+            yield message
+
+    monkeypatch.setattr(module, "query", _query_with_state)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    client = AUX.AsyncClaudeSdkAuxClient(ClaudeSdkAuxClient())
+
+    async def _call_async_facade():
+        with M.aux_interrupt_protection(active=True):
+            return await client.chat.completions.create(
+                model="claude-sonnet-5",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+    result = asyncio.run(_call_async_facade())
+
+    assert result.choices[0].message.content == "summary"
+    assert observed == [(True, None)]
 
 
 def test_async_sdk_aux_facade_preserves_cancel_identity_and_fails_open(monkeypatch):
@@ -477,6 +667,170 @@ def test_sdk_aux_facade_propagates_progress_across_worker(
 
     assert result.choices[0].message.content == "summary"
     assert pulses == ["pulse", "pulse"]
+
+
+def test_sdk_aux_none_progress_hook_preserves_consuming_thread_hook(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+    messages = [
+        module.AssistantMessage([module.TextBlock("summary")]),
+        module.ResultMessage(usage={"input_tokens": 2}),
+    ]
+    monkeypatch.setattr(
+        module,
+        "query",
+        lambda **kwargs: _async_messages(messages, captured, kwargs),
+    )
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    pulses = []
+
+    with M.aux_progress_hook(lambda: pulses.append("worker")):
+        text, _, _ = asyncio.run(
+            AUX._collect_text(
+                "prompt",
+                model="claude-sonnet-5",
+                progress_hook=None,
+            )
+        )
+
+    assert text == "summary"
+    assert pulses == ["worker", "worker"]
+
+
+def test_sdk_aux_progress_hook_failure_does_not_abort_stream(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+    messages = [
+        module.AssistantMessage([module.TextBlock("summary")]),
+        module.ResultMessage(usage={"input_tokens": 2}),
+    ]
+    monkeypatch.setattr(
+        module,
+        "query",
+        lambda **kwargs: _async_messages(messages, captured, kwargs),
+    )
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    calls = []
+
+    def _raising_progress():
+        calls.append("pulse")
+        raise RuntimeError("progress hooks are advisory")
+
+    client = ClaudeSdkAuxClient()
+    with M.aux_progress_hook(_raising_progress):
+        result = client.chat.completions.create(
+            model="claude-sonnet-5",
+            messages=[{"role": "user", "content": "summarize"}],
+        )
+
+    assert result.choices[0].message.content == "summary"
+    assert calls == ["pulse", "pulse"]
+
+
+@pytest.mark.parametrize("async_facade", [False, True])
+def test_sdk_aux_composes_with_protected_provider_worker(monkeypatch, async_facade):
+    captured = {}
+
+    async def _fake_collect(
+        prompt, *, model, cancel_check=None, progress_hook=None
+    ):
+        captured["prompt"] = prompt
+        captured["model"] = model
+        captured["cancel_check"] = cancel_check
+        captured["progress_hook"] = progress_hook
+        return "summary", {"input_tokens": 2}, "stop"
+
+    monkeypatch.setattr(AUX, "_collect_text", _fake_collect)
+    client = ClaudeSdkAuxClient()
+    async_client = AUX.AsyncClaudeSdkAuxClient(client)
+
+    def _never_cancel():
+        return False
+
+    def _progress():
+        return None
+
+    def _provider_call(kwargs):
+        if async_facade:
+            return asyncio.run(async_client.chat.completions.create(**kwargs))
+        return client.chat.completions.create(**kwargs)
+
+    kwargs = {
+        "model": "claude-sonnet-5",
+        "messages": [{"role": "user", "content": "summarize"}],
+    }
+    with (
+        M.aux_progress_hook(_progress),
+        M.aux_interrupt_protection(cancel_check=_never_cancel),
+    ):
+        result = M._run_protected_sync_provider_call(_provider_call, kwargs)
+
+    assert result.choices[0].message.content == "summary"
+    assert isinstance(captured["cancel_check"], M._AuxiliaryCancellationDecision)
+    assert captured["cancel_check"]._source_cancel_check is _never_cancel
+    assert captured["progress_hook"] is _progress
+
+
+def test_sdk_aux_composed_hard_cancel_latches_without_timeout_cleanup(monkeypatch):
+    source_event = threading.Event()
+    worker_started = threading.Event()
+    worker_unwound = threading.Event()
+    captured = {}
+    begin_timeout_calls = []
+    original_begin_timeout = M._AuxiliaryCancellationDecision.begin_timeout_cleanup
+
+    def _record_begin_timeout(self):
+        begin_timeout_calls.append(self)
+        return original_begin_timeout(self)
+
+    async def _fake_collect(
+        prompt, *, model, cancel_check=None, progress_hook=None
+    ):
+        captured["prompt"] = prompt
+        captured["cancel_check"] = cancel_check
+        assert callable(cancel_check)
+        worker_started.set()
+        try:
+            while not cancel_check():
+                await asyncio.sleep(0.005)
+            raise M.AuxiliaryExplicitCancellation()
+        finally:
+            worker_unwound.set()
+
+    monkeypatch.setattr(
+        M._AuxiliaryCancellationDecision,
+        "begin_timeout_cleanup",
+        _record_begin_timeout,
+    )
+    monkeypatch.setattr(AUX, "_collect_text", _fake_collect)
+    client = ClaudeSdkAuxClient()
+
+    def _provider_call(kwargs):
+        return client.chat.completions.create(**kwargs)
+
+    def _cancel_after_worker_starts():
+        assert worker_started.wait(timeout=5)
+        source_event.set()
+
+    cancel_worker = threading.Thread(target=_cancel_after_worker_starts)
+    cancel_worker.start()
+    try:
+        with M.aux_interrupt_protection(cancel_event=source_event):
+            with pytest.raises(M.AuxiliaryExplicitCancellation):
+                M._run_protected_sync_provider_call(
+                    _provider_call,
+                    {
+                        "model": "claude-sonnet-5",
+                        "messages": [{"role": "user", "content": "summarize"}],
+                    },
+                )
+    finally:
+        cancel_worker.join(timeout=5)
+
+    assert not cancel_worker.is_alive()
+    assert worker_unwound.wait(timeout=5)
+    decision = captured["cancel_check"]
+    assert isinstance(decision, M._AuxiliaryCancellationDecision)
+    assert decision._outcome == "cancelled"
+    assert begin_timeout_calls == []
 
 
 def test_async_sdk_aux_facade_honors_public_sync_create_wrapper(monkeypatch):
@@ -575,6 +929,566 @@ def test_async_sdk_aux_worker_context_is_restored_between_calls(monkeypatch):
     assert observed[0][2] is _never_cancel
     assert observed[0][3] is False
     assert observed[1][1:] == (None, None, False)
+
+
+@pytest.mark.parametrize(
+    "raised_error",
+    [
+        ClaudeSdkAuxError("expected first-call failure"),
+        M.AuxiliaryExplicitCancellation(),
+    ],
+)
+def test_async_sdk_aux_worker_context_is_restored_after_create_raises(
+    monkeypatch, raised_error
+):
+    sync_client = ClaudeSdkAuxClient()
+    async_client = AUX.AsyncClaudeSdkAuxClient(sync_client)
+    original_create = sync_client.chat.completions.create
+    observed = []
+    calls = 0
+
+    def _recording_create(**kwargs):
+        nonlocal calls
+        calls += 1
+        observed.append(
+            (
+                threading.get_ident(),
+                getattr(M._aux_progress, "hook", None),
+                getattr(M._aux_interrupt_protection, "cancel_check", None),
+                M._aux_interrupt_protected(),
+            )
+        )
+        if calls == 1:
+            raise raised_error
+        return original_create(**kwargs)
+
+    sync_client.chat.completions.create = _recording_create
+    module, captured = _plant_sdk(monkeypatch, [])
+    messages = [
+        module.AssistantMessage([module.TextBlock("summary")]),
+        module.ResultMessage(usage={"input_tokens": 2}),
+    ]
+    monkeypatch.setattr(
+        module,
+        "query",
+        lambda **kwargs: _async_messages(messages, captured, kwargs),
+    )
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+
+    def _progress():
+        return None
+
+    def _never_cancel():
+        return False
+
+    async def _call_after_failure():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=1))
+        with (
+            M.aux_progress_hook(_progress),
+            M.aux_interrupt_protection(active=False, cancel_check=_never_cancel),
+        ):
+            with pytest.raises(type(raised_error)):
+                await async_client.chat.completions.create(
+                    model="claude-sonnet-5",
+                    messages=[{"role": "user", "content": "first"}],
+                )
+        return await async_client.chat.completions.create(
+            model="claude-sonnet-5",
+            messages=[{"role": "user", "content": "second"}],
+        )
+
+    result = asyncio.run(_call_after_failure())
+
+    assert result.choices[0].message.content == "summary"
+    assert len(observed) == 2
+    assert observed[0][0] == observed[1][0]
+    assert observed[0][1:] == (_progress, _never_cancel, False)
+    assert observed[1][1:] == (None, None, False)
+
+
+def test_collect_text_closes_query_generator_before_cancellation_escapes(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+    generator_closed = threading.Event()
+    checks = 0
+
+    async def _query_with_cleanup(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        captured["options"] = kwargs["options"]
+        try:
+            yield module.AssistantMessage([module.TextBlock("partial")])
+            yield module.ResultMessage(usage={"input_tokens": 2})
+        finally:
+            generator_closed.set()
+
+    def _cancel_after_stream_starts():
+        nonlocal checks
+        checks += 1
+        return checks > 1
+
+    monkeypatch.setattr(module, "query", _query_with_cleanup)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+
+    async def _exercise():
+        with pytest.raises(M.AuxiliaryExplicitCancellation):
+            await AUX._collect_text(
+                "prompt",
+                model="claude-sonnet-5",
+                cancel_check=_cancel_after_stream_starts,
+            )
+        assert generator_closed.is_set()
+
+    asyncio.run(_exercise())
+
+
+def test_query_close_failure_does_not_mask_explicit_cancellation(monkeypatch):
+    module, _ = _plant_sdk(monkeypatch, [])
+    checks = 0
+
+    async def _query_with_failing_cleanup(**_kwargs):
+        try:
+            yield module.AssistantMessage([module.TextBlock("partial")])
+            yield module.ResultMessage(usage={"input_tokens": 2})
+        finally:
+            raise RuntimeError("transport teardown failed")
+
+    def _cancel_after_stream_starts():
+        nonlocal checks
+        checks += 1
+        return checks > 1
+
+    monkeypatch.setattr(module, "query", _query_with_failing_cleanup)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+
+    with pytest.raises(M.AuxiliaryExplicitCancellation):
+        asyncio.run(
+            AUX._collect_text(
+                "prompt",
+                model="claude-sonnet-5",
+                cancel_check=_cancel_after_stream_starts,
+            )
+        )
+
+
+def test_query_close_timeout_does_not_block_explicit_cancellation(
+    monkeypatch, caplog
+):
+    module, _ = _plant_sdk(monkeypatch, [])
+    checks = 0
+    never_finishes = asyncio.Event()
+
+    async def _query_with_blocked_cleanup(**_kwargs):
+        try:
+            yield module.AssistantMessage([module.TextBlock("partial")])
+            yield module.ResultMessage(usage={"input_tokens": 2})
+        finally:
+            await never_finishes.wait()
+
+    def _cancel_after_stream_starts():
+        nonlocal checks
+        checks += 1
+        return checks > 1
+
+    monkeypatch.setattr(module, "query", _query_with_blocked_cleanup)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(AUX, "_QUERY_CLOSE_TIMEOUT", 0.01)
+
+    async def _exercise():
+        return await asyncio.wait_for(
+            AUX._collect_text(
+                "prompt",
+                model="claude-sonnet-5",
+                cancel_check=_cancel_after_stream_starts,
+            ),
+            timeout=0.2,
+        )
+
+    with pytest.raises(M.AuxiliaryExplicitCancellation):
+        asyncio.run(_exercise())
+
+    assert "query close timed out" in caplog.text
+
+
+def test_query_close_timeout_after_success_returns_result(monkeypatch, caplog):
+    module, _ = _plant_sdk(monkeypatch, [])
+    never_finishes = asyncio.Event()
+
+    class BlockingCloseIterator(_SequenceAsyncIterator):
+        async def aclose(self):
+            await never_finishes.wait()
+
+    stream = BlockingCloseIterator(
+        [
+            module.AssistantMessage([module.TextBlock("summary")]),
+            module.ResultMessage(usage={"input_tokens": 2}),
+        ]
+    )
+    monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(AUX, "_QUERY_CLOSE_TIMEOUT", 0.01)
+
+    text, usage, stop_reason = asyncio.run(
+        AUX._collect_text("prompt", model="claude-sonnet-5")
+    )
+
+    assert (text, usage, stop_reason) == (
+        "summary",
+        {"input_tokens": 2},
+        "stop",
+    )
+    assert "model=claude-sonnet-5, timeout=0.01s" in caplog.text
+    assert "prompt" not in caplog.text
+    assert "summary" not in caplog.text
+
+
+def test_outer_deadline_during_close_does_not_mask_explicit_cancellation(
+    monkeypatch,
+):
+    module, _ = _plant_sdk(monkeypatch, [])
+    checks = 0
+    never_finishes = asyncio.Event()
+
+    async def _query_with_blocked_cleanup(**_kwargs):
+        try:
+            yield module.AssistantMessage([module.TextBlock("partial")])
+            yield module.ResultMessage(usage={"input_tokens": 2})
+        finally:
+            await never_finishes.wait()
+
+    def _cancel_after_stream_starts():
+        nonlocal checks
+        checks += 1
+        return checks > 1
+
+    monkeypatch.setattr(module, "query", _query_with_blocked_cleanup)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(AUX, "_QUERY_CLOSE_TIMEOUT", 1.0)
+
+    async def _exercise():
+        return await asyncio.wait_for(
+            AUX._collect_text(
+                "prompt",
+                model="claude-sonnet-5",
+                cancel_check=_cancel_after_stream_starts,
+            ),
+            timeout=0.02,
+        )
+
+    with pytest.raises(M.AuxiliaryExplicitCancellation):
+        asyncio.run(_exercise())
+
+
+def test_query_close_failure_does_not_mask_terminal_error(monkeypatch):
+    module, _ = _plant_sdk(monkeypatch, [])
+
+    stream = _FailingCloseAsyncIterator(
+        [module.ResultMessage(is_error=True, result="sdk failed safely")],
+        RuntimeError("transport teardown failed"),
+    )
+    monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+
+    with pytest.raises(ClaudeSdkAuxError, match="sdk failed safely"):
+        asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
+
+
+def test_query_plain_async_iterator_without_aclose_is_supported(monkeypatch):
+    module, _ = _plant_sdk(monkeypatch, [])
+
+    stream = _SequenceAsyncIterator(
+        [
+            module.AssistantMessage([module.TextBlock("summary")]),
+            module.ResultMessage(usage={"input_tokens": 2}),
+        ]
+    )
+    monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+
+    text, usage, stop_reason = asyncio.run(
+        AUX._collect_text("prompt", model="claude-sonnet-5")
+    )
+
+    assert text == "summary"
+    assert usage == {"input_tokens": 2}
+    assert stop_reason == "stop"
+
+
+def test_query_plain_async_iterator_cancellation_needs_no_close(monkeypatch):
+    module, _ = _plant_sdk(monkeypatch, [])
+    checks = 0
+
+    stream = _SequenceAsyncIterator(
+        [module.AssistantMessage([module.TextBlock("partial")])]
+    )
+
+    def _cancel_after_stream_starts():
+        nonlocal checks
+        checks += 1
+        return checks > 1
+
+    monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+
+    with pytest.raises(M.AuxiliaryExplicitCancellation):
+        asyncio.run(
+            AUX._collect_text(
+                "prompt",
+                model="claude-sonnet-5",
+                cancel_check=_cancel_after_stream_starts,
+            )
+        )
+
+
+def test_query_slow_close_finishes_under_default_bound(monkeypatch):
+    module, _ = _plant_sdk(monkeypatch, [])
+    checks = 0
+    generator_closed = asyncio.Event()
+
+    async def _query_with_slow_cleanup(**_kwargs):
+        try:
+            yield module.AssistantMessage([module.TextBlock("partial")])
+            yield module.ResultMessage(usage={"input_tokens": 2})
+        finally:
+            await asyncio.sleep(0.01)
+            generator_closed.set()
+
+    def _cancel_after_stream_starts():
+        nonlocal checks
+        checks += 1
+        return checks > 1
+
+    assert AUX._QUERY_CLOSE_TIMEOUT == 5.0
+    monkeypatch.setattr(module, "query", _query_with_slow_cleanup)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+
+    async def _exercise():
+        with pytest.raises(M.AuxiliaryExplicitCancellation):
+            await AUX._collect_text(
+                "prompt",
+                model="claude-sonnet-5",
+                cancel_check=_cancel_after_stream_starts,
+            )
+        assert generator_closed.is_set()
+
+    asyncio.run(_exercise())
+
+
+def test_query_close_failure_after_success_returns_result(monkeypatch, caplog):
+    module, _ = _plant_sdk(monkeypatch, [])
+    stream = _FailingCloseAsyncIterator(
+        [
+            module.AssistantMessage([module.TextBlock("summary")]),
+            module.ResultMessage(usage={"input_tokens": 2}),
+        ],
+        RuntimeError("transport teardown failed"),
+    )
+    monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+
+    text, usage, stop_reason = asyncio.run(
+        AUX._collect_text("prompt", model="claude-sonnet-5")
+    )
+
+    assert (text, usage, stop_reason) == (
+        "summary",
+        {"input_tokens": 2},
+        "stop",
+    )
+    assert "query close failed" in caplog.text
+    assert "model=claude-sonnet-5" in caplog.text
+    assert "error=RuntimeError" in caplog.text
+    assert "prompt" not in caplog.text
+    assert "summary" not in caplog.text
+
+
+def test_query_close_cancelled_error_outranks_terminal_error(monkeypatch):
+    module, _ = _plant_sdk(monkeypatch, [])
+    stream = _FailingCloseAsyncIterator(
+        [module.ResultMessage(is_error=True, result="sdk failed safely")],
+        asyncio.CancelledError(),
+    )
+    monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
+
+
+def test_query_sdk_close_timeout_error_is_not_our_bound(monkeypatch, caplog):
+    module, _ = _plant_sdk(monkeypatch, [])
+    stream = _FailingCloseAsyncIterator(
+        [
+            module.AssistantMessage([module.TextBlock("summary")]),
+            module.ResultMessage(usage={"input_tokens": 2}),
+        ],
+        TimeoutError("transport timeout"),
+    )
+    monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+
+    text, usage, stop_reason = asyncio.run(
+        AUX._collect_text("prompt", model="claude-sonnet-5")
+    )
+
+    assert (text, usage, stop_reason) == (
+        "summary",
+        {"input_tokens": 2},
+        "stop",
+    )
+    assert "query close timed out" not in caplog.text
+
+
+@pytest.mark.parametrize("host_stop", [KeyboardInterrupt(), SystemExit()])
+def test_query_close_host_interrupt_outranks_terminal_error(
+    monkeypatch, host_stop
+):
+    module, _ = _plant_sdk(monkeypatch, [])
+    stream = _FailingCloseAsyncIterator(
+        [module.ResultMessage(is_error=True, result="sdk failed safely")],
+        host_stop,
+    )
+    monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+
+    with pytest.raises(type(host_stop)):
+        asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
+
+
+def test_query_close_explicit_cancellation_outranks_terminal_error(monkeypatch):
+    module, _ = _plant_sdk(monkeypatch, [])
+    stream = _FailingCloseAsyncIterator(
+        [module.ResultMessage(is_error=True, result="sdk failed safely")],
+        M.AuxiliaryExplicitCancellation(),
+    )
+    monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+
+    with pytest.raises(M.AuxiliaryExplicitCancellation):
+        asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
+
+
+def test_query_close_cancel_precedence_is_independent_of_base_class(monkeypatch):
+    module, _ = _plant_sdk(monkeypatch, [])
+
+    class FutureAuxiliaryExplicitCancellation(Exception):
+        pass
+
+    monkeypatch.setattr(
+        M,
+        "AuxiliaryExplicitCancellation",
+        FutureAuxiliaryExplicitCancellation,
+    )
+    stream = _FailingCloseAsyncIterator(
+        [module.ResultMessage(is_error=True, result="sdk failed safely")],
+        FutureAuxiliaryExplicitCancellation(),
+    )
+    monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+
+    with pytest.raises(FutureAuxiliaryExplicitCancellation):
+        asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
+
+
+def test_query_close_base_exception_does_not_mask_terminal_error(monkeypatch):
+    module, _ = _plant_sdk(monkeypatch, [])
+
+    class CleanupFailure(BaseException):
+        pass
+
+    stream = _FailingCloseAsyncIterator(
+        [module.ResultMessage(is_error=True, result="sdk failed safely")],
+        CleanupFailure("cleanup base exception"),
+    )
+    monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+
+    with pytest.raises(ClaudeSdkAuxError, match="sdk failed safely"):
+        asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
+
+
+def test_query_close_base_exception_surfaces_after_success(monkeypatch):
+    module, _ = _plant_sdk(monkeypatch, [])
+
+    class CleanupFailure(BaseException):
+        pass
+
+    stream = _FailingCloseAsyncIterator(
+        [
+            module.AssistantMessage([module.TextBlock("summary")]),
+            module.ResultMessage(usage={"input_tokens": 2}),
+        ],
+        CleanupFailure("cleanup base exception"),
+    )
+    monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+
+    with pytest.raises(CleanupFailure, match="cleanup base exception"):
+        asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
+
+
+def test_query_close_cancelled_error_propagates_inside_ancestor_except(monkeypatch):
+    module, _ = _plant_sdk(monkeypatch, [])
+    stream = _FailingCloseAsyncIterator(
+        [
+            module.AssistantMessage([module.TextBlock("summary")]),
+            module.ResultMessage(usage={"input_tokens": 2}),
+        ],
+        asyncio.CancelledError(),
+    )
+    monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+
+    try:
+        raise RuntimeError("ancestor exception")
+    except RuntimeError:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
+
+
+def test_sync_sdk_aux_cancellation_closes_query_generator(monkeypatch):
+    module, captured = _plant_sdk(monkeypatch, [])
+    cancel_event = threading.Event()
+    stream_started = threading.Event()
+    generator_closed = threading.Event()
+
+    async def _query_until_cancelled(**kwargs):
+        captured["prompt"] = kwargs["prompt"]
+        captured["options"] = kwargs["options"]
+        try:
+            stream_started.set()
+            yield module.AssistantMessage([module.TextBlock("partial")])
+            while not cancel_event.is_set():
+                await asyncio.sleep(0.01)
+            yield module.ResultMessage(usage={"input_tokens": 2})
+        finally:
+            generator_closed.set()
+
+    monkeypatch.setattr(module, "query", _query_until_cancelled)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    client = ClaudeSdkAuxClient()
+
+    def _cancel_after_start():
+        assert stream_started.wait(timeout=5)
+        cancel_event.set()
+
+    cancel_worker = threading.Thread(target=_cancel_after_start)
+    cancel_worker.start()
+
+    async def _call_sync_facade():
+        with M.aux_interrupt_protection(cancel_event=cancel_event):
+            return client.chat.completions.create(
+                model="claude-sonnet-5",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+    try:
+        with pytest.raises(M.AuxiliaryExplicitCancellation):
+            asyncio.run(_call_sync_facade())
+    finally:
+        cancel_worker.join(timeout=5)
+
+    assert not cancel_worker.is_alive()
+    assert generator_closed.wait(timeout=5)
 
 
 def test_one_shot_query_has_no_tools_and_scrubs_child_env(monkeypatch):
