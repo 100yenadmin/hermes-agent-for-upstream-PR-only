@@ -68,6 +68,16 @@ def test_api_key_providers_expose_a_credential_env_var():
             assert d.api_key_env_vars, f"{d.slug} is api_key but exposes no env var"
 
 
+def test_keyless_metadata_propagates_from_overlay_and_defaults_false():
+    from hermes_cli.providers import get_provider
+
+    free = get_provider("opencode-free", allow_network=False)
+    keyed = get_provider("openrouter", allow_network=False)
+    assert free is not None and free.keyless is True
+    assert keyed is not None and keyed.keyless is False
+    assert provider_catalog_by_slug()["opencode-free"].keyless is True
+
+
 
 
 def test_tab_for_auth_type_helper():

@@ -1112,9 +1112,15 @@ def dispatch_async_delegation_batch(
         status = "error"
         try:
             combined = runner() or {}
-            # Batch status: completed unless every child errored/was interrupted.
+            # Preserve a graceful all-child cancellation as ``interrupted``.
+            # Otherwise retain the legacy aggregate contract: any usable child
+            # result completes the batch, while an all-failure batch is error.
             child_results = combined.get("results") or []
             if child_results and all(
+                r.get("status") == "interrupted" for r in child_results
+            ):
+                status = "interrupted"
+            elif child_results and all(
                 (r.get("status") not in ("completed", "success"))
                 for r in child_results
             ):
@@ -1209,6 +1215,12 @@ def _push_batch_completion_event(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
     }
+    # Explicit routed batches carry safe aggregate metadata from the normal
+    # delegate_task result. Leave legacy batches byte-compatible.
+    if "mixed_routes" in combined:
+        evt["mixed_routes"] = combined.get("mixed_routes")
+        evt["provider"] = combined.get("provider")
+        evt["model"] = combined.get("model")
     # Routing origin captured at dispatch (see _capture_routing_origin).
     for _k in ("scope_id", "user_id", "user_name"):
         if event_record.get(_k):

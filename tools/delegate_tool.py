@@ -1640,6 +1640,7 @@ def _build_child_agent(
     override_provider: Optional[str] = None,
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
+    override_api_key_set: bool = False,
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
@@ -1809,7 +1810,12 @@ def _build_child_agent(
     effective_base_url = override_base_url or parent_agent.base_url
     if not override_base_url:
         effective_base_url = _inherit_parent_base_url(parent_agent, effective_base_url)
-    effective_api_key = override_api_key or parent_api_key
+    # Explicit routes pin credential ownership too. In particular, a trusted
+    # OAuth/external/virtual/keyless runtime may intentionally have no string
+    # API key; never replace that explicit empty value with the parent's key.
+    effective_api_key = (
+        override_api_key if override_api_key_set else (override_api_key or parent_api_key)
+    )
     # Same-class follow-up to #94036/#97292: the trusted-proxy capability map
     # (`agent.capabilities`, e.g. ``openai_native_compaction`` from a
     # custom_providers entry) is an endpoint-scoped trust decision. Children
@@ -3080,6 +3086,7 @@ def _run_single_child(
 
         summary = result.get("final_response") or ""
         completed = result.get("completed", False)
+        child_failed = bool(result.get("failed", False) or result.get("error"))
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
 
@@ -3092,6 +3099,12 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
+        elif child_failed:
+            # ``run_conversation`` may preserve a user-facing transport error
+            # in final_response while also stamping failed/error. A non-empty
+            # error explanation is not usable task output and must not turn a
+            # provider failure into a false-success delegation receipt.
+            status = "failed"
         elif summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already
@@ -3141,6 +3154,8 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif child_failed:
+            exit_reason = "error"
         elif completed:
             exit_reason = "completed"
         else:
@@ -3666,6 +3681,194 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+_ROUTE_FIELDS = frozenset({"provider", "model"})
+_SAFE_ROUTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_SAFE_ROUTE_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+\-]*$")
+_SECRET_LIKE_PREFIXES = ("sk-", "sk_", "api-key-", "token-", "secret-", "bearer-")
+_TRUSTED_ROUTE_AUTH_TYPES = frozenset(
+    {"oauth_device_code", "oauth_external", "oauth_minimax", "external_process", "copilot", "virtual", "aws_sdk", "vertex"}
+)
+
+
+def _validate_delegation_routes(cfg: dict) -> Dict[str, Dict[str, str]]:
+    """Validate the exact, credential-free operator route shape."""
+    raw_routes = cfg.get("routes", {})
+    if not isinstance(raw_routes, dict):
+        raise ValueError("delegation.routes must be an object mapping aliases to routes")
+    routes: Dict[str, Dict[str, str]] = {}
+    for raw_alias, entry in raw_routes.items():
+        alias = raw_alias.strip() if isinstance(raw_alias, str) else ""
+        if (
+            not alias
+            or not _SAFE_ROUTE_NAME_RE.fullmatch(alias)
+            or alias.lower().startswith(_SECRET_LIKE_PREFIXES)
+        ):
+            raise ValueError("delegation.routes contains an invalid route alias")
+        if alias in routes or not isinstance(entry, dict) or set(entry) != _ROUTE_FIELDS:
+            raise ValueError(
+                "Each delegation route must contain exactly nonempty provider and model strings"
+            )
+        provider = entry.get("provider")
+        model = entry.get("model")
+        provider = provider.strip() if isinstance(provider, str) else ""
+        model = model.strip() if isinstance(model, str) else ""
+        if (
+            not provider
+            or not _SAFE_ROUTE_NAME_RE.fullmatch(provider)
+            or provider.lower().startswith(_SECRET_LIKE_PREFIXES)
+            or not model
+            or not _SAFE_ROUTE_MODEL_RE.fullmatch(model)
+            or model.lower().startswith(_SECRET_LIKE_PREFIXES)
+            or "://" in model
+            or model.startswith(("/", "\\"))
+        ):
+            raise ValueError(
+                "Each delegation route must contain exactly nonempty provider and model strings"
+            )
+        routes[alias] = {"provider": provider, "model": model}
+    return routes
+
+
+def _route_meter_policy(cfg: dict, credentials: Dict[str, Any]) -> str:
+    """Return a runtime billing mode, failing closed when it is unsafe."""
+    provider = credentials.get("provider")
+    model = credentials.get("model")
+    if not isinstance(provider, str) or not provider.strip() or not isinstance(model, str) or not model.strip():
+        raise ValueError("Delegation route resolved without a provider/model")
+
+    from hermes_cli.providers import get_provider
+    from agent.usage_pricing import resolve_billing_route
+
+    provider_def = None
+    try:
+        provider_def = get_provider(provider.strip(), allow_network=False)
+    except Exception:
+        pass
+    if provider_def is None:
+        raise ValueError("Delegation route has unknown provider authentication metadata")
+    auth_type = str(getattr(provider_def, "auth_type", "") or "").strip().lower()
+    keyless = bool(getattr(provider_def, "keyless", False))
+    if not auth_type or auth_type in {"unknown", "none"}:
+        raise ValueError("Delegation route has unknown provider authentication metadata")
+
+    try:
+        billing = resolve_billing_route(
+            model.strip(), provider=provider.strip(), base_url=credentials.get("base_url")
+        )
+    except Exception:
+        billing = None
+    billing_mode = str(getattr(billing, "billing_mode", "") or "").strip()
+    if keyless:
+        # Keyless is an explicit provider contract, not an inference from an
+        # empty key or endpoint. Its safe receipt is deliberately stable even
+        # when the generic pricing classifier has no model entry.
+        return "non_metered"
+    if not billing_mode or billing_mode == "unknown":
+        raise ValueError("Delegation route has unknown billing classification")
+
+    allow_metered = is_truthy_value(cfg.get("allow_metered_routes", False))
+    if billing_mode == "subscription_included":
+        if auth_type not in _TRUSTED_ROUTE_AUTH_TYPES:
+            raise ValueError("Delegation route has untrusted subscription metadata")
+        return billing_mode
+    if not allow_metered:
+        raise ValueError(
+            "Delegation route is not subscription-included; set "
+            "delegation.allow_metered_routes: true to allow metered routes"
+        )
+    return billing_mode
+
+
+def _resolve_task_routes(
+    task_list: List[Dict[str, Any]],
+    cfg: dict,
+    parent_agent,
+    credentials_cfg: Optional[Dict[str, Any]] = None,
+) -> tuple[List[Dict[str, Any]], bool]:
+    """Resolve and policy-check every task route before child construction."""
+    routes = _validate_delegation_routes(cfg)
+    supplied = ["route" in task for task in task_list]
+    explicit = any(supplied)
+    if explicit and not all(supplied):
+        raise ValueError("Every task must supply route when any task supplies route")
+    if not explicit:
+        credentials = _resolve_delegation_credentials(
+            credentials_cfg if credentials_cfg else cfg, parent_agent
+        )
+        return [
+            {"explicit": False, "route": None, "credentials": credentials}
+            for _ in task_list
+        ], False
+
+    resolved: List[Dict[str, Any]] = []
+    for task in task_list:
+        route_name = task.get("route")
+        if not isinstance(route_name, str) or not route_name.strip():
+            raise ValueError("Each task route must be a nonempty opaque string")
+        route_name = route_name.strip()
+        route_cfg = routes.get(route_name)
+        if route_cfg is None:
+            raise ValueError("Unknown delegation route")
+        credentials = _resolve_delegation_credentials(route_cfg, parent_agent)
+        billing_mode = _route_meter_policy(cfg, credentials)
+        resolved.append(
+            {
+                "explicit": True,
+                "route": route_name,
+                "credentials": credentials,
+                "billing_mode": billing_mode,
+            }
+        )
+    return resolved, True
+
+
+def _attach_route_receipt(entry: Dict[str, Any], route_info: Dict[str, Any], child: Any) -> None:
+    """Attach only safe, runtime-derived metadata for an explicit route."""
+    if not route_info.get("explicit"):
+        return
+    credentials = route_info.get("credentials") or {}
+    provider = getattr(child, "provider", None) or credentials.get("provider")
+    model = getattr(child, "model", None) or credentials.get("model")
+    if (
+        not isinstance(provider, str)
+        or not provider.strip()
+        or any(ch.isspace() or ord(ch) < 32 for ch in provider)
+        or "://" in provider
+    ):
+        provider = credentials.get("provider") or "unknown"
+    if (
+        not isinstance(model, str)
+        or not model.strip()
+        or any(ch.isspace() or ord(ch) < 32 for ch in model)
+        or "://" in model
+    ):
+        model = credentials.get("model") or "unknown"
+    if credentials.get("keyless"):
+        billing_mode = route_info.get("billing_mode", "non_metered")
+        cost_status = "included"
+    else:
+        try:
+            from agent.usage_pricing import resolve_billing_route
+
+            billing_mode = resolve_billing_route(
+                model, provider=provider, base_url=getattr(child, "base_url", None)
+            ).billing_mode
+        except Exception:
+            billing_mode = route_info.get("billing_mode", "unknown")
+        cost_status = getattr(child, "session_cost_status", None)
+        if not isinstance(cost_status, str) or not cost_status:
+            cost_status = "unknown"
+    entry.update(
+        {
+            "route": route_info["route"],
+            "provider": provider,
+            "model": model,
+            "billing_mode": billing_mode,
+            "cost_status": cost_status,
+        }
+    )
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -3767,24 +3970,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    #
-    # ``credentials_cfg`` (internal callers only — never model-facing) is a
-    # per-call override shaped like the delegation config section
-    # ({provider, model, base_url, api_key, api_mode}); the /review engine
-    # uses it to route its reviewer subagent onto ``auxiliary.review``
-    # without touching the global delegation pin.
-    try:
-        creds = _resolve_delegation_credentials(
-            credentials_cfg if credentials_cfg else cfg, parent_agent
-        )
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -3843,6 +4028,16 @@ def delegate_task(
         batch_error = _validate_batch_tasks(task_list)
         if batch_error:
             return tool_error(batch_error)
+
+    # Validate the complete route map and resolve every task's credentials and
+    # billing policy before creating the first child or consuming model usage.
+    try:
+        task_routes, explicit_routes = _resolve_task_routes(
+            task_list, cfg, parent_agent, credentials_cfg=credentials_cfg
+        )
+    except ValueError as exc:
+        return tool_error(str(exc))
+    creds = task_routes[0]["credentials"]
 
     # T1-24: coerce/validate optional per-task output_schema up front so a
     # malformed schema fails the whole call loudly instead of spawning
@@ -3911,6 +4106,7 @@ def delegate_task(
     # subagent-lifecycle API).
     children = []
     for i, t in enumerate(task_list):
+        task_creds = task_routes[i]["credentials"]
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
@@ -3930,18 +4126,19 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=task_creds.get("model"),
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=task_creds.get("provider"),
+                override_base_url=task_creds.get("base_url"),
+                override_api_key=task_creds.get("api_key"),
+                override_api_key_set=bool(task_routes[i].get("explicit")),
+                override_api_mode=task_creds.get("api_mode"),
+                override_request_overrides=task_creds.get("request_overrides"),
+                override_max_tokens=task_creds.get("max_output_tokens"),
+                override_acp_command=task_creds.get("command"),
+                override_acp_args=task_creds.get("args"),
                 role=effective_role,
             )
         except ValueError as exc:
@@ -3955,6 +4152,9 @@ def delegate_task(
                 child._delegate_output_schema = _task_schema
             except Exception:
                 logger.debug("Could not attach output schema to child %d", i)
+        if task_routes[i].get("explicit"):
+            child._delegate_route = task_routes[i]["route"]
+            child._delegate_explicit_route = True
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
         # (including the _flush attribute) and never lets writer failures
@@ -4130,6 +4330,14 @@ def delegate_task(
         # headroom (split across the batch) before they enter the parent's
         # conversation. Full text is spilled to disk so nothing is lost.
         # Covers both the single-task and batch paths. See PR #9126.
+        if explicit_routes:
+            child_by_index = {index: child for index, _task, child in children}
+            for entry in results:
+                task_index = entry.get("task_index", -1)
+                if isinstance(task_index, int) and 0 <= task_index < len(task_routes):
+                    _attach_route_receipt(
+                        entry, task_routes[task_index], child_by_index.get(task_index)
+                    )
         _finalize_child_results(results, task_list, children, parent_agent)
 
         total_duration = round(time.monotonic() - overall_start, 2)
@@ -4158,6 +4366,20 @@ def delegate_task(
             "results": results,
             "total_duration_seconds": total_duration,
         }
+        if explicit_routes:
+            route_keys = {
+                (entry.get("route"), entry.get("provider"), entry.get("model"))
+                for entry in results
+            }
+            mixed_routes = len(route_keys) > 1
+            combined["mixed_routes"] = mixed_routes
+            if mixed_routes:
+                combined["provider"] = None
+                combined["model"] = None
+            else:
+                only_entry = results[0] if results else {}
+                combined["provider"] = only_entry.get("provider")
+                combined["model"] = only_entry.get("model")
         if live_paths:
             combined["live_transcripts"] = list(live_paths)
         return combined
@@ -4719,7 +4941,9 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         ) from exc
 
     api_key = runtime.get("api_key", "")
-    if not api_key:
+    auth_type = str(runtime.get("auth_type") or "").strip().lower()
+    keyless = bool(runtime.get("keyless", False))
+    if not api_key and not keyless and auth_type not in _TRUSTED_ROUTE_AUTH_TYPES:
         raise ValueError(
             f"Delegation provider '{configured_provider}' resolved but has no API key. "
             f"Set the appropriate environment variable or run 'hermes auth'."
@@ -4745,6 +4969,8 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "base_url": runtime.get("base_url"),
         "api_key": api_key,
         "api_mode": runtime.get("api_mode"),
+        "auth_type": auth_type,
+        "keyless": keyless,
         # Explicit delegation.request_overrides merges OVER the named
         # provider's runtime overrides (explicit wins; extra_body deep-merged
         # one level) — same precedence as the direct-base_url branch above.
@@ -4977,6 +5203,14 @@ DELEGATE_TASK_SCHEMA = {
                                 "error messages, constraints. Each child "
                                 "sees only its own context — repeat shared "
                                 "background in every task that needs it."
+                            ),
+                        },
+                        "route": {
+                            "type": "string",
+                            "description": (
+                                "Optional opaque operator-configured route "
+                                "alias. The runtime resolves its provider "
+                                "and model; aliases are not enumerated here."
                             ),
                         },
                         "output_schema": {

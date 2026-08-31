@@ -99,10 +99,13 @@ class TestDetectDangerousRm:
             assert "delete" in desc.lower()
 
 
-    def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self):
-        with mock_patch("tempfile.gettempdir", return_value="/tmp"):
+    def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self, tmp_path):
+        # Use a real, canonical temp directory. On macOS, /tmp resolves to
+        # /private/tmp; the production guard intentionally refuses a symlinked
+        # spelling and that behavior has its own test below.
+        with mock_patch("tempfile.gettempdir", return_value=str(tmp_path)):
             for prefix in ("hermes-verify-", "hermes-ad-hoc-"):
-                assert detect_dangerous_command(f"rm -f /tmp/{prefix}example.py") == (
+                assert detect_dangerous_command(f"rm -f {tmp_path / f'{prefix}example.py'}") == (
                     False,
                     None,
                     None,
@@ -1689,6 +1692,49 @@ class TestConcurrentApprovalCoalescing:
         for t in threads:
             t.join(timeout=5)
         assert all(r is not None and r["choice"] == "once" for r in results)
+
+    def test_explicit_no_coalesce_keeps_correlated_prompts_distinct(
+        self, monkeypatch,
+    ):
+        from tools import approval as mod
+        monkeypatch.setattr(mod, "_get_approval_timeout", lambda: 30)
+
+        notified = []
+        results = [None, None]
+        threads = []
+        for index, tool_use_id in enumerate(("toolu_A", "toolu_B")):
+            data = self._data()
+            data.update({"no_coalesce": True, "tool_use_id": tool_use_id})
+            thread = threading.Thread(
+                target=lambda idx=index, payload=data: results.__setitem__(
+                    idx,
+                    mod._await_gateway_decision(
+                        self.SESSION_KEY,
+                        notified.append,
+                        payload,
+                        surface="claude_sdk",
+                    ),
+                )
+            )
+            thread.start()
+            threads.append(thread)
+
+        for _ in range(400):
+            if len(notified) == 2:
+                break
+            time.sleep(0.005)
+        assert {item["tool_use_id"] for item in notified} == {"toolu_A", "toolu_B"}
+        assert len(mod._gateway_queues.get(self.SESSION_KEY, [])) == 2
+
+        assert mod.resolve_gateway_approval(
+            self.SESSION_KEY, "once", tool_use_id="toolu_A"
+        ) == 1
+        assert mod.resolve_gateway_approval(
+            self.SESSION_KEY, "deny", tool_use_id="toolu_B"
+        ) == 1
+        for thread in threads:
+            thread.join(timeout=5)
+        assert sorted(result["choice"] for result in results) == ["deny", "once"]
 
     def test_different_commands_are_not_coalesced(self, monkeypatch):
         from tools import approval as mod

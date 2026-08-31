@@ -675,6 +675,32 @@ class TestDelegateObservability(unittest.TestCase):
             result = json.loads(delegate_task(goal="Test empty sentinel", parent_agent=parent))
             self.assertEqual(result["results"][0]["status"], "failed")
 
+    def test_transport_error_text_does_not_mark_child_completed(self):
+        """A user-facing error explanation remains a failed delegation."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "synthetic-model"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": "The provider request failed.",
+                "completed": False,
+                "failed": True,
+                "error": "synthetic transport failure",
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test transport failure", parent_agent=parent))
+            entry = result["results"][0]
+            self.assertEqual(entry["status"], "failed")
+            self.assertEqual(entry["exit_reason"], "error")
+            self.assertEqual(entry["error"], "synthetic transport failure")
+
 
 class TestSubagentCostRollup(unittest.TestCase):
     """Port of Kilo-Org/kilocode#9448 — parent's session_estimated_cost_usd

@@ -2960,6 +2960,29 @@ def _format_age(seconds: float) -> str:
     return f"{h}h" if m == 0 else f"{h}h{m}m"
 
 
+_ROUTE_RECEIPT_FIELDS = ("route", "provider", "model", "billing_mode", "cost_status")
+
+
+def _safe_route_receipt_value(value: Any) -> str:
+    if value is None:
+        return "null"
+    if not isinstance(value, str) or not value or any(
+        ch.isspace() or ord(ch) < 32 for ch in value
+    ):
+        return "unknown"
+    return value
+
+
+def _format_route_receipt(result: dict) -> str:
+    if not isinstance(result, dict) or "route" not in result:
+        return ""
+    fields = " ".join(
+        f"{key}={_safe_route_receipt_value(result.get(key))}"
+        for key in _ROUTE_RECEIPT_FIELDS
+    )
+    return f"Route receipt: {fields}"
+
+
 def _format_async_delegation(evt: dict) -> str:
     """Format an async-delegation completion into a self-contained re-injection.
 
@@ -2972,7 +2995,18 @@ def _format_async_delegation(evt: dict) -> str:
     """
     import time as _time
 
-    deleg_id = evt.get("delegation_id", "unknown")
+    deleg_id = evt.get("delegation_id")
+    if not deleg_id:
+        # No real delegation behind this event (synthetic/echo lane) — never
+        # render a completion envelope for it; empty text makes the watcher
+        # skip injection entirely.
+        logger.warning(
+            "async-delegation completion with empty delegation_id dropped "
+            "(goal=%r, status=%r) — envelope not rendered",
+            evt.get("goal", ""),
+            evt.get("status"),
+        )
+        return ""
     goal = evt.get("goal", "") or ""
     context = evt.get("context")
     toolsets = evt.get("toolsets")
@@ -3013,7 +3047,16 @@ def _format_async_delegation(evt: dict) -> str:
             lines.append(f"Context you provided: {context}")
         if toolsets:
             lines.append(f"Toolsets: {', '.join(toolsets)}")
-        lines.append(f"Role: {role}   Model: {model}   Total duration: {total_dur}s")
+        if "mixed_routes" in evt:
+            lines.append(
+                "Role: "
+                f"{role}   Route aggregate: mixed_routes={bool(evt.get('mixed_routes'))} "
+                f"provider={_safe_route_receipt_value(evt.get('provider'))} "
+                f"model={_safe_route_receipt_value(evt.get('model'))}   "
+                f"Total duration: {total_dur}s"
+            )
+        else:
+            lines.append(f"Role: {role}   Model: {model}   Total duration: {total_dur}s")
         if error and not results:
             lines.append("--- ERROR ---")
             lines.append(f"The batch did not complete successfully: {error}")
@@ -3039,6 +3082,9 @@ def _format_async_delegation(evt: dict) -> str:
                 header += ", TRUNCATED: hit max_iterations — work may be incomplete"
             header += ") ---"
             lines.append(header)
+            receipt = _format_route_receipt(r)
+            if receipt:
+                lines.append(receipt)
             if r_status in ("completed", "success") and r_summary:
                 if r_truncated:
                     lines.append(

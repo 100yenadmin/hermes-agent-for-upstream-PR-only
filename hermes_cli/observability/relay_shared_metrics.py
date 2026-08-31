@@ -1138,9 +1138,15 @@ def observe_lifecycle(hook_name: str, **kwargs: Any) -> None:
         elif hook_name in {"on_session_finalize", "on_session_reset"}:
             runtime.close_session(kwargs)
     except Exception:
-        logger.warning(
-            "Hermes shared metrics hook failed: %s", hook_name, exc_info=True
-        )
+        from hermes_cli.lifecycle import current_observer_failure_log
+
+        fixed_log = current_observer_failure_log()
+        if fixed_log is not None:
+            logger.debug("%s", fixed_log)
+        else:
+            logger.warning(
+                "Hermes shared metrics hook failed: %s", hook_name, exc_info=True
+            )
 
 
 def _with_runtime_toolset(event: dict[str, Any]) -> dict[str, Any]:

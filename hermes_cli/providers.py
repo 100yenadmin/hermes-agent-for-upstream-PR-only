@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 class HermesOverlay:
     """Hermes-specific provider metadata layered on top of models.dev."""
 
-    transport: str = "openai_chat"        # openai_chat | anthropic_messages | codex_responses
+    transport: str = "openai_chat"        # openai_chat | anthropic_messages | codex_responses | bedrock_converse | claude_agent_sdk
     is_aggregator: bool = False
     auth_type: str = "api_key"            # api_key | oauth_device_code | oauth_external | external_process
     extra_env_vars: Tuple[str, ...] = ()  # env vars models.dev doesn't list
@@ -102,6 +102,16 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
     "anthropic": HermesOverlay(
         transport="anthropic_messages",
         extra_env_vars=("ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
+    ),
+    # Claude Agent SDK runtime: the SDK-managed Claude Code CLI subprocess
+    # self-authenticates with the Claude subscription (CLAUDE_CODE_OAUTH_TOKEN
+    # / ~/.claude); Hermes resolves NO credentials on this path (#25267).
+    # The env var here is discovery metadata (doctor/status), never a key
+    # Hermes sends anywhere.
+    "claude-agent-sdk": HermesOverlay(
+        transport="claude_agent_sdk",
+        auth_type="oauth_external",
+        extra_env_vars=("CLAUDE_CODE_OAUTH_TOKEN",),
     ),
     "zai": HermesOverlay(
         transport="openai_chat",
@@ -283,6 +293,7 @@ class ProviderDef:
     auth_type: str = "api_key"
     doc: str = ""
     source: str = ""                      # "models.dev", "hermes", "user-config"
+    keyless: bool = False                 # explicitly served without credentials
 
 
 # -- Aliases ------------------------------------------------------------------
@@ -331,6 +342,12 @@ ALIASES: Dict[str, str] = {
     # anthropic
     "claude": "anthropic",
     "claude-code": "anthropic",
+
+    # claude-agent-sdk (same accepted spellings as the runtime_provider
+    # short-circuit)
+    "claude-sdk": "claude-agent-sdk",
+    "claude-code-sdk": "claude-agent-sdk",
+    "claude_agent_sdk": "claude-agent-sdk",
 
     # github-copilot (models.dev ID)
     "copilot": "github-copilot",
@@ -444,6 +461,7 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "moa": "Mixture of Agents",
     "nous": "Nous Portal",
     "openai-codex": "ChatGPT or Codex Subscription",
+    "claude-agent-sdk": "Claude Agent SDK",
     "copilot-acp": "GitHub Copilot ACP",
     "stepfun": "StepFun Step Plan",
     "xiaomi": "Xiaomi MiMo",
@@ -470,6 +488,9 @@ TRANSPORT_TO_API_MODE: Dict[str, str] = {
     "anthropic_messages": "anthropic_messages",
     "codex_responses": "codex_responses",
     "bedrock_converse": "bedrock_converse",
+    # Agent-loop runtime via the official claude-agent-sdk — matches the
+    # api_mode the runtime_provider short-circuit returns (#25267).
+    "claude_agent_sdk": "claude_agent_sdk",
 }
 
 
@@ -540,6 +561,7 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
             base_url_env_var=base_url_env,
             is_aggregator=is_agg,
             auth_type=auth,
+            keyless=bool(getattr(overlay, "keyless", False)),
             doc=mdev_info.doc,
             source="models.dev",
         )
@@ -555,6 +577,7 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
             base_url_env_var=overlay.base_url_env_var,
             is_aggregator=overlay.is_aggregator,
             auth_type=overlay.auth_type,
+            keyless=bool(getattr(overlay, "keyless", False)),
             source="hermes",
         )
 
@@ -584,6 +607,7 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
                 api_key_env_vars=tuple(_prof.env_vars or ()),
                 base_url=_prof.base_url or "",
                 auth_type=_prof.auth_type or "api_key",
+                keyless=bool(getattr(_prof, "keyless", False)),
                 source="plugin-profile",
             )
     except Exception:
@@ -824,6 +848,7 @@ def resolve_user_provider(name: str, user_config: Dict[str, Any]) -> Optional[Pr
         base_url=api_url,
         is_aggregator=False,
         auth_type="api_key",
+        keyless=bool(entry.get("keyless", False)),
         source="user-config",
     )
 

@@ -438,6 +438,10 @@ _VALID_API_MODES = {
     # `model.openai_runtime == "codex_app_server"` AND provider in
     # {"openai", "openai-codex"}. Default is unchanged.
     "codex_app_server",
+    # Agent-loop runtime via the official claude-agent-sdk (subscription
+    # OAuth; the SDK subprocess self-authenticates — Hermes resolves no
+    # credentials). Selected by `provider: claude-agent-sdk`. See #25267.
+    "claude_agent_sdk",
 }
 
 
@@ -1873,7 +1877,7 @@ def _resolve_explicit_runtime(
     return None
 
 
-def resolve_runtime_provider(
+def _resolve_runtime_provider(
     *,
     requested: Optional[str] = None,
     explicit_api_key: Optional[str] = None,
@@ -1920,6 +1924,23 @@ def resolve_runtime_provider(
             "base_url": "moa://local",
             "api_key": "moa-virtual-provider",
             "source": "moa-virtual-provider",
+            "requested_provider": requested_provider,
+        }
+
+    # claude-agent-sdk short-circuit: the official Agent SDK runtime resolves
+    # its OWN credentials (subscription OAuth via CLAUDE_CODE_OAUTH_TOKEN /
+    # ~/.claude) inside the SDK-managed subprocess. Nothing here must reach
+    # the credential pool or the generic api_key resolver — there is no API
+    # key on this path, by design (#25267).
+    if requested_provider in {
+        "claude-agent-sdk", "claude-sdk", "claude-code-sdk", "claude_agent_sdk",
+    }:
+        return {
+            "provider": "claude-agent-sdk",
+            "api_mode": "claude_agent_sdk",
+            "base_url": "",
+            "api_key": "claude-subscription-oauth",
+            "source": "claude-agent-sdk",
             "requested_provider": requested_provider,
         }
 
@@ -2546,6 +2567,52 @@ def resolve_runtime_provider(
     )
     runtime["requested_provider"] = requested_provider
     return runtime
+
+
+def _annotate_runtime_provider(runtime: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach non-secret provider metadata for policy consumers.
+
+    This is deliberately derived from the provider catalog/profile, never from
+    an empty key, a loopback URL, or an inferred endpoint.  Existing runtime
+    fields remain unchanged; the additive metadata lets delegation enforce
+    keyless and trusted-auth policy without inspecting credentials.
+    """
+    if not isinstance(runtime, dict):
+        return runtime
+    provider = str(runtime.get("provider") or "").strip()
+    provider_def = None
+    if provider:
+        try:
+            from hermes_cli.providers import get_provider
+
+            provider_def = get_provider(provider, allow_network=False)
+        except Exception:
+            provider_def = None
+    if provider_def is not None:
+        runtime.setdefault("auth_type", getattr(provider_def, "auth_type", ""))
+        runtime.setdefault("keyless", bool(getattr(provider_def, "keyless", False)))
+    else:
+        runtime.setdefault("auth_type", "")
+        runtime.setdefault("keyless", False)
+    return runtime
+
+
+def resolve_runtime_provider(
+    *,
+    requested: Optional[str] = None,
+    explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Resolve a provider and add safe auth metadata to the runtime record."""
+    return _annotate_runtime_provider(
+        _resolve_runtime_provider(
+            requested=requested,
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=explicit_base_url,
+            target_model=target_model,
+        )
+    )
 
 
 def format_runtime_provider_error(error: Exception) -> str:

@@ -1,11 +1,32 @@
 """Hermes lifecycle dispatch for first-party observers and plugins."""
 
 from __future__ import annotations
-
+import contextvars
+from collections.abc import Iterator
+from contextlib import contextmanager
 import logging
 from typing import Any, List
 
 logger = logging.getLogger(__name__)
+
+_observer_failure_log: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "observer_failure_log", default=None
+)
+
+
+@contextmanager
+def observer_failure_log(message: str) -> Iterator[None]:
+    """Use a fixed failure message for one sensitive observer dispatch."""
+    token = _observer_failure_log.set(message)
+    try:
+        yield
+    finally:
+        _observer_failure_log.reset(token)
+
+
+def current_observer_failure_log() -> str | None:
+    """Return the fixed message active for this observer dispatch, if any."""
+    return _observer_failure_log.get()
 
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
@@ -15,7 +36,11 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
         observe_lifecycle(hook_name, **kwargs)
     except Exception:
-        logger.warning("Built-in observability hook failed", exc_info=True)
+        fixed_log = current_observer_failure_log()
+        if fixed_log is not None:
+            logger.debug("%s", fixed_log)
+        else:
+            logger.warning("Built-in observability hook failed", exc_info=True)
 
     from hermes_cli import plugins
 

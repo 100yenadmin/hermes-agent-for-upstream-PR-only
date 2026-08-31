@@ -317,6 +317,82 @@ def test_interrupt_all_signals_running_children():
     assert evt["status"] == "interrupted"
 
 
+def test_interrupt_all_preserves_interrupted_batch_status():
+    released = threading.Event()
+
+    def runner():
+        released.wait(timeout=60)
+        return {
+            "results": [
+                {
+                    "task_index": 0,
+                    "status": "interrupted",
+                    "summary": None,
+                    "error": "cancelled",
+                }
+            ],
+            "total_duration_seconds": 0.1,
+        }
+
+    res = ad.dispatch_async_delegation_batch(
+        goals=["long batch task"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="batch-parent",
+        runner=runner,
+        interrupt_fn=released.set,
+        max_async_children=1,
+    )
+
+    assert ad.interrupt_all(reason="test batch") == 1
+    evt = _drain_for(res["delegation_id"])
+    assert evt is not None
+    assert evt["is_batch"] is True
+    assert evt["status"] == "interrupted"
+    assert evt["results"][0]["status"] == "interrupted"
+    durable = ad.get_durable_delegation(res["delegation_id"])
+    assert durable is not None
+    assert durable["state"] == "interrupted"
+
+
+@pytest.mark.parametrize(
+    ("child_statuses", "expected"),
+    [
+        (["interrupted", "error"], "error"),
+        (["completed", "interrupted"], "completed"),
+    ],
+)
+def test_batch_terminal_status_preserves_existing_mixed_outcomes(
+    child_statuses, expected
+):
+    res = ad.dispatch_async_delegation_batch(
+        goals=[f"task {index}" for index, _status in enumerate(child_statuses)],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="batch-parent",
+        runner=lambda: {
+            "results": [
+                {
+                    "task_index": index,
+                    "status": status,
+                    "summary": "usable" if status == "completed" else None,
+                }
+                for index, status in enumerate(child_statuses)
+            ],
+            "total_duration_seconds": 0.1,
+        },
+        max_async_children=1,
+    )
+
+    evt = _drain_for(res["delegation_id"])
+    assert evt is not None
+    assert evt["status"] == expected
+
+
 def _fast_stale_monitor(monkeypatch, *, idle=0.15, in_tool=0.3, grace=0.15):
     """Shrink the stale-monitor cadence so tests run in milliseconds."""
     monkeypatch.setattr(ad, "_STALE_CHECK_INTERVAL", 0.03)
@@ -808,6 +884,22 @@ def test_gateway_formatter_renders_async_block():
     assert "Investigate flaky test" in txt
 
 
+def test_empty_delegation_id_envelope_never_rendered(caplog):
+    """A completion with an empty/absent delegation_id has no real delegation
+    behind it (synthetic/echo lane) and must never render an envelope."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="tools.process_registry"):
+        assert format_process_notification(_make_async_evt(delegation_id="")) == ""
+    assert "empty delegation_id" in caplog.text
+    evt = _make_async_evt()
+    del evt["delegation_id"]
+    assert format_process_notification(evt) == ""
+    assert format_process_notification(
+        _make_async_evt(delegation_id="", is_batch=True, results=[])
+    ) == ""
+
+
 def test_gateway_cli_origin_event_left_unrouted():
     """An empty session_key (CLI origin) is left without routing fields."""
     from gateway.run import GatewayRunner
@@ -881,3 +973,102 @@ def test_batch_truncation_banner_marks_only_truncated_task():
     # The header banner for task 2 appears after task 1's summary.
     assert banner_pos > clean_pos
 
+
+def test_routed_batch_completion_preserves_safe_receipts(monkeypatch):
+    monkeypatch.setattr(ad, "_persist_completion", lambda event, result: None)
+    combined = {
+        "results": [
+            {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "safe one",
+                "route": "codex-fast",
+                "provider": "openai-codex",
+                "model": "gpt-5.2-codex",
+                "billing_mode": "subscription_included",
+                "cost_status": "estimated",
+            },
+            {
+                "task_index": 1,
+                "status": "completed",
+                "summary": "safe two",
+                "route": "paid",
+                "provider": "openrouter",
+                "model": "provider/model",
+                "billing_mode": "official_models_api",
+                "cost_status": "estimated",
+            },
+        ],
+        "total_duration_seconds": 2.0,
+        "mixed_routes": True,
+        "provider": None,
+        "model": None,
+    }
+    ad._push_batch_completion_event(
+        {
+            "delegation_id": "deleg_receipt",
+            "session_key": "owner",
+            "goals": ["one", "two"],
+            "dispatched_at": 1000.0,
+            "completed_at": 1002.0,
+        },
+        combined,
+        "completed",
+    )
+    event = _drain_one()
+    assert event["mixed_routes"] is True
+    assert event["provider"] is None and event["model"] is None
+    text = format_process_notification(event)
+    assert "Route aggregate: mixed_routes=True provider=null model=null" in text
+    assert "Route receipt: route=codex-fast provider=openai-codex model=gpt-5.2-codex billing_mode=subscription_included cost_status=estimated" in text
+    assert "Route receipt: route=paid provider=openrouter model=provider/model billing_mode=official_models_api cost_status=estimated" in text
+    assert "api_key" not in text and "base_url" not in text and "fallback" not in text
+
+
+def test_single_routed_batch_keeps_explicit_aggregate_metadata(monkeypatch):
+    monkeypatch.setattr(ad, "_persist_completion", lambda event, result: None)
+    ad._push_batch_completion_event(
+        {"delegation_id": "deleg_single_route", "session_key": "owner", "goals": ["one"]},
+        {
+            "results": [{
+                "task_index": 0,
+                "status": "completed",
+                "summary": "safe",
+                "route": "codex-fast",
+                "provider": "openai-codex",
+                "model": "gpt-5.2-codex",
+                "billing_mode": "subscription_included",
+                "cost_status": "included",
+            }],
+            "total_duration_seconds": 1.0,
+            "mixed_routes": False,
+            "provider": "openai-codex",
+            "model": "gpt-5.2-codex",
+        },
+        "completed",
+    )
+    event = _drain_one()
+    assert event["mixed_routes"] is False
+    assert event["provider"] == "openai-codex"
+    text = format_process_notification(event)
+    assert "Route aggregate: mixed_routes=False provider=openai-codex model=gpt-5.2-codex" in text
+    assert "Route receipt: route=codex-fast" in text
+
+
+def test_legacy_batch_completion_has_no_route_metadata(monkeypatch):
+    monkeypatch.setattr(ad, "_persist_completion", lambda event, result: None)
+    ad._push_batch_completion_event(
+        {
+            "delegation_id": "deleg_legacy",
+            "session_key": "owner",
+            "goals": ["one", "two"],
+            "dispatched_at": 1000.0,
+            "completed_at": 1002.0,
+        },
+        {"results": [{"task_index": 0, "status": "completed", "summary": "safe"}], "total_duration_seconds": 2.0},
+        "completed",
+    )
+    event = _drain_one()
+    assert all(key not in event for key in ("mixed_routes", "provider"))
+    text = format_process_notification(event)
+    assert "Route aggregate:" not in text and "Route receipt:" not in text
