@@ -309,7 +309,7 @@ def test_sdk_aux_query_reports_progress_for_each_consumed_message(monkeypatch):
         "query",
         lambda **kwargs: _async_messages(messages, captured, kwargs),
     )
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
     pulses = []
     monkeypatch.setattr(M, "_notify_aux_progress", lambda: pulses.append("progress"))
 
@@ -331,7 +331,7 @@ def test_sdk_aux_query_honors_cancellation_before_stream_start(monkeypatch):
         "query",
         lambda **kwargs: _async_messages(messages, captured, kwargs),
     )
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
     checks = []
     pulses = []
     monkeypatch.setattr(
@@ -366,7 +366,7 @@ def test_sdk_aux_query_honors_cancellation_after_message_arrives(monkeypatch):
             yield message
 
     monkeypatch.setattr(module, "query", _messages_after_start)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
     pulses = []
     monkeypatch.setattr(
         M,
@@ -405,7 +405,7 @@ def test_sync_sdk_aux_facade_propagates_cancel_inside_running_loop(monkeypatch):
             yield message
 
     monkeypatch.setattr(module, "query", _messages_after_cancel)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
     client = ClaudeSdkAuxClient()
     stream_started_in_time = []
 
@@ -445,7 +445,7 @@ def test_async_sdk_aux_facade_propagates_cancel_across_worker(monkeypatch):
         "query",
         lambda **kwargs: _async_messages(messages, captured, kwargs),
     )
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
     cancel_event = threading.Event()
     cancel_event.set()
     client = AUX.AsyncClaudeSdkAuxClient(ClaudeSdkAuxClient())
@@ -471,7 +471,7 @@ def test_async_sdk_aux_facade_propagates_cancel_event_across_worker(monkeypatch)
         "query",
         lambda **kwargs: _async_messages(messages, captured, kwargs),
     )
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
     cancel_event = threading.Event()
     cancel_event.set()
     client = AUX.AsyncClaudeSdkAuxClient(ClaudeSdkAuxClient())
@@ -500,7 +500,7 @@ def test_async_sdk_aux_cancel_event_precedes_cancel_check(monkeypatch):
         "query",
         lambda **kwargs: _async_messages(messages, captured, kwargs),
     )
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
     cancel_event = threading.Event()
     check_calls = 0
 
@@ -535,7 +535,7 @@ def test_async_sdk_aux_facade_inactive_with_source_still_cancels(monkeypatch):
         "query",
         lambda **kwargs: _async_messages(messages, captured, kwargs),
     )
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
     client = AUX.AsyncClaudeSdkAuxClient(ClaudeSdkAuxClient())
 
     async def _call_async_facade():
@@ -575,7 +575,7 @@ def test_async_sdk_aux_facade_active_without_source_does_not_cancel(monkeypatch)
             yield message
 
     monkeypatch.setattr(module, "query", _query_with_state)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
     client = AUX.AsyncClaudeSdkAuxClient(ClaudeSdkAuxClient())
 
     async def _call_async_facade():
@@ -602,7 +602,7 @@ def test_async_sdk_aux_facade_preserves_cancel_identity_and_fails_open(monkeypat
         "query",
         lambda **kwargs: _async_messages(messages, captured, kwargs),
     )
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     class RaisingCancelCheck:
         def __init__(self):
@@ -652,7 +652,7 @@ def test_sdk_aux_facade_propagates_progress_across_worker(
         "query",
         lambda **kwargs: _async_messages(messages, captured, kwargs),
     )
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
     sync_client = ClaudeSdkAuxClient()
     pulses = []
 
@@ -686,7 +686,7 @@ def test_sdk_aux_none_progress_hook_preserves_consuming_thread_hook(monkeypatch)
         "query",
         lambda **kwargs: _async_messages(messages, captured, kwargs),
     )
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
     pulses = []
 
     with M.aux_progress_hook(lambda: pulses.append("worker")):
@@ -713,7 +713,7 @@ def test_sdk_aux_progress_hook_failure_does_not_abort_stream(monkeypatch):
         "query",
         lambda **kwargs: _async_messages(messages, captured, kwargs),
     )
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
     calls = []
 
     def _raising_progress():
@@ -736,10 +736,16 @@ def test_sdk_aux_composes_with_protected_provider_worker(monkeypatch, async_faca
     captured = {}
 
     async def _fake_collect(
-        prompt, *, model, cancel_check=None, progress_hook=None
+        prompt,
+        *,
+        model,
+        system_prompt,
+        cancel_check=None,
+        progress_hook=None,
     ):
         captured["prompt"] = prompt
         captured["model"] = model
+        captured["system_prompt"] = system_prompt
         captured["cancel_check"] = cancel_check
         captured["progress_hook"] = progress_hook
         return "summary", {"input_tokens": 2}, "stop"
@@ -770,6 +776,7 @@ def test_sdk_aux_composes_with_protected_provider_worker(monkeypatch, async_faca
         result = M._run_protected_sync_provider_call(_provider_call, kwargs)
 
     assert result.choices[0].message.content == "summary"
+    assert AUX._AUX_SYSTEM_GUARD in captured["system_prompt"]
     assert isinstance(captured["cancel_check"], M._AuxiliaryCancellationDecision)
     assert captured["cancel_check"]._source_cancel_check is _never_cancel
     assert captured["progress_hook"] is _progress
@@ -788,9 +795,15 @@ def test_sdk_aux_composed_hard_cancel_latches_without_timeout_cleanup(monkeypatc
         return original_begin_timeout(self)
 
     async def _fake_collect(
-        prompt, *, model, cancel_check=None, progress_hook=None
+        prompt,
+        *,
+        model,
+        system_prompt,
+        cancel_check=None,
+        progress_hook=None,
     ):
         captured["prompt"] = prompt
+        captured["system_prompt"] = system_prompt
         captured["cancel_check"] = cancel_check
         assert callable(cancel_check)
         worker_started.set()
@@ -833,6 +846,7 @@ def test_sdk_aux_composed_hard_cancel_latches_without_timeout_cleanup(monkeypatc
 
     assert not cancel_worker.is_alive()
     assert worker_unwound.wait(timeout=5)
+    assert AUX._AUX_SYSTEM_GUARD in captured["system_prompt"]
     decision = captured["cancel_check"]
     assert isinstance(decision, M._AuxiliaryCancellationDecision)
     assert decision._outcome == "cancelled"
@@ -850,7 +864,7 @@ def test_async_sdk_aux_facade_honors_public_sync_create_wrapper(monkeypatch):
         "query",
         lambda **kwargs: _async_messages(messages, captured, kwargs),
     )
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
     sync_client = ClaudeSdkAuxClient()
     original_create = sync_client.chat.completions.create
     calls = []
@@ -895,7 +909,7 @@ def test_async_sdk_aux_worker_context_is_restored_between_calls(monkeypatch):
             yield message
 
     monkeypatch.setattr(module, "query", _query_with_worker_state)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
     client = AUX.AsyncClaudeSdkAuxClient(ClaudeSdkAuxClient())
     pulses = []
 
@@ -979,7 +993,7 @@ def test_async_sdk_aux_worker_context_is_restored_after_create_raises(
         "query",
         lambda **kwargs: _async_messages(messages, captured, kwargs),
     )
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     def _progress():
         return None
@@ -1033,7 +1047,7 @@ def test_collect_text_closes_query_generator_before_cancellation_escapes(monkeyp
         return checks > 1
 
     monkeypatch.setattr(module, "query", _query_with_cleanup)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     async def _exercise():
         with pytest.raises(M.AuxiliaryExplicitCancellation):
@@ -1064,7 +1078,7 @@ def test_query_close_failure_does_not_mask_explicit_cancellation(monkeypatch):
         return checks > 1
 
     monkeypatch.setattr(module, "query", _query_with_failing_cleanup)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     with pytest.raises(M.AuxiliaryExplicitCancellation):
         asyncio.run(
@@ -1096,7 +1110,7 @@ def test_query_close_timeout_does_not_block_explicit_cancellation(
         return checks > 1
 
     monkeypatch.setattr(module, "query", _query_with_blocked_cleanup)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
     monkeypatch.setattr(AUX, "_QUERY_CLOSE_TIMEOUT", 0.01)
 
     async def _exercise():
@@ -1130,7 +1144,7 @@ def test_query_close_timeout_after_success_returns_result(monkeypatch, caplog):
         ]
     )
     monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
     monkeypatch.setattr(AUX, "_QUERY_CLOSE_TIMEOUT", 0.01)
 
     text, usage, stop_reason = asyncio.run(
@@ -1167,7 +1181,7 @@ def test_outer_deadline_during_close_does_not_mask_explicit_cancellation(
         return checks > 1
 
     monkeypatch.setattr(module, "query", _query_with_blocked_cleanup)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
     monkeypatch.setattr(AUX, "_QUERY_CLOSE_TIMEOUT", 1.0)
 
     async def _exercise():
@@ -1192,7 +1206,7 @@ def test_query_close_failure_does_not_mask_terminal_error(monkeypatch):
         RuntimeError("transport teardown failed"),
     )
     monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     with pytest.raises(ClaudeSdkAuxError, match="sdk failed safely"):
         asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
@@ -1208,7 +1222,7 @@ def test_query_plain_async_iterator_without_aclose_is_supported(monkeypatch):
         ]
     )
     monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     text, usage, stop_reason = asyncio.run(
         AUX._collect_text("prompt", model="claude-sonnet-5")
@@ -1233,7 +1247,7 @@ def test_query_plain_async_iterator_cancellation_needs_no_close(monkeypatch):
         return checks > 1
 
     monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     with pytest.raises(M.AuxiliaryExplicitCancellation):
         asyncio.run(
@@ -1265,7 +1279,7 @@ def test_query_slow_close_finishes_under_default_bound(monkeypatch):
 
     assert AUX._QUERY_CLOSE_TIMEOUT == 5.0
     monkeypatch.setattr(module, "query", _query_with_slow_cleanup)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     async def _exercise():
         with pytest.raises(M.AuxiliaryExplicitCancellation):
@@ -1289,7 +1303,7 @@ def test_query_close_failure_after_success_returns_result(monkeypatch, caplog):
         RuntimeError("transport teardown failed"),
     )
     monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     text, usage, stop_reason = asyncio.run(
         AUX._collect_text("prompt", model="claude-sonnet-5")
@@ -1314,7 +1328,7 @@ def test_query_close_cancelled_error_outranks_terminal_error(monkeypatch):
         asyncio.CancelledError(),
     )
     monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
@@ -1330,7 +1344,7 @@ def test_query_sdk_close_timeout_error_is_not_our_bound(monkeypatch, caplog):
         TimeoutError("transport timeout"),
     )
     monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     text, usage, stop_reason = asyncio.run(
         AUX._collect_text("prompt", model="claude-sonnet-5")
@@ -1354,7 +1368,7 @@ def test_query_close_host_interrupt_outranks_terminal_error(
         host_stop,
     )
     monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     with pytest.raises(type(host_stop)):
         asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
@@ -1367,7 +1381,7 @@ def test_query_close_explicit_cancellation_outranks_terminal_error(monkeypatch):
         M.AuxiliaryExplicitCancellation(),
     )
     monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     with pytest.raises(M.AuxiliaryExplicitCancellation):
         asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
@@ -1389,7 +1403,7 @@ def test_query_close_cancel_precedence_is_independent_of_base_class(monkeypatch)
         FutureAuxiliaryExplicitCancellation(),
     )
     monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     with pytest.raises(FutureAuxiliaryExplicitCancellation):
         asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
@@ -1406,7 +1420,7 @@ def test_query_close_base_exception_does_not_mask_terminal_error(monkeypatch):
         CleanupFailure("cleanup base exception"),
     )
     monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     with pytest.raises(ClaudeSdkAuxError, match="sdk failed safely"):
         asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
@@ -1426,7 +1440,7 @@ def test_query_close_base_exception_surfaces_after_success(monkeypatch):
         CleanupFailure("cleanup base exception"),
     )
     monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     with pytest.raises(CleanupFailure, match="cleanup base exception"):
         asyncio.run(AUX._collect_text("prompt", model="claude-sonnet-5"))
@@ -1442,7 +1456,7 @@ def test_query_close_cancelled_error_propagates_inside_ancestor_except(monkeypat
         asyncio.CancelledError(),
     )
     monkeypatch.setattr(module, "query", lambda **_kwargs: stream)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     try:
         raise RuntimeError("ancestor exception")
@@ -1470,7 +1484,7 @@ def test_sync_sdk_aux_cancellation_closes_query_generator(monkeypatch):
             generator_closed.set()
 
     monkeypatch.setattr(module, "query", _query_until_cancelled)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
     client = ClaudeSdkAuxClient()
 
     def _cancel_after_start():
@@ -1498,7 +1512,7 @@ def test_sync_sdk_aux_cancellation_closes_query_generator(monkeypatch):
 def test_sdk_aux_cold_start_ensures_dependency_before_import(monkeypatch):
     """The auxiliary path must install the optional SDK before importing it."""
     monkeypatch.delitem(sys.modules, "claude_agent_sdk", raising=False)
-    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda **_kwargs: {})
 
     real_import = builtins.__import__
     sdk_available = False
