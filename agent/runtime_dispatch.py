@@ -9,7 +9,7 @@ import json
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, Callable, Mapping, Sequence
 
@@ -107,6 +107,33 @@ def _unclassified_failure_phase(events: Sequence[RuntimeEvent]) -> RuntimeFailur
     if any(isinstance(event, _RUNTIME_VISIBLE_EVENT_TYPES) for event in events):
         return RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT
     return RuntimeFailurePhase.BEFORE_VISIBLE_OUTPUT
+
+
+def _constrain_failure_to_host_evidence(
+    failure: RuntimeFailure,
+    events: Sequence[RuntimeEvent],
+    host: RuntimeHostServices,
+    *,
+    tool_calls_at_turn_start: int,
+) -> RuntimeFailure:
+    """Prevent runtime replay claims from contradicting host-observed effects."""
+
+    host_tool_calls = getattr(host, "_tool_call_count", 0)
+    side_effect_observed = host_tool_calls > tool_calls_at_turn_start or any(
+        isinstance(event, _RUNTIME_SIDE_EFFECT_EVENT_TYPES) for event in events
+    )
+    if not side_effect_observed:
+        return failure
+    if (
+        failure.phase is RuntimeFailurePhase.AFTER_SIDE_EFFECTS
+        and not failure.replay_safe
+    ):
+        return failure
+    return replace(
+        failure,
+        phase=RuntimeFailurePhase.AFTER_SIDE_EFFECTS,
+        replay_safe=False,
+    )
 
 
 def _freeze_value(value: Any) -> Any:
@@ -302,6 +329,7 @@ async def _collect_runtime_turn(
     descriptor: RuntimeDescriptor | None = None,
 ) -> RuntimeDispatchResult:
     events: list[RuntimeEvent] = []
+    tool_calls_at_turn_start = getattr(host, "_tool_call_count", 0)
     terminal: RuntimeCompletedEvent | RuntimeCancelledEvent | RuntimeFailedEvent | None = None
     try:
         failure = runtime.preflight(request)
@@ -324,6 +352,15 @@ async def _collect_runtime_turn(
                 raise RuntimeExecutionError(
                     "runtime emitted an event after its terminal event"
                 )
+            if isinstance(event, RuntimeFailedEvent):
+                constrained_failure = _constrain_failure_to_host_evidence(
+                    event.failure,
+                    events,
+                    host,
+                    tool_calls_at_turn_start=tool_calls_at_turn_start,
+                )
+                if constrained_failure is not event.failure:
+                    event = RuntimeFailedEvent(failure=constrained_failure)
             events.append(event)
             if isinstance(event, RuntimeStatusEvent):
                 await host.emit_status(event.message)
