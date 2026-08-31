@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import concurrent.futures
 import sys
 import threading
@@ -18,6 +19,7 @@ from agent.transports import claude_agent_sdk_session as SESSION
 
 def _plant_sdk(monkeypatch, messages):
     """Install the optional SDK's minimal typed surface for one test."""
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
     module = ModuleType("claude_agent_sdk")
 
     class TextBlock:
@@ -1489,6 +1491,47 @@ def test_sync_sdk_aux_cancellation_closes_query_generator(monkeypatch):
 
     assert not cancel_worker.is_alive()
     assert generator_closed.wait(timeout=5)
+def test_sdk_aux_cold_start_ensures_dependency_before_import(monkeypatch):
+    """The auxiliary path must install the optional SDK before importing it."""
+    monkeypatch.delitem(sys.modules, "claude_agent_sdk", raising=False)
+    monkeypatch.setattr(SESSION, "_sdk_env_overrides", lambda: {})
+
+    real_import = builtins.__import__
+    sdk_available = False
+    ensure_calls = []
+    captured = {}
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "claude_agent_sdk" and not sdk_available:
+            raise ModuleNotFoundError("No module named 'claude_agent_sdk'")
+        return real_import(name, *args, **kwargs)
+
+    def ensure(feature, *, prompt):
+        nonlocal sdk_available, captured
+        ensure_calls.append((feature, prompt))
+        sdk_available = True
+        module, captured = _plant_sdk(monkeypatch, [])
+        messages = [
+            module.AssistantMessage([module.TextBlock("answer")]),
+            module.ResultMessage(usage={"input_tokens": 2}),
+        ]
+        monkeypatch.setattr(
+            module,
+            "query",
+            lambda **call_kwargs: _async_messages(messages, captured, call_kwargs),
+        )
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    monkeypatch.setattr("tools.lazy_deps.ensure", ensure)
+
+    text, usage, _ = asyncio.run(
+        AUX._collect_text("prompt", model="claude-sonnet-5")
+    )
+
+    assert ensure_calls == [("provider.claude_agent_sdk", False)]
+    assert text == "answer"
+    assert usage == {"input_tokens": 2}
+    assert captured["prompt"] == "prompt"
 
 
 def test_one_shot_query_has_no_tools_and_scrubs_child_env(monkeypatch):
