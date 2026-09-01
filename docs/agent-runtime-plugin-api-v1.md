@@ -2,7 +2,7 @@
 
 Status: Candidate contract on `codex/agent-runtime-plugin-api-v1`
 
-Host base: `NousResearch/hermes-agent@64b96bb5d2755f1d34347e1fb15924a97d652f31`
+Host base: `NousResearch/hermes-agent@3783fd9ffeada5bee050326f6f96360b6e213d6a`
 
 Decision owner: Hermes core maintainers
 
@@ -118,10 +118,24 @@ typed `RuntimeEvent` values. The host owns event validation and terminal-state
 enforcement.
 
 `RuntimeTurnRequest` is immutable and contains normalized content, attachments,
-prompt snapshot, stable tool schemas and their SHA-256 hash, provider/model
-selection, correlation ids, and a generic runtime-state envelope. Cancellation
-is observed through the host facade. The request contains no `AIAgent`,
-`SessionDB`, plugin manager, credential object, or mutable host internals.
+prompt snapshot, stable tool schemas and their SHA-256 hash, a provider-neutral
+`RuntimeToolInventory`, provider/model selection, correlation ids, and a generic
+runtime-state envelope. Cancellation is observed through the host facade. The
+request contains no `AIAgent`, `SessionDB`, plugin manager, credential object,
+or mutable host internals.
+
+The tool inventory describes the exact `delivered_request` surface already
+resolved for the turn; it does not run a second discovery pass. Each tool has a
+canonical input-schema hash, `host` or `plugin` declaration ownership, and an
+effective enabled state. Sanitized `mcp__<server>__<tool>` names are grouped by
+delivered server bucket, whose hash covers the sorted delivered
+tool-name/schema-hash projection. That projection is not a source MCP manifest:
+raw server identity, disabled or zero-tool servers, and exclusion reasons are
+outside this surface. Omitted tools are likewise not represented. The aggregate
+`tool_schema_hash` remains a separate hash of the full ordered request schema
+list, and candidate identity remains outside the inventory. Request construction
+rejects any inventory whose names or hashes differ from the delivered schemas.
+This contract is exposed as `runtime_tool_inventory_v1`.
 
 `RuntimeHostServices` is a stable facade for:
 

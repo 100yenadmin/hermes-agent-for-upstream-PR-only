@@ -26,6 +26,10 @@ class _ExternalRuntime:
     async def run_turn(self, request, host):
         self._counters["turn"] += 1
         self._counters["prompt_snapshot"] = request.prompt_snapshot
+        self._counters["tool_inventory"] = request.tool_inventory
+        self._counters["tool_schema_names"] = tuple(
+            schema["function"]["name"] for schema in request.tool_schemas
+        )
         yield RuntimeCompletedEvent(
             result={
                 "final_response": "external runtime reply",
@@ -43,6 +47,13 @@ class _ExternalRuntime:
 def test_external_plugin_runtime_is_selected_before_the_ordinary_model_loop(
     monkeypatch,
 ):
+    from tools import tool_search
+
+    monkeypatch.setattr(
+        tool_search,
+        "load_config",
+        lambda: tool_search.ToolSearchConfig.from_raw({"enabled": "off"}),
+    )
     manager = PluginManager()
     manager._discovered = True
     context = PluginContext(PluginManifest(name="external-runtime"), manager)
@@ -71,6 +82,16 @@ def test_external_plugin_runtime_is_selected_before_the_ordinary_model_loop(
         ),
         factory=factory,
     )
+    context.register_tool(
+        name="synthetic_plugin_tool",
+        toolset="synthetic-plugin-tools",
+        schema={
+            "name": "synthetic_plugin_tool",
+            "description": "Synthetic plugin tool",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda: "synthetic",
+    )
 
     import hermes_cli.plugins as plugins_module
 
@@ -81,6 +102,7 @@ def test_external_plugin_runtime_is_selected_before_the_ordinary_model_loop(
         provider="openai",
         model="synthetic-model",
         api_mode="chat_completions",
+        enabled_toolsets=["synthetic-plugin-tools"],
         quiet_mode=True,
         skip_context_files=True,
         skip_memory=True,
@@ -92,6 +114,16 @@ def test_external_plugin_runtime_is_selected_before_the_ordinary_model_loop(
 
     assert result["final_response"] == "external runtime reply"
     assert second["final_response"] == "external runtime reply"
+    inventory = counters.pop("tool_inventory")
+    tool_schema_names = counters.pop("tool_schema_names")
+    assert tuple(entry.name for entry in inventory.tools) == tuple(
+        sorted(tool_schema_names)
+    )
+    plugin_entry = next(
+        entry for entry in inventory.tools if entry.name == "synthetic_plugin_tool"
+    )
+    assert plugin_entry.declared_by == "plugin"
+    assert plugin_entry.enabled is True
     assert counters == {
         "factory": 1,
         "preflight": 2,

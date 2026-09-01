@@ -2027,6 +2027,7 @@ def run_conversation(
         resolve_runtime_registration,
     )
     from agent.runtime_dispatch import (
+        build_runtime_tool_inventory,
         build_runtime_turn_request,
         close_runtime_session,
         get_runtime_session,
@@ -2241,6 +2242,7 @@ def run_conversation(
                 runtime_session_id,
                 runtime_registration.descriptor.runtime_id,
             )
+        runtime_tool_schemas = getattr(agent, "tools", ()) or ()
         request = build_runtime_turn_request(
             provider=agent.provider,
             model=agent.model,
@@ -2251,7 +2253,8 @@ def run_conversation(
                 or getattr(agent, "system_prompt", "")
                 or ""
             ),
-            tool_schemas=getattr(agent, "tools", ()) or (),
+            tool_schemas=runtime_tool_schemas,
+            tool_inventory=build_runtime_tool_inventory(runtime_tool_schemas),
             session_state=runtime_session_state,
             correlation_id=effective_task_id,
         )

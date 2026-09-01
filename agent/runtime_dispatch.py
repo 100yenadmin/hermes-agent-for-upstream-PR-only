@@ -28,6 +28,7 @@ from agent.runtime_api import (
     RuntimeFailure,
     RuntimeFailurePhase,
     RuntimeHostServices,
+    RuntimeMCPServerInventoryEntry,
     RuntimeDescriptor,
     RuntimeRegistration,
     RuntimeSelection,
@@ -35,6 +36,9 @@ from agent.runtime_api import (
     RuntimeStateEnvelope,
     RuntimeStatusEvent,
     RuntimeToolRequestEvent,
+    RuntimeToolInventory,
+    RuntimeToolInventoryEntry,
+    RuntimeToolInventorySurface,
     RuntimeTurnRequest,
     RuntimeUsageEvent,
     RuntimeUsageReceipt,
@@ -123,6 +127,117 @@ def _freeze_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     return _freeze_value(value)
 
 
+def _canonical_sha256(value: Any) -> str:
+    try:
+        payload = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeExecutionError(
+            "runtime tool inventory schema is not canonical JSON"
+        ) from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _runtime_tool_declared_by(name: str) -> str:
+    """Classify one delivered tool through the active profile registry."""
+    from tools.registry import registry
+    from tools.tool_search import BRIDGE_TOOL_NAMES
+
+    origin = registry.get_registration_origin(name)
+    if origin is not None:
+        return origin
+    if name in BRIDGE_TOOL_NAMES:
+        return "host"
+    # The only remaining post-build schemas at this boundary are supplied by
+    # external memory providers or non-default context engines. Built-in
+    # ContextCompressor contributes no schemas.
+    return "plugin"
+
+
+def build_runtime_tool_inventory(
+    tool_schemas: Sequence[Mapping[str, Any]],
+    *,
+    declared_by_by_name: Mapping[str, str] | None = None,
+) -> RuntimeToolInventory:
+    """Snapshot the exact delivered request surface without another discovery pass.
+
+    Per-tool hashes cover the normalized input schema only. MCP server hashes
+    cover the sorted delivered tool-name/schema-hash projection for that
+    sanitized server name. Omitted tools and zero-tool servers are outside the
+    ``delivered_request`` surface; every represented entry is therefore enabled.
+    """
+    entries: list[RuntimeToolInventoryEntry] = []
+    seen: set[str] = set()
+    server_tools: dict[str, list[dict[str, Any]]] = {}
+    explicit_origins = declared_by_by_name or {}
+
+    for raw_schema in tool_schemas:
+        if not isinstance(raw_schema, Mapping):
+            raise RuntimeExecutionError("runtime tool inventory schema must be a mapping")
+        function = raw_schema.get("function")
+        if raw_schema.get("type") == "function" and isinstance(function, Mapping):
+            schema = function
+        else:
+            schema = raw_schema
+        name = schema.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise RuntimeExecutionError("runtime tool inventory schema has no name")
+        if name in seen:
+            raise RuntimeExecutionError(
+                f"runtime tool inventory contains duplicate tool name: {name}"
+            )
+        seen.add(name)
+        parameters = schema.get("parameters", {})
+        if not isinstance(parameters, Mapping):
+            raise RuntimeExecutionError(
+                f"runtime tool inventory schema for {name} has invalid parameters"
+            )
+        schema_sha256 = _canonical_sha256(dict(parameters))
+        declared_by = explicit_origins.get(name)
+        if declared_by is None:
+            declared_by = _runtime_tool_declared_by(name)
+        entry = RuntimeToolInventoryEntry(
+            name=name,
+            schema_sha256=schema_sha256,
+            declared_by=declared_by,
+            enabled=True,
+        )
+        entries.append(entry)
+
+        if name.startswith("mcp__"):
+            server_name, separator, tool_name = name[5:].partition("__")
+            if server_name and separator and tool_name:
+                server_tools.setdefault(server_name, []).append(
+                    {
+                        "name": name,
+                        "schema_sha256": schema_sha256,
+                        "enabled": True,
+                    }
+                )
+
+    sorted_entries = tuple(sorted(entries, key=lambda item: item.name))
+    mcp_servers = tuple(
+        RuntimeMCPServerInventoryEntry(
+            name=server_name,
+            schema_sha256=_canonical_sha256(
+                sorted(server_tools[server_name], key=lambda item: item["name"])
+            ),
+            enabled=True,
+        )
+        for server_name in sorted(server_tools)
+    )
+    return RuntimeToolInventory(
+        tools=sorted_entries,
+        mcp_servers=mcp_servers,
+        surface=RuntimeToolInventorySurface.DELIVERED_REQUEST,
+        schema_version=1,
+    )
+
+
 def build_runtime_turn_request(
     *,
     provider: str,
@@ -131,6 +246,7 @@ def build_runtime_turn_request(
     messages: Sequence[Mapping[str, Any]],
     prompt_snapshot: str,
     tool_schemas: Sequence[Mapping[str, Any]],
+    tool_inventory: RuntimeToolInventory | None = None,
     session_state: RuntimeStateEnvelope | None = None,
     attachments: Sequence[Mapping[str, Any]] = (),
     correlation_id: str | None = None,
@@ -148,6 +264,20 @@ def build_runtime_turn_request(
             schema_version=int(session_state.schema_version),
             state=_freeze_mapping(session_state.state),
         )
+    frozen_tool_inventory = None
+    if tool_inventory is not None:
+        inventory_origins = {
+            item.name: item.declared_by for item in tool_inventory.tools
+        }
+        expected_inventory = build_runtime_tool_inventory(
+            tool_schemas,
+            declared_by_by_name=inventory_origins,
+        )
+        if expected_inventory != tool_inventory:
+            raise RuntimeExecutionError(
+                "runtime tool inventory does not match the delivered tool schemas"
+            )
+        frozen_tool_inventory = expected_inventory
     return RuntimeTurnRequest(
         selection=RuntimeSelection(
             provider=provider,
@@ -158,6 +288,7 @@ def build_runtime_turn_request(
         prompt_snapshot=str(prompt_snapshot),
         tool_schemas=tuple(_freeze_mapping(item) for item in tool_schemas),
         tool_schema_hash=hashlib.sha256(canonical_tool_schemas).hexdigest(),
+        tool_inventory=frozen_tool_inventory,
         session_state=frozen_session_state,
         attachments=tuple(_freeze_mapping(item) for item in attachments),
         correlation_id=correlation_id,

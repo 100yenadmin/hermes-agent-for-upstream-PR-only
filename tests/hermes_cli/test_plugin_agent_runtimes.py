@@ -157,6 +157,7 @@ def test_host_manifest_exports_only_versioned_concrete_capabilities():
     assert manifest["host_capabilities"] == sorted(HOST_RUNTIME_CAPABILITIES)
     assert "host_tool_execution_v1" in manifest["host_capabilities"]
     assert "provider_profile_registration_v1" in manifest["host_capabilities"]
+    assert "runtime_tool_inventory_v1" in manifest["host_capabilities"]
     assert all(capability.endswith("_v1") for capability in manifest["host_capabilities"])
 
 

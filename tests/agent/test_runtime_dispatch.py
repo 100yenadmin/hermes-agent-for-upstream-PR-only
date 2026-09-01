@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from collections.abc import AsyncIterator
 
 import pytest
@@ -26,6 +28,9 @@ from agent.runtime_api import (
     RuntimeStateEvent,
     RuntimeStatusEvent,
     RuntimeToolRequestEvent,
+    RuntimeToolInventory,
+    RuntimeToolInventoryEntry,
+    RuntimeToolInventorySurface,
     RuntimeUsageEvent,
     RuntimeUsageReceipt,
     RuntimeRegistration,
@@ -34,6 +39,7 @@ from agent.runtime_api import (
 from agent.runtime_dispatch import (
     HermesRuntimeHostServices,
     RuntimeExecutionError,
+    build_runtime_tool_inventory,
     build_runtime_turn_request,
     close_runtime_session,
     get_runtime_session,
@@ -110,6 +116,168 @@ def test_runtime_turn_request_deep_freezes_state_and_host_inputs():
     assert request.session_state.state["resume"]["external"] == "synthetic"
     with pytest.raises(TypeError):
         request.session_state.state["resume"]["external"] = "blocked"
+
+
+def test_runtime_tool_inventory_is_stable_and_hashes_input_schemas():
+    filesystem_parameters = {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+    }
+    plugin_parameters = {"type": "object", "properties": {}}
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "plugin_tool",
+                "description": "Synthetic plugin tool",
+                "parameters": plugin_parameters,
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "mcp__filesystem__read_file",
+                "description": "Synthetic MCP tool",
+                "parameters": filesystem_parameters,
+            },
+        },
+    ]
+
+    inventory = build_runtime_tool_inventory(
+        tools,
+        declared_by_by_name={
+            "mcp__filesystem__read_file": "host",
+            "plugin_tool": "plugin",
+        },
+    )
+    reordered = build_runtime_tool_inventory(
+        list(reversed(tools)),
+        declared_by_by_name={
+            "mcp__filesystem__read_file": "host",
+            "plugin_tool": "plugin",
+        },
+    )
+
+    assert inventory == reordered
+    assert inventory.surface is RuntimeToolInventorySurface.DELIVERED_REQUEST
+    assert [entry.name for entry in inventory.tools] == [
+        "mcp__filesystem__read_file",
+        "plugin_tool",
+    ]
+    assert [entry.declared_by for entry in inventory.tools] == ["host", "plugin"]
+    assert all(entry.enabled for entry in inventory.tools)
+    expected_schema_hash = hashlib.sha256(
+        json.dumps(
+            filesystem_parameters,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert inventory.tools[0].schema_sha256 == expected_schema_hash
+    assert [server.name for server in inventory.mcp_servers] == ["filesystem"]
+    assert inventory.mcp_servers[0].enabled is True
+    assert len(inventory.mcp_servers[0].schema_sha256) == 64
+
+
+def test_runtime_turn_request_copies_the_tool_inventory_contract():
+    tool_schema = {
+        "type": "function",
+        "function": {
+            "name": "pwd",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    inventory = build_runtime_tool_inventory(
+        (tool_schema,),
+        declared_by_by_name={"pwd": "host"},
+    )
+    request = build_runtime_turn_request(
+        provider="example",
+        model="example-large",
+        api_mode="example_runtime",
+        messages=(),
+        prompt_snapshot="stable prompt",
+        tool_schemas=(tool_schema,),
+        tool_inventory=inventory,
+    )
+
+    assert request.tool_inventory == inventory
+    assert request.tool_inventory is not inventory
+    with pytest.raises(Exception):
+        request.tool_inventory.tools[0].name = "mutated"
+
+
+def test_runtime_tool_inventory_normalizes_direct_sequences_to_tuples():
+    source_entries = [
+        RuntimeToolInventoryEntry(
+            name="pwd",
+            schema_sha256="0" * 64,
+            declared_by="host",
+        )
+    ]
+
+    inventory = RuntimeToolInventory(tools=source_entries)
+    source_entries.clear()
+
+    assert isinstance(inventory.tools, tuple)
+    assert [entry.name for entry in inventory.tools] == ["pwd"]
+
+
+def test_runtime_turn_request_rejects_inventory_schema_mismatch():
+    inventory = build_runtime_tool_inventory(
+        (
+            {
+                "type": "function",
+                "function": {
+                    "name": "pwd",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ),
+        declared_by_by_name={"pwd": "host"},
+    )
+
+    with pytest.raises(RuntimeExecutionError, match="does not match"):
+        build_runtime_turn_request(
+            provider="example",
+            model="example-large",
+            api_mode="example_runtime",
+            messages=(),
+            prompt_snapshot="stable prompt",
+            tool_schemas=(),
+            tool_inventory=inventory,
+        )
+
+
+def test_runtime_tool_inventory_marks_host_tool_search_bridges_as_host():
+    inventory = build_runtime_tool_inventory(
+        (
+            {
+                "type": "function",
+                "function": {
+                    "name": "tool_search",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        )
+    )
+
+    assert inventory.tools[0].declared_by == "host"
+
+
+def test_runtime_tool_inventory_rejects_duplicate_delivered_names():
+    duplicate = {
+        "type": "function",
+        "function": {
+            "name": "pwd",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+    with pytest.raises(RuntimeExecutionError, match="duplicate tool name"):
+        build_runtime_tool_inventory((duplicate, duplicate))
 
 
 def test_public_runtime_request_events_are_typed_and_frozen():

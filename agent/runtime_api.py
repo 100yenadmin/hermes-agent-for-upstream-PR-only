@@ -38,11 +38,13 @@ HOST_RUNTIME_CAPABILITIES: FrozenSet[str] = frozenset(
         "host_tool_execution_v1",
         "provider_profile_registration_v1",
         "runtime_state_v1",
+        "runtime_tool_inventory_v1",
         "usage_receipts_v1",
     }
 )
 
 _RUNTIME_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class RuntimeCompatibilityError(RuntimeError):
@@ -90,6 +92,12 @@ class RuntimeBackgroundOutcome(str, Enum):
 
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class RuntimeToolInventorySurface(str, Enum):
+    """Which effective tool surface a runtime inventory describes."""
+
+    DELIVERED_REQUEST = "delivered_request"
 
 
 _MAX_BACKGROUND_RESULT_BYTES = 16_384
@@ -179,6 +187,91 @@ class RuntimeStateEnvelope:
 
 
 @dataclass(frozen=True)
+class RuntimeToolInventoryEntry:
+    """One tool on the effective request surface."""
+
+    name: str
+    schema_sha256: str
+    declared_by: str
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("runtime tool inventory name must not be empty")
+        if not isinstance(self.schema_sha256, str) or not _SHA256_RE.fullmatch(
+            self.schema_sha256
+        ):
+            raise ValueError("runtime tool inventory schema_sha256 is invalid")
+        if self.declared_by not in {"host", "plugin"}:
+            raise ValueError("runtime tool inventory declared_by must be host or plugin")
+        if type(self.enabled) is not bool:
+            raise TypeError("runtime tool inventory enabled must be a boolean")
+
+
+@dataclass(frozen=True)
+class RuntimeMCPServerInventoryEntry:
+    """One sanitized source MCP server represented on the request surface."""
+
+    name: str
+    schema_sha256: str
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("runtime MCP server inventory name must not be empty")
+        if not isinstance(self.schema_sha256, str) or not _SHA256_RE.fullmatch(
+            self.schema_sha256
+        ):
+            raise ValueError("runtime MCP server inventory schema_sha256 is invalid")
+        if type(self.enabled) is not bool:
+            raise TypeError("runtime MCP server inventory enabled must be a boolean")
+
+
+@dataclass(frozen=True)
+class RuntimeToolInventory:
+    """Immutable, provider-neutral inventory of the delivered tool surface."""
+
+    tools: tuple[RuntimeToolInventoryEntry, ...] = ()
+    mcp_servers: tuple[RuntimeMCPServerInventoryEntry, ...] = ()
+    surface: RuntimeToolInventorySurface = RuntimeToolInventorySurface.DELIVERED_REQUEST
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        try:
+            tools = tuple(self.tools)
+            mcp_servers = tuple(self.mcp_servers)
+        except TypeError as exc:
+            raise TypeError(
+                "runtime tool inventory entries must be iterable"
+            ) from exc
+        object.__setattr__(self, "tools", tools)
+        object.__setattr__(self, "mcp_servers", mcp_servers)
+        if self.schema_version != 1 or type(self.schema_version) is not int:
+            raise ValueError("runtime tool inventory schema_version must be 1")
+        if not isinstance(self.surface, RuntimeToolInventorySurface):
+            raise TypeError("runtime tool inventory surface is invalid")
+        if any(not isinstance(item, RuntimeToolInventoryEntry) for item in self.tools):
+            raise TypeError("runtime tool inventory tools contain an invalid entry")
+        if any(
+            not isinstance(item, RuntimeMCPServerInventoryEntry)
+            for item in self.mcp_servers
+        ):
+            raise TypeError("runtime tool inventory MCP servers contain an invalid entry")
+        tool_names = tuple(item.name for item in self.tools)
+        server_names = tuple(item.name for item in self.mcp_servers)
+        if tool_names != tuple(sorted(tool_names)) or len(tool_names) != len(
+            set(tool_names)
+        ):
+            raise ValueError("runtime tool inventory tools must be sorted and unique")
+        if server_names != tuple(sorted(server_names)) or len(server_names) != len(
+            set(server_names)
+        ):
+            raise ValueError(
+                "runtime tool inventory MCP servers must be sorted and unique"
+            )
+
+
+@dataclass(frozen=True)
 class RuntimeUsageReceipt:
     runtime_id: str
     provider: str
@@ -217,6 +310,7 @@ class RuntimeTurnRequest:
     session_state: RuntimeStateEnvelope | None = None
     attachments: Sequence[Mapping[str, Any]] = ()
     correlation_id: str | None = None
+    tool_inventory: RuntimeToolInventory | None = None
 
 
 @dataclass(frozen=True)
