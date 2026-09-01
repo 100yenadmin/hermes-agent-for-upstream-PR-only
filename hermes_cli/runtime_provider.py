@@ -1222,6 +1222,29 @@ def canonical_custom_identity(
     return None
 
 
+def _provider_config_is_enabled(
+    provider: str, config: Optional[Dict[str, Any]] = None
+) -> bool:
+    """Apply the top-level ``providers.<name>.enabled`` runtime gate.
+
+    The key lookup intentionally matches ``resolve_runtime_provider``: the
+    requested provider is already normalized, and only an explicit mapping
+    with ``enabled: false`` disables it. Missing or non-mapping entries keep
+    the existing enabled-by-default behavior.
+    """
+    if config is None:
+        config = load_config()
+    providers = config.get("providers") if isinstance(config, dict) else None
+    if not isinstance(providers, dict):
+        return True
+    block = providers.get(provider)
+    if not isinstance(block, dict):
+        return True
+    from hermes_cli.config import is_provider_enabled
+
+    return is_provider_enabled(block)
+
+
 def is_routable_provider(provider: Optional[str]) -> bool:
     """Whether a provider name currently resolves to a routable route.
 
@@ -1245,6 +1268,26 @@ def is_routable_provider(provider: Optional[str]) -> bool:
         # heal it (canonical_custom_identity) or fall back, never hand it
         # straight to agent init.
         return False
+    try:
+        if not _provider_config_is_enabled(name.lower()):
+            return False
+    except Exception:
+        return False
+    try:
+        # Whole-turn runtimes are discovered through the public provider
+        # profile registry rather than the static ProviderDef resolver.
+        # Keep this authority in lockstep with _resolve_agent_runtime_profile
+        # so a currently registered plugin profile survives fresh-session
+        # resume validation while an unloaded profile remains stale.
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(name.lower())
+        if profile is not None and _parse_api_mode(
+            getattr(profile, "api_mode", None)
+        ) == "agent_runtime":
+            return True
+    except Exception:
+        pass
     try:
         from hermes_cli.providers import resolve_provider_full
 
@@ -2060,16 +2103,13 @@ def resolve_runtime_provider(
     #
     # Fail fast with a typed error so the fallback chain can advance to
     # the next provider instead of using a disabled one.
-    from hermes_cli.config import is_provider_enabled, load_config
+    from hermes_cli.config import load_config
     _full_cfg = load_config()
-    _provs_cfg = _full_cfg.get("providers") if isinstance(_full_cfg, dict) else None
-    if isinstance(_provs_cfg, dict):
-        _block = _provs_cfg.get(requested_provider)
-        if isinstance(_block, dict) and not is_provider_enabled(_block):
-            raise ValueError(
-                f"provider {requested_provider!r} is disabled in config "
-                f"(providers.{requested_provider}.enabled: false)"
-            )
+    if not _provider_config_is_enabled(requested_provider, _full_cfg):
+        raise ValueError(
+            f"provider {requested_provider!r} is disabled in config "
+            f"(providers.{requested_provider}.enabled: false)"
+        )
 
     model_cfg = _get_model_config()
     profile_runtime = _resolve_agent_runtime_profile(

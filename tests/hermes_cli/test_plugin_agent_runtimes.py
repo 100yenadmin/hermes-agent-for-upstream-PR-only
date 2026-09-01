@@ -127,6 +127,7 @@ def test_runtime_registration_is_removed_when_plugin_unloads():
 def test_provider_profile_registration_is_removed_when_plugin_unloads():
     from providers import get_provider_profile, register_provider
     from providers.base import ProviderProfile
+    from hermes_cli.runtime_provider import is_routable_provider
 
     context, manager = _make_context()
     profile = ProviderProfile(
@@ -144,10 +145,49 @@ def test_provider_profile_registration_is_removed_when_plugin_unloads():
     context.register_provider_profile(profile)
     assert get_provider_profile(profile.name) is profile
     assert get_provider_profile("example-runtime-alias") is profile
+    assert is_routable_provider(profile.name) is True
+    assert is_routable_provider("example-runtime-alias") is True
 
     assert manager.unload("runtime-plugin") is True
     assert get_provider_profile(profile.name) is None
     assert get_provider_profile("example-runtime-alias") is None
+    assert is_routable_provider(profile.name) is False
+    assert is_routable_provider("example-runtime-alias") is False
+
+
+def test_disabled_provider_profile_is_not_routable(monkeypatch):
+    from hermes_cli import config as config_mod
+    from hermes_cli.runtime_provider import is_routable_provider
+    from providers.base import ProviderProfile
+
+    context, manager = _make_context("disabled-runtime-plugin")
+    profile = ProviderProfile(
+        name="disabled-runtime-provider",
+        api_mode="agent_runtime",
+    )
+    context.register_provider_profile(profile)
+
+    try:
+        for block in ({}, {"enabled": True}):
+            monkeypatch.setattr(
+                config_mod,
+                "load_config",
+                lambda block=block: {"providers": {profile.name: block}},
+            )
+            assert is_routable_provider(profile.name) is True
+
+        monkeypatch.setattr(
+            config_mod,
+            "load_config",
+            lambda: {"providers": {profile.name: {"enabled": False}}},
+        )
+        assert is_routable_provider(profile.name) is False
+        with pytest.raises(ValueError, match="disabled-runtime-provider"):
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            resolve_runtime_provider(requested=profile.name)
+    finally:
+        manager.unload("disabled-runtime-plugin")
 
 
 def test_host_manifest_exports_only_versioned_concrete_capabilities():
