@@ -114,12 +114,12 @@ def _constrain_failure_to_host_evidence(
     events: Sequence[RuntimeEvent],
     host: RuntimeHostServices,
     *,
-    tool_calls_at_turn_start: int,
+    side_effects_at_turn_start: int,
 ) -> RuntimeFailure:
     """Prevent runtime replay claims from contradicting host-observed effects."""
 
-    host_tool_calls = getattr(host, "_tool_call_count", 0)
-    side_effect_observed = host_tool_calls > tool_calls_at_turn_start or any(
+    host_side_effects = getattr(host, "_side_effect_count", 0)
+    side_effect_observed = host_side_effects > side_effects_at_turn_start or any(
         isinstance(event, _RUNTIME_SIDE_EFFECT_EVENT_TYPES) for event in events
     )
     if not side_effect_observed:
@@ -329,7 +329,7 @@ async def _collect_runtime_turn(
     descriptor: RuntimeDescriptor | None = None,
 ) -> RuntimeDispatchResult:
     events: list[RuntimeEvent] = []
-    tool_calls_at_turn_start = getattr(host, "_tool_call_count", 0)
+    side_effects_at_turn_start = getattr(host, "_side_effect_count", 0)
     terminal: RuntimeCompletedEvent | RuntimeCancelledEvent | RuntimeFailedEvent | None = None
     try:
         failure = runtime.preflight(request)
@@ -357,7 +357,7 @@ async def _collect_runtime_turn(
                     event.failure,
                     events,
                     host,
-                    tool_calls_at_turn_start=tool_calls_at_turn_start,
+                    side_effects_at_turn_start=side_effects_at_turn_start,
                 )
                 if constrained_failure is not event.failure:
                     event = RuntimeFailedEvent(failure=constrained_failure)
@@ -454,12 +454,17 @@ async def _collect_runtime_turn(
         # An unclassified runtime exception is fail-closed. Do not infer
         # replay safety from its type or message; expose only a bounded,
         # conservative result for host policy.
-        failure = RuntimeFailure(
-            code="runtime_exception",
-            message="runtime execution failed",
-            phase=_unclassified_failure_phase(events),
-            replay_safe=False,
-            retryable=False,
+        failure = _constrain_failure_to_host_evidence(
+            RuntimeFailure(
+                code="runtime_exception",
+                message="runtime execution failed",
+                phase=_unclassified_failure_phase(events),
+                replay_safe=False,
+                retryable=False,
+            ),
+            events,
+            host,
+            side_effects_at_turn_start=side_effects_at_turn_start,
         )
         terminal = RuntimeFailedEvent(failure=failure)
         events.append(terminal)
@@ -547,6 +552,7 @@ class HermesRuntimeHostServices:
         self._route: dict[str, str] = {}
         self.refresh_turn(task_id)
         self._tool_call_count = 0
+        self._side_effect_count = 0
         self._compaction_events: list[dict[str, Any]] = []
         try:
             # A fresh host is created for each whole turn, so the lifecycle
@@ -612,6 +618,10 @@ class HermesRuntimeHostServices:
             raise RuntimeExecutionError("Hermes tool executor is unavailable")
 
         self._tool_call_count += 1
+        # Entering the canonical executor is host-observed effect evidence.
+        # Count it before invocation so an executor failure cannot make a
+        # potentially executed tool replayable.
+        self._side_effect_count += 1
         tool_call_id = f"runtime-tool-{self._tool_call_count:04d}"
         tool_call = SimpleNamespace(
             id=tool_call_id,
@@ -776,6 +786,7 @@ class HermesRuntimeHostServices:
                 **{key: value for key, value in self._route.items() if value},
             }
             process_registry.completion_queue.put(event)
+            self._side_effect_count += 1
 
     async def close(self) -> None:
         """Reject future background emissions from the retired parent binding."""

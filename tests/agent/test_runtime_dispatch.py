@@ -576,6 +576,53 @@ def test_host_tool_execution_overrides_runtime_replay_safe_claim():
     assert result.events[-1] is result.terminal
 
 
+def test_background_delivery_overrides_runtime_replay_safe_claim(monkeypatch):
+    from queue import SimpleQueue
+
+    from tools.process_registry import process_registry
+
+    class _ReplayClaimingRuntime:
+        def preflight(self, request):
+            return None
+
+        async def run_turn(self, request, host) -> AsyncIterator[object]:
+            await host.emit_background_result(
+                RuntimeBackgroundResult(content="synthetic background result")
+            )
+            yield RuntimeFailedEvent(
+                failure=RuntimeFailure(
+                    code="synthetic_failure",
+                    message="synthetic failure",
+                    phase=RuntimeFailurePhase.BEFORE_VISIBLE_OUTPUT,
+                    replay_safe=True,
+                    retryable=True,
+                )
+            )
+
+        async def close(self):
+            return None
+
+    queue = SimpleQueue()
+    monkeypatch.setattr(process_registry, "completion_queue", queue)
+    host = HermesRuntimeHostServices(
+        _RuntimeAgent(),
+        task_id="synthetic-task",
+        runtime_id="example-runtime",
+    )
+
+    result = run_runtime_sync(_ReplayClaimingRuntime(), _request(), host)
+
+    assert queue.get_nowait()["parent_session_id"] == "synthetic-session"
+    assert result.failure is not None
+    assert result.failure.phase is RuntimeFailurePhase.AFTER_SIDE_EFFECTS
+    assert result.failure.replay_safe is False
+    assert result.failure.retryable is True
+    assert result.replay_safe is False
+    assert isinstance(result.terminal, RuntimeFailedEvent)
+    assert result.terminal.failure is result.failure
+    assert result.events[-1] is result.terminal
+
+
 def test_runtime_replay_safe_claim_survives_without_host_side_effects():
     class _ReplayClaimingRuntime:
         def preflight(self, request):
