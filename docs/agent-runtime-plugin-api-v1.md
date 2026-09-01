@@ -2,7 +2,7 @@
 
 Status: Candidate contract on `codex/agent-runtime-plugin-api-v1`
 
-Host base: `NousResearch/hermes-agent@3783fd9ffeada5bee050326f6f96360b6e213d6a`
+Host base: `NousResearch/hermes-agent@f98f5e74e00e54c36088fa2e78171e2a408ba7c9`
 
 Decision owner: Hermes core maintainers
 
