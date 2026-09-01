@@ -454,6 +454,29 @@ async def _collect_runtime_turn(
         # An unclassified runtime exception is fail-closed. Do not infer
         # replay safety from its type or message; expose only a bounded,
         # conservative result for host policy.
+        # If the runtime already emitted a terminal event, preserve it:
+        # an exception while the async generator unwinds must not create a
+        # second terminal outcome for the same turn.
+        if isinstance(terminal, RuntimeCompletedEvent):
+            return RuntimeDispatchResult(
+                response=terminal.result or {},
+                events=tuple(events),
+                terminal=terminal,
+            )
+        if isinstance(terminal, RuntimeFailedEvent):
+            return RuntimeDispatchResult(
+                response={},
+                events=tuple(events),
+                terminal=terminal,
+                failure=terminal.failure,
+            )
+        if isinstance(terminal, RuntimeCancelledEvent):
+            return RuntimeDispatchResult(
+                response={},
+                events=tuple(events),
+                terminal=terminal,
+                cancelled=True,
+            )
         failure = _constrain_failure_to_host_evidence(
             RuntimeFailure(
                 code="runtime_exception",

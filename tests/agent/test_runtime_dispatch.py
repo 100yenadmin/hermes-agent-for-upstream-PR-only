@@ -916,6 +916,60 @@ def test_cancellation_after_terminal_preserves_exactly_one_terminal_event():
     ) == 1
 
 
+class _ExceptionAfterTerminalRuntime:
+    def __init__(self, terminal):
+        self.terminal = terminal
+
+    def preflight(self, request):
+        return None
+
+    async def run_turn(self, request, host) -> AsyncIterator[object]:
+        yield self.terminal
+        raise RuntimeError("synthetic generator cleanup failure")
+
+    async def close(self):
+        return None
+
+
+@pytest.mark.parametrize(
+    "terminal",
+    (
+        RuntimeCompletedEvent(result={"final_response": "done"}),
+        RuntimeCancelledEvent(reason="synthetic cancellation"),
+        RuntimeFailedEvent(
+            failure=RuntimeFailure(
+                code="synthetic_failure",
+                message="synthetic failure",
+                phase=RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT,
+                replay_safe=False,
+            )
+        ),
+    ),
+    ids=("completed", "cancelled", "failed"),
+)
+def test_unclassified_exception_after_terminal_preserves_exactly_one_terminal_event(
+    terminal,
+):
+    result = run_runtime_sync(
+        _ExceptionAfterTerminalRuntime(terminal),
+        _request(),
+        _HostServices(),
+    )
+
+    assert result.terminal is terminal
+    assert sum(
+        isinstance(event, (RuntimeCompletedEvent, RuntimeCancelledEvent, RuntimeFailedEvent))
+        for event in result.events
+    ) == 1
+    if isinstance(terminal, RuntimeCompletedEvent):
+        assert result.completed is True
+        assert result.response == {"final_response": "done"}
+    elif isinstance(terminal, RuntimeCancelledEvent):
+        assert result.cancelled is True
+    else:
+        assert result.failure is terminal.failure
+
+
 def test_background_result_is_bounded_provider_neutral_and_immutable():
     result = RuntimeBackgroundResult(
         content="synthetic background result",
