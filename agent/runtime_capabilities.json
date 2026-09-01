@@ -16,7 +16,21 @@
       "consumer": "PluginContext.register_provider_profile",
       "lifecycle": "plugin_owned"
     },
+    "runtime_model_provenance_v1": {
+      "consumer": "RuntimeUsageReceipt",
+      "fields": [
+        "selected_model",
+        "effective_model",
+        "canonical_model",
+        "model_resolution"
+      ],
+      "persistence_owner": "host"
+    },
     "runtime_state_v1": {},
+    "runtime_tool_inventory_v1": {
+      "consumer": "RuntimeTurnRequest.tool_inventory",
+      "surface": "delivered_request"
+    },
     "usage_receipts_v1": {}
   }
 }

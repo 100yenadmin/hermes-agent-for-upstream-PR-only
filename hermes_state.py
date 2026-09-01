@@ -308,6 +308,11 @@ def _validate_runtime_usage_receipt(receipt: RuntimeUsageReceipt) -> None:
     _validate_runtime_id(receipt.runtime_id)
     _validate_runtime_text(receipt.provider, "provider")
     _validate_runtime_text(receipt.model, "model")
+    for field in ("selected_model", "effective_model", "canonical_model"):
+        value = getattr(receipt, field)
+        if value is not None:
+            _validate_runtime_text(value, field)
+    _validate_runtime_text(receipt.model_resolution, "model_resolution")
     _validate_runtime_text(receipt.billing_mode, "billing_mode", allow_empty=True)
     _validate_runtime_text(receipt.cost_status, "cost_status", allow_empty=True)
     for field in (
@@ -15765,17 +15770,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _do(conn):
             cursor = conn.execute(
                 """INSERT OR IGNORE INTO runtime_usage_receipts (
-                       session_id, runtime_id, provider, model, billing_mode,
-                       cost_status, input_tokens, output_tokens,
+                       session_id, runtime_id, provider, model, selected_model,
+                       effective_model, canonical_model, model_resolution,
+                       billing_mode, cost_status, input_tokens, output_tokens,
                        cache_read_tokens, cache_write_tokens, reasoning_tokens,
                        replay_safe, correlation_id, fallback_used, failure_phase,
                        recorded_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     receipt.runtime_id,
                     receipt.provider,
                     receipt.model,
+                    receipt.selected_model,
+                    receipt.effective_model,
+                    receipt.canonical_model,
+                    receipt.model_resolution,
                     receipt.billing_mode,
                     receipt.cost_status,
                     receipt.input_tokens,
@@ -15810,8 +15820,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             params.append(runtime_id)
         with self._read_ctx() as conn:
             rows = conn.execute(
-                """SELECT runtime_id, provider, model, billing_mode,
-                              cost_status, input_tokens, output_tokens,
+                """SELECT runtime_id, provider, model, selected_model,
+                              effective_model, canonical_model, model_resolution,
+                              billing_mode, cost_status, input_tokens, output_tokens,
                               cache_read_tokens, cache_write_tokens,
                               reasoning_tokens, replay_safe, correlation_id,
                               fallback_used, failure_phase
@@ -15827,6 +15838,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 runtime_id=row["runtime_id"],
                 provider=row["provider"],
                 model=row["model"],
+                selected_model=row["selected_model"],
+                effective_model=row["effective_model"],
+                canonical_model=row["canonical_model"],
+                model_resolution=row["model_resolution"],
                 billing_mode=row["billing_mode"],
                 cost_status=row["cost_status"],
                 input_tokens=row["input_tokens"],

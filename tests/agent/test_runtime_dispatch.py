@@ -376,6 +376,10 @@ def test_host_persists_runtime_state_and_idempotent_usage_for_selected_runtime()
         correlation_id="synthetic-turn",
         fallback_used=True,
         failure_phase=RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT,
+        selected_model="example-requested",
+        effective_model="example-effective",
+        canonical_model="example-large",
+        model_resolution="canonicalized",
     )
 
     _run_async(host.persist_state(state))
@@ -387,7 +391,12 @@ def test_host_persists_runtime_state_and_idempotent_usage_for_selected_runtime()
         agent._session_db.receipts[0][1].failure_phase
         is RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT
     )
+    assert agent._session_db.receipts[0][1].selected_model == "example-requested"
+    assert agent._session_db.receipts[0][1].effective_model == "example-effective"
+    assert agent._session_db.receipts[0][1].canonical_model == "example-large"
+    assert agent._session_db.receipts[0][1].model_resolution == "canonicalized"
     assert len(agent._session_db.aggregate_receipts) == 1
+    assert agent._session_db.aggregate_receipts[0][1]["model"] == "example-large"
 
     agent._session_db.inserted = False
     _run_async(host.persist_usage(receipt))

@@ -37,6 +37,7 @@ HOST_RUNTIME_CAPABILITIES: FrozenSet[str] = frozenset(
         "host_status_v1",
         "host_tool_execution_v1",
         "provider_profile_registration_v1",
+        "runtime_model_provenance_v1",
         "runtime_state_v1",
         "runtime_tool_inventory_v1",
         "usage_receipts_v1",
@@ -287,6 +288,10 @@ class RuntimeUsageReceipt:
     correlation_id: str | None = None
     fallback_used: bool = False
     failure_phase: RuntimeFailurePhase | None = None
+    selected_model: str | None = None
+    effective_model: str | None = None
+    canonical_model: str | None = None
+    model_resolution: str = "unknown"
 
 
 @dataclass(frozen=True)

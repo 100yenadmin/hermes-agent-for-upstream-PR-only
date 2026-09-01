@@ -179,7 +179,15 @@ that candidate's `claude_sdk_session_id` when present and never drops it.
 
 `RuntimeUsageReceipt` records runtime/provider/model, billing mode, cost status,
 available token/cache fields, replay/fallback classification, and safe
-correlation identifiers. Host persistence remains the source of truth.
+correlation identifiers. Its legacy `model` field remains the observed
+billing/ledger identity. Optional `selected_model`, `effective_model`, and
+`canonical_model` fields plus a bounded `model_resolution` value keep request
+identity separate from runtime-reported and canonical identities. Old rows and
+old plugins default those additive fields to absent/`unknown`; the host never
+rewrites `model` from the selection. Host persistence remains the source of
+truth. Plugins that construct these fields require the concrete
+`runtime_model_provenance_v1` host capability, so an older v1 host rejects the
+plugin before its factory, SDK import, credentials, subprocess, or query.
 
 ### Compaction and lifecycle
 

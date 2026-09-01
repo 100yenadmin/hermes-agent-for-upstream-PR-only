@@ -24,6 +24,20 @@ consumer owns idle wake-up, busy-session requeue, exact-parent preflight,
 transcript re-entry, outbound adapter delivery, and retry. No runtime plugin
 performs a latest-session lookup or supplies routing metadata.
 
+## Durable model provenance
+
+`RuntimeUsageReceipt.model` remains the runtime-observed billing/ledger model;
+it is never overwritten with the requested selection. AgentRuntime v1
+additively carries optional selected, effective, and canonical model identities
+plus a bounded resolution label. The existing SQLite receipt stream persists
+those fields with nullable/`unknown` defaults so legacy rows and plugins remain
+readable without a destructive migration. Provider-specific runtimes classify
+provenance; the host validates and stores it without model aliases or provider
+policy. Runtime evidence must fail closed when provenance is unknown,
+ambiguous, or a true mismatch. New plugins declare
+`runtime_model_provenance_v1`, allowing compatibility rejection before the
+runtime factory or any provider-facing work on older v1 hosts.
+
 ## Lifecycle
 
 One runtime instance and one host-services binding are cached on the parent

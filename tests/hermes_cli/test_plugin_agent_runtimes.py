@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from agent.runtime_api import (
@@ -197,8 +200,20 @@ def test_host_manifest_exports_only_versioned_concrete_capabilities():
     assert manifest["host_capabilities"] == sorted(HOST_RUNTIME_CAPABILITIES)
     assert "host_tool_execution_v1" in manifest["host_capabilities"]
     assert "provider_profile_registration_v1" in manifest["host_capabilities"]
+    assert "runtime_model_provenance_v1" in manifest["host_capabilities"]
     assert "runtime_tool_inventory_v1" in manifest["host_capabilities"]
     assert all(capability.endswith("_v1") for capability in manifest["host_capabilities"])
+
+
+def test_machine_readable_runtime_capabilities_match_public_host_contract():
+    manifest = json.loads(
+        (Path(__file__).parents[2] / "agent" / "runtime_capabilities.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert manifest["runtime_api_version"] == RUNTIME_API_VERSION
+    assert set(manifest["capabilities"]) == set(HOST_RUNTIME_CAPABILITIES)
 
 
 def test_runtime_turn_request_is_deeply_immutable():

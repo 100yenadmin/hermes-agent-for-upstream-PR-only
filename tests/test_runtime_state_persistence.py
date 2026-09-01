@@ -19,6 +19,10 @@ def _receipt(
     correlation_id: str | None = "turn-1",
     fallback_used: bool = False,
     failure_phase: RuntimeFailurePhase | None = None,
+    selected_model: str | None = None,
+    effective_model: str | None = None,
+    canonical_model: str | None = None,
+    model_resolution: str = "unknown",
 ) -> RuntimeUsageReceipt:
     return RuntimeUsageReceipt(
         runtime_id="example-runtime",
@@ -35,6 +39,10 @@ def _receipt(
         correlation_id=correlation_id,
         fallback_used=fallback_used,
         failure_phase=failure_phase,
+        selected_model=selected_model,
+        effective_model=effective_model,
+        canonical_model=canonical_model,
+        model_resolution=model_resolution,
     )
 
 
@@ -74,6 +82,10 @@ def test_fresh_schema_contains_runtime_tables(tmp_path):
             "runtime_id",
             "provider",
             "model",
+            "selected_model",
+            "effective_model",
+            "canonical_model",
+            "model_resolution",
             "billing_mode",
             "cost_status",
             "input_tokens",
@@ -178,6 +190,10 @@ def test_runtime_usage_receipts_are_append_only_and_correlated_retries_are_idemp
                 "output_tokens": 999,
                 "fallback_used": True,
                 "failure_phase": RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT,
+                "selected_model": "changed-selection",
+                "effective_model": "changed-effective",
+                "canonical_model": "changed-canonical",
+                "model_resolution": "mismatch",
             }
         )
         assert db.record_runtime_usage_receipt("session-a", changed_retry) is False
@@ -192,9 +208,39 @@ def test_runtime_usage_receipts_are_append_only_and_correlated_retries_are_idemp
         db.close()
 
 
+def test_runtime_usage_receipt_round_trips_model_provenance(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("session-a", source="cli")
+        receipt = RuntimeUsageReceipt(
+            runtime_id="example-runtime",
+            provider="example-provider",
+            model="example-model-2026-09",
+            billing_mode="subscription",
+            cost_status="known",
+            correlation_id="turn-with-provenance",
+            selected_model="example-model",
+            effective_model="example-model",
+            canonical_model="example-model-2026-09",
+            model_resolution="canonicalized",
+        )
+
+        assert db.record_runtime_usage_receipt("session-a", receipt) is True
+        assert db.list_runtime_usage_receipts("session-a") == [receipt]
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("fallback_used", 1), ("failure_phase", "unsupported-phase")],
+    [
+        ("fallback_used", 1),
+        ("failure_phase", "unsupported-phase"),
+        ("selected_model", 1),
+        ("effective_model", "bad\nmodel"),
+        ("canonical_model", "x" * 1025),
+        ("model_resolution", None),
+    ],
 )
 def test_runtime_usage_receipts_reject_untyped_classifications(
     tmp_path, field, value
@@ -219,6 +265,15 @@ def test_legacy_runtime_usage_receipts_reconcile_classification_columns(tmp_path
     db._conn.execute(
         "ALTER TABLE runtime_usage_receipts DROP COLUMN failure_phase"
     )
+    for column in (
+        "selected_model",
+        "effective_model",
+        "canonical_model",
+        "model_resolution",
+    ):
+        db._conn.execute(
+            f'ALTER TABLE runtime_usage_receipts DROP COLUMN "{column}"'
+        )
     db._conn.execute(
         """INSERT INTO runtime_usage_receipts (
                session_id, runtime_id, provider, model, billing_mode,
@@ -254,10 +309,23 @@ def test_legacy_runtime_usage_receipts_reconcile_classification_columns(tmp_path
                 "PRAGMA table_info(runtime_usage_receipts)"
             ).fetchall()
         }
-        assert {"fallback_used", "failure_phase"} <= columns
+        assert {
+            "fallback_used",
+            "failure_phase",
+            "selected_model",
+            "effective_model",
+            "canonical_model",
+            "model_resolution",
+        } <= columns
         assert reopened.list_runtime_usage_receipts("session-a") == [
             _receipt(correlation_id="legacy-turn")
         ]
+        raw = reopened._conn.execute(
+            """SELECT selected_model, effective_model, canonical_model,
+                      model_resolution
+                 FROM runtime_usage_receipts"""
+        ).fetchone()
+        assert tuple(raw) == (None, None, None, "unknown")
     finally:
         reopened.close()
 
