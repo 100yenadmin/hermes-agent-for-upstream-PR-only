@@ -7970,7 +7970,7 @@ def _todo_state_from_history(history) -> dict | None:
             if not isinstance(msg, dict):
                 continue
             for call in msg.get("tool_calls") or []:
-                if (call.get("function") or {}).get("name") == "todo":
+                if (call.get("function") or {}).get("name") in ("todo_list", "todo"):
                     cid = call.get("id")
                     if cid:
                         todo_call_ids.add(cid)
@@ -8055,7 +8055,7 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         if result_text:
             payload["result_text"] = result_text
     todo_state = None
-    if name == "todo":
+    if name in ("todo_list", "todo"):  # legacy alias: pre-rename replays
         todo_state = _normalize_todo_state(payload.get("result"))
         if todo_state is not None:
             payload.update(todo_state)
@@ -8081,7 +8081,7 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         _tool_progress_enabled(sid)
         or payload.get("inline_diff")
         or _tool_lifecycle_required_for_ui(name)
-        or name == "todo"
+        or name in ("todo_list", "todo")
     ):
         _emit("tool.complete", sid, payload)
     # Task state is application data, not optional tool-progress chrome. A
@@ -10851,8 +10851,39 @@ def _schedule_resume_hydration(
                 {"phase": "history", "status": "loading"},
             )
             db.reopen_session(stored_id)
-            raw_history, display_history = db.get_resume_conversations(stored_id)
-            prefix = db.get_ancestor_display_prefix(stored_id)
+            from hermes_state import SessionResumeTooLargeError
+
+            # The deferred resume is guarded tip-only (session.resume): the
+            # display transcript is REST-paginated, so the ancestor prefix is
+            # an in-memory convenience (rewind ordinal translation, branch
+            # snapshots), not a requirement. Materialize the full lineage only
+            # while it fits sessions.max_resume_messages; past that, hydrate
+            # the tip alone instead of loading the runaway lineage the guard
+            # exists to keep out of memory (the omit_messages resume already
+            # runs with an empty prefix, so this is an existing shape).
+            prefix_fits = True
+            guard = getattr(db, "assert_resume_safe", None)
+            if callable(guard):
+                try:
+                    guard(stored_id)
+                except SessionResumeTooLargeError as exc:
+                    prefix_fits = False
+                    logger.info(
+                        "resume %s: compression lineage exceeds the resume "
+                        "limit (%s); hydrating the tip segment only",
+                        stored_id, exc,
+                    )
+                except Exception:
+                    logger.debug("resume lineage guard failed; loading full lineage", exc_info=True)
+            if prefix_fits:
+                raw_history, display_history = db.get_resume_conversations(stored_id)
+                prefix = db.get_ancestor_display_prefix(stored_id)
+            else:
+                raw_history = db.get_messages_as_conversation(
+                    stored_id, repair_alternation=True, include_row_ids=True
+                )
+                display_history = raw_history
+                prefix = []
             history = sanitize_replay_history(raw_history)
 
             if _sessions.get(sid) is not session:
