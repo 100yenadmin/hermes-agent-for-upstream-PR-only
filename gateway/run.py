@@ -21296,6 +21296,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if resolved_entry is None:
                 return
             session_entry = resolved_entry
+
+        # Async completion turns carry a stable delivery id.  The adapter
+        # accepts the synthetic event before this handler runs, so an append /
+        # ack crash can replay it after restart.  Consult the canonical
+        # transcript before building an agent turn; this is the push-surface
+        # counterpart to the api_server display-row check in
+        # ``_inject_watch_notification``.
+        async_delivery_id = str(
+            event_metadata.get("async_delegation_delivery_id") or ""
+        ).strip()
+        if async_delivery_id:
+            # Check both the resolved continuation and the pinned parent. A
+            # compression rotation may copy the transcript to its tip after
+            # the first delivery, or may leave the original row as the only
+            # durable copy; either row proves this delivery was already
+            # persisted.
+            delivery_session_ids = [session_entry.session_id]
+            if pinned_session_id and pinned_session_id not in delivery_session_ids:
+                delivery_session_ids.append(pinned_session_id)
+            try:
+                for delivery_session_id in delivery_session_ids:
+                    if await self.async_session_store.has_platform_message_id(
+                        delivery_session_id, async_delivery_id,
+                    ):
+                        logger.info(
+                            "Skipping duplicate async delegation delivery before "
+                            "agent turn (stable delivery id already persisted)"
+                        )
+                        return
+            except Exception:
+                logger.debug(
+                    "Async delegation delivery idempotency lookup failed",
+                    exc_info=True,
+                )
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
@@ -28159,6 +28193,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.error("Watch notification injection error: %s", exc)
 
+    @staticmethod
+    def _async_delegation_delivery_id(evt: dict) -> Optional[str]:
+        """Return the durable consumer identity for an async completion."""
+        explicit = str(evt.get("delivery_id") or "").strip()
+        if explicit:
+            return explicit
+        delegation_id = str(evt.get("delegation_id") or "").strip()
+        if not delegation_id:
+            return None
+        parent_session_id = str(evt.get("parent_session_id") or "").strip()
+        if parent_session_id:
+            return f"async-delegation:{delegation_id}:{parent_session_id}"
+        return f"async-delegation:{delegation_id}"
+
+    async def _async_delegation_delivery_already_persisted(
+        self, adapter: Any, session_id: str, evt: dict,
+    ) -> bool:
+        """Check the api_server delivery ledger before replaying an append.
+
+        ``persist_delegation_delivery`` intentionally has no gateway turn. A
+        process can therefore crash after its append commits but before the
+        async-delegation claim is acknowledged. The display row is the
+        consumer's durable idempotency key on that surface; checking it before
+        the retry keeps at-least-once recovery from creating a second visible
+        completion.
+        """
+        if evt.get("type") != "async_delegation":
+            return False
+        delegation_id = str(evt.get("delegation_id") or "").strip()
+        if not delegation_id or not session_id:
+            return False
+        ensure = getattr(adapter, "_ensure_session_db", None)
+        if not callable(ensure):
+            return False
+        try:
+            db = await asyncio.to_thread(ensure)
+            get_messages = getattr(db, "get_messages", None)
+            if db is None or not callable(get_messages):
+                return False
+            rows = await asyncio.to_thread(get_messages, session_id)
+        except Exception:
+            # Let the authoritative append path report/retry a transient DB
+            # failure. This check is only a replay fast-path, never a second
+            # persistence ledger.
+            logger.debug(
+                "Async-delegation delivery idempotency lookup failed",
+                exc_info=True,
+            )
+            return False
+        delivery_id = self._async_delegation_delivery_id(evt)
+        for row in rows or ():
+            if not isinstance(row, dict) or row.get("display_kind") != (
+                "async_delegation_complete"
+            ):
+                continue
+            metadata = row.get("display_metadata")
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except (TypeError, ValueError):
+                    metadata = None
+            if not isinstance(metadata, dict):
+                continue
+            if metadata.get("delegation_id") == delegation_id:
+                return True
+            if delivery_id and metadata.get("delivery_id") == delivery_id:
+                return True
+        return False
+
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict,
     ) -> Optional[bool]:
@@ -28168,8 +28271,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         foreground message happened to be active when the queue was drained.
         Returns ``True`` after adapter acceptance, ``False`` after a retryable
         adapter failure, and ``None`` when the event has no gateway route. This
-        is not a transactional boundary: a process crash after adapter
-        acceptance can still cause durable at-least-once replay.
+        The producer and adapter boundary remains at-least-once: a process
+        crash after adapter acceptance can replay the event. Durable
+        consumers use the stable delivery identity to make that replay
+        idempotent after their append commits.
         """
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if not source:
@@ -28205,10 +28310,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "(no wake turn)",
                                 raw_sid,
                             )
-                            await persist_delegation_delivery(
-                                adapter, text=synth_text,
-                                session_id=raw_sid, evt=evt,
-                            )
+                            if await self._async_delegation_delivery_already_persisted(
+                                adapter, raw_sid, evt,
+                            ):
+                                logger.info(
+                                    "Async delegation completion already persisted; "
+                                    "acknowledging replay without a second row"
+                                )
+                            else:
+                                await persist_delegation_delivery(
+                                    adapter, text=synth_text,
+                                    session_id=raw_sid, evt=evt,
+                                )
                             return True
                         except Exception as e:
                             logger.warning(
@@ -28294,9 +28407,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "row for api_server session %s (no wake turn)",
                         raw_sid,
                     )
-                    await persist_delegation_delivery(
-                        adapter, text=synth_text, session_id=raw_sid, evt=evt,
-                    )
+                    if await self._async_delegation_delivery_already_persisted(
+                        adapter, raw_sid, evt,
+                    ):
+                        logger.info(
+                            "Async delegation completion already persisted; "
+                            "acknowledging replay without a second row"
+                        )
+                    else:
+                        await persist_delegation_delivery(
+                            adapter, text=synth_text, session_id=raw_sid, evt=evt,
+                        )
                     return True
                 except Exception as e:
                     logger.warning(
@@ -28325,12 +28446,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            async_delivery_id = (
+                self._async_delegation_delivery_id(evt)
+                if evt.get("type") == "async_delegation" else None
+            )
+            if async_delivery_id:
+                metadata["async_delegation_delivery_id"] = async_delivery_id
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
-                message_id=str(evt.get("message_id") or "").strip() or None,
+                message_id=(
+                    async_delivery_id
+                    or str(evt.get("message_id") or "").strip()
+                    or None
+                ),
                 metadata=metadata,
             )
             logger.info(
@@ -28366,8 +28497,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         evt_type = str(evt.get("type") or "")
         if evt_type == "async_delegation":
-            producer_id = str(evt.get("delegation_id") or "")
-            return (evt_type, producer_id, "") if producer_id else None
+            producer_id = GatewayRunner._async_delegation_delivery_id(evt)
+            parent_session_id = str(evt.get("parent_session_id") or "").strip()
+            return (
+                (evt_type, producer_id, parent_session_id)
+                if producer_id else None
+            )
         if evt_type == "completion":
             producer_id = str(evt.get("session_id") or "")
             started_at = evt.get("started_at")
@@ -28450,8 +28585,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ``True`` means this caller reached adapter acceptance, ``False`` means
         injection failed and the claim was released for retry, and ``None``
         means either another same-lifecycle caller owns/delivered the producer
-        event or the event has no gateway route. No cross-process exactly-once
-        guarantee is claimed.
+        event or the event has no gateway route. Consumer transcript and
+        display-row persistence is idempotent across process recovery;
+        external adapter side effects remain at-least-once.
         """
         identity = self._completion_delivery_identity(evt)
         durable_claim_id = ""

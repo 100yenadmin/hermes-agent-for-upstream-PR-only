@@ -78,6 +78,26 @@ _DEFAULT_MAX_ASYNC_CHILDREN = 3
 _MAX_RETAINED_COMPLETED = 50
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_DURABLE_PENDING = 1000
+
+
+def _completion_delivery_id(
+    delegation_id: Any, parent_session_id: Any = None,
+) -> str:
+    """Return the stable consumer identity for one async completion.
+
+    The delegation id is the producer identity.  Include the spawning parent
+    when available so a consumer can never confuse a completion with a
+    different parent session, while retaining a deterministic fallback for
+    legacy records that predate parent binding.
+    """
+    delegation = str(delegation_id or "").strip()
+    parent = str(parent_session_id or "").strip()
+    if not delegation:
+        return ""
+    return (
+        f"async-delegation:{delegation}:{parent}"
+        if parent else f"async-delegation:{delegation}"
+    )
 # A pending completion whose delivery keeps failing is retried across claim
 # cycles (and across restarts via restore_undelivered_completions). Cap the
 # attempts so an unroutable row converges to a terminal 'dropped' state
@@ -341,7 +361,13 @@ def _note_delivery_attempt(delegation_id: str) -> None:
 
 
 def recover_abandoned_delegations() -> int:
-    """Classify records whose owning process disappeared as outcome unknown."""
+    """Classify dead-owner records without creating a deliverable turn.
+
+    The terminal result remains queryable as ``unknown`` because the worker
+    outcome cannot be reconstructed.  It is explicitly dropped from the
+    completion-delivery rail: an owner-lost delegation is not a successful
+    result and must not be replayed into a current or replacement parent.
+    """
     try:
         from gateway.status import _pid_exists, get_process_start_time
     except Exception:
@@ -368,6 +394,9 @@ def recover_abandoned_delegations() -> int:
             task = json.loads(task_json or "{}")
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id,
+                "delivery_id": _completion_delivery_id(
+                    delegation_id, parent_id,
+                ),
                 "session_key": session_key, "origin_ui_session_id": origin_ui,
                 # Restore the durable wake target so completions recovered
                 # after a restart remain routable to api_server sessions.
@@ -389,7 +418,8 @@ def recover_abandoned_delegations() -> int:
             result = {"status": "unknown", "summary": None, "error": event["error"]}
             conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
-                   updated_at=?, event_json=?, result_json=?, delivery_state='pending'
+                   updated_at=?, event_json=?, result_json=?, delivery_state='dropped',
+                   delivery_claim=NULL, delivery_claimed_at=NULL
                    WHERE delegation_id=?""",
                 (now, now, json.dumps(event), json.dumps(result), delegation_id),
             )
@@ -971,6 +1001,9 @@ def _push_completion_event(
     evt = {
         "type": "async_delegation",
         "delegation_id": record.get("delegation_id"),
+        "delivery_id": _completion_delivery_id(
+            record.get("delegation_id"), record.get("parent_session_id"),
+        ),
         # session_key routes the completion back to the originating gateway
         # session; empty string => CLI (single-session) path.
         "session_key": record.get("session_key", ""),
@@ -1185,6 +1218,10 @@ def _push_batch_completion_event(
     evt = {
         "type": "async_delegation",
         "delegation_id": event_record.get("delegation_id"),
+        "delivery_id": _completion_delivery_id(
+            event_record.get("delegation_id"),
+            event_record.get("parent_session_id"),
+        ),
         "session_key": event_record.get("session_key", ""),
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
         "origin_session_id": event_record.get("origin_session_id", ""),
