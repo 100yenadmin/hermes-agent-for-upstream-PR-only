@@ -18,6 +18,7 @@ from agent.runtime_api import (
     RuntimeCompactionPhase,
     CompactionOwnership,
     RuntimeCompletedEvent,
+    RuntimeContentEvent,
     RuntimeEventKind,
     RuntimeFailedEvent,
     RuntimeFailure,
@@ -76,6 +77,21 @@ class _HostServices:
 
     def cancellation_requested(self):
         return False
+
+
+class _RuntimeRequestHost(_HostServices):
+    def __init__(self, *, approval: bool = True):
+        super().__init__()
+        self.approval = approval
+        self.calls = []
+
+    async def execute_tool(self, name, arguments):
+        self.calls.append(("tool", name, dict(arguments)))
+        return {"ok": True, "name": name}
+
+    async def request_approval(self, action, details):
+        self.calls.append(("approval", action, dict(details)))
+        return self.approval
 
 
 def _request():
@@ -325,6 +341,56 @@ def test_dispatch_rejects_unknown_event_types_without_closing_session_runtime():
         run_runtime_sync(runtime, _request(), _HostServices())
 
     assert runtime.close_calls == 0
+
+
+class _RequestEventsRuntime:
+    def preflight(self, request):
+        return None
+
+    async def run_turn(self, request, host) -> AsyncIterator[object]:
+        yield RuntimeContentEvent(text="visible before requests")
+        yield RuntimeToolRequestEvent(
+            request_id="tool-request-1",
+            name="synthetic_tool",
+            arguments={"value": "one"},
+        )
+        yield RuntimeApprovalRequestEvent(
+            request_id="approval-request-1",
+            action="synthetic_action",
+            details={"reason": "synthetic approval"},
+        )
+        yield RuntimeCompletedEvent(result={"final_response": "done"})
+
+    async def close(self):
+        return None
+
+
+def test_dispatch_routes_typed_tool_and_approval_events_through_host_services():
+    host = _RuntimeRequestHost()
+
+    result = run_runtime_sync(_RequestEventsRuntime(), _request(), host)
+
+    assert result.completed is True
+    assert host.calls == [
+        ("tool", "synthetic_tool", {"value": "one"}),
+        ("approval", "synthetic_action", {"reason": "synthetic approval"}),
+    ]
+    assert [event.request_id for event in result.events if isinstance(
+        event, (RuntimeToolRequestEvent, RuntimeApprovalRequestEvent)
+    )] == ["tool-request-1", "approval-request-1"]
+
+
+def test_dispatch_denied_typed_approval_fails_closed_before_completion():
+    host = _RuntimeRequestHost(approval=False)
+
+    result = run_runtime_sync(_RequestEventsRuntime(), _request(), host)
+
+    assert result.failure is not None
+    assert result.failure.code == "runtime_approval_denied"
+    assert result.failure.phase is RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT
+    assert result.failure.replay_safe is False
+    assert isinstance(result.terminal, RuntimeFailedEvent)
+    assert not result.completed
 
 
 class _RuntimeDatabase:
@@ -585,6 +651,47 @@ def test_host_tool_execution_overrides_runtime_replay_safe_claim():
     assert result.events[-1] is result.terminal
 
 
+def test_refresh_turn_rebuilds_allowed_tools_from_current_agent_inventory():
+    class _ToolAgent(_RuntimeAgent):
+        valid_tool_names = frozenset({"old_tool"})
+        tools = (
+            {
+                "type": "function",
+                "function": {"name": "old_tool"},
+            },
+        )
+
+        def _execute_tool_calls(self, assistant_message, messages, task_id):
+            tool_call = assistant_message.tool_calls[0]
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": "tool completed",
+                }
+            )
+
+    agent = _ToolAgent()
+    host = HermesRuntimeHostServices(
+        agent,
+        task_id="synthetic-turn-1",
+        runtime_id="example-runtime",
+    )
+
+    agent.valid_tool_names = frozenset({"new_tool"})
+    agent.tools = (
+        {
+            "type": "function",
+            "function": {"name": "new_tool"},
+        },
+    )
+    host.refresh_turn("synthetic-turn-2")
+
+    _run_async(host.execute_tool("new_tool", {"value": "one"}))
+    with pytest.raises(RuntimeExecutionError, match="old_tool.*not available"):
+        _run_async(host.execute_tool("old_tool", {"value": "two"}))
+
+
 def test_background_delivery_overrides_runtime_replay_safe_claim(monkeypatch):
     from queue import SimpleQueue
 
@@ -793,6 +900,55 @@ def test_unclassified_exception_after_visible_status_is_not_preflight_safe():
         _ExplodingAfterStatusRuntime(),
         _request(),
         _HostServices(),
+    )
+
+    assert result.failure is not None
+    assert result.failure.phase is RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT
+    assert result.failure.replay_safe is False
+
+
+@pytest.mark.parametrize(
+    "visible_event",
+    (
+        RuntimeContentEvent(text="visible content"),
+        RuntimeStatusEvent(message="visible status"),
+        RuntimeToolRequestEvent(
+            request_id="tool-request-visible",
+            name="synthetic_tool",
+            arguments={},
+        ),
+        RuntimeApprovalRequestEvent(
+            request_id="approval-request-visible",
+            action="synthetic_action",
+            details={},
+        ),
+    ),
+    ids=("content", "status", "tool", "approval"),
+)
+def test_visible_runtime_events_constrain_later_replay_claims(visible_event):
+    class _ReplayClaimingRuntime:
+        def preflight(self, request):
+            return None
+
+        async def run_turn(self, request, host) -> AsyncIterator[object]:
+            yield visible_event
+            yield RuntimeFailedEvent(
+                failure=RuntimeFailure(
+                    code="synthetic_failure",
+                    message="synthetic failure",
+                    phase=RuntimeFailurePhase.BEFORE_VISIBLE_OUTPUT,
+                    replay_safe=True,
+                    retryable=True,
+                )
+            )
+
+        async def close(self):
+            return None
+
+    result = run_runtime_sync(
+        _ReplayClaimingRuntime(),
+        _request(),
+        _RuntimeRequestHost(),
     )
 
     assert result.failure is not None

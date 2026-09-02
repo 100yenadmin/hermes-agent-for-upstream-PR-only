@@ -122,18 +122,38 @@ def _constrain_failure_to_host_evidence(
     side_effect_observed = host_side_effects > side_effects_at_turn_start or any(
         isinstance(event, _RUNTIME_SIDE_EFFECT_EVENT_TYPES) for event in events
     )
-    if not side_effect_observed:
-        return failure
-    if (
-        failure.phase is RuntimeFailurePhase.AFTER_SIDE_EFFECTS
-        and not failure.replay_safe
-    ):
-        return failure
-    return replace(
-        failure,
-        phase=RuntimeFailurePhase.AFTER_SIDE_EFFECTS,
-        replay_safe=False,
+    if side_effect_observed:
+        if (
+            failure.phase is RuntimeFailurePhase.AFTER_SIDE_EFFECTS
+            and not failure.replay_safe
+        ):
+            return failure
+        return replace(
+            failure,
+            phase=RuntimeFailurePhase.AFTER_SIDE_EFFECTS,
+            replay_safe=False,
+        )
+    visible_output_observed = any(
+        isinstance(event, _RUNTIME_VISIBLE_EVENT_TYPES) for event in events
     )
+    if visible_output_observed:
+        # A runtime cannot make a later replay-safe claim after content,
+        # status, tool, or approval output has crossed the host boundary.
+        # Preserve an explicit stronger runtime phase, but always clear its
+        # replay claim.
+        if failure.phase is RuntimeFailurePhase.AFTER_SIDE_EFFECTS:
+            return replace(failure, replay_safe=False)
+        if (
+            failure.phase is RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT
+            and not failure.replay_safe
+        ):
+            return failure
+        return replace(
+            failure,
+            phase=RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT,
+            replay_safe=False,
+        )
+    return failure
 
 
 def _freeze_value(value: Any) -> Any:
@@ -362,7 +382,30 @@ async def _collect_runtime_turn(
                 if constrained_failure is not event.failure:
                     event = RuntimeFailedEvent(failure=constrained_failure)
             events.append(event)
-            if isinstance(event, RuntimeStatusEvent):
+            if isinstance(event, RuntimeToolRequestEvent):
+                # Runtime events are requests crossing into host-owned
+                # services.  Keep the runtime out of Hermes' executor and
+                # preserve the request event in the lifecycle record; the
+                # host service owns validation, policy, and result shaping.
+                await host.execute_tool(event.name, event.arguments)
+            elif isinstance(event, RuntimeApprovalRequestEvent):
+                # Approval is fail-closed.  A runtime that emits a denied (or
+                # malformed) decision must not be allowed to continue to its
+                # own completion event.
+                approved = await host.request_approval(event.action, event.details)
+                if approved is not True:
+                    terminal = RuntimeFailedEvent(
+                        failure=RuntimeFailure(
+                            code="runtime_approval_denied",
+                            message="runtime approval was denied",
+                            phase=RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT,
+                            replay_safe=False,
+                            retryable=False,
+                        )
+                    )
+                    events.append(terminal)
+                    break
+            elif isinstance(event, RuntimeStatusEvent):
                 await host.emit_status(event.message)
             elif isinstance(event, RuntimeCompactionEvent):
                 # Compaction is an observable lifecycle event, not a signal to
@@ -583,15 +626,6 @@ class HermesRuntimeHostServices:
             self._agent._runtime_compaction_events = self._compaction_events
         except Exception:
             pass
-        allowed = set(getattr(agent, "valid_tool_names", ()) or ())
-        for schema in getattr(agent, "tools", ()) or ():
-            if not isinstance(schema, Mapping):
-                continue
-            function = schema.get("function")
-            if isinstance(function, Mapping) and function.get("name"):
-                allowed.add(str(function["name"]))
-        self._allowed_tool_names = frozenset(allowed)
-
     def refresh_turn(self, task_id: str) -> None:
         """Refresh per-turn correlation and route data for the bound parent only."""
         current_parent = str(getattr(self._agent, "session_id", None) or "")
@@ -618,6 +652,14 @@ class HermesRuntimeHostServices:
             }
         except Exception:
             self._route = {}
+        allowed = set(getattr(self._agent, "valid_tool_names", ()) or ())
+        for schema in getattr(self._agent, "tools", ()) or ():
+            if not isinstance(schema, Mapping):
+                continue
+            function = schema.get("function")
+            if isinstance(function, Mapping) and function.get("name"):
+                allowed.add(str(function["name"]))
+        self._allowed_tool_names = frozenset(allowed)
 
     async def execute_tool(self, name: str, arguments: Mapping[str, Any]) -> Any:
         """Execute one runtime-requested tool through Hermes' canonical funnel.
