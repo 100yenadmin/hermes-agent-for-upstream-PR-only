@@ -298,6 +298,12 @@ def build_runtime_turn_request(
     attachments: Sequence[Mapping[str, Any]] = (),
     correlation_id: str | None = None,
 ) -> RuntimeTurnRequest:
+    try:
+        from agent.turn_context import effective_prompt_sha256
+
+        prompt_hash = effective_prompt_sha256(str(prompt_snapshot), messages)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeExecutionError("runtime prompt is not canonical JSON") from exc
     canonical_tool_schemas = json.dumps(
         list(tool_schemas),
         sort_keys=True,
@@ -335,6 +341,7 @@ def build_runtime_turn_request(
         prompt_snapshot=str(prompt_snapshot),
         tool_schemas=tuple(_freeze_mapping(item) for item in tool_schemas),
         tool_schema_hash=hashlib.sha256(canonical_tool_schemas).hexdigest(),
+        prompt_hash=prompt_hash,
         tool_inventory=frozen_tool_inventory,
         session_state=frozen_session_state,
         attachments=tuple(_freeze_mapping(item) for item in attachments),
@@ -387,7 +394,15 @@ async def _collect_runtime_turn(
                 # services.  Keep the runtime out of Hermes' executor and
                 # preserve the request event in the lifecycle record; the
                 # host service owns validation, policy, and result shaping.
-                await host.execute_tool(event.name, event.arguments)
+                set_request_id = getattr(host, "_set_tool_request_id", None)
+                if callable(set_request_id):
+                    set_request_id(event.request_id)
+                try:
+                    await host.execute_tool(event.name, event.arguments)
+                finally:
+                    clear_request_id = getattr(host, "_clear_tool_request_id", None)
+                    if callable(clear_request_id):
+                        clear_request_id()
             elif isinstance(event, RuntimeApprovalRequestEvent):
                 # Approval is fail-closed.  A runtime that emits a denied (or
                 # malformed) decision must not be allowed to continue to its
@@ -407,6 +422,14 @@ async def _collect_runtime_turn(
                     break
             elif isinstance(event, RuntimeStatusEvent):
                 await host.emit_status(event.message)
+            elif isinstance(event, RuntimeContentEvent):
+                # Runtime content is projected through the same sanitized
+                # stream funnel as built-in provider deltas. Older test and
+                # host doubles may not implement the optional method yet;
+                # they remain valid no-op consumers of the typed event.
+                emit_content = getattr(host, "emit_content", None)
+                if callable(emit_content):
+                    await emit_content(event.text)
             elif isinstance(event, RuntimeCompactionEvent):
                 # Compaction is an observable lifecycle event, not a signal to
                 # invoke the host compressor. Runtime-native implementations
@@ -604,10 +627,21 @@ def make_builtin_codex_registration(
     )
 
 
+class RuntimeToolPersistenceError(RuntimeError):
+    """The canonical tool-call row could not be flushed before execution."""
+
+
 class HermesRuntimeHostServices:
     """The only stateful Hermes surface available to runtime plugins."""
 
-    def __init__(self, agent: Any, *, task_id: str, runtime_id: str):
+    def __init__(
+        self,
+        agent: Any,
+        *,
+        task_id: str,
+        runtime_id: str,
+        turn_messages: list[dict[str, Any]] | None = None,
+    ):
         self._agent = agent
         self._task_id = str(task_id)
         self._runtime_id = str(runtime_id)
@@ -616,10 +650,16 @@ class HermesRuntimeHostServices:
         self._delivery_lock = threading.Lock()
         self._delivery_counter = 0
         self._route: dict[str, str] = {}
-        self.refresh_turn(task_id)
+        self._turn_messages = turn_messages
+        self._pending_tool_call_id: str | None = None
+        self._tool_results_by_id: dict[str, Any] = {}
+        self._tool_call_specs_by_id: dict[str, tuple[str, str]] = {}
+        self._tool_call_ids_seen: set[str] = set()
+        self._tool_calls_in_flight: set[str] = set()
         self._tool_call_count = 0
         self._side_effect_count = 0
         self._compaction_events: list[dict[str, Any]] = []
+        self.refresh_turn(task_id, turn_messages=turn_messages)
         try:
             # A fresh host is created for each whole turn, so the lifecycle
             # projection cannot accidentally bleed into a later turn.
@@ -647,11 +687,21 @@ class HermesRuntimeHostServices:
         if callable(touch):
             touch(message)
 
-    def refresh_turn(self, task_id: str) -> None:
+    def refresh_turn(
+        self,
+        task_id: str,
+        turn_messages: list[dict[str, Any]] | None = None,
+    ) -> None:
         """Refresh per-turn correlation and route data for the bound parent only."""
         with self._delivery_lock:
             self._ensure_open_parent_locked()
             self._task_id = str(task_id)
+            self._turn_messages = turn_messages
+            self._pending_tool_call_id = None
+            self._tool_results_by_id = {}
+            self._tool_call_specs_by_id = {}
+            self._tool_call_ids_seen = set()
+            self._tool_calls_in_flight = set()
             try:
                 from gateway.session_context import get_session_env
 
@@ -679,6 +729,16 @@ class HermesRuntimeHostServices:
                     allowed.add(str(function["name"]))
             self._allowed_tool_names = frozenset(allowed)
 
+    def _set_tool_request_id(self, request_id: str) -> None:
+        """Bind the public runtime request ID to the next host execution."""
+        with self._delivery_lock:
+            self._ensure_open_parent_locked()
+            self._pending_tool_call_id = str(request_id or "").strip() or None
+
+    def _clear_tool_request_id(self) -> None:
+        with self._delivery_lock:
+            self._pending_tool_call_id = None
+
     async def execute_tool(self, name: str, arguments: Mapping[str, Any]) -> Any:
         """Execute one runtime-requested tool through Hermes' canonical funnel.
 
@@ -701,36 +761,152 @@ class HermesRuntimeHostServices:
         if not callable(executor):
             raise RuntimeExecutionError("Hermes tool executor is unavailable")
 
-        self._tool_call_count += 1
-        # Entering the canonical executor is host-observed effect evidence.
-        # Count it before invocation so an executor failure cannot make a
-        # potentially executed tool replayable.
-        self._side_effect_count += 1
-        tool_call_id = f"runtime-tool-{self._tool_call_count:04d}"
+        try:
+            arguments_json = json.dumps(
+                dict(arguments),
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeExecutionError(
+                "runtime tool arguments must be JSON serializable"
+            ) from exc
+
+        # A public request ID is the transcript pairing key.  Cache the exact
+        # name/arguments tuple too, so a duplicate ID cannot silently replay a
+        # result for a different call payload.
+        with self._delivery_lock:
+            tool_call_id = self._pending_tool_call_id
+            if not tool_call_id:
+                self._tool_call_count += 1
+                tool_call_id = f"runtime-tool-{self._tool_call_count:04d}"
+            call_spec = (normalized_name, arguments_json)
+            prior_result = self._tool_results_by_id.get(tool_call_id)
+            if tool_call_id in self._tool_results_by_id:
+                if self._tool_call_specs_by_id.get(tool_call_id) != call_spec:
+                    raise RuntimeExecutionError(
+                        "duplicate runtime tool call id with different payload: "
+                        f"{tool_call_id}"
+                    )
+                return prior_result
+            if (
+                tool_call_id in self._tool_call_ids_seen
+                or tool_call_id in self._tool_calls_in_flight
+            ):
+                raise RuntimeExecutionError(
+                    f"duplicate runtime tool call id: {tool_call_id}"
+                )
+            self._tool_call_specs_by_id[tool_call_id] = call_spec
+            self._tool_call_ids_seen.add(tool_call_id)
+            self._tool_calls_in_flight.add(tool_call_id)
+
+        # Build the same paired assistant row the ordinary loop persists
+        # before invoking Hermes' canonical executor. This row is deliberately
+        # appended to the live turn list, not a throwaway adapter list, so the
+        # finalizer and the runtime host share one transcript authority.
         tool_call = SimpleNamespace(
             id=tool_call_id,
             type="function",
             function=SimpleNamespace(
                 name=normalized_name,
-                arguments=json.dumps(dict(arguments), ensure_ascii=False),
+                arguments=arguments_json,
             ),
         )
         assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
-        tool_messages: list[Mapping[str, Any]] = []
-        executor(assistant_message, tool_messages, self._task_id)
+        assistant_row = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": normalized_name,
+                        "arguments": arguments_json,
+                    },
+                }
+            ],
+            "finish_reason": "tool_calls",
+        }
+        turn_messages = self._turn_messages
+        if turn_messages is None:
+            turn_messages = []
+        assistant_index = len(turn_messages)
+        turn_messages.append(assistant_row)
+        flush = getattr(self._agent, "_flush_messages_to_session_db", None)
+        if callable(flush):
+            try:
+                persisted = flush(turn_messages)
+            except Exception as exc:
+                turn_messages.pop()
+                self._agent._incremental_persistence_failed = True
+                self._agent._last_persistence_error_cause = "runtime_tool_call"
+                with self._delivery_lock:
+                    self._tool_calls_in_flight.discard(tool_call_id)
+                raise RuntimeToolPersistenceError(
+                    "runtime tool-call persistence failed before execution"
+                ) from exc
+            if persisted is False:
+                turn_messages.pop()
+                self._agent._incremental_persistence_failed = True
+                self._agent._last_persistence_error_cause = "runtime_tool_call"
+                with self._delivery_lock:
+                    self._tool_calls_in_flight.discard(tool_call_id)
+                raise RuntimeToolPersistenceError(
+                    "runtime tool-call persistence failed before execution"
+                )
 
-        matches = [
-            message
-            for message in tool_messages
-            if message.get("role") == "tool"
-            and message.get("tool_call_id") == tool_call_id
-        ]
-        if len(matches) != 1:
-            raise RuntimeExecutionError(
-                "Hermes tool executor did not produce exactly one canonical result"
-            )
+        # Match the ordinary loop's post-flush projection ordering: UI sees a
+        # tool-call card only after its canonical assistant row is durable.
+        interim = getattr(self._agent, "_emit_interim_assistant_message", None)
+        if callable(interim):
+            try:
+                interim(assistant_row)
+            except Exception:
+                pass
+        display_callback = getattr(self._agent, "stream_delta_callback", None)
+        if callable(display_callback):
+            try:
+                display_callback(None)
+            except Exception:
+                pass
 
-        return matches[0].get("content")
+        # Entering the canonical executor is host-observed effect evidence.
+        # Count it before invocation so an executor failure cannot make a
+        # potentially executed tool replayable.
+        self._side_effect_count += 1
+        try:
+            executor(assistant_message, turn_messages, self._task_id)
+            if getattr(self._agent, "_incremental_persistence_failed", False):
+                self._agent._last_persistence_error_cause = (
+                    getattr(
+                        self._agent,
+                        "_last_persistence_error_cause",
+                        None,
+                    )
+                    or "runtime_tool_result"
+                )
+                raise RuntimeToolPersistenceError(
+                    "runtime tool result persistence failed"
+                )
+            matches = [
+                message
+                for message in turn_messages[assistant_index + 1 :]
+                if isinstance(message, Mapping)
+                and message.get("role") == "tool"
+                and message.get("tool_call_id") == tool_call_id
+            ]
+            if len(matches) != 1:
+                raise RuntimeExecutionError(
+                    "Hermes tool executor did not produce exactly one canonical result"
+                )
+            result = matches[0].get("content")
+            with self._delivery_lock:
+                self._tool_results_by_id[tool_call_id] = result
+            return result
+        finally:
+            with self._delivery_lock:
+                self._tool_calls_in_flight.discard(tool_call_id)
 
     async def request_approval(
         self,
@@ -757,6 +933,32 @@ class HermesRuntimeHostServices:
     async def emit_status(self, message: str) -> None:
         self._ensure_open_parent()
         self._emit_status_locked(message)
+
+    async def emit_content(self, text: str) -> None:
+        """Project visible runtime content through Hermes' sanitizing funnel."""
+        self._ensure_open_parent()
+        if not isinstance(text, str):
+            raise RuntimeExecutionError("runtime content must be text")
+        if not text:
+            return
+        fire_delta = getattr(self._agent, "_fire_stream_delta", None)
+        if callable(fire_delta):
+            fire_delta(text)
+            return
+        # Minimal host doubles may not expose the full sanitizer. Preserve
+        # their existing callback seam without inventing a second stream API.
+        callbacks = []
+        for callback in (
+            getattr(self._agent, "stream_delta_callback", None),
+            getattr(self._agent, "_stream_callback", None),
+        ):
+            if callable(callback) and callback not in callbacks:
+                callbacks.append(callback)
+        for callback in callbacks:
+            try:
+                callback(text)
+            except Exception:
+                pass
 
     async def persist_state(self, state: RuntimeStateEnvelope) -> None:
         self._ensure_open_parent()
@@ -939,6 +1141,7 @@ def get_runtime_session(
     registration: RuntimeRegistration,
     *,
     task_id: str,
+    turn_messages: list[dict[str, Any]] | None = None,
 ) -> RuntimeSessionBinding:
     """Return the exact-parent runtime binding, creating it once per session."""
     parent_session_id = str(getattr(agent, "session_id", None) or "")
@@ -954,7 +1157,7 @@ def get_runtime_session(
                 candidate = registration.factory()
                 if isinstance(candidate, BuiltInCodexRuntime):
                     existing.runtime.refresh_runner(candidate._runner)
-            existing.host.refresh_turn(task_id)
+            existing.host.refresh_turn(task_id, turn_messages)
             return existing
         close_runtime_session(agent)
 
@@ -963,6 +1166,7 @@ def get_runtime_session(
         agent,
         task_id=task_id,
         runtime_id=registration.descriptor.runtime_id,
+        turn_messages=turn_messages,
     )
     binding = RuntimeSessionBinding(
         runtime=runtime,

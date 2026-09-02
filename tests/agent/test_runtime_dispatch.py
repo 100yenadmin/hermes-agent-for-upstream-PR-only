@@ -40,12 +40,18 @@ from agent.runtime_api import (
 from agent.runtime_dispatch import (
     HermesRuntimeHostServices,
     RuntimeExecutionError,
+    RuntimeToolPersistenceError,
     build_runtime_tool_inventory,
     build_runtime_turn_request,
     close_runtime_session,
     get_runtime_session,
     make_builtin_codex_registration,
     run_runtime_sync,
+)
+from agent.turn_context import (
+    build_effective_prompt_messages,
+    compose_effective_system_prompt,
+    effective_prompt_sha256,
 )
 from model_tools import _run_async
 
@@ -94,6 +100,15 @@ class _RuntimeRequestHost(_HostServices):
         return self.approval
 
 
+class _ContentHost(_HostServices):
+    def __init__(self):
+        super().__init__()
+        self.contents = []
+
+    async def emit_content(self, text):
+        self.contents.append(text)
+
+
 def _request():
     return build_runtime_turn_request(
         provider="example",
@@ -132,6 +147,52 @@ def test_runtime_turn_request_deep_freezes_state_and_host_inputs():
     assert request.session_state.state["resume"]["external"] == "synthetic"
     with pytest.raises(TypeError):
         request.session_state.state["resume"]["external"] = "blocked"
+
+
+def test_effective_prompt_projection_is_shared_by_runtime_request_and_hash():
+    messages = [
+        {
+            "role": "user",
+            "content": "hello",
+            "api_content": "hello\n\n<synthetic-context>",
+            "display_kind": "user",
+            "_db_persisted": True,
+        },
+        {
+            "role": "assistant",
+            "content": "answer",
+            "api_content": "answer",
+            "display_metadata": {"synthetic": True},
+        },
+    ]
+    effective_messages = build_effective_prompt_messages(
+        messages,
+        current_turn_user_idx=0,
+        ext_prefetch_cache="unused",
+        plugin_user_context="unused",
+    )
+    effective_system = compose_effective_system_prompt(
+        "base system",
+        "ephemeral system",
+    )
+    request = build_runtime_turn_request(
+        provider="example",
+        model="example-large",
+        api_mode="example_runtime",
+        messages=effective_messages,
+        prompt_snapshot=effective_system,
+        tool_schemas=(),
+    )
+
+    assert list(request.messages) == effective_messages
+    assert request.prompt_hash == effective_prompt_sha256(
+        effective_system,
+        effective_messages,
+    )
+    assert request.effective_prompt_hash == request.prompt_hash
+    assert effective_messages[0]["content"] == "hello\n\n<synthetic-context>"
+    assert "api_content" not in effective_messages[0]
+    assert "display_kind" not in effective_messages[0]
 
 
 def test_runtime_tool_inventory_is_stable_and_hashes_input_schemas():
@@ -380,6 +441,44 @@ def test_dispatch_routes_typed_tool_and_approval_events_through_host_services():
     )] == ["tool-request-1", "approval-request-1"]
 
 
+def test_dispatch_projects_runtime_content_before_terminal_completion():
+    class _ContentRuntime:
+        def preflight(self, request):
+            return None
+
+        async def run_turn(self, request, host) -> AsyncIterator[object]:
+            yield RuntimeContentEvent(text="visible runtime delta")
+            yield RuntimeCompletedEvent(result={"final_response": "done"})
+
+        async def close(self):
+            return None
+
+    host = _ContentHost()
+    result = run_runtime_sync(_ContentRuntime(), _request(), host)
+
+    assert host.contents == ["visible runtime delta"]
+    assert [type(event) for event in result.events] == [
+        RuntimeContentEvent,
+        RuntimeCompletedEvent,
+    ]
+    assert result.events.index(result.terminal) == 1
+
+
+def test_host_content_uses_the_agent_stream_sanitization_funnel():
+    agent = _RuntimeAgent()
+    streamed = []
+    agent._fire_stream_delta = streamed.append
+    host = HermesRuntimeHostServices(
+        agent,
+        task_id="synthetic-task",
+        runtime_id="example-runtime",
+    )
+
+    _run_async(host.emit_content("visible runtime content"))
+
+    assert streamed == ["visible runtime content"]
+
+
 def test_dispatch_denied_typed_approval_fails_closed_before_completion():
     host = _RuntimeRequestHost(approval=False)
 
@@ -442,6 +541,104 @@ class _GuardedRuntimeAgent(_RuntimeAgent):
 
     def _touch_activity(self, message):
         self.statuses.append(message)
+
+
+class _PersistingRuntimeToolAgent(_GuardedRuntimeAgent):
+    """Small fake that preserves the host's pre/post-flush ordering contract."""
+
+    def __init__(self, *, fail_flush: bool = False):
+        super().__init__()
+        self.fail_flush = fail_flush
+        self.flush_calls = []
+        self.persisted_rows = []
+        self.execution_calls = 0
+        self._persisted_message_ids = set()
+
+    def _flush_messages_to_session_db(self, messages):
+        self.flush_calls.append(
+            [
+                (
+                    message.get("role"),
+                    message.get("tool_call_id"),
+                    tuple(
+                        call.get("id")
+                        for call in message.get("tool_calls", ())
+                        if isinstance(call, dict)
+                    ),
+                )
+                for message in messages
+            ]
+        )
+        if self.fail_flush:
+            return False
+        for message in messages:
+            marker = id(message)
+            if marker not in self._persisted_message_ids:
+                self._persisted_message_ids.add(marker)
+                self.persisted_rows.append(
+                    (message.get("role"), message.get("tool_call_id"))
+                )
+        return True
+
+    def _execute_tool_calls(self, assistant_message, messages, task_id):
+        self.execution_calls += 1
+        tool_call = assistant_message.tool_calls[0]
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": "tool completed",
+            }
+        )
+        assert self._flush_messages_to_session_db(messages) is True
+
+
+def test_runtime_tool_call_persists_pair_before_effect_and_is_idempotent():
+    agent = _PersistingRuntimeToolAgent()
+    messages = [{"role": "user", "content": "synthetic request"}]
+    host = HermesRuntimeHostServices(
+        agent,
+        task_id="synthetic-task",
+        runtime_id="example-runtime",
+        turn_messages=messages,
+    )
+
+    host._set_tool_request_id("synthetic-call-1")
+    first = _run_async(host.execute_tool("synthetic_tool", {"value": "one"}))
+    host._set_tool_request_id("synthetic-call-1")
+    second = _run_async(host.execute_tool("synthetic_tool", {"value": "one"}))
+
+    assert first == second == "tool completed"
+    assert agent.execution_calls == 1
+    assert len(agent.flush_calls) == 2
+    assert agent.flush_calls[0][-1] == (
+        "assistant",
+        None,
+        ("synthetic-call-1",),
+    )
+    assert agent.flush_calls[1][-1] == ("tool", "synthetic-call-1", ())
+    assert agent.persisted_rows.count(("assistant", None)) == 1
+    assert agent.persisted_rows.count(("tool", "synthetic-call-1")) == 1
+    assert [message.get("tool_call_id") for message in messages if message.get("role") == "tool"] == [
+        "synthetic-call-1"
+    ]
+
+
+def test_runtime_tool_persistence_failure_prevents_executor_side_effect():
+    agent = _PersistingRuntimeToolAgent(fail_flush=True)
+    messages = [{"role": "user", "content": "synthetic request"}]
+    host = HermesRuntimeHostServices(
+        agent,
+        task_id="synthetic-task",
+        runtime_id="example-runtime",
+        turn_messages=messages,
+    )
+
+    with pytest.raises(RuntimeToolPersistenceError, match="before execution"):
+        _run_async(host.execute_tool("synthetic_tool", {"value": "one"}))
+
+    assert agent.execution_calls == 0
+    assert messages == [{"role": "user", "content": "synthetic request"}]
 
 
 def _stateful_host_operations(host):

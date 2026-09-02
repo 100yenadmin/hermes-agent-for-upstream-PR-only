@@ -25,11 +25,14 @@ move-and-name refactor with no semantic change.
 from __future__ import annotations
 
 import logging
+import copy
+import hashlib
+import json
 import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
@@ -163,6 +166,94 @@ def compose_user_api_content(
     if not injections:
         return None
     return content + "\n\n" + "\n\n".join(injections)
+
+
+def compose_effective_system_prompt(
+    active_system_prompt: Any,
+    ephemeral_system_prompt: Any,
+) -> str:
+    """Compose the provider-neutral system prompt for one live turn.
+
+    Both the ordinary provider path and AgentRuntime receive this exact
+    string.  Keeping the join here prevents a runtime turn from silently
+    dropping scoped, per-turn system guidance that the normal request sends.
+    """
+    base = active_system_prompt if isinstance(active_system_prompt, str) else ""
+    ephemeral = (
+        ephemeral_system_prompt
+        if isinstance(ephemeral_system_prompt, str)
+        else ""
+    )
+    if ephemeral:
+        return (base + "\n\n" + ephemeral).strip()
+    return base
+
+
+def build_effective_prompt_messages(
+    messages: Any,
+    *,
+    current_turn_user_idx: int | None = None,
+    ext_prefetch_cache: str = "",
+    plugin_user_context: str = "",
+) -> List[Dict[str, Any]]:
+    """Build the shared provider-neutral message copy for a live request.
+
+    ``api_content`` is the durable byte-fidelity sidecar.  Applying it here
+    means the ordinary provider path and a whole-turn runtime see the same
+    effective user/assistant bytes, while the original transcript remains
+    clean and mutable only by the host.
+    """
+    effective: List[Dict[str, Any]] = []
+    for idx, raw_message in enumerate(messages or ()):
+        if not isinstance(raw_message, Mapping):
+            continue
+        message = copy.deepcopy(dict(raw_message))
+        role = message.get("role")
+        sidecar = message.pop("api_content", None)
+        # These fields are host bookkeeping and are not part of provider or
+        # runtime prompt content.
+        for key in ("display_kind", "display_metadata", "_row_id", "_db_persisted"):
+            message.pop(key, None)
+        if (
+            isinstance(sidecar, str)
+            and sidecar
+            and role in ("user", "assistant")
+        ):
+            message["content"] = sidecar
+        elif (
+            current_turn_user_idx is not None
+            and idx == current_turn_user_idx
+            and role == "user"
+        ):
+            composed = compose_user_api_content(
+                message.get("content", ""),
+                ext_prefetch_cache,
+                plugin_user_context,
+            )
+            if composed is not None:
+                message["content"] = composed
+        effective.append(message)
+    return effective
+
+
+def effective_prompt_sha256(
+    system_prompt: str,
+    messages: Sequence[Mapping[str, Any]],
+) -> str:
+    """Hash the canonical provider-neutral system-plus-history prompt."""
+    try:
+        payload = json.dumps(
+            {
+                "prompt_snapshot": system_prompt if isinstance(system_prompt, str) else "",
+                "messages": messages,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("effective prompt is not canonical JSON") from exc
+    return hashlib.sha256(payload).hexdigest()
 
 
 def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:

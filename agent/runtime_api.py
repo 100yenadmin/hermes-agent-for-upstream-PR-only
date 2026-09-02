@@ -34,6 +34,7 @@ HOST_RUNTIME_CAPABILITIES: FrozenSet[str] = frozenset(
         "cancellation_v1",
         "compaction_events_v1",
         "host_approval_v1",
+        "host_content_stream_v1",
         "host_status_v1",
         "host_tool_execution_v1",
         "provider_profile_registration_v1",
@@ -316,6 +317,12 @@ class RuntimeTurnRequest:
     attachments: Sequence[Mapping[str, Any]] = ()
     correlation_id: str | None = None
     tool_inventory: RuntimeToolInventory | None = None
+    prompt_hash: str = ""
+
+    @property
+    def effective_prompt_hash(self) -> str:
+        """Alias for the canonical hash of the host-prepared prompt."""
+        return self.prompt_hash
 
 
 @dataclass(frozen=True)
@@ -411,6 +418,8 @@ class RuntimeHostServices(Protocol):
     ) -> bool: ...
 
     async def emit_status(self, message: str) -> None: ...
+
+    async def emit_content(self, text: str) -> None: ...
 
     async def persist_state(self, state: RuntimeStateEnvelope) -> None: ...
 

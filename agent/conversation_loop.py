@@ -49,7 +49,9 @@ from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     _review_fork_first_request_pending,
     build_turn_context,
-    compose_user_api_content,
+    build_effective_prompt_messages,
+    compose_effective_system_prompt,
+    effective_prompt_sha256,
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
@@ -234,14 +236,24 @@ def _materialize_runtime_messages(runtime_messages: Any) -> Optional[List[Dict[s
 
 
 def _runtime_messages_match(left: Any, right: Any) -> bool:
-    """Compare rows while ignoring the host's internal persistence marker."""
+    """Compare rows at the shared effective-prompt boundary.
+
+    Runtime requests intentionally omit host bookkeeping (persistence markers,
+    display metadata, row IDs, and API sidecars). Normalize both sides through
+    the same provider-neutral projection before deciding whether a returned
+    transcript is already present in the live host list.
+    """
     if not isinstance(left, Mapping) or not isinstance(right, Mapping):
         return False
-    return {
-        key: value for key, value in left.items() if key != "_db_persisted"
-    } == {
-        key: value for key, value in right.items() if key != "_db_persisted"
-    }
+    try:
+        left_projection = build_effective_prompt_messages((left,))
+        right_projection = build_effective_prompt_messages((right,))
+    except (TypeError, ValueError):
+        return False
+    return (
+        bool(left_projection and right_projection)
+        and left_projection[0] == right_projection[0]
+    )
 
 
 def _merge_external_runtime_messages(
@@ -2417,16 +2429,22 @@ def run_conversation(
                 runtime_registration.descriptor.runtime_id,
             )
         runtime_tool_schemas = getattr(agent, "tools", ()) or ()
+        runtime_prompt_snapshot = compose_effective_system_prompt(
+            active_system_prompt,
+            getattr(agent, "ephemeral_system_prompt", None),
+        )
+        runtime_prompt_messages = build_effective_prompt_messages(
+            messages,
+            current_turn_user_idx=current_turn_user_idx,
+            ext_prefetch_cache=_ext_prefetch_cache,
+            plugin_user_context=_plugin_user_context,
+        )
         request = build_runtime_turn_request(
             provider=agent.provider,
             model=agent.model,
             api_mode=agent.api_mode,
-            messages=messages,
-            prompt_snapshot=(
-                getattr(agent, "_cached_system_prompt", "")
-                or getattr(agent, "system_prompt", "")
-                or ""
-            ),
+            messages=runtime_prompt_messages,
+            prompt_snapshot=runtime_prompt_snapshot,
             tool_schemas=runtime_tool_schemas,
             tool_inventory=build_runtime_tool_inventory(runtime_tool_schemas),
             session_state=runtime_session_state,
@@ -2436,7 +2454,9 @@ def run_conversation(
             agent,
             runtime_registration,
             task_id=effective_task_id,
+            turn_messages=messages,
         )
+        agent._last_effective_prompt_hash = request.effective_prompt_hash
         dispatched = run_runtime_sync(
             runtime_session.runtime,
             request,
@@ -2775,6 +2795,15 @@ def run_conversation(
                 agent.session_id or "-",
             )
 
+        # Apply the provider-neutral sidecar/content projection once. The
+        # runtime path uses the same helper before dispatch, so both routes
+        # consume byte-identical effective prompt content.
+        effective_prompt_messages = build_effective_prompt_messages(
+            messages,
+            current_turn_user_idx=current_turn_user_idx,
+            ext_prefetch_cache=_ext_prefetch_cache,
+            plugin_user_context=_plugin_user_context,
+        )
         api_messages = []
         for idx, msg in enumerate(messages):
 
@@ -2783,66 +2812,7 @@ def run_conversation(
             # cache decoration) must be unable to reach the persisted
             # history through shared nested containers. See
             # _clone_message_for_send.
-            api_msg = _clone_message_for_send(msg)
-
-            # api_content is the persistence sidecar carrying the exact bytes
-            # sent to the API for this message when they differ from the clean
-            # stored content (see compose_user_api_content in turn_context).
-            # It is bookkeeping, never a provider field — pop it from EVERY
-            # outgoing copy.
-            _api_content = api_msg.pop("api_content", None)
-
-            # Display-only timeline metadata. Never a provider field — strip
-            # from every outgoing copy so strict OpenAI-compatible backends
-            # don't reject the request after a model switch or resumed typed
-            # event row enters the live history.
-            api_msg.pop("display_kind", None)
-            api_msg.pop("display_metadata", None)
-
-            # Durable row identity stamped by _rows_to_conversation so the
-            # desktop can address a specific persisted message (reactions).
-            # Bookkeeping, never a provider field — only the chat-completions
-            # transport strips underscore keys, so drop it centrally here.
-            api_msg.pop("_row_id", None)
-
-            # Inject ephemeral context into the current turn's user message.
-            # Sources: memory manager prefetch + plugin pre_llm_call hooks
-            # with target="user_message" (the default).  Both are
-            # API-call-time only — the original message in `messages` is
-            # never mutated beyond the api_content stamp, so nothing leaks
-            # into the clean transcript content.
-            if idx == current_turn_user_idx and msg.get("role") == "user":
-                if isinstance(_api_content, str) and _api_content:
-                    # Stamped by the prologue from the same composition —
-                    # reuse it so the persisted sidecar and the wire cannot
-                    # drift, and so every pass this turn sends identical
-                    # bytes (composed from msg["content"], never from a
-                    # previously-injected copy).
-                    api_msg["content"] = _api_content
-                else:
-                    # Callers that bypass the prologue stamping: compose live.
-                    _composed = compose_user_api_content(
-                        api_msg.get("content", ""),
-                        _ext_prefetch_cache,
-                        _plugin_user_context,
-                    )
-                    if _composed is not None:
-                        api_msg["content"] = _composed
-            elif (
-                isinstance(_api_content, str)
-                and _api_content
-                and msg.get("role") in ("user", "assistant")
-            ):
-                # Historical message: replay the exact bytes sent when it was
-                # live, so the provider prompt-cache prefix stays byte-stable
-                # instead of diverging at the injection point and
-                # re-prefilling everything after it. User rows carry the
-                # prefetch/plugin injection sidecar; user AND assistant rows
-                # can carry a sanitize-divergence sidecar (content that
-                # ``get_messages_as_conversation``'s sanitize_context/strip
-                # would rewrite on reload — see the capture in
-                # ``_flush_messages_to_session_db``).
-                api_msg["content"] = _api_content
+            api_msg = _clone_message_for_send(effective_prompt_messages[idx])
 
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved
@@ -2916,11 +2886,22 @@ def run_conversation(
         # every turn. ``apply_anthropic_cache_control`` may split its stable
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
-        effective_system = active_system_prompt or ""
-        if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        effective_system = compose_effective_system_prompt(
+            active_system_prompt,
+            getattr(agent, "ephemeral_system_prompt", None),
+        )
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
+        try:
+            agent._last_effective_prompt_hash = effective_prompt_sha256(
+                effective_system,
+                effective_prompt_messages,
+            )
+        except (TypeError, ValueError):
+            # Provider-specific sanitizers below retain their existing
+            # behavior for unusual test-only message values; a hash is an
+            # observability field and must not change request delivery.
+            agent._last_effective_prompt_hash = ""
 
         if moa_config:
             try:

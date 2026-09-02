@@ -8,6 +8,7 @@ from agent.runtime_api import (
     RUNTIME_API_VERSION,
     RuntimeCancelledEvent,
     RuntimeCompletedEvent,
+    RuntimeContentEvent,
     RuntimeDescriptor,
     RuntimeFailedEvent,
     RuntimeFailure,
@@ -192,6 +193,80 @@ def test_external_runtime_reply_is_persisted_once_by_host_finalization(
     assert [(message["role"], message.get("content")) for message in persisted] == [
         ("user", "hello"),
         ("assistant", "external runtime reply"),
+    ]
+
+
+def test_runtime_content_stream_is_visible_without_duplicate_final_persistence(
+    monkeypatch, tmp_path
+):
+    from hermes_state import SessionDB
+
+    manager = PluginManager()
+    manager._discovered = True
+    context = PluginContext(PluginManifest(name="streaming-runtime"), manager)
+
+    class _StreamingRuntime:
+        def preflight(self, request):
+            return None
+
+        async def run_turn(self, request, host):
+            yield RuntimeContentEvent(text="streamed runtime reply")
+            yield RuntimeCompletedEvent(
+                result={
+                    "final_response": "streamed runtime reply",
+                    "messages": list(request.messages),
+                }
+            )
+
+        async def close(self):
+            return None
+
+    context.register_agent_runtime(
+        descriptor=RuntimeDescriptor(
+            runtime_id="streaming-test-runtime",
+            plugin_version="0.1.0",
+            runtime_api_min=RUNTIME_API_VERSION,
+            runtime_api_max=RUNTIME_API_VERSION,
+            required_host_capabilities=frozenset({"cancellation_v1"}),
+            provider_ids=frozenset({"openai"}),
+            api_modes=frozenset({"chat_completions"}),
+            session_state_schema_version=1,
+        ),
+        factory=_StreamingRuntime,
+    )
+
+    import hermes_cli.plugins as plugins_module
+
+    monkeypatch.setattr(plugins_module, "_plugin_manager", manager)
+    monkeypatch.setattr(
+        "agent.turn_context._maybe_title_session_at_turn_start",
+        lambda *_args, **_kwargs: None,
+    )
+    streamed = []
+    db = SessionDB(db_path=tmp_path / "streaming-state.db")
+    agent = run_agent.AIAgent(
+        api_key="synthetic-test-value",
+        base_url="https://test.invalid",
+        provider="openai",
+        model="synthetic-model",
+        api_mode="chat_completions",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        session_id="streaming-runtime-session",
+        session_db=db,
+        stream_delta_callback=streamed.append,
+    )
+    agent._cached_system_prompt = "composed synthetic prompt"
+
+    result = agent.run_conversation("hello", task_id="streaming-runtime-session")
+
+    assert result["final_response"] == "streamed runtime reply"
+    assert streamed == ["streamed runtime reply"]
+    persisted = db.get_messages_as_conversation("streaming-runtime-session")
+    assert [(message["role"], message.get("content")) for message in persisted] == [
+        ("user", "hello"),
+        ("assistant", "streamed runtime reply"),
     ]
 
 
