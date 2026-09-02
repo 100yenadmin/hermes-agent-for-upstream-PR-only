@@ -180,13 +180,14 @@ def test_nonstreaming_dispatch_revalidates_at_transport_boundary(monkeypatch):
     assert captured == {"model": "gpt-5.4", "timeout": 5}
 
 
-def test_streaming_entry_revalidates_before_direct_dispatch(monkeypatch):
+def test_codex_streaming_entry_revalidates_before_direct_dispatch(monkeypatch):
     from agent.chat_completion_helpers import interruptible_streaming_api_call
 
     captured = {}
     agent = _agent(
-        api_mode="chat_completions",
-        provider="openai",
+        api_mode="codex_responses",
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
         platform="cron",
         _interrupt_requested=False,
     )
