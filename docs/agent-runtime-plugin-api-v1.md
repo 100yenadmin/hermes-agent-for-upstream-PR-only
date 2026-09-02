@@ -16,7 +16,7 @@ frozen Revision 4 host boundary, including:
 - the honest at-least-once adapter boundary with idempotent durable consumers.
 
 Current implementation source before the documentation-only restamp:
-`02dd8fcc8aa4a520fc78d6826ce52a29bb6545c6`.
+`0b1dea57f303d2db5d2e9099254a663e7cc8faa8`.
 
 Do not add requirements, provider policy, or implementation detail here; update
 the ADR and its [canonical coupling map](architecture/agent-runtime-v1-coupling-map.md)
