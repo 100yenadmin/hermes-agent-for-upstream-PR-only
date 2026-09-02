@@ -421,6 +421,121 @@ class _RuntimeAgent:
         self._session_db = _RuntimeDatabase()
 
 
+class _GuardedRuntimeAgent(_RuntimeAgent):
+    valid_tool_names = frozenset({"synthetic_tool"})
+
+    def __init__(self):
+        super().__init__()
+        self.tool_calls = []
+        self.statuses = []
+
+    def _execute_tool_calls(self, assistant_message, messages, task_id):
+        tool_call = assistant_message.tool_calls[0]
+        self.tool_calls.append((tool_call.function.name, task_id))
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": "tool completed",
+            }
+        )
+
+    def _touch_activity(self, message):
+        self.statuses.append(message)
+
+
+def _stateful_host_operations(host):
+    state = RuntimeStateEnvelope(
+        runtime_id="example-runtime",
+        schema_version=1,
+        state={"external": "synthetic"},
+    )
+    receipt = RuntimeUsageReceipt(
+        runtime_id="example-runtime",
+        provider="example",
+        model="example-large",
+        billing_mode="subscription_included",
+        cost_status="included",
+    )
+    compaction = RuntimeCompactionEvent(
+        phase=RuntimeCompactionPhase.STARTED,
+        details={"watchdog_seconds": 60},
+    )
+    return (
+        ("refresh", lambda: host.refresh_turn("late-task")),
+        (
+            "tool",
+            lambda: _run_async(host.execute_tool("synthetic_tool", {"value": "one"})),
+        ),
+        (
+            "approval",
+            lambda: _run_async(
+                host.request_approval("terminal", {"reason": "synthetic"})
+            ),
+        ),
+        ("status", lambda: _run_async(host.emit_status("late status"))),
+        ("state", lambda: _run_async(host.persist_state(state))),
+        ("usage", lambda: _run_async(host.persist_usage(receipt))),
+        ("compaction", lambda: _run_async(host.emit_compaction(compaction))),
+        (
+            "background",
+            lambda: _run_async(
+                host.emit_background_result(
+                    RuntimeBackgroundResult(content="late background result")
+                )
+            ),
+        ),
+    )
+
+
+def _assert_guarded_agent_has_no_late_effects(agent):
+    assert agent.tool_calls == []
+    assert agent.statuses == []
+    assert agent._session_db.states == []
+    assert agent._session_db.receipts == []
+    assert agent._session_db.aggregate_receipts == []
+    assert agent._runtime_compaction_events == []
+
+
+def test_runtime_host_rejects_every_stateful_operation_after_close_and_rebind():
+    agent = _GuardedRuntimeAgent()
+    host = HermesRuntimeHostServices(
+        agent,
+        task_id="synthetic-task",
+        runtime_id="example-runtime",
+    )
+
+    _run_async(host.close())
+    agent.session_id = "different-session"
+
+    for _operation, invoke in _stateful_host_operations(host):
+        with pytest.raises(RuntimeExecutionError, match="closed"):
+            invoke()
+
+    assert host.cancellation_requested() is True
+    _assert_guarded_agent_has_no_late_effects(agent)
+
+
+def test_runtime_host_rejects_parent_rebind_before_any_stateful_effect():
+    agent = _GuardedRuntimeAgent()
+    host = HermesRuntimeHostServices(
+        agent,
+        task_id="synthetic-task",
+        runtime_id="example-runtime",
+    )
+    agent.session_id = "different-session"
+
+    for _operation, invoke in _stateful_host_operations(host):
+        with pytest.raises(
+            RuntimeExecutionError,
+            match="different Hermes session",
+        ):
+            invoke()
+
+    assert host.cancellation_requested() is True
+    _assert_guarded_agent_has_no_late_effects(agent)
+
+
 def test_host_persists_runtime_state_and_idempotent_usage_for_selected_runtime():
     agent = _RuntimeAgent()
     host = HermesRuntimeHostServices(

@@ -626,40 +626,58 @@ class HermesRuntimeHostServices:
             self._agent._runtime_compaction_events = self._compaction_events
         except Exception:
             pass
-    def refresh_turn(self, task_id: str) -> None:
-        """Refresh per-turn correlation and route data for the bound parent only."""
+
+    def _ensure_open_parent_locked(self) -> None:
+        """Fail closed unless this host still owns its captured Hermes parent."""
+        if self._closed:
+            raise RuntimeExecutionError("runtime host binding is closed")
         current_parent = str(getattr(self._agent, "session_id", None) or "")
         if current_parent != self._parent_session_id:
             raise RuntimeExecutionError(
                 "runtime host binding cannot move to a different Hermes session"
             )
-        self._task_id = str(task_id)
-        try:
-            from gateway.session_context import get_session_env
 
-            self._route = {
-                event_key: get_session_env(env_name, "")
-                for event_key, env_name in (
-                    ("session_key", "HERMES_SESSION_KEY"),
-                    ("origin_ui_session_id", "HERMES_UI_SESSION_ID"),
-                    ("platform", "HERMES_SESSION_PLATFORM"),
-                    ("chat_type", "HERMES_SESSION_CHAT_TYPE"),
-                    ("chat_id", "HERMES_SESSION_CHAT_ID"),
-                    ("thread_id", "HERMES_SESSION_THREAD_ID"),
-                    ("user_id", "HERMES_SESSION_USER_ID"),
-                    ("scope_id", "HERMES_SESSION_SCOPE_ID"),
-                )
-            }
-        except Exception:
-            self._route = {}
-        allowed = set(getattr(self._agent, "valid_tool_names", ()) or ())
-        for schema in getattr(self._agent, "tools", ()) or ():
-            if not isinstance(schema, Mapping):
-                continue
-            function = schema.get("function")
-            if isinstance(function, Mapping) and function.get("name"):
-                allowed.add(str(function["name"]))
-        self._allowed_tool_names = frozenset(allowed)
+    def _ensure_open_parent(self) -> None:
+        """Linearize a host operation before it touches state or side effects."""
+        with self._delivery_lock:
+            self._ensure_open_parent_locked()
+
+    def _emit_status_locked(self, message: str) -> None:
+        touch = getattr(self._agent, "_touch_activity", None)
+        if callable(touch):
+            touch(message)
+
+    def refresh_turn(self, task_id: str) -> None:
+        """Refresh per-turn correlation and route data for the bound parent only."""
+        with self._delivery_lock:
+            self._ensure_open_parent_locked()
+            self._task_id = str(task_id)
+            try:
+                from gateway.session_context import get_session_env
+
+                self._route = {
+                    event_key: get_session_env(env_name, "")
+                    for event_key, env_name in (
+                        ("session_key", "HERMES_SESSION_KEY"),
+                        ("origin_ui_session_id", "HERMES_UI_SESSION_ID"),
+                        ("platform", "HERMES_SESSION_PLATFORM"),
+                        ("chat_type", "HERMES_SESSION_CHAT_TYPE"),
+                        ("chat_id", "HERMES_SESSION_CHAT_ID"),
+                        ("thread_id", "HERMES_SESSION_THREAD_ID"),
+                        ("user_id", "HERMES_SESSION_USER_ID"),
+                        ("scope_id", "HERMES_SESSION_SCOPE_ID"),
+                    )
+                }
+            except Exception:
+                self._route = {}
+            allowed = set(getattr(self._agent, "valid_tool_names", ()) or ())
+            for schema in getattr(self._agent, "tools", ()) or ():
+                if not isinstance(schema, Mapping):
+                    continue
+                function = schema.get("function")
+                if isinstance(function, Mapping) and function.get("name"):
+                    allowed.add(str(function["name"]))
+            self._allowed_tool_names = frozenset(allowed)
 
     async def execute_tool(self, name: str, arguments: Mapping[str, Any]) -> Any:
         """Execute one runtime-requested tool through Hermes' canonical funnel.
@@ -670,6 +688,7 @@ class HermesRuntimeHostServices:
         terminal result normalization.  The plugin receives only the canonical
         tool result content.
         """
+        self._ensure_open_parent()
         normalized_name = str(name or "").strip()
         if not normalized_name or normalized_name not in self._allowed_tool_names:
             raise RuntimeExecutionError(
@@ -718,6 +737,7 @@ class HermesRuntimeHostServices:
         action: str,
         details: Mapping[str, Any],
     ) -> bool:
+        self._ensure_open_parent()
         from tools.approval import request_tool_approval
 
         try:
@@ -735,39 +755,41 @@ class HermesRuntimeHostServices:
         return bool(decision.get("approved"))
 
     async def emit_status(self, message: str) -> None:
-        touch = getattr(self._agent, "_touch_activity", None)
-        if callable(touch):
-            touch(message)
+        self._ensure_open_parent()
+        self._emit_status_locked(message)
 
     async def persist_state(self, state: RuntimeStateEnvelope) -> None:
+        self._ensure_open_parent()
         if state.runtime_id != self._runtime_id:
             raise RuntimeExecutionError(
                 "runtime state identity does not match the selected runtime"
             )
         database = getattr(self._agent, "_session_db", None)
-        session_id = getattr(self._agent, "session_id", None)
-        if database is None or not session_id:
+        if database is None or not self._parent_session_id:
             raise RuntimeExecutionError(
                 "runtime state persistence requires an active Hermes session"
             )
-        database.update_runtime_state(session_id, state)
+        database.update_runtime_state(self._parent_session_id, state)
 
     async def persist_usage(self, receipt: RuntimeUsageReceipt) -> None:
+        self._ensure_open_parent()
         if receipt.runtime_id != self._runtime_id:
             raise RuntimeExecutionError(
                 "runtime usage identity does not match the selected runtime"
             )
         database = getattr(self._agent, "_session_db", None)
-        session_id = getattr(self._agent, "session_id", None)
-        if database is None or not session_id:
+        if database is None or not self._parent_session_id:
             raise RuntimeExecutionError(
                 "runtime usage persistence requires an active Hermes session"
             )
-        inserted = database.record_runtime_usage_receipt(session_id, receipt)
+        inserted = database.record_runtime_usage_receipt(
+            self._parent_session_id,
+            receipt,
+        )
         if not inserted:
             return
         database.queue_token_counts(
-            session_id,
+            self._parent_session_id,
             input_tokens=receipt.input_tokens,
             output_tokens=receipt.output_tokens,
             cache_read_tokens=receipt.cache_read_tokens,
@@ -788,25 +810,29 @@ class HermesRuntimeHostServices:
         are retained on the agent for lifecycle observers; arbitrary runtime
         payloads are intentionally not persisted or surfaced.
         """
-        if not isinstance(event, RuntimeCompactionEvent):
-            raise RuntimeExecutionError("runtime compaction event has an unsupported type")
-        details = {
-            key: value
-            for key, value in event.details.items()
-            if key in {"watchdog_seconds"}
-            and isinstance(value, (str, int, float, bool))
-        }
-        record = {
-            "runtime_id": self._runtime_id,
-            "phase": event.phase.value,
-            "details": details,
-        }
-        self._compaction_events.append(record)
+        with self._delivery_lock:
+            self._ensure_open_parent_locked()
+            if not isinstance(event, RuntimeCompactionEvent):
+                raise RuntimeExecutionError(
+                    "runtime compaction event has an unsupported type"
+                )
+            details = {
+                key: value
+                for key, value in event.details.items()
+                if key in {"watchdog_seconds"}
+                and isinstance(value, (str, int, float, bool))
+            }
+            record = {
+                "runtime_id": self._runtime_id,
+                "phase": event.phase.value,
+                "details": details,
+            }
+            self._compaction_events.append(record)
 
-        # Keep existing host status delivery as the lifecycle projection. The
-        # message is derived solely from the typed phase and carries no runtime
-        # details or provider-specific policy.
-        await self.emit_status(f"Runtime compaction {event.phase.value}")
+            # Keep existing host status delivery as the lifecycle projection. The
+            # message is derived solely from the typed phase and carries no runtime
+            # details or provider-specific policy.
+            self._emit_status_locked(f"Runtime compaction {event.phase.value}")
 
     async def emit_background_result(
         self,
@@ -819,11 +845,10 @@ class HermesRuntimeHostServices:
             raise RuntimeExecutionError(
                 "background delivery requires an active Hermes parent session"
             )
-        from tools.process_registry import process_registry
-
         with self._delivery_lock:
-            if self._closed:
-                raise RuntimeExecutionError("runtime host binding is closed")
+            self._ensure_open_parent_locked()
+            from tools.process_registry import process_registry
+
             self._delivery_counter += 1
             delivery_id = (
                 f"runtime-background-{self._delivery_counter:04d}-{uuid.uuid4().hex}"
@@ -859,7 +884,13 @@ class HermesRuntimeHostServices:
             self._closed = True
 
     def cancellation_requested(self) -> bool:
-        return bool(getattr(self._agent, "_interrupt_requested", False))
+        with self._delivery_lock:
+            current_parent = str(getattr(self._agent, "session_id", None) or "")
+            return bool(
+                self._closed
+                or current_parent != self._parent_session_id
+                or getattr(self._agent, "_interrupt_requested", False)
+            )
 
 
 class RuntimeSessionBinding:
