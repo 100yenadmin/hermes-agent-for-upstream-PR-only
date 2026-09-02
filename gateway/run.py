@@ -2624,7 +2624,7 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
     Platforms that do not use ``PlatformConfig.token`` always return True so we
     never skip them here (Signal session paths, port-binding HTTP adapters, etc.).
     """
-    from gateway.config import PLATFORM_TOKEN_ENV_NAMES
+    from gateway.config import PLATFORM_TOKEN_ENV_NAMES, Platform
 
     if platform not in PLATFORM_TOKEN_ENV_NAMES:
         return True
@@ -2635,6 +2635,26 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
     api_key = getattr(platform_config, "api_key", None) or ""
     if isinstance(api_key, str) and api_key.strip():
         return True
+    # Matrix also authenticates by password login (MATRIX_USER_ID +
+    # MATRIX_PASSWORD, no MATRIX_ACCESS_TOKEN). Those credentials land in
+    # ``extra`` rather than ``.token``, so a token-only check reads a
+    # perfectly reconnectable password-auth config as credential-less and
+    # evicts it from the retry queue on the first transient failure — after
+    # which it stays down until the gateway is restarted by hand. Mirror the
+    # adapter's own gate: homeserver + user_id + password.
+    #
+    # Read ONLY from extra, never os.getenv: build_config() already copies all
+    # three env vars onto extra, and importing this module loads ~/.hermes/.env,
+    # so an env fallback would report "has credential" for every Matrix config
+    # on the box — including the empty-primary multiplex case (#64674) this
+    # check exists to evict.
+    if platform is Platform.MATRIX:
+        extra = getattr(platform_config, "extra", None) or {}
+        if all(
+            str(extra.get(key) or "").strip()
+            for key in ("homeserver", "user_id", "password")
+        ):
+            return True
     return False
 
 
@@ -3044,6 +3064,7 @@ from gateway.restart import (
     DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT,
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    is_global_startup_conflict,
     parse_cron_drain_timeout,
     parse_restart_after_turn_timeout,
     parse_restart_drain_timeout,
@@ -9760,6 +9781,72 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             depth += 1
         return depth
 
+    def _rescue_orphaned_overflow(
+        self, session_key: str, adapter: Any
+    ) -> Optional["MessageEvent"]:
+        """Pop the oldest orphaned FIFO overflow event for an idle session (#99882).
+
+        The FIFO overflow (``queued_events``) drains only at the post-turn
+        promotion site (``_promote_queued_event`` inside the ``_run_agent``
+        drain).  When a busy window ends without that drain running — the
+        #99882 shape: a follow-up queued during compression-in-flight lands
+        in overflow, compression finishes, the slot event's turn runs, but
+        the drain recursion exits before promoting (or the busy window ends
+        through an exception / interrupt / generation-bump exit that never
+        reaches the promotion site) — the overflow entries are silently
+        orphaned: never dispatched, never persisted, never logged.
+
+        This rescue runs at the point where a NEW event arrives for a
+        session that is NOT busy (the idle entry in
+        ``_process_message_priority``).  If the session went idle with a
+        populated overflow, the oldest orphan is returned so the caller runs
+        it as THIS turn, and the next orphan (if any) is staged into the
+        slot so the post-turn drain continues the chain in arrival order
+        (#28503).  The caller then enqueues the incoming event behind the
+        chain via ``_enqueue_fifo``.
+
+        The returned event is REMOVED from both stores: leaving it in the
+        slot while it also runs as the current turn would make the post-turn
+        ``_dequeue_pending_event`` run it a second time.
+
+        Returns the orphaned event to run now, or ``None`` when there is
+        nothing to rescue (no overflow, slot occupied, or no slot storage).
+        """
+        try:
+            _q_state = self._peek_session_state(session_key)
+            overflow = _q_state.conversation.queued_events if _q_state else None
+            if not overflow:
+                return None
+            pending_slot = getattr(adapter, "_pending_messages", None)
+            if not isinstance(pending_slot, dict) or pending_slot.get(session_key):
+                # Slot occupied (busy) or no slot storage — promotion owns
+                # this; do not fight it from the idle path.
+                return None
+            head = overflow.pop(0)
+            # Keep the slot occupied for the rest of the chain so the drain
+            # promotes in order and any mid-chain arrival routes to overflow
+            # instead of jumping the queue (same invariant as the drain's
+            # own _promote_queued_event).  Only ONE event fits the slot.
+            if overflow:
+                pending_slot[session_key] = overflow.pop(0)
+            logger.warning(
+                "Rescued orphaned FIFO overflow event for idle session "
+                "%s — it was queued during a busy window but the post-turn "
+                "drain never promoted it (#99882)",
+                session_key,
+            )
+            if overflow:
+                logger.warning(
+                    "%d overflow event(s) still queued for session %s after "
+                    "rescue staging (will drain via normal promotion)",
+                    len(overflow),
+                    session_key,
+                )
+            return head
+        except Exception:
+            logger.debug("FIFO overflow rescue failed for %s", session_key, exc_info=True)
+            return None
+
     @staticmethod
     def _is_goal_continuation_event(event_or_text: Any) -> bool:
         """Return True for synthetic /goal continuation turns.
@@ -14098,20 +14185,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Python logs "Unclosed client session" at process exit.
                 await self._safe_adapter_disconnect(adapter, platform)
                 if adapter.has_fatal_error:
+                    # A live foreign holder of this bot token / identity is
+                    # a single-writer ownership conflict, not a transient
+                    # blip — even though ``_acquire_platform_lock`` emits it
+                    # retryable so a MID-RUN reconnect can recover (#54167).
+                    # At startup route it as non-retryable: with nothing
+                    # connected the gateway exits 78 instead of sitting alive
+                    # and deaf in the retry queue forever (#83183).
+                    _retryable = adapter.fatal_error_retryable and not (
+                        is_global_startup_conflict(adapter.fatal_error_code)
+                    )
                     self._update_platform_runtime_status(
                         platform.value,
-                        platform_state="retrying" if adapter.fatal_error_retryable else "fatal",
+                        platform_state="retrying" if _retryable else "fatal",
                         error_code=adapter.fatal_error_code,
                         error_message=adapter.fatal_error_message,
                     )
                     target = (
                         startup_retryable_errors
-                        if adapter.fatal_error_retryable
+                        if _retryable
                         else startup_nonretryable_errors
                     )
                     target.append(f"{platform.value}: {adapter.fatal_error_message}")
                     # Queue for reconnection if the error is retryable
-                    if adapter.fatal_error_retryable:
+                    if _retryable:
                         self._failed_platforms[platform] = {
                             "config": platform_config,
                             "attempts": 1,
@@ -16444,6 +16541,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 flush_pending_to_file(dict(self._pending_messages), reason="shutdown")
             except Exception:
                 pass
+            # The FIFO tail lives in SessionState.conversation.queued_events,
+            # not in the slot dict above — flush it too or every follow-up
+            # parked in overflow at restart time is lost (#99882).
+            try:
+                from gateway.shutdown_flush import flush_overflow_to_file
+                flush_overflow_to_file(
+                    {
+                        _k: list(_v)
+                        for _k, _v in dict(getattr(self, "_queued_events", None) or {}).items()
+                        if _v
+                    },
+                    reason="shutdown",
+                )
+            except Exception:
+                pass
             # On the real runner these are live SessionState views whose
             # clear() resets one field per session — never a wholesale dict
             # swap, so a concurrent writer on another session can't lose its
@@ -17055,6 +17167,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         scheduler would.
         """
         if not getattr(adapter, "fatal_error_retryable", True):
+            return
+        if is_global_startup_conflict(getattr(adapter, "fatal_error_code", None)):
+            # Same startup contract as the primary path: a live foreign holder
+            # of this profile's token/identity is an ownership conflict, not
+            # a transient blip. Park it fatal (like ``duplicate_credential``)
+            # instead of retry-storming the token every backoff (#83183).
+            logger.error(
+                "[MULTIPLEX] Profile '%s': %s credential is held by another "
+                "gateway (%s) — parked, not retried. %s",
+                profile_name,
+                platform.value,
+                adapter.fatal_error_code,
+                adapter.fatal_error_message or "",
+            )
+            self._update_platform_runtime_status(
+                f"{profile_name}:{platform.value}",
+                platform_state="fatal",
+                error_code=adapter.fatal_error_code,
+                error_message=adapter.fatal_error_message,
+            )
             return
 
         async def _await_running_then_schedule() -> None:
@@ -19679,6 +19811,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _quick_key,
             )
             return _limit_message
+
+        # ── FIFO orphan rescue (#99882) ────────────────────────────────
+        # If this session went idle with a populated overflow (queued
+        # during a busy window whose post-turn drain never promoted —
+        # e.g. a compression-demoted follow-up after the compression
+        # window ended through an exit that skipped the promotion site),
+        # those events were silently orphaned.  We are starting the next
+        # turn for this session NOW: re-stage the orphans in FIFO order
+        # and enqueue the incoming event behind them, so arrival order
+        # (#28503) holds: oldest orphan runs as this turn, the rest drain
+        # in order, the new message last.  Skipped for control commands
+        # (/stop etc. own their own semantics) and internal events.
+        try:
+            _orphan_adapter = self._adapter_for_source(source)
+            if (
+                _orphan_adapter is not None
+                and not bool(getattr(event, "internal", False))
+                and not event.get_command()
+            ):
+                _rescued = self._rescue_orphaned_overflow(
+                    _quick_key, _orphan_adapter
+                )
+                if _rescued is not None:
+                    # The oldest orphan runs as THIS turn.  Park the
+                    # incoming event behind the rest of the chain: into the
+                    # slot when the chain was a single orphan (so the
+                    # post-turn drain picks it up), otherwise into overflow
+                    # behind the already-staged next orphan (FIFO).
+                    self._enqueue_fifo(_quick_key, event, _orphan_adapter)
+                    event = _rescued
+                    # Same session key by construction; carry the orphan's
+                    # own source so reply anchors / thread metadata point
+                    # at the message that is actually being answered.
+                    _rescued_source = getattr(_rescued, "source", None)
+                    if _rescued_source is not None:
+                        source = _rescued_source
+                    is_internal = bool(getattr(_rescued, "internal", False))
+        except Exception:
+            logger.debug(
+                "FIFO orphan rescue pre-claim failed for %s",
+                _quick_key,
+                exc_info=True,
+            )
+
         _claim_state = self._session_state(_quick_key)
         if _active_session_lease is not None:
             _claim_state.turn.lease = _active_session_lease
