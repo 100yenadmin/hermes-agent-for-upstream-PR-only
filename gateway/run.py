@@ -7186,6 +7186,7 @@ class TurnRunner:
                 "interrupted": result.get("interrupted", False),
                 "interrupt_message": result.get("interrupt_message"),
                 "error": result.get("error"),
+                "agent_persisted": result.get("agent_persisted"),
                 "compression_exhausted": result.get("compression_exhausted", False),
                 "compression_deferred": result.get("compression_deferred", False),
                 "tools": ctx.tools_holder[0] or [],
@@ -22661,17 +22662,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     }
                 )
             
-            # The agent already persisted these messages to SQLite via
-            # _flush_messages_to_session_db(), so skip the DB write here
-            # to prevent the duplicate-write bug (#860 / #42039). This holds
-            # for the codex app-server runtime too: although it early-returns
-            # and bypasses conversation_loop's per-step flushes, it flushes its
-            # own projected assistant/tool messages before returning and
-            # reports agent_persisted=True (see agent/codex_runtime.py). Reading
-            # the flag (default = self._session_db is not None) keeps the
-            # persistence contract explicit and lets any future non-persisting
-            # runtime opt into a gateway-side write by returning False.
-            agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
+            # Host-finalized external runtimes report whether their durable DB
+            # flush actually succeeded. Built-in Codex reports its own
+            # projected flush. Legacy ordinary-loop results have no flag and
+            # retain the existing session-DB default; an explicit non-boolean
+            # value is never allowed to silently skip gateway persistence.
+            _agent_persisted = agent_result.get("agent_persisted")
+            agent_persisted = (
+                _agent_persisted
+                if isinstance(_agent_persisted, bool)
+                else self._session_db is not None
+            )
 
             # Find only the NEW messages from this turn (skip history we loaded).
             # Use the filtered history length (history_offset) that was actually

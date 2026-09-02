@@ -24,6 +24,7 @@ import re
 import ssl
 import sys
 import time
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -192,6 +193,114 @@ def _review_input_budget_exhausted(agent: Any) -> bool:
         return False
     used = getattr(agent, "session_input_tokens", 0)
     return isinstance(used, int) and not isinstance(used, bool) and used >= budget
+
+
+def _materialize_runtime_value(value: Any) -> Any:
+    """Convert an immutable runtime payload into JSON-compatible containers."""
+    if isinstance(value, Mapping):
+        materialized = {}
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                raise TypeError("runtime message mapping keys must be strings")
+            materialized[key] = _materialize_runtime_value(nested)
+        return materialized
+    if isinstance(value, (list, tuple)):
+        return [_materialize_runtime_value(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError("runtime message contains a non-serializable value")
+
+
+def _materialize_runtime_messages(runtime_messages: Any) -> Optional[List[Dict[str, Any]]]:
+    """Materialize a runtime message snapshot, or reject an invalid payload."""
+    if not isinstance(runtime_messages, (list, tuple)):
+        return None
+    try:
+        materialized = _materialize_runtime_value(runtime_messages)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid external runtime message snapshot")
+        return None
+    if not isinstance(materialized, list) or not all(
+        isinstance(message, dict) for message in materialized
+    ):
+        logger.warning("Ignoring invalid external runtime message snapshot")
+        return None
+    for message in materialized:
+        # Persistence markers are host-owned. A runtime must not be able to
+        # make a newly returned row look durable before the host flushes it.
+        message.pop("_db_persisted", None)
+    return materialized
+
+
+def _runtime_messages_match(left: Any, right: Any) -> bool:
+    """Compare rows while ignoring the host's internal persistence marker."""
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        return False
+    return {
+        key: value for key, value in left.items() if key != "_db_persisted"
+    } == {
+        key: value for key, value in right.items() if key != "_db_persisted"
+    }
+
+
+def _merge_external_runtime_messages(
+    messages: List[Dict[str, Any]], runtime_messages: Any
+) -> None:
+    """Merge a runtime transcript delta into the host-owned turn list.
+
+    Runtime requests are immutable snapshots. A runtime may return that full
+    snapshot, a current-turn snapshot, or only newly produced rows. Preserve
+    the host's original row objects (and their idempotence markers) while
+    appending only an unambiguous delta.
+    """
+    materialized = _materialize_runtime_messages(runtime_messages)
+    if materialized is None:
+        return
+    common_prefix = 0
+    while (
+        common_prefix < len(messages)
+        and common_prefix < len(materialized)
+        and _runtime_messages_match(messages[common_prefix], materialized[common_prefix])
+    ):
+        common_prefix += 1
+    if common_prefix == len(materialized):
+        return
+    if common_prefix:
+        messages.extend(materialized[common_prefix:])
+        return
+    if materialized and _runtime_messages_match(messages[-1], materialized[0]):
+        messages.extend(materialized[1:])
+        return
+    # A delta containing no user row is safe to append; a user-containing
+    # snapshot with no stable anchor would risk replaying a prior turn.
+    if not any(message.get("role") == "user" for message in materialized):
+        messages.extend(materialized)
+        return
+    logger.warning("Ignoring unanchored external runtime message snapshot")
+
+
+def _runtime_persistence_succeeded(agent: Any, result: Mapping[str, Any]) -> bool:
+    """Report whether host finalization completed its durable DB flush."""
+    if getattr(agent, "_persist_disabled", False):
+        return False
+    if not getattr(agent, "_session_db", None):
+        return False
+    if getattr(agent, "_last_persistence_error_cause", None) is not None:
+        return False
+    cleanup_errors = result.get("cleanup_errors") or ()
+    if any(
+        isinstance(error, str) and error.startswith("persist_session:")
+        for error in cleanup_errors
+    ):
+        return False
+    final_response = result.get("final_response")
+    if final_response:
+        messages = result.get("messages") or ()
+        for message in reversed(messages):
+            if isinstance(message, Mapping) and message.get("role") == "assistant":
+                return message.get("_db_persisted") is True
+        return False
+    return True
 
 
 def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) -> bool:
@@ -2311,6 +2420,77 @@ def run_conversation(
             runtime_session.host,
             descriptor=runtime_registration.descriptor,
         )
+        # The built-in Codex adapter owns its projected persistence and must
+        # retain its existing short-circuit. External runtimes only return an
+        # immutable result envelope; host finalization owns the durable turn.
+        if runtime_registration.plugin_id != "hermes-core":
+            runtime_response = dict(dispatched.response or {})
+            _merge_external_runtime_messages(
+                messages, runtime_response.get("messages")
+            )
+            runtime_api_calls = runtime_response.get("api_calls", 0)
+            if not isinstance(runtime_api_calls, int) or isinstance(
+                runtime_api_calls, bool
+            ):
+                runtime_api_calls = 0
+            runtime_failure = dispatched.failure
+            runtime_cancelled = dispatched.cancelled
+            runtime_final_response = (
+                None
+                if runtime_failure is not None or runtime_cancelled
+                else runtime_response.get("final_response")
+            )
+            result = finalize_turn(
+                agent,
+                final_response=runtime_final_response,
+                api_call_count=max(0, runtime_api_calls),
+                interrupted=runtime_cancelled,
+                failed=runtime_failure is not None,
+                messages=messages,
+                conversation_history=conversation_history,
+                effective_task_id=effective_task_id,
+                turn_id=turn_id,
+                user_message=user_message,
+                original_user_message=original_user_message,
+                _should_review_memory=_should_review_memory,
+                _turn_exit_reason=(
+                    "runtime_failure"
+                    if runtime_failure is not None
+                    else "runtime_cancelled"
+                    if runtime_cancelled
+                    else "runtime_completed"
+                ),
+            )
+            result["agent_persisted"] = _runtime_persistence_succeeded(agent, result)
+            if runtime_failure is not None:
+                result.update(
+                    {
+                        "error": runtime_failure.message,
+                        "partial": runtime_failure.phase
+                        in {
+                            RuntimeFailurePhase.AFTER_VISIBLE_OUTPUT,
+                            RuntimeFailurePhase.AFTER_SIDE_EFFECTS,
+                        },
+                        "failed": True,
+                        "failure": runtime_failure,
+                        "replay_safe": runtime_failure.replay_safe,
+                    }
+                )
+            elif runtime_cancelled:
+                result.update(
+                    {
+                        "error": (
+                            dispatched.terminal.reason
+                            if dispatched.terminal is not None
+                            and hasattr(dispatched.terminal, "reason")
+                            else "cancelled"
+                        ),
+                        "partial": True,
+                        "interrupted": True,
+                    }
+                )
+            return result
+
         if dispatched.failure is not None:
             _runtime_failure = dispatched.failure
             return {
