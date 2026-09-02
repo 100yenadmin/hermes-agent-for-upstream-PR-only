@@ -24,7 +24,7 @@ from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
 from typing import Any, Dict, List, Optional, Tuple
-from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
+from utils import base_url_host_matches, normalize_proxy_env_vars
 from agent.secret_scope import get_secret as _get_secret
 
 # This module keeps client construction and the Messages API call itself.  The
@@ -459,8 +459,9 @@ def _is_native_anthropic_fast_endpoint(base_url: str | None) -> bool:
     as native. Fast Mode is a protected capability, so dynamic turns require
     the exact hostname and cannot trust a lookalike host or path.
     """
-    normalized = str(base_url or "").strip()
-    return bool(normalized) and base_url_hostname(normalized) == "api.anthropic.com"
+    from hermes_cli.models import _is_verified_fast_origin
+
+    return _is_verified_fast_origin(base_url, "api.anthropic.com")
 
 
 # Beta headers for enhanced features that are safe on ordinary/native Anthropic

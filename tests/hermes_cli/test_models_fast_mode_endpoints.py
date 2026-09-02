@@ -48,6 +48,7 @@ def test_zero_arg_calls_unchanged(model_id, expected):
         ("gpt-5.6-sol", "openai", "codex_responses", "https://api.openai.com/v1"),
         ("gpt-5.6-terra", "openai", "codex_responses", "https://api.openai.com/v1"),
         ("gpt-5.6-luna", "openai", "codex_responses", "https://api.openai.com/v1"),
+        ("gpt-5.6-sol", "openai", "codex_responses", "https://api.openai.com:443/v1"),
         ("gpt-5.5", "openai", "codex_responses", "https://api.openai.com/v1"),
         ("gpt-5.4-mini", "openai", "chat_completions", "https://api.openai.com/v1"),
         ("gpt-5.4", "openai-codex", "codex_responses", "https://chatgpt.com/backend-api/codex"),
@@ -78,6 +79,10 @@ def test_allowlisted_endpoints_get_priority(model_id, provider, api_mode, base_u
         ("gpt-4.1", "openai", "chat_completions", "https://api.openai.com/v1"),
         ("gpt-5.4-pro", "openai", "codex_responses", "https://api.openai.com/v1"),
         ("gpt-6-preview", "openai", "codex_responses", "https://api.openai.com/v1"),
+        # correct hostname on an unsupported scheme or non-default port
+        ("gpt-5.6-sol", "openai", "codex_responses", "http://api.openai.com/v1"),
+        ("gpt-5.6-sol", "openai", "codex_responses", "ftp://api.openai.com/v1"),
+        ("gpt-5.6-sol", "openai", "codex_responses", "https://api.openai.com:8443/v1"),
         # grok-shaped model on a proxy
         ("grok-4.6", "openrouter", "chat_completions", "https://openrouter.ai/api/v1"),
         # xAI provider but non-first-party host
@@ -126,6 +131,9 @@ def test_anthropic_legacy_models_do_not_get_dynamic_speed_fast(model_id):
     [
         "https://api.anthropic.com.attacker.test/v1",
         "https://proxy.example/api.anthropic.com/v1",
+        "http://api.anthropic.com/v1",
+        "ftp://api.anthropic.com/v1",
+        "https://api.anthropic.com:8443/v1",
     ],
 )
 def test_anthropic_dynamic_speed_fast_rejects_lookalike_hosts(base_url):

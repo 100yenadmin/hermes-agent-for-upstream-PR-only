@@ -251,6 +251,27 @@ def test_dynamic_fast_requires_complete_runtime_identity(missing):
     }
 
 
+def test_dynamic_fast_uses_base_url_owned_by_active_transport():
+    active_proxy = _agent(
+        base_url="https://proxy.example/v1",
+        _anthropic_base_url="https://api.openai.com/v1",
+    )
+    active_openai = _agent(
+        base_url="https://api.openai.com/v1",
+        _anthropic_base_url="https://api.anthropic.com/v1",
+    )
+    begin_fast_mode_turn(active_proxy, [], now=10.0)
+    begin_fast_mode_turn(active_openai, [], now=10.0)
+
+    assert effective_request_overrides(active_proxy, now=10.0) == {
+        "unrelated": "preserved"
+    }
+    assert effective_request_overrides(active_openai, now=10.0) == {
+        "service_tier": "priority",
+        "unrelated": "preserved",
+    }
+
+
 @pytest.mark.parametrize("model", ["claude-opus-4-8", "claude-opus-5"])
 def test_dynamic_anthropic_fast_uses_current_native_models_only(model, monkeypatch):
     agent = _agent(
@@ -345,6 +366,27 @@ def test_dispatch_revalidation_uses_final_model_identity(monkeypatch):
         {"model": "claude-opus-4-8", "service_tier": "priority", "timeout": 5},
     )
     assert dispatched == {"model": "claude-opus-4-8", "timeout": 5}
+
+
+def test_anthropic_dispatch_applies_final_model_identity(monkeypatch):
+    agent = _agent(
+        model="claude-opus-4-7",
+        provider="anthropic",
+        api_mode="anthropic_messages",
+        base_url="https://api.anthropic.com/v1",
+        _anthropic_base_url="https://api.anthropic.com/v1",
+        _is_anthropic_oauth=False,
+        _oauth_1m_beta_disabled=False,
+    )
+    begin_fast_mode_turn(agent, [], now=100.0)
+    monkeypatch.setattr("agent.fast_mode.time.monotonic", lambda: 110.0)
+
+    dispatched = revalidate_fast_mode_request(
+        agent,
+        {"model": "claude-opus-4-8", "extra_body": {"unrelated": 1}},
+    )
+    assert dispatched["extra_body"] == {"speed": "fast", "unrelated": 1}
+    assert "fast-mode-2026-02-01" in dispatched["extra_headers"]["anthropic-beta"]
 
 
 def test_nonstreaming_dispatch_revalidates_at_transport_boundary(monkeypatch):

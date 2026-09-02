@@ -4031,6 +4031,25 @@ def _is_anthropic_dynamic_fast_model(model_id: Optional[str]) -> bool:
     )
 
 
+def _is_verified_fast_origin(base_url: Optional[str], *allowed_hosts: str) -> bool:
+    """Return True only for an HTTPS first-party origin on its default port."""
+    raw = str(base_url or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.lower() == "https"
+        and parsed.username is None
+        and parsed.password is None
+        and port in (None, 443)
+        and base_url_hostname(raw) in allowed_hosts
+    )
+
+
 def resolve_fast_mode_overrides(
     model_id: Optional[str],
     *,
@@ -4077,15 +4096,13 @@ def resolve_fast_mode_overrides(
         return None
 
     normalized_provider = normalize_provider(provider)
-    hostname = base_url_hostname(str(base_url or ""))
-
     # Anthropic's native dynamic contract is intentionally exact: provider,
     # Messages transport, native hostname, and a currently documented model
     # must all agree before speed=fast is emitted.
     if normalized_provider == "anthropic":
         if (
             api_mode != "anthropic_messages"
-            or hostname != "api.anthropic.com"
+            or not _is_verified_fast_origin(base_url, "api.anthropic.com")
             or not _is_anthropic_dynamic_fast_model(model_id)
         ):
             return None
@@ -4097,13 +4114,13 @@ def resolve_fast_mode_overrides(
     direct_api = (
         normalized_provider in {"openai", "openai-api"}
         and api_mode in {"chat_completions", "codex_responses"}
-        and hostname == "api.openai.com"
+        and _is_verified_fast_origin(base_url, "api.openai.com")
         and _is_openai_dynamic_fast_model(model_id)
     )
     codex_backend = (
         normalized_provider == "openai-codex"
         and api_mode == "codex_responses"
-        and hostname in {"chatgpt.com", "chat.openai.com"}
+        and _is_verified_fast_origin(base_url, "chatgpt.com", "chat.openai.com")
         and _is_openai_dynamic_fast_model(model_id)
     )
     # xAI Grok 4.6 Priority Processing. Both first-party xAI wire surfaces are
@@ -4113,7 +4130,7 @@ def resolve_fast_mode_overrides(
     xai_direct = (
         normalized_provider in {"xai", "xai-oauth"}
         and api_mode in {"chat_completions", "codex_responses"}
-        and hostname == "api.x.ai"
+        and _is_verified_fast_origin(base_url, "api.x.ai")
         and is_grok_46_family(str(model_id or ""))
     )
     if not (direct_api or codex_backend or xai_direct):

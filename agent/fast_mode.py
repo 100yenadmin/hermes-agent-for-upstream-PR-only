@@ -68,6 +68,15 @@ def invalidate_fast_mode_turn(agent: Any) -> None:
     agent._fast_mode_turn_started_at = None
 
 
+def _runtime_base_url(agent: Any) -> Any:
+    """Return the endpoint owned by the agent's active transport."""
+    if getattr(agent, "api_mode", None) == "anthropic_messages":
+        return getattr(agent, "_anthropic_base_url", None) or getattr(
+            agent, "base_url", None
+        )
+    return getattr(agent, "base_url", None)
+
+
 def effective_request_overrides(
     agent: Any, *, now: float | None = None, model: Any = None
 ) -> dict[str, Any]:
@@ -96,10 +105,7 @@ def effective_request_overrides(
     if max(0.0, current - float(started_at)) <= cutoff:
         from hermes_cli.models import resolve_fast_mode_overrides
 
-        runtime_base_url = (
-            getattr(agent, "_anthropic_base_url", None)
-            or getattr(agent, "base_url", None)
-        )
+        runtime_base_url = _runtime_base_url(agent)
         runtime_identity = (
             getattr(agent, "provider", None),
             getattr(agent, "api_mode", None),
@@ -143,14 +149,8 @@ def revalidate_fast_mode_request(
     kwargs = dict(api_kwargs)
     kwargs.pop("service_tier", None)
     kwargs.pop("speed", None)
-    overrides = effective_fast_mode_overrides(
-        agent,
-        model=(
-            kwargs["model"]
-            if "model" in kwargs
-            else getattr(agent, "model", None)
-        ),
-    )
+    final_model = kwargs.get("model", getattr(agent, "model", None))
+    overrides = effective_fast_mode_overrides(agent, model=final_model)
 
     if getattr(agent, "api_mode", None) == "anthropic_messages":
         from agent.anthropic_adapter import _apply_fast_mode_to_kwargs
@@ -158,8 +158,8 @@ def revalidate_fast_mode_request(
         return _apply_fast_mode_to_kwargs(
             kwargs,
             enabled=overrides.get("speed") == "fast",
-            model=getattr(agent, "model", "") or "",
-            base_url=getattr(agent, "_anthropic_base_url", None),
+            model=final_model or "",
+            base_url=_runtime_base_url(agent),
             is_oauth=bool(getattr(agent, "_is_anthropic_oauth", False)),
             drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
             dynamic=True,
