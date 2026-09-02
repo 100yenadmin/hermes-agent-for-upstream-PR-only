@@ -1,6 +1,7 @@
 # AgentRuntime v1 coupling map (Revision 4)
 
-Host source: `40ed52e69aa02e00ddf271513784d1d7eee29dad`
+Host implementation source before this documentation-only restamp:
+`02dd8fcc8aa4a520fc78d6826ce52a29bb6545c6`
 
 The [canonical ADR](../adr/agent-runtime-v1.md) defines the rules. This map
 records the final ownership split; it is not a second contract.

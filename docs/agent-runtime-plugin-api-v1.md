@@ -15,7 +15,8 @@ frozen Revision 4 host boundary, including:
   streaming, and typed terminal events; and
 - the honest at-least-once adapter boundary with idempotent durable consumers.
 
-Frozen host source: `40ed52e69aa02e00ddf271513784d1d7eee29dad`.
+Current implementation source before the documentation-only restamp:
+`02dd8fcc8aa4a520fc78d6826ce52a29bb6545c6`.
 
 Do not add requirements, provider policy, or implementation detail here; update
 the ADR and its [canonical coupling map](architecture/agent-runtime-v1-coupling-map.md)

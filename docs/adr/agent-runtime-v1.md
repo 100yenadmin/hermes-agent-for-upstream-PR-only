@@ -2,7 +2,8 @@
 
 Status: accepted and frozen for Revision 4
 
-Host source: `40ed52e69aa02e00ddf271513784d1d7eee29dad`
+Host implementation source before this documentation-only restamp:
+`02dd8fcc8aa4a520fc78d6826ce52a29bb6545c6`
 
 Contract authority: [Hermes-owned parity issue #19](https://github.com/100yenadmin/hermes-claude-agent-sdk/issues/19)
 
