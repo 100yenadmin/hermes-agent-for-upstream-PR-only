@@ -29,7 +29,10 @@ back to today's string-sniffing behavior (older backends keep working).
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional
+
+from agent.runtime_api import RuntimeFailure
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +106,11 @@ _STREAM_DROP_FRAGMENTS = (
     "mid-stream",
 )
 
+# Runtime plugins may provide their own failure codes, but those codes are
+# still public wire data. Keep the projection to a short, ASCII identifier so
+# arbitrary plugin fields or control text cannot cross the gateway boundary.
+_RUNTIME_FAILURE_CODE_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,127}$")
+
 # Exception modules that indicate the failure came from an API/transport call
 # (vs. a bug in our own dispatcher code, which is a gateway-layer failure).
 # Covers every SDK family our provider adapters raise from: OpenAI-compatible
@@ -133,6 +141,20 @@ def _is_custom_endpoint(provider: Optional[str]) -> bool:
 def _looks_like_stream_drop(message: str) -> bool:
     msg = message.lower()
     return any(fragment in msg for fragment in _STREAM_DROP_FRAGMENTS)
+
+
+def _surface_from_runtime_failure(
+    failure: RuntimeFailure,
+    provider: str = "",
+    model: str = "",
+) -> dict:
+    """Project only the safe public fields from a host runtime failure."""
+    code = failure.code
+    if type(code) is not str or _RUNTIME_FAILURE_CODE_RE.fullmatch(code) is None:
+        return _surface(LAYER_RUNTIME, "runtime_failed", False, provider, model)
+
+    retryable = failure.retryable if type(failure.retryable) is bool else False
+    return _surface(LAYER_RUNTIME, code, retryable, provider, model)
 
 
 def _surface(
@@ -167,7 +189,8 @@ def build_error_surface_from_result(
             return None
         error_text = str(result.get("error") or "")
         reason = str(result.get("failure_reason") or "").strip()
-        if not error_text and not reason:
+        failure = result.get("failure")
+        if not error_text and not reason and not isinstance(failure, RuntimeFailure):
             return None
 
         # Disk-full wins outright: the fix (free space) is unrelated to the
@@ -182,6 +205,9 @@ def build_error_surface_from_result(
 
         if result.get("billing_block") or reason in ("billing", "billing_unverified"):
             return _surface(LAYER_BILLING, reason or "billing", False, provider, model)
+
+        if isinstance(failure, RuntimeFailure):
+            return _surface_from_runtime_failure(failure, provider, model)
 
         if not reason:
             # Failed result without a classified reason (legacy paths).
