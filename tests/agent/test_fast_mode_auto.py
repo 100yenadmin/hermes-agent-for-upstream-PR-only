@@ -127,6 +127,100 @@ def test_dynamic_openai_priority_remains_enabled_on_native_endpoint():
     }
 
 
+@pytest.mark.parametrize(
+    ("model", "provider", "api_mode", "base_url"),
+    [
+        ("gpt-5.6-sol", "openrouter", "chat_completions", "https://openrouter.ai/api/v1"),
+        ("gpt-5.6-sol", "copilot", "chat_completions", "https://api.githubcopilot.com"),
+        ("gpt-5.6-sol", "nous", "chat_completions", "https://inference-api.nousresearch.com/v1"),
+        ("gpt-5.6-sol", "deepseek", "chat_completions", "https://api.deepseek.com/v1"),
+        ("gpt-5.6-sol", "kimi-coding", "chat_completions", "https://api.kimi.com/coding/v1"),
+        ("gpt-5.6-sol", "azure", "chat_completions", "https://example.openai.azure.com/openai/v1"),
+        ("gpt-5.6-sol", "custom", "chat_completions", "https://proxy.example/v1"),
+        ("claude-opus-4-8", "minimax", "anthropic_messages", "https://api.minimax.io/anthropic"),
+        ("claude-opus-4-8", "nous", "anthropic_messages", "https://portal.nousresearch.com/api"),
+        ("claude-opus-4-8", "vertex", "anthropic_messages", "https://aiplatform.googleapis.com/v1"),
+        ("claude-opus-4-8", "anthropic", "anthropic_messages", "https://example.services.ai.azure.com/anthropic/v1"),
+        ("claude-opus-4-8", "bedrock", "bedrock_converse", "https://bedrock-runtime.us-east-1.amazonaws.com"),
+    ],
+)
+def test_unsupported_provider_matrix_silently_degrades_to_normal(
+    model, provider, api_mode, base_url, monkeypatch
+):
+    agent = _agent(
+        model=model,
+        provider=provider,
+        api_mode=api_mode,
+        base_url=base_url,
+        _anthropic_base_url=base_url,
+        _is_anthropic_oauth=False,
+        _oauth_1m_beta_disabled=False,
+    )
+    begin_fast_mode_turn(agent, [], now=10.0)
+    monkeypatch.setattr("agent.fast_mode.time.monotonic", lambda: 10.0)
+
+    assert effective_request_overrides(agent, now=10.0) == {
+        "unrelated": "preserved"
+    }
+
+    if api_mode == "anthropic_messages":
+        dispatched = revalidate_fast_mode_request(
+            agent,
+            {
+                "model": model,
+                "extra_body": {"speed": "fast", "unrelated": 1},
+                "extra_headers": {
+                    "anthropic-beta": "plugin-feature,fast-mode-2026-02-01"
+                },
+            },
+        )
+        assert dispatched == {
+            "model": model,
+            "extra_body": {"unrelated": 1},
+            "extra_headers": {"anthropic-beta": "plugin-feature"},
+        }
+    else:
+        dispatched = revalidate_fast_mode_request(
+            agent,
+            {
+                "model": model,
+                "service_tier": "priority",
+                "speed": "fast",
+                "timeout": 5,
+            },
+        )
+        assert dispatched == {"model": model, "timeout": 5}
+
+
+@pytest.mark.parametrize(
+    ("model", "provider", "api_mode", "base_url"),
+    [
+        ("gpt-5.6-sol", "openai", "codex_responses", "https://api.openai.com/v1"),
+        ("gpt-5.4", "openai-codex", "codex_responses", "https://chatgpt.com/backend-api/codex"),
+        ("grok-4.6", "xai", "codex_responses", "https://api.x.ai/v1"),
+    ],
+)
+def test_supported_priority_provider_matrix_reaches_final_dispatch(
+    model, provider, api_mode, base_url, monkeypatch
+):
+    agent = _agent(
+        model=model,
+        provider=provider,
+        api_mode=api_mode,
+        base_url=base_url,
+    )
+    begin_fast_mode_turn(agent, [], now=10.0)
+    monkeypatch.setattr("agent.fast_mode.time.monotonic", lambda: 10.0)
+
+    assert effective_request_overrides(agent, now=10.0)["service_tier"] == "priority"
+    dispatched = revalidate_fast_mode_request(agent, {"model": model, "timeout": 5})
+    assert dispatched == {
+        "model": model,
+        "service_tier": "priority",
+        "timeout": 5,
+    }
+
+
 def test_dynamic_anthropic_metadata_is_not_emitted_for_bedrock():
     agent = _agent(
         model="anthropic/claude-opus-4.6",
@@ -141,6 +235,94 @@ def test_dynamic_anthropic_metadata_is_not_emitted_for_bedrock():
     }
 
 
+@pytest.mark.parametrize("missing", ["provider", "api_mode", "base_url"])
+def test_dynamic_fast_requires_complete_runtime_identity(missing):
+    values = {
+        "provider": "openai-api",
+        "api_mode": "chat_completions",
+        "base_url": "https://api.openai.com/v1",
+    }
+    values[missing] = None
+    agent = _agent(**values)
+    begin_fast_mode_turn(agent, [], now=10.0)
+
+    assert effective_request_overrides(agent, now=10.0) == {
+        "unrelated": "preserved"
+    }
+
+
+@pytest.mark.parametrize("model", ["claude-opus-4-8", "claude-opus-5"])
+def test_dynamic_anthropic_fast_uses_current_native_models_only(model, monkeypatch):
+    agent = _agent(
+        model=model,
+        provider="anthropic",
+        api_mode="anthropic_messages",
+        base_url="https://api.anthropic.com/v1",
+        _anthropic_base_url="https://api.anthropic.com/v1",
+        _is_anthropic_oauth=False,
+        _oauth_1m_beta_disabled=False,
+    )
+    begin_fast_mode_turn(agent, [], now=10.0)
+    monkeypatch.setattr("agent.fast_mode.time.monotonic", lambda: 10.0)
+
+    assert effective_request_overrides(agent, now=10.0) == {
+        "speed": "fast",
+        "unrelated": "preserved",
+    }
+    dispatched = revalidate_fast_mode_request(
+        agent,
+        {
+            "model": model,
+            "extra_body": {"speed": "fast", "unrelated": 1},
+            "extra_headers": {
+                "anthropic-beta": "plugin-feature,fast-mode-2026-02-01"
+            },
+        },
+    )
+    assert dispatched["extra_body"] == {"speed": "fast", "unrelated": 1}
+    assert "fast-mode-2026-02-01" in dispatched["extra_headers"]["anthropic-beta"]
+
+
+@pytest.mark.parametrize(
+    ("model", "base_url"),
+    [
+        ("claude-opus-4-6", "https://api.anthropic.com/v1"),
+        ("claude-opus-4-7", "https://api.anthropic.com/v1"),
+        ("claude-opus-4-8", "https://api.anthropic.com.attacker.test/v1"),
+    ],
+)
+def test_dynamic_anthropic_fast_degrades_to_normal_for_unsupported_identity(
+    model, base_url, monkeypatch
+):
+    agent = _agent(
+        model=model,
+        provider="anthropic",
+        api_mode="anthropic_messages",
+        base_url=base_url,
+        _anthropic_base_url=base_url,
+        _is_anthropic_oauth=False,
+        _oauth_1m_beta_disabled=False,
+    )
+    begin_fast_mode_turn(agent, [], now=10.0)
+    monkeypatch.setattr("agent.fast_mode.time.monotonic", lambda: 10.0)
+
+    dispatched = revalidate_fast_mode_request(
+        agent,
+        {
+            "model": model,
+            "extra_body": {"speed": "fast", "unrelated": 1},
+            "extra_headers": {
+                "anthropic-beta": "plugin-feature,fast-mode-2026-02-01"
+            },
+        },
+    )
+    assert dispatched == {
+        "model": model,
+        "extra_body": {"unrelated": 1},
+        "extra_headers": {"anthropic-beta": "plugin-feature"},
+    }
+
+
 def test_dispatch_revalidation_preserves_middleware_fields(monkeypatch):
     agent = _agent(api_mode="chat_completions")
     begin_fast_mode_turn(agent, [], now=100.0)
@@ -151,6 +333,18 @@ def test_dispatch_revalidation_preserves_middleware_fields(monkeypatch):
     )
     assert dispatched == {"model": "gpt-5.4", "timeout": 5}
     assert agent.request_overrides == {"unrelated": "preserved"}
+
+
+def test_dispatch_revalidation_uses_final_model_identity(monkeypatch):
+    agent = _agent(model="gpt-5.4")
+    begin_fast_mode_turn(agent, [], now=100.0)
+    monkeypatch.setattr("agent.fast_mode.time.monotonic", lambda: 110.0)
+
+    dispatched = revalidate_fast_mode_request(
+        agent,
+        {"model": "claude-opus-4-8", "service_tier": "priority", "timeout": 5},
+    )
+    assert dispatched == {"model": "claude-opus-4-8", "timeout": 5}
 
 
 def test_nonstreaming_dispatch_revalidates_at_transport_boundary(monkeypatch):

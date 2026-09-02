@@ -433,14 +433,34 @@ def _forbids_sampling_params(model: str) -> bool:
 
 
 def _supports_fast_mode(model: str) -> bool:
-    """Return True for models that support Anthropic Fast Mode (speed=fast).
+    """Return True for models that support the legacy Fast Mode parameter.
 
-    Per Anthropic docs, fast mode is currently supported on Opus 4.6 only.
-    Sending ``speed: "fast"`` to any other Claude model (including Opus 4.7)
-    returns HTTP 400. This guard prevents silently 400'ing when stale config
-    or older callers leave fast mode enabled across a model upgrade.
+    The helper preserves the existing static ``fast`` path. Dynamic auto/cold
+    turns use ``_supports_dynamic_fast_mode`` and the narrower current model
+    table in ``hermes_cli.models`` instead.
     """
-    return any(v in model for v in _FAST_MODE_SUPPORTED_SUBSTRINGS)
+    return any(v in (model or "") for v in _FAST_MODE_SUPPORTED_SUBSTRINGS) or (
+        _supports_dynamic_fast_mode(model)
+    )
+
+
+def _supports_dynamic_fast_mode(model: str) -> bool:
+    """Return whether the current native Anthropic dynamic contract applies."""
+    from hermes_cli.models import _is_anthropic_dynamic_fast_model
+
+    return _is_anthropic_dynamic_fast_model(model)
+
+
+def _is_native_anthropic_fast_endpoint(base_url: str | None) -> bool:
+    """Return True only for Anthropic's canonical Fast Mode host.
+
+    ``_is_third_party_anthropic_endpoint`` intentionally serves broader legacy
+    auth/message compatibility and treats any URL containing ``anthropic.com``
+    as native. Fast Mode is a protected capability, so dynamic turns require
+    the exact hostname and cannot trust a lookalike host or path.
+    """
+    normalized = str(base_url or "").strip()
+    return bool(normalized) and base_url_hostname(normalized) == "api.anthropic.com"
 
 
 # Beta headers for enhanced features that are safe on ordinary/native Anthropic
@@ -490,6 +510,7 @@ def _apply_fast_mode_to_kwargs(
     base_url: str | None,
     is_oauth: bool,
     drop_context_1m_beta: bool = False,
+    dynamic: bool = False,
 ) -> Dict[str, Any]:
     """Apply (or revoke) Anthropic Fast Mode request metadata idempotently.
 
@@ -537,11 +558,14 @@ def _apply_fast_mode_to_kwargs(
     else:
         kwargs.pop("extra_headers", None)
 
-    if not (
-        enabled
-        and not _is_third_party_anthropic_endpoint(base_url)
-        and _supports_fast_mode(model)
-    ):
+    if dynamic:
+        endpoint_supported = _is_native_anthropic_fast_endpoint(base_url)
+        model_supported = _supports_dynamic_fast_mode(model)
+    else:
+        endpoint_supported = not _is_third_party_anthropic_endpoint(base_url)
+        model_supported = _supports_fast_mode(model)
+
+    if not (enabled and endpoint_supported and model_supported):
         return kwargs
 
     # ── Apply fast mode (byte-identical to the historical inline block) ──

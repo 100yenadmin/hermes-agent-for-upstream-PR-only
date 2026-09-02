@@ -69,7 +69,7 @@ def invalidate_fast_mode_turn(agent: Any) -> None:
 
 
 def effective_request_overrides(
-    agent: Any, *, now: float | None = None
+    agent: Any, *, now: float | None = None, model: Any = None
 ) -> dict[str, Any]:
     """Return a request-local copy with the current fast policy applied."""
     overrides = dict(getattr(agent, "request_overrides", {}) or {})
@@ -96,14 +96,27 @@ def effective_request_overrides(
     if max(0.0, current - float(started_at)) <= cutoff:
         from hermes_cli.models import resolve_fast_mode_overrides
 
-        fast_overrides = resolve_fast_mode_overrides(
-            getattr(agent, "model", None),
-            provider=getattr(agent, "provider", None),
-            api_mode=getattr(agent, "api_mode", None),
-            base_url=(
-                getattr(agent, "_anthropic_base_url", None)
-                or getattr(agent, "base_url", None)
-            ),
+        runtime_base_url = (
+            getattr(agent, "_anthropic_base_url", None)
+            or getattr(agent, "base_url", None)
+        )
+        runtime_identity = (
+            getattr(agent, "provider", None),
+            getattr(agent, "api_mode", None),
+            runtime_base_url,
+        )
+        # The model-only resolver intentionally serves legacy static callers.
+        # Dynamic turns must never fall through to that compatibility path when
+        # provider, transport, or endpoint identity is absent.
+        fast_overrides = (
+            resolve_fast_mode_overrides(
+                getattr(agent, "model", None) if model is None else model,
+                provider=runtime_identity[0],
+                api_mode=runtime_identity[1],
+                base_url=runtime_identity[2],
+            )
+            if all(value is not None for value in runtime_identity)
+            else None
         )
         if fast_overrides:
             overrides.update(fast_overrides)
@@ -111,10 +124,10 @@ def effective_request_overrides(
 
 
 def effective_fast_mode_overrides(
-    agent: Any, *, now: float | None = None
+    agent: Any, *, now: float | None = None, model: Any = None
 ) -> dict[str, Any]:
     """Return only provider fast-tier keys from the effective policy."""
-    effective = effective_request_overrides(agent, now=now)
+    effective = effective_request_overrides(agent, now=now, model=model)
     return {
         key: effective[key] for key in ("service_tier", "speed") if key in effective
     }
@@ -130,7 +143,14 @@ def revalidate_fast_mode_request(
     kwargs = dict(api_kwargs)
     kwargs.pop("service_tier", None)
     kwargs.pop("speed", None)
-    overrides = effective_fast_mode_overrides(agent)
+    overrides = effective_fast_mode_overrides(
+        agent,
+        model=(
+            kwargs["model"]
+            if "model" in kwargs
+            else getattr(agent, "model", None)
+        ),
+    )
 
     if getattr(agent, "api_mode", None) == "anthropic_messages":
         from agent.anthropic_adapter import _apply_fast_mode_to_kwargs
@@ -142,6 +162,7 @@ def revalidate_fast_mode_request(
             base_url=getattr(agent, "_anthropic_base_url", None),
             is_oauth=bool(getattr(agent, "_is_anthropic_oauth", False)),
             drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
+            dynamic=True,
         )
 
     kwargs.update(overrides)

@@ -983,19 +983,13 @@ class TestBuildAnthropicKwargs:
 
 
     def test_supports_fast_mode_predicate(self):
-        """Fast mode is Opus 4.6 only — Opus 4.7 and others must be excluded.
-
-        For Opus 4.8 the fast variant is a separate model ID
-        (anthropic/claude-opus-4.8-fast) routed through the normal model
-        field, NOT via the ``speed: "fast"`` request parameter. So
-        ``_supports_fast_mode`` (which gates the parameter) must stay
-        False for both opus-4-8 and opus-4-8-fast.
-        """
+        """Static fast keeps 4.6 and tracks the current native Opus rows."""
         from agent.anthropic_adapter import _supports_fast_mode
         assert _supports_fast_mode("claude-opus-4-6") is True
         assert _supports_fast_mode("anthropic/claude-opus-4-6") is True
         assert _supports_fast_mode("claude-opus-4-7") is False
-        assert _supports_fast_mode("claude-opus-4-8") is False
+        assert _supports_fast_mode("claude-opus-4-8") is True
+        assert _supports_fast_mode("claude-opus-5") is True
         assert _supports_fast_mode("claude-opus-4-8-fast") is False
         assert _supports_fast_mode("claude-sonnet-4-6") is False
         assert _supports_fast_mode("claude-haiku-4-5") is False
@@ -1075,6 +1069,55 @@ class TestBuildAnthropicKwargs:
         # No fast-mode beta header should be added either
         beta_header = (kwargs.get("extra_headers") or {}).get("anthropic-beta", "")
         assert "fast-mode-2026-02-01" not in beta_header
+
+    @pytest.mark.parametrize("model", ["claude-opus-4-8", "claude-opus-5"])
+    def test_dynamic_fast_mode_uses_current_native_anthropic_models(self, model):
+        from agent.anthropic_adapter import _apply_fast_mode_to_kwargs
+
+        kwargs = _apply_fast_mode_to_kwargs(
+            {"model": model},
+            enabled=True,
+            model=model,
+            base_url="https://api.anthropic.com/v1",
+            is_oauth=False,
+            dynamic=True,
+        )
+        assert kwargs["extra_body"]["speed"] == "fast"
+        assert "fast-mode-2026-02-01" in kwargs["extra_headers"]["anthropic-beta"]
+
+    @pytest.mark.parametrize(
+        ("model", "base_url"),
+        [
+            ("claude-opus-4-6", "https://api.anthropic.com/v1"),
+            ("claude-opus-4-7", "https://api.anthropic.com/v1"),
+            ("claude-opus-4-8", "https://api.anthropic.com.attacker.test/v1"),
+            ("claude-opus-4-8", "https://proxy.example/api.anthropic.com/v1"),
+        ],
+    )
+    def test_dynamic_fast_mode_rejects_old_models_and_lookalike_hosts(
+        self, model, base_url
+    ):
+        from agent.anthropic_adapter import _apply_fast_mode_to_kwargs
+
+        kwargs = _apply_fast_mode_to_kwargs(
+            {
+                "model": model,
+                "extra_body": {"speed": "fast", "unrelated": 1},
+                "extra_headers": {
+                    "anthropic-beta": "plugin-feature,fast-mode-2026-02-01"
+                },
+            },
+            enabled=True,
+            model=model,
+            base_url=base_url,
+            is_oauth=False,
+            dynamic=True,
+        )
+        assert kwargs == {
+            "model": model,
+            "extra_body": {"unrelated": 1},
+            "extra_headers": {"anthropic-beta": "plugin-feature"},
+        }
 
     def test_apply_fast_mode_helper_idempotent_revocable_and_byte_identical(self):
         """``_apply_fast_mode_to_kwargs`` must be byte-identical to the

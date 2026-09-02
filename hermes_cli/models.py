@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
 from hermes_cli import __version__ as _HERMES_VERSION
 from hermes_cli.urllib_security import open_credentialed_url, url_origin
-from utils import atomic_json_write, base_url_host_matches
+from utils import atomic_json_write, base_url_host_matches, base_url_hostname
 
 logger = logging.getLogger(__name__)
 
@@ -3911,12 +3911,9 @@ def provider_label(provider: Optional[str]) -> str:
 # Models that support OpenAI Priority Processing (service_tier="priority").
 # See https://openai.com/api-priority-processing/ for the canonical list.
 #
-# Pattern-based matching — any OpenAI flagship model (gpt-*, o1*, o3*, o4*)
-# is assumed to support Priority Processing. service_tier=priority is silently
-# ignored by non-OpenAI endpoints (OpenRouter/Copilot/opencode-zen proxies
-# strip the field), so false positives are harmless. Codex-series models
-# (gpt-5-codex, gpt-5.3-codex, etc.) are excluded — they don't expose the
-# service_tier parameter through the Codex Responses API.
+# The broad prefix matcher below is retained only for the legacy model-only
+# static toggle. Dynamic auto/cold turns use the documented allow-list in
+# ``_is_openai_dynamic_fast_model`` and exact first-party endpoint checks.
 _OPENAI_FAST_MODE_PREFIXES: tuple[str, ...] = (
     "gpt-",
     "o1",
@@ -3955,6 +3952,38 @@ def _strip_vendor_prefix(model_id: str) -> str:
     return raw
 
 
+# Current OpenAI Fast Mode rows documented at https://openai.com/api-fast-mode/.
+# Keep this explicit: OpenAI does not guarantee every future model will support
+# Fast Mode, so an unknown release must run normally until this table is
+# refreshed. Codex-specialized ids remain excluded because Hermes may route
+# them through a Codex backend that does not expose ``service_tier``.
+_OPENAI_DYNAMIC_FAST_MODE_MODELS: tuple[str, ...] = (
+    "gpt-5.6",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.2",
+    "gpt-5.1",
+    "gpt-5",
+    "gpt-5-mini",
+)
+
+
+def _is_openai_dynamic_fast_model(model_id: Optional[str]) -> bool:
+    """Return True only for a currently documented OpenAI Fast model."""
+    base = _strip_vendor_prefix(str(model_id or "")).split(":")[0]
+    if "codex" in base:
+        return False
+    return any(
+        base == supported
+        or bool(re.fullmatch(rf"{re.escape(supported)}-\d{{4}}-\d{{2}}-\d{{2}}", base))
+        for supported in _OPENAI_DYNAMIC_FAST_MODE_MODELS
+    )
+
+
 def model_supports_fast_mode(model_id: Optional[str]) -> bool:
     """Return whether Hermes should expose the /fast toggle for this model."""
     from agent.model_metadata import is_grok_46_family
@@ -3967,22 +3996,39 @@ def model_supports_fast_mode(model_id: Optional[str]) -> bool:
 
 
 def _is_anthropic_fast_model(model_id: Optional[str]) -> bool:
-    """Return True if the model accepts the Anthropic Fast Mode ``speed`` param.
+    """Return True for legacy or currently documented Anthropic Fast models.
 
-    This gates the *speed=fast request parameter*, which Anthropic supports on
-    Opus 4.6 only (Opus 4.7 explicitly 400s). It is deliberately NOT a general
-    "is this a fast model" check: for Opus 4.8 the fast offering is a SEPARATE
-    model id (``…-opus-4.8-fast``) selected via the model field, not the speed
-    parameter — see ``agent.anthropic_adapter._supports_fast_mode`` and its
-    test. Keep this in lock-step with that adapter gate so the UI never shows a
-    Fast toggle that the runtime would silently drop.
+    Opus 4.6 remains here so the pre-existing static ``fast`` path does not
+    change underneath users with saved config. Current dynamic auto/cold turns
+    use ``_is_anthropic_dynamic_fast_model`` directly and therefore only emit
+    ``speed=fast`` for the current native contract.
     """
     raw = _strip_vendor_prefix(str(model_id or ""))
     base = raw.split(":")[0]
     if not base.startswith("claude-"):
         return False
-    # Only Opus 4.6 supports the speed=fast parameter at present.
-    return "opus-4-6" in base or "opus-4.6" in base
+    legacy_supported = "opus-4-6" in base or "opus-4.6" in base
+    return legacy_supported or _is_anthropic_dynamic_fast_model(model_id)
+
+
+# Dynamic fast mode is deliberately narrower than the legacy static resolver.
+# Anthropic's current native Fast Mode contract names Opus 4.8 and Opus 5;
+# older 4.6/4.7 rows must remain normal when a turn asks for auto/cold.
+_ANTHROPIC_DYNAMIC_FAST_MODE_PREFIXES: tuple[str, ...] = (
+    "claude-opus-4-8",
+    "claude-opus-5",
+)
+
+
+def _is_anthropic_dynamic_fast_model(model_id: Optional[str]) -> bool:
+    """Return True only for current native Anthropic dynamic Fast Mode models."""
+    raw = _strip_vendor_prefix(str(model_id or ""))
+    base = raw.split(":")[0].replace(".", "-")
+    return any(
+        base == prefix
+        or bool(re.fullmatch(rf"{re.escape(prefix)}-\d{{8}}", base))
+        for prefix in _ANTHROPIC_DYNAMIC_FAST_MODE_PREFIXES
+    )
 
 
 def resolve_fast_mode_overrides(
@@ -4013,45 +4059,65 @@ def resolve_fast_mode_overrides(
     (native OpenAI, ChatGPT-Codex, or xAI). An OpenAI-compatible proxy that
     merely echoes the model name fails closed to ``None``.
     """
-    if not model_supports_fast_mode(model_id):
+    runtime_identity = (provider, api_mode, base_url)
+    if not any(value is not None for value in runtime_identity):
+        # Keep the pre-89991 model-only resolver compatible for static ``fast``
+        # callers while exposing newly documented Anthropic models in the UI.
+        # Dynamic callers always provide runtime identity and use the stricter
+        # provider + transport + endpoint + current-model contract below.
+        if not model_supports_fast_mode(model_id):
+            return None
+        if _is_anthropic_fast_model(model_id):
+            return {"speed": "fast"}
+        return {"service_tier": "priority"}
+
+    # A partial identity is not positive proof of the endpoint that will be
+    # called. Unknown or stale runtime identity therefore degrades to normal.
+    if any(value is None for value in runtime_identity):
         return None
-    if _is_anthropic_fast_model(model_id):
-        # Anthropic speed=fast is valid only on the native Anthropic Messages
-        # transport; any other declared api_mode fails closed.
-        if api_mode is not None and api_mode != "anthropic_messages":
+
+    normalized_provider = normalize_provider(provider)
+    hostname = base_url_hostname(str(base_url or ""))
+
+    # Anthropic's native dynamic contract is intentionally exact: provider,
+    # Messages transport, native hostname, and a currently documented model
+    # must all agree before speed=fast is emitted.
+    if normalized_provider == "anthropic":
+        if (
+            api_mode != "anthropic_messages"
+            or hostname != "api.anthropic.com"
+            or not _is_anthropic_dynamic_fast_model(model_id)
+        ):
             return None
         return {"speed": "fast"}
 
-    # Preserve the legacy model-only resolver for static ``fast`` callers, but
-    # dynamic policies provide runtime identity and must fail closed. A gpt- or
+    # Dynamic policies provide runtime identity and must fail closed. A gpt- or
     # grok-shaped model name on an OpenAI-compatible proxy does not prove
     # support for first-party Priority Processing.
-    if any(value is not None for value in (provider, api_mode, base_url)):
-        normalized_provider = normalize_provider(provider)
-        hostname = (
-            urllib.parse.urlparse(str(base_url or "")).hostname or ""
-        ).lower()
-        direct_api = (
-            normalized_provider in {"openai", "openai-api"}
-            and api_mode in {"chat_completions", "codex_responses"}
-            and hostname == "api.openai.com"
-        )
-        codex_backend = (
-            normalized_provider == "openai-codex"
-            and api_mode == "codex_responses"
-            and hostname in {"chatgpt.com", "chat.openai.com"}
-        )
-        # xAI Grok 4.6 Priority Processing. The runtime routes ``api.x.ai``
-        # through the codex_responses transport (see
-        # ``runtime_provider._detect_api_mode_for_url``); accept the
-        # chat_completions surface too — both are first-party xAI.
-        xai_direct = (
-            normalized_provider in {"xai", "xai-oauth"}
-            and api_mode in {"chat_completions", "codex_responses"}
-            and hostname == "api.x.ai"
-        )
-        if not (direct_api or codex_backend or xai_direct):
-            return None
+    direct_api = (
+        normalized_provider in {"openai", "openai-api"}
+        and api_mode in {"chat_completions", "codex_responses"}
+        and hostname == "api.openai.com"
+        and _is_openai_dynamic_fast_model(model_id)
+    )
+    codex_backend = (
+        normalized_provider == "openai-codex"
+        and api_mode == "codex_responses"
+        and hostname in {"chatgpt.com", "chat.openai.com"}
+        and _is_openai_dynamic_fast_model(model_id)
+    )
+    # xAI Grok 4.6 Priority Processing. Both first-party xAI wire surfaces are
+    # supported; ``is_grok_46_family`` remains the centralized model rule.
+    from agent.model_metadata import is_grok_46_family
+
+    xai_direct = (
+        normalized_provider in {"xai", "xai-oauth"}
+        and api_mode in {"chat_completions", "codex_responses"}
+        and hostname == "api.x.ai"
+        and is_grok_46_family(str(model_id or ""))
+    )
+    if not (direct_api or codex_backend or xai_direct):
+        return None
     return {"service_tier": "priority"}
 
 

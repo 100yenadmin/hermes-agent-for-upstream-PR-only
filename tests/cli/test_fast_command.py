@@ -227,20 +227,16 @@ class TestAnthropicFastMode(unittest.TestCase):
         assert model_supports_fast_mode("anthropic/claude-opus-4-6") is True
         assert model_supports_fast_mode("anthropic/claude-opus-4.6") is True
 
-    def test_anthropic_non_opus46_models_excluded(self):
-        """The speed=fast parameter is gated to Opus 4.6 — others excluded.
-
-        Per https://platform.claude.com/docs/en/build-with-claude/fast-mode,
-        sending speed=fast to Opus 4.7, Sonnet, or Haiku returns HTTP 400.
-        Opus 4.8 uses a separate ``…-fast`` model id, not this parameter.
-        """
+    def test_anthropic_unsupported_models_excluded(self):
+        """The toggle includes current Opus fast models, not other families."""
         from hermes_cli.models import model_supports_fast_mode
 
         assert model_supports_fast_mode("claude-sonnet-4-6") is False
         assert model_supports_fast_mode("claude-sonnet-4.6") is False
         assert model_supports_fast_mode("claude-haiku-4-5") is False
         assert model_supports_fast_mode("claude-opus-4-7") is False
-        assert model_supports_fast_mode("claude-opus-4-8") is False
+        assert model_supports_fast_mode("claude-opus-4-8") is True
+        assert model_supports_fast_mode("claude-opus-5") is True
         assert model_supports_fast_mode("anthropic/claude-sonnet-4.6") is False
         assert model_supports_fast_mode("anthropic/claude-opus-4-7") is False
 
