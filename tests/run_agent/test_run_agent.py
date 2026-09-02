@@ -954,6 +954,64 @@ class TestHydrateTodoStore:
         assert agent._todo_store.snapshot()["revision"] == 2
         assert agent._todo_store.read()[0]["id"] == "new"
 
+    @pytest.mark.parametrize("tool_name", ["todo_list", "todo"])
+    def test_history_recovers_canonical_and_legacy_todo_names(self, agent, tool_name):
+        assistant_call = self._assistant_todo_call(call_id="canonical-or-legacy")
+        assistant_call["tool_calls"][0]["function"]["name"] = tool_name
+        history = [
+            assistant_call,
+            {
+                "role": "tool",
+                "tool_call_id": "canonical-or-legacy",
+                "content": json.dumps(
+                    {
+                        "todos": [
+                            {"id": "recover", "content": "Recovered", "status": "pending"}
+                        ],
+                        "revision": 2,
+                    }
+                ),
+            },
+        ]
+
+        with patch("run_agent._set_interrupt"):
+            agent._hydrate_todo_store(history)
+
+        assert agent._todo_store.read() == [
+            {"id": "recover", "content": "Recovered", "status": "pending"}
+        ]
+
+    def test_unrelated_tool_result_does_not_hydrate(self, agent):
+        history = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "unrelated",
+                        "type": "function",
+                        "function": {"name": "web_search", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "unrelated",
+                "content": json.dumps(
+                    {
+                        "todos": [
+                            {"id": "must-not-recover", "content": "Unrelated", "status": "pending"}
+                        ]
+                    }
+                ),
+            },
+        ]
+
+        with patch("run_agent._set_interrupt"):
+            agent._hydrate_todo_store(history)
+
+        assert not agent._todo_store.has_items()
+
 
 
 

@@ -5314,7 +5314,7 @@ class AIAgent:
         assistant_msg: Dict[str, Any],
         tool_call_id: str,
     ) -> bool:
-        """True when the assistant message issued a ``todo`` call with this id."""
+        """True when the assistant issued a canonical or legacy todo call."""
         tool_calls = assistant_msg.get("tool_calls")
         if not isinstance(tool_calls, list):
             return False
@@ -5322,7 +5322,9 @@ class AIAgent:
         for tool_call in tool_calls:
             if cls._get_tool_call_id_static(tool_call) != tool_call_id:
                 continue
-            if cls._get_tool_call_name_static(tool_call) == "todo":
+            # ``todo_list`` is the canonical registry name. ``todo`` remains
+            # a supported alias for transcripts created before the rename.
+            if cls._get_tool_call_name_static(tool_call) in {"todo_list", "todo"}:
                 return True
         return False
 
