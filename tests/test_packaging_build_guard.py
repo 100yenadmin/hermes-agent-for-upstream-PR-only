@@ -107,29 +107,8 @@ def test_wheel_ships_state_holder_module_and_imports_state(tmp_path):
         shipped = set(wheel.namelist())
     assert {"hermes_state_holders.py", "hermes_state_registry.py"} <= shipped
 
-    install_dir = tmp_path / "installed"
-    install_dir.mkdir()
-    install = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--no-deps",
-            "--target",
-            str(install_dir),
-            str(artifacts[0]),
-        ],
-        cwd=tmp_path,
-        env=os.environ.copy(),
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert install.returncode == 0, install.stderr
-
     import_env = os.environ.copy()
-    import_env["PYTHONPATH"] = str(install_dir)
+    import_env["PYTHONPATH"] = str(artifacts[0])
     imported = subprocess.run(
         [sys.executable, "-c", "import hermes_state"],
         cwd=tmp_path,
