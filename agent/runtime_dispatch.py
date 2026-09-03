@@ -58,6 +58,9 @@ _RUNTIME_EVENT_TYPES = (
     RuntimeFailedEvent,
 )
 
+_RUNTIME_TOOL_REQUEST_ID_MAX_LENGTH = 256
+_RUNTIME_TOOL_TURN_NAMESPACE_LENGTH = 16
+
 _RUNTIME_SIDE_EFFECT_EVENT_TYPES = (
     RuntimeCompactionEvent,
     RuntimeStateEvent,
@@ -394,15 +397,11 @@ async def _collect_runtime_turn(
                 # services.  Keep the runtime out of Hermes' executor and
                 # preserve the request event in the lifecycle record; the
                 # host service owns validation, policy, and result shaping.
-                set_request_id = getattr(host, "_set_tool_request_id", None)
-                if callable(set_request_id):
-                    set_request_id(event.request_id)
-                try:
-                    await host.execute_tool(event.name, event.arguments)
-                finally:
-                    clear_request_id = getattr(host, "_clear_tool_request_id", None)
-                    if callable(clear_request_id):
-                        clear_request_id()
+                await host.execute_tool(
+                    event.name,
+                    event.arguments,
+                    request_id=event.request_id,
+                )
             elif isinstance(event, RuntimeApprovalRequestEvent):
                 # Approval is fail-closed.  A runtime that emits a denied (or
                 # malformed) decision must not be allowed to continue to its
@@ -651,7 +650,7 @@ class HermesRuntimeHostServices:
         self._delivery_counter = 0
         self._route: dict[str, str] = {}
         self._turn_messages = turn_messages
-        self._pending_tool_call_id: str | None = None
+        self._turn_namespace = ""
         self._tool_results_by_id: dict[str, Any] = {}
         self._tool_call_specs_by_id: dict[str, tuple[str, str]] = {}
         self._tool_call_ids_seen: set[str] = set()
@@ -697,11 +696,19 @@ class HermesRuntimeHostServices:
             self._ensure_open_parent_locked()
             self._task_id = str(task_id)
             self._turn_messages = turn_messages
-            self._pending_tool_call_id = None
+            turn_identity = json.dumps(
+                [self._runtime_id, self._task_id],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self._turn_namespace = hashlib.sha256(turn_identity).hexdigest()[
+                :_RUNTIME_TOOL_TURN_NAMESPACE_LENGTH
+            ]
             self._tool_results_by_id = {}
             self._tool_call_specs_by_id = {}
             self._tool_call_ids_seen = set()
             self._tool_calls_in_flight = set()
+            self._tool_call_count = 0
             try:
                 from gateway.session_context import get_session_env
 
@@ -729,17 +736,32 @@ class HermesRuntimeHostServices:
                     allowed.add(str(function["name"]))
             self._allowed_tool_names = frozenset(allowed)
 
-    def _set_tool_request_id(self, request_id: str) -> None:
-        """Bind the public runtime request ID to the next host execution."""
-        with self._delivery_lock:
-            self._ensure_open_parent_locked()
-            self._pending_tool_call_id = str(request_id or "").strip() or None
+    @staticmethod
+    def _normalize_tool_request_id(request_id: str | None) -> str | None:
+        if request_id is None:
+            return None
+        if not isinstance(request_id, str):
+            raise RuntimeExecutionError("runtime tool request id must be a string")
+        normalized = request_id.strip()
+        if not normalized:
+            raise RuntimeExecutionError("runtime tool request id must not be empty")
+        if len(normalized) > _RUNTIME_TOOL_REQUEST_ID_MAX_LENGTH:
+            raise RuntimeExecutionError(
+                "runtime tool request id exceeds the 256 character bound"
+            )
+        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in normalized):
+            raise RuntimeExecutionError(
+                "runtime tool request id contains a control character"
+            )
+        return normalized
 
-    def _clear_tool_request_id(self) -> None:
-        with self._delivery_lock:
-            self._pending_tool_call_id = None
-
-    async def execute_tool(self, name: str, arguments: Mapping[str, Any]) -> Any:
+    async def execute_tool(
+        self,
+        name: str,
+        arguments: Mapping[str, Any],
+        *,
+        request_id: str | None = None,
+    ) -> Any:
         """Execute one runtime-requested tool through Hermes' canonical funnel.
 
         The synthetic assistant/tool-call objects are host-private adapters for
@@ -756,6 +778,7 @@ class HermesRuntimeHostServices:
             )
         if not isinstance(arguments, Mapping):
             raise RuntimeExecutionError("runtime tool arguments must be a mapping")
+        normalized_request_id = self._normalize_tool_request_id(request_id)
 
         executor = getattr(self._agent, "_execute_tool_calls", None)
         if not callable(executor):
@@ -776,10 +799,13 @@ class HermesRuntimeHostServices:
         # name/arguments tuple too, so a duplicate ID cannot silently replay a
         # result for a different call payload.
         with self._delivery_lock:
-            tool_call_id = self._pending_tool_call_id
-            if not tool_call_id:
+            tool_call_id = normalized_request_id
+            if tool_call_id is None:
                 self._tool_call_count += 1
-                tool_call_id = f"runtime-tool-{self._tool_call_count:04d}"
+                tool_call_id = (
+                    f"runtime-tool-{self._turn_namespace}-"
+                    f"{self._tool_call_count:04d}"
+                )
             call_spec = (normalized_name, arguments_json)
             prior_result = self._tool_results_by_id.get(tool_call_id)
             if tool_call_id in self._tool_results_by_id:
@@ -843,6 +869,8 @@ class HermesRuntimeHostServices:
                 self._agent._last_persistence_error_cause = "runtime_tool_call"
                 with self._delivery_lock:
                     self._tool_calls_in_flight.discard(tool_call_id)
+                    self._tool_call_ids_seen.discard(tool_call_id)
+                    self._tool_call_specs_by_id.pop(tool_call_id, None)
                 raise RuntimeToolPersistenceError(
                     "runtime tool-call persistence failed before execution"
                 ) from exc
@@ -852,6 +880,8 @@ class HermesRuntimeHostServices:
                 self._agent._last_persistence_error_cause = "runtime_tool_call"
                 with self._delivery_lock:
                     self._tool_calls_in_flight.discard(tool_call_id)
+                    self._tool_call_ids_seen.discard(tool_call_id)
+                    self._tool_call_specs_by_id.pop(tool_call_id, None)
                 raise RuntimeToolPersistenceError(
                     "runtime tool-call persistence failed before execution"
                 )

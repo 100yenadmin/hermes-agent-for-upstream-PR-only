@@ -92,6 +92,42 @@ def test_missing_host_capability_is_rejected_before_factory_runs():
     assert manager.get_agent_runtime("example-runtime") is None
 
 
+def test_request_id_capability_rejects_a_legacy_host_before_factory_runs(monkeypatch):
+    import agent.runtime_api as runtime_api
+
+    context, manager = _make_context()
+    factory_calls = 0
+
+    def factory():
+        nonlocal factory_calls
+        factory_calls += 1
+        return object()
+
+    legacy_capabilities = frozenset(
+        capability
+        for capability in runtime_api.HOST_RUNTIME_CAPABILITIES
+        if capability != "host_tool_request_id_v1"
+    )
+    monkeypatch.setattr(
+        runtime_api,
+        "HOST_RUNTIME_CAPABILITIES",
+        legacy_capabilities,
+    )
+
+    with pytest.raises(RuntimeCompatibilityError, match="host_tool_request_id_v1"):
+        context.register_agent_runtime(
+            descriptor=_descriptor(
+                required_host_capabilities=frozenset(
+                    {"host_tool_execution_v1", "host_tool_request_id_v1"}
+                ),
+            ),
+            factory=factory,
+        )
+
+    assert factory_calls == 0
+    assert manager.get_agent_runtime("example-runtime") is None
+
+
 def test_compatible_runtime_is_selected_without_instantiating_it():
     context, manager = _make_context()
     factory_calls = 0
@@ -202,6 +238,7 @@ def test_host_manifest_exports_only_versioned_concrete_capabilities():
     assert "provider_profile_registration_v1" in manifest["host_capabilities"]
     assert "runtime_model_provenance_v1" in manifest["host_capabilities"]
     assert "runtime_tool_inventory_v1" in manifest["host_capabilities"]
+    assert "host_tool_request_id_v1" in manifest["host_capabilities"]
     assert all(capability.endswith("_v1") for capability in manifest["host_capabilities"])
 
 
@@ -214,6 +251,9 @@ def test_machine_readable_runtime_capabilities_match_public_host_contract():
 
     assert manifest["runtime_api_version"] == RUNTIME_API_VERSION
     assert set(manifest["capabilities"]) == set(HOST_RUNTIME_CAPABILITIES)
+    assert manifest["capabilities"]["host_tool_request_id_v1"]["consumer"] == (
+        "RuntimeHostServices.execute_tool"
+    )
 
 
 def test_runtime_turn_request_is_deeply_immutable():

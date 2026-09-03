@@ -37,6 +37,7 @@ HOST_RUNTIME_CAPABILITIES: FrozenSet[str] = frozenset(
         "host_content_stream_v1",
         "host_status_v1",
         "host_tool_execution_v1",
+        "host_tool_request_id_v1",
         "provider_profile_registration_v1",
         "runtime_model_provenance_v1",
         "runtime_state_v1",
@@ -417,7 +418,13 @@ RuntimeEvent: TypeAlias = (
 class RuntimeHostServices(Protocol):
     """Stable host-owned security, state, status, and lifecycle boundary."""
 
-    async def execute_tool(self, name: str, arguments: Mapping[str, Any]) -> Any: ...
+    async def execute_tool(
+        self,
+        name: str,
+        arguments: Mapping[str, Any],
+        *,
+        request_id: str | None = None,
+    ) -> Any: ...
 
     async def request_approval(
         self, action: str, details: Mapping[str, Any]

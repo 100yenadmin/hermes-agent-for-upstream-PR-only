@@ -19,6 +19,11 @@ frozen Revision 4 host boundary, including:
   Hermes turn and distinct between turns, never the session-scoped task id; and
 - the honest at-least-once adapter boundary with idempotent durable consumers.
 
+The host capability `host_tool_request_id_v1` exposes the provider-neutral
+`RuntimeHostServices.execute_tool()` request-ID seam. Its `request_id` argument
+is optional and keyword-only for compatibility with existing two-argument
+callers; omitted IDs use a host-generated per-turn namespace.
+
 Current implementation source before the documentation-only restamp:
 `e6398e75c24be9b3e22f024d621a0221414cfe65`.
 

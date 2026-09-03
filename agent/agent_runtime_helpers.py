@@ -4645,23 +4645,34 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     # A result whose assistant call frame is missing entirely never reaches
     # here — pass 1 above drops it as an orphan — so the only results this pass
     # sees are ones whose call name is knowable.
-    call_names: Dict[str, str] = {}
-    for msg in messages:
-        if msg.get("role") == "assistant":
-            for tc in msg.get("tool_calls") or []:
-                # Strip on insert to match the lookup below (and pass 1's
-                # ``result_call_ids``), so an id that arrives padded still
-                # pairs instead of silently skipping realignment.
-                cid = (_ra().AIAgent._get_tool_call_id_static(tc) or "").strip()
-                nm = _ra().AIAgent._get_tool_call_name_static(tc)
-                if cid and nm:
-                    call_names[cid] = nm
+    # Pair result names against the assistant frame in the same local tool
+    # run.  Tool-call ids are not globally unique: providers can reuse an id
+    # on a later turn, so a transcript-global id -> name map would rewrite an
+    # earlier result with the later turn's function name.
+    declared_names: Dict[str, tuple[str, frozenset[str]]] = {}
     realigned: List[Tuple[str, str]] = []
     aligned: List[Dict[str, Any]] = []
     for msg in messages:
-        if msg.get("role") == "tool":
-            cid = (msg.get("tool_call_id") or "").strip()
-            expected = call_names.get(cid)
+        if msg.get("role") == "assistant":
+            declared_names = {}
+            for tc in msg.get("tool_calls") or []:
+                variants = tool_call_id_variants(tc)
+                nm = _ra().AIAgent._get_tool_call_name_static(tc)
+                if variants and nm:
+                    declared_names[sorted(variants)[0]] = (nm, variants)
+        elif msg.get("role") == "tool":
+            result_variants = tool_result_id_variants(msg.get("tool_call_id"))
+            matched = next(
+                (
+                    key
+                    for key, (_name, variants) in declared_names.items()
+                    if variants & result_variants
+                ),
+                None,
+            )
+            expected = None
+            if matched is not None:
+                expected, _variants = declared_names.pop(matched)
             current = msg.get("name")
             # Only rewrite a name that is present and disagrees. A result with
             # no ``name`` is already valid for Gemini (the id pairs it), so
@@ -4670,6 +4681,10 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             if expected and current and current != expected:
                 msg = {**msg, "name": expected}
                 realigned.append((current, expected))
+        elif msg.get("role") == "user":
+            # A user message closes the preceding tool-result run, matching
+            # the positional pairing pass above.
+            declared_names = {}
         aligned.append(msg)
     if realigned:
         messages = aligned

@@ -16,6 +16,12 @@
     },
     "host_status_v1": {},
     "host_tool_execution_v1": {},
+    "host_tool_request_id_v1": {
+      "consumer": "RuntimeHostServices.execute_tool",
+      "request_id": "optional keyword-only request_id",
+      "scope": "turn",
+      "validation": "bounded string with control characters rejected"
+    },
     "provider_profile_registration_v1": {
       "consumer": "PluginContext.register_provider_profile",
       "lifecycle": "plugin_owned"

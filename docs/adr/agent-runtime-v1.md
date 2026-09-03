@@ -36,7 +36,8 @@ The host exports `RUNTIME_API_VERSION = 1` and the concrete capabilities in
 
 `background_delivery_v1`, `cancellation_v1`, `compaction_events_v1`,
 `host_approval_v1`, `host_content_stream_v1`, `host_status_v1`,
-`host_tool_execution_v1`, `provider_profile_registration_v1`,
+`host_tool_execution_v1`, `host_tool_request_id_v1`,
+`provider_profile_registration_v1`,
 `runtime_model_provenance_v1`, `runtime_state_v1`,
 `runtime_tool_inventory_v1`, and `usage_receipts_v1`.
 
@@ -102,8 +103,11 @@ row to the live turn and flushes it to the session database. Only after that
 pre-effect flush succeeds can the tool execute; the canonical tool result is
 then appended and flushed. A repeated request id with the same name and
 arguments returns the cached host result; a repeated id with different payload
-fails closed. This preserves one durable assistant/tool pair and prevents an
-unpaired effect from entering the transcript.
+fails closed. The public `execute_tool()` seam accepts that request id as an
+optional keyword-only argument for provider-neutral plugins; callers that omit
+it receive a bounded host-generated per-turn id. This preserves one durable
+assistant/tool pair and prevents an unpaired effect from entering the
+transcript.
 
 Approval is host policy. A denied or malformed approval terminates the runtime
 turn before completion and cannot be converted into a plugin-owned success.

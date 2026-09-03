@@ -92,9 +92,11 @@ class _RuntimeRequestHost(_HostServices):
         super().__init__()
         self.approval = approval
         self.calls = []
+        self.request_ids = []
 
-    async def execute_tool(self, name, arguments):
+    async def execute_tool(self, name, arguments, *, request_id=None):
         self.calls.append(("tool", name, dict(arguments)))
+        self.request_ids.append(request_id)
         return {"ok": True, "name": name}
 
     async def request_approval(self, action, details):
@@ -438,6 +440,7 @@ def test_dispatch_routes_typed_tool_and_approval_events_through_host_services():
         ("tool", "synthetic_tool", {"value": "one"}),
         ("approval", "synthetic_action", {"reason": "synthetic approval"}),
     ]
+    assert host.request_ids == ["tool-request-1"]
     assert [event.request_id for event in result.events if isinstance(
         event, (RuntimeToolRequestEvent, RuntimeApprovalRequestEvent)
     )] == ["tool-request-1", "approval-request-1"]
@@ -605,10 +608,20 @@ def test_runtime_tool_call_persists_pair_before_effect_and_is_idempotent():
         turn_messages=messages,
     )
 
-    host._set_tool_request_id("synthetic-call-1")
-    first = _run_async(host.execute_tool("synthetic_tool", {"value": "one"}))
-    host._set_tool_request_id("synthetic-call-1")
-    second = _run_async(host.execute_tool("synthetic_tool", {"value": "one"}))
+    first = _run_async(
+        host.execute_tool(
+            "synthetic_tool",
+            {"value": "one"},
+            request_id="synthetic-call-1",
+        )
+    )
+    second = _run_async(
+        host.execute_tool(
+            "synthetic_tool",
+            {"value": "one"},
+            request_id="synthetic-call-1",
+        )
+    )
 
     assert first == second == "tool completed"
     assert agent.execution_calls == 1
@@ -624,6 +637,110 @@ def test_runtime_tool_call_persists_pair_before_effect_and_is_idempotent():
     assert [message.get("tool_call_id") for message in messages if message.get("role") == "tool"] == [
         "synthetic-call-1"
     ]
+
+
+def test_runtime_tool_request_id_conflict_is_rejected_within_turn():
+    agent = _PersistingRuntimeToolAgent()
+    host = HermesRuntimeHostServices(
+        agent,
+        task_id="synthetic-task",
+        runtime_id="example-runtime",
+        turn_messages=[],
+    )
+
+    _run_async(
+        host.execute_tool(
+            "synthetic_tool",
+            {"value": "one"},
+            request_id="synthetic-call-1",
+        )
+    )
+
+    with pytest.raises(RuntimeExecutionError, match="different payload"):
+        _run_async(
+            host.execute_tool(
+                "synthetic_tool",
+                {"value": "two"},
+                request_id="synthetic-call-1",
+            )
+        )
+
+
+def test_runtime_tool_fallback_id_is_namespaced_per_turn():
+    agent = _PersistingRuntimeToolAgent()
+    messages = [{"role": "user", "content": "synthetic request"}]
+    host = HermesRuntimeHostServices(
+        agent,
+        task_id="synthetic-turn-1",
+        runtime_id="example-runtime",
+        turn_messages=messages,
+    )
+
+    _run_async(host.execute_tool("synthetic_tool", {"value": "one"}))
+    first_id = next(
+        message["tool_call_id"]
+        for message in messages
+        if message.get("role") == "tool"
+    )
+
+    host.refresh_turn("synthetic-turn-2", turn_messages=messages)
+    _run_async(host.execute_tool("synthetic_tool", {"value": "two"}))
+    second_id = [
+        message["tool_call_id"]
+        for message in messages
+        if message.get("role") == "tool"
+    ][-1]
+
+    assert first_id != second_id
+    assert first_id.startswith("runtime-tool-")
+    assert second_id.startswith("runtime-tool-")
+    assert first_id.endswith("-0001")
+    assert second_id.endswith("-0001")
+
+
+def test_runtime_tool_fallback_id_is_deterministic_for_replayed_turn_identity():
+    def run_turn(task_id):
+        agent = _PersistingRuntimeToolAgent()
+        messages = [{"role": "user", "content": "synthetic request"}]
+        host = HermesRuntimeHostServices(
+            agent,
+            task_id=task_id,
+            runtime_id="example-runtime",
+            turn_messages=messages,
+        )
+        _run_async(host.execute_tool("synthetic_tool", {"value": "one"}))
+        return next(
+            message["tool_call_id"]
+            for message in messages
+            if message.get("role") == "tool"
+        )
+
+    first_id = run_turn("synthetic-turn-replay")
+    replay_id = run_turn("synthetic-turn-replay")
+    next_turn_id = run_turn("synthetic-turn-next")
+
+    assert first_id == replay_id
+    assert first_id != next_turn_id
+    assert len(first_id) <= 256
+
+
+def test_runtime_tool_request_id_is_bounded():
+    agent = _PersistingRuntimeToolAgent()
+    host = HermesRuntimeHostServices(
+        agent,
+        task_id="synthetic-task",
+        runtime_id="example-runtime",
+        turn_messages=[],
+    )
+
+    with pytest.raises(RuntimeExecutionError, match="request id"):
+        _run_async(
+            host.execute_tool(
+                "synthetic_tool",
+                {"value": "one"},
+                request_id="x" * 257,
+            )
+        )
 
 
 def test_runtime_tool_persistence_failure_prevents_executor_side_effect():
