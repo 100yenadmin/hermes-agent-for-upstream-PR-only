@@ -2235,6 +2235,7 @@ def run_conversation(
         close_runtime_session,
         get_runtime_session,
         make_builtin_codex_registration,
+        RuntimeExecutionError,
     )
     from hermes_cli.plugins import discover_plugins, get_plugin_manager
 
@@ -2273,6 +2274,10 @@ def run_conversation(
     )
     if runtime_registration is None:
         close_runtime_session(agent)
+        if agent.api_mode == "agent_runtime":
+            raise RuntimeExecutionError(
+                "api_mode=agent_runtime has no registered runtime"
+            )
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
@@ -2484,6 +2489,7 @@ def run_conversation(
             runtime_registration,
             task_id=effective_task_id,
             turn_messages=messages,
+            correlation_id=request.correlation_id,
         )
         agent._last_effective_prompt_hash = request.effective_prompt_hash
         dispatched = runtime_session.run_turn(request)

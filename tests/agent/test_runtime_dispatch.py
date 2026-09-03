@@ -753,6 +753,67 @@ def test_runtime_tool_fallback_id_is_namespaced_per_turn():
     assert second_id.endswith("-0001")
 
 
+def test_runtime_tool_fallback_id_uses_host_turn_correlation_id():
+    registration = RuntimeRegistration(
+        descriptor=RuntimeDescriptor(
+            runtime_id="example-runtime",
+            plugin_version="0.1.0",
+            runtime_api_min=1,
+            runtime_api_max=1,
+            required_host_capabilities=frozenset(),
+            provider_ids=frozenset({"example"}),
+            api_modes=frozenset({"example_runtime"}),
+            session_state_schema_version=1,
+        ),
+        factory=_SuccessfulRuntime,
+        plugin_id="synthetic-plugin",
+    )
+    agent = _PersistingRuntimeToolAgent()
+    messages = [{"role": "user", "content": "synthetic request"}]
+
+    first = get_runtime_session(
+        agent,
+        registration,
+        task_id="same-task",
+        turn_messages=messages,
+        correlation_id="synthetic-session:same-task:turn-1",
+    )
+    first_result = _run_async(
+        first.host.execute_tool("synthetic_tool", {"value": "one"})
+    )
+    first_id = next(
+        message["tool_call_id"]
+        for message in messages
+        if message.get("role") == "tool"
+    )
+
+    second = get_runtime_session(
+        agent,
+        registration,
+        task_id="same-task",
+        turn_messages=messages,
+        correlation_id="synthetic-session:same-task:turn-2",
+    )
+    second_result = _run_async(
+        second.host.execute_tool("synthetic_tool", {"value": "two"})
+    )
+    second_id = [
+        message["tool_call_id"]
+        for message in messages
+        if message.get("role") == "tool"
+    ][-1]
+    close_runtime_session(agent)
+
+    assert first_result == "tool completed"
+    assert second_result == "tool completed"
+    assert agent.execution_calls == 2
+    assert first_id != second_id
+    assert first_id.startswith("runtime-tool-")
+    assert second_id.startswith("runtime-tool-")
+    assert first_id.endswith("-0001")
+    assert second_id.endswith("-0001")
+
+
 def test_runtime_tool_fallback_id_is_deterministic_for_replayed_turn_identity():
     def run_turn(task_id):
         agent = _PersistingRuntimeToolAgent()

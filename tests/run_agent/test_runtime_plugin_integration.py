@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import run_agent
+import pytest
 
 from agent.runtime_api import (
     RUNTIME_API_VERSION,
@@ -631,3 +632,43 @@ def test_external_plugin_runtime_mode_skips_provider_client(monkeypatch):
     assert counters == {"factory": 1, "preflight": 1, "turn": 1, "close": 0}
     agent.close()
     assert counters["close"] == 1
+
+
+def test_agent_runtime_without_registration_fails_before_provider_transport(
+    monkeypatch,
+):
+    from agent.runtime_dispatch import RuntimeExecutionError
+
+    manager = PluginManager()
+    manager._discovered = True
+
+    import hermes_cli.plugins as plugins_module
+
+    monkeypatch.setattr(plugins_module, "_plugin_manager", manager)
+
+    def fail_build_api_kwargs(*_args, **_kwargs):
+        raise AssertionError("missing agent_runtime must not build provider kwargs")
+
+    monkeypatch.setattr(
+        run_agent.AIAgent,
+        "_build_api_kwargs",
+        fail_build_api_kwargs,
+    )
+    agent = run_agent.AIAgent(
+        base_url="runtime://missing",
+        provider="missing-runtime-provider",
+        model="synthetic-model",
+        api_mode="agent_runtime",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    try:
+        with pytest.raises(
+            RuntimeExecutionError,
+            match="agent_runtime.*registered runtime",
+        ):
+            agent.run_conversation("hello")
+    finally:
+        agent.close()

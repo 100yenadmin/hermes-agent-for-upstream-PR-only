@@ -643,6 +643,7 @@ class HermesRuntimeHostServices:
         task_id: str,
         runtime_id: str,
         turn_messages: list[dict[str, Any]] | None = None,
+        correlation_id: str | None = None,
     ):
         self._agent = agent
         self._task_id = str(task_id)
@@ -664,7 +665,11 @@ class HermesRuntimeHostServices:
         from agent.agent_runtime_helpers import StreamingToolCallMarkupScrubber
 
         self._content_scrubber = StreamingToolCallMarkupScrubber()
-        self.refresh_turn(task_id, turn_messages=turn_messages)
+        self.refresh_turn(
+            task_id,
+            turn_messages=turn_messages,
+            correlation_id=correlation_id,
+        )
         try:
             # A fresh host is created for each whole turn, so the lifecycle
             # projection cannot accidentally bleed into a later turn.
@@ -696,14 +701,22 @@ class HermesRuntimeHostServices:
         self,
         task_id: str,
         turn_messages: list[dict[str, Any]] | None = None,
+        *,
+        correlation_id: str | None = None,
     ) -> None:
         """Refresh per-turn correlation and route data for the bound parent only."""
         with self._delivery_lock:
             self._ensure_open_parent_locked()
             self._task_id = str(task_id)
             self._turn_messages = turn_messages
+            # The gateway-issued correlation ID is the stable identity of a
+            # whole turn.  Task IDs intentionally may be reused by a cached
+            # gateway agent, so they cannot namespace fallback tool IDs across
+            # turns.  Keep the task fallback for direct/manual host callers
+            # that do not have a request identity yet.
+            turn_key = str(correlation_id or self._task_id)
             turn_identity = json.dumps(
-                [self._runtime_id, self._task_id],
+                [self._runtime_id, turn_key],
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode("utf-8")
@@ -1266,6 +1279,7 @@ def get_runtime_session(
     *,
     task_id: str,
     turn_messages: list[dict[str, Any]] | None = None,
+    correlation_id: str | None = None,
 ) -> RuntimeSessionBinding:
     """Return the exact-parent runtime binding, creating it once per session."""
     parent_session_id = str(getattr(agent, "session_id", None) or "")
@@ -1281,7 +1295,11 @@ def get_runtime_session(
                 candidate = registration.factory()
                 if isinstance(candidate, BuiltInCodexRuntime):
                     existing.runtime.refresh_runner(candidate._runner)
-            existing.host.refresh_turn(task_id, turn_messages)
+            existing.host.refresh_turn(
+                task_id,
+                turn_messages,
+                correlation_id=correlation_id,
+            )
             return existing
         close_runtime_session(agent)
 
@@ -1291,6 +1309,7 @@ def get_runtime_session(
         task_id=task_id,
         runtime_id=registration.descriptor.runtime_id,
         turn_messages=turn_messages,
+        correlation_id=correlation_id,
     )
     binding = RuntimeSessionBinding(
         runtime=runtime,
