@@ -363,6 +363,86 @@ def test_runtime_content_stream_is_visible_without_duplicate_final_persistence(
     ]
 
 
+def test_runtime_content_cut_markup_is_hidden_from_stream_and_persistence(
+    monkeypatch, tmp_path
+):
+    from hermes_state import SessionDB
+
+    cut_reply = (
+        "Visible runtime prefix.\n"
+        "<arg_key>session_id</arg_key>\n"
+        "<arg_value>synthetic-session"
+    )
+    manager = PluginManager()
+    manager._discovered = True
+    context = PluginContext(PluginManifest(name="cut-streaming-runtime"), manager)
+
+    class _CutStreamingRuntime:
+        def preflight(self, request):
+            return None
+
+        async def run_turn(self, request, host):
+            yield RuntimeContentEvent(text=cut_reply)
+            yield RuntimeCompletedEvent(
+                result={
+                    "final_response": cut_reply,
+                    "messages": list(request.messages),
+                }
+            )
+
+        async def close(self):
+            return None
+
+    context.register_agent_runtime(
+        descriptor=RuntimeDescriptor(
+            runtime_id="cut-streaming-test-runtime",
+            plugin_version="0.1.0",
+            runtime_api_min=RUNTIME_API_VERSION,
+            runtime_api_max=RUNTIME_API_VERSION,
+            required_host_capabilities=frozenset({"cancellation_v1"}),
+            provider_ids=frozenset({"openai"}),
+            api_modes=frozenset({"chat_completions"}),
+            session_state_schema_version=1,
+        ),
+        factory=_CutStreamingRuntime,
+    )
+
+    import hermes_cli.plugins as plugins_module
+
+    monkeypatch.setattr(plugins_module, "_plugin_manager", manager)
+    monkeypatch.setattr(
+        "agent.turn_context._maybe_title_session_at_turn_start",
+        lambda *_args, **_kwargs: None,
+    )
+    streamed = []
+    session_id = "cut-streaming-runtime-session"
+    db = SessionDB(db_path=tmp_path / "cut-streaming-state.db")
+    agent = run_agent.AIAgent(
+        api_key="synthetic-test-value",
+        base_url="https://test.invalid",
+        provider="openai",
+        model="synthetic-model",
+        api_mode="chat_completions",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        session_id=session_id,
+        session_db=db,
+        stream_delta_callback=streamed.append,
+    )
+    agent._cached_system_prompt = "composed synthetic prompt"
+
+    result = agent.run_conversation("hello", task_id=session_id)
+
+    assert result["final_response"] == "Visible runtime prefix."
+    assert streamed == ["Visible runtime prefix."]
+    persisted = db.get_messages_as_conversation(session_id)
+    assert [(message["role"], message.get("content")) for message in persisted] == [
+        ("user", "hello"),
+        ("assistant", "Visible runtime prefix."),
+    ]
+
+
 def test_runtime_failure_reaches_host_policy_with_phase_and_replay_classification(
     monkeypatch,
 ):

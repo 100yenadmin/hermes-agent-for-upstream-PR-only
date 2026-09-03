@@ -112,6 +112,197 @@ _UNTERMINATED_TOOL_CALL_PATTERN = re.compile(
 )
 
 
+def _strip_tool_call_blocks(content: str) -> str:
+    """Remove complete tool-call XML blocks from provider text."""
+    for _pattern in _TOOL_CALL_BLOCK_PATTERNS:
+        content = _pattern.sub('', content)
+    return _NAMED_FUNCTION_BLOCK_PATTERN.sub('', content)
+
+
+def _strip_tool_call_tail(content: str) -> str:
+    """Remove orphan tool-call tags and cut-off tool-call tails."""
+    content = _STRAY_TOOL_CALL_CLOSER_PATTERN.sub('', content)
+    return _UNTERMINATED_TOOL_CALL_PATTERN.sub('', content)
+
+
+def strip_tool_call_markup(content: str) -> str:
+    """Remove provider-neutral tool-call markup without touching reasoning.
+
+    Runtime content is passed to the agent's stateful reasoning scrubber
+    immediately afterwards. Keeping reasoning out of this helper preserves
+    split ``<think>`` tags while sharing the same tool-call cleanup as the
+    complete-response sanitizer below.
+    """
+    if not content:
+        return ""
+    if not isinstance(content, str):
+        content = str(content)
+    return _strip_tool_call_tail(_strip_tool_call_blocks(content))
+
+
+class StreamingToolCallMarkupScrubber:
+    """Stream-safe wrapper around :func:`strip_tool_call_markup`.
+
+    Runtime content arrives as deltas, so a cut marker can span events. Keep
+    only a partial tag or an active generic tool block between calls; complete
+    text still goes through the same stateless helper used at persistence.
+    """
+
+    _GENERIC_OPEN_TAG = re.compile(
+        rf"<({'|'.join(_TOOL_CALL_TAG_NAMES)})\b[^>]*>",
+        re.IGNORECASE,
+    )
+    _GENERIC_CLOSE_TAGS = {
+        name: re.compile(rf"</{name}\s*>", re.IGNORECASE)
+        for name in _TOOL_CALL_TAG_NAMES
+    }
+    _ARG_TAG = re.compile(
+        r"</?arg_(?:key|value)\b[^>]*>",
+        re.IGNORECASE,
+    )
+    _PARTIAL_TAG_NAMES = _TOOL_CALL_TAG_NAMES + (
+        "function",
+        "arg_key",
+        "arg_value",
+    )
+    _PARTIAL_TAGS = tuple(
+        prefix
+        for name in _PARTIAL_TAG_NAMES
+        for prefix in (f"<{name}", f"</{name}")
+    )
+
+    def __init__(self) -> None:
+        self._buffer = ""
+        self._in_generic_block = False
+        self._generic_block_name: str | None = None
+        self._discarded_tail = False
+
+    def reset(self) -> None:
+        self._buffer = ""
+        self._in_generic_block = False
+        self._generic_block_name = None
+        self._discarded_tail = False
+
+    def feed(self, text: str) -> str:
+        if not text or self._discarded_tail:
+            return ""
+        buf = self._buffer + text
+        self._buffer = ""
+        out: list[str] = []
+        while buf:
+            if self._in_generic_block:
+                close = self._GENERIC_CLOSE_TAGS[self._generic_block_name].search(buf)
+                if close is None:
+                    self._buffer = self._hold_partial_suffix(buf)
+                    return "".join(out)
+                buf = buf[close.end():]
+                self._in_generic_block = False
+                self._generic_block_name = None
+                continue
+
+            pair = self._find_generic_pair(buf)
+            if pair is not None:
+                start, end = pair
+                out.append(strip_tool_call_markup(buf[:start]))
+                buf = buf[end:]
+                continue
+
+            opener = self._GENERIC_OPEN_TAG.search(buf)
+            if opener is not None and self._is_boundary(buf, opener.start()):
+                preceding = buf[:opener.start()]
+                # The cut-tail regex consumes the boundary newline before an
+                # unterminated opener; do the same before entering the block.
+                line_start = preceding.rfind("\n")
+                if line_start >= 0 and not preceding[line_start + 1:].strip():
+                    preceding = preceding[:line_start]
+                if preceding:
+                    out.append(strip_tool_call_markup(preceding))
+                self._in_generic_block = True
+                self._generic_block_name = opener.group(1).lower()
+                buf = buf[opener.end():]
+                continue
+
+            arg = self._ARG_TAG.search(buf)
+            if arg is not None:
+                line_start = buf.rfind("\n", 0, arg.start()) + 1
+                line_prefix = buf[line_start:arg.start()]
+                if "<" not in line_prefix:
+                    if line_start:
+                        # Consume the newline that introduces the cut line,
+                        # matching _UNTERMINATED_TOOL_CALL_PATTERN.
+                        out.append(strip_tool_call_markup(buf[:line_start - 1]))
+                    self._discarded_tail = True
+                    return "".join(out)
+
+            held_start = self._partial_tag_start(buf)
+            if held_start is None:
+                out.append(strip_tool_call_markup(buf))
+                return "".join(out)
+            if self._is_boundary(buf, held_start):
+                line_start = buf.rfind("\n", 0, held_start) + 1
+                if line_start and buf[line_start - 1] == "\n":
+                    held_start = line_start - 1
+                else:
+                    held_start = line_start
+            else:
+                # Preserve the line prefix so a split mid-line prose mention
+                # cannot become a block-boundary opener on the next delta.
+                held_start = buf.rfind("\n", 0, held_start) + 1
+            if held_start:
+                out.append(strip_tool_call_markup(buf[:held_start]))
+            self._buffer = buf[held_start:]
+            return "".join(out)
+        return "".join(out)
+
+    def flush(self) -> str:
+        if self._in_generic_block or self._discarded_tail:
+            self.reset()
+            return ""
+        tail = self._buffer
+        self.reset()
+        return strip_tool_call_markup(tail)
+
+    @classmethod
+    def _find_generic_pair(cls, text: str) -> tuple[int, int] | None:
+        best: tuple[int, int] | None = None
+        for name in _TOOL_CALL_TAG_NAMES:
+            opener_pattern = re.compile(
+                rf"<{name}\b[^>]*>", re.IGNORECASE
+            )
+            close_pattern = cls._GENERIC_CLOSE_TAGS[name]
+            for opener in opener_pattern.finditer(text):
+                close = close_pattern.search(text, opener.end())
+                if close is None:
+                    continue
+                candidate = (opener.start(), close.end())
+                if best is None or candidate[0] < best[0]:
+                    best = candidate
+        return best
+
+    @staticmethod
+    def _is_boundary(text: str, index: int) -> bool:
+        line_start = text.rfind("\n", 0, index) + 1
+        return not text[line_start:index].strip()
+
+    @classmethod
+    def _partial_tag_start(cls, text: str) -> int | None:
+        for index in range(max(0, len(text) - 32), len(text)):
+            suffix = text[index:].lower()
+            if any(
+                tag.lower().startswith(suffix) and suffix != tag.lower()
+                for tag in cls._PARTIAL_TAGS
+            ):
+                return index
+        return None
+
+    @classmethod
+    def _hold_partial_suffix(cls, text: str) -> str:
+        match = cls._partial_tag_start(text)
+        if match is None:
+            return ""
+        return text[match:]
+
+
 def _ra():
     """Lazy ``run_agent`` reference for test-patch routing."""
     import run_agent
@@ -1053,17 +1244,10 @@ def strip_think_blocks(agent, content: str) -> str:
     #    the unterminated-tag pass and take trailing content with them.
     for _pattern in _REASONING_BLOCK_PATTERNS:
         content = _pattern.sub('', content)
-    # 1b. Tool-call XML blocks (openclaw/openclaw#67318). Handle the
-    #     generic tag names first — they have no attribute gating since
-    #     a literal <tool_call> in prose is already vanishingly rare.
-    for _pattern in _TOOL_CALL_BLOCK_PATTERNS:
-        content = _pattern.sub('', content)
-    # 1c. <function name="...">...</function> — Gemma-style standalone
-    #     tool call. Only strip when the tag sits at a block boundary
-    #     (start of text, after a newline, or after sentence-ending
-    #     punctuation) AND carries a name="..." attribute. This keeps
-    #     prose mentions like "Use <function> to declare" safe.
-    content = _NAMED_FUNCTION_BLOCK_PATTERN.sub('', content)
+    # 1b/1c. Share tool-call XML cleanup with runtime content projection.
+    #     Reasoning remains separate so the streaming state machine below
+    #     still sees tags split across deltas.
+    content = _strip_tool_call_blocks(content)
     # 2. Unterminated reasoning block — open tag at a block boundary
     #    (start of text, or after a newline) with no matching close.
     #    Strip from the tag to end of string.  Fixes #8878 / #9568
@@ -1071,14 +1255,8 @@ def strip_think_blocks(agent, content: str) -> str:
     content = _UNTERMINATED_REASONING_BLOCK_PATTERN.sub('', content)
     # 3. Stray orphan open/close tags that slipped through.
     content = _ORPHAN_REASONING_TAG_PATTERN.sub('', content)
-    # 3b. Stray tool-call closers. (We do NOT strip bare <function> or
-    #     unterminated <function name="..."> because a truncated tail
-    #     during streaming may still be valuable to the user; matches
-    #     OpenClaw's intentional asymmetry.)
-    content = _STRAY_TOOL_CALL_CLOSER_PATTERN.sub('', content)
-    # 3c. Tool-call openers or argument markup surviving 1b belong to a
-    #     block that never closed — a mid-serialization stream cut (#101899).
-    content = _UNTERMINATED_TOOL_CALL_PATTERN.sub('', content)
+    # 3b/3c. Share orphan and cut-tail cleanup with runtime projection.
+    content = _strip_tool_call_tail(content)
     return content
 
 
@@ -5369,6 +5547,8 @@ __all__ = [
     "sanitize_tool_call_arguments",
     "repair_message_sequence",
     "strip_think_blocks",
+    "strip_tool_call_markup",
+    "StreamingToolCallMarkupScrubber",
     "recover_with_credential_pool",
     "try_recover_primary_transport",
     "drop_thinking_only_and_merge_users",

@@ -484,6 +484,61 @@ def test_host_content_uses_the_agent_stream_sanitization_funnel():
     assert streamed == ["visible runtime content"]
 
 
+def test_host_content_drops_cut_tool_markup_before_stream_delivery():
+    agent = _RuntimeAgent()
+    streamed = []
+    agent._fire_stream_delta = streamed.append
+    host = HermesRuntimeHostServices(
+        agent,
+        task_id="synthetic-task",
+        runtime_id="example-runtime",
+    )
+
+    _run_async(
+        host.emit_content(
+            "Visible runtime prefix.\n"
+            "<arg_key>session_id</arg_key>\n"
+            "<arg_value>synthetic-session"
+        )
+    )
+
+    assert streamed == ["Visible runtime prefix."]
+
+
+def test_host_content_keeps_cut_markup_hidden_across_runtime_deltas():
+    agent = _RuntimeAgent()
+    streamed = []
+    agent._fire_stream_delta = streamed.append
+    host = HermesRuntimeHostServices(
+        agent,
+        task_id="synthetic-task",
+        runtime_id="example-runtime",
+    )
+
+    _run_async(host.emit_content("Visible runtime prefix.\n<tool_"))
+    _run_async(host.emit_content("call>hidden tool payload"))
+    _run_async(host.emit_content("</tool_call>Visible tail."))
+
+    assert streamed == ["Visible runtime prefix.", "Visible tail."]
+
+
+def test_host_content_keeps_cut_argument_tail_hidden_across_runtime_deltas():
+    agent = _RuntimeAgent()
+    streamed = []
+    agent._fire_stream_delta = streamed.append
+    host = HermesRuntimeHostServices(
+        agent,
+        task_id="synthetic-task",
+        runtime_id="example-runtime",
+    )
+
+    _run_async(host.emit_content("Visible runtime prefix.\n<arg_"))
+    _run_async(host.emit_content("key>session_id</arg_key>"))
+    _run_async(host.emit_content("<arg_value>synthetic-session"))
+
+    assert streamed == ["Visible runtime prefix."]
+
+
 def test_dispatch_denied_typed_approval_fails_closed_before_completion():
     host = _RuntimeRequestHost(approval=False)
 

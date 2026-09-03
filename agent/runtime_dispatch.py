@@ -452,6 +452,9 @@ async def _collect_runtime_turn(
                 event,
                 (RuntimeCompletedEvent, RuntimeCancelledEvent, RuntimeFailedEvent),
             ):
+                flush_content = getattr(host, "flush_content", None)
+                if callable(flush_content):
+                    await flush_content()
                 terminal = event
 
         if terminal is None:
@@ -658,6 +661,9 @@ class HermesRuntimeHostServices:
         self._tool_call_count = 0
         self._side_effect_count = 0
         self._compaction_events: list[dict[str, Any]] = []
+        from agent.agent_runtime_helpers import StreamingToolCallMarkupScrubber
+
+        self._content_scrubber = StreamingToolCallMarkupScrubber()
         self.refresh_turn(task_id, turn_messages=turn_messages)
         try:
             # A fresh host is created for each whole turn, so the lifecycle
@@ -709,6 +715,7 @@ class HermesRuntimeHostServices:
             self._tool_call_ids_seen = set()
             self._tool_calls_in_flight = set()
             self._tool_call_count = 0
+            self._content_scrubber.reset()
             try:
                 from gateway.session_context import get_session_env
 
@@ -971,6 +978,18 @@ class HermesRuntimeHostServices:
             raise RuntimeExecutionError("runtime content must be text")
         if not text:
             return
+        # Remove provider-neutral tool-call markup before handing the delta to
+        # AIAgent. Its stateful scrubber keeps split tool markers buffered;
+        # reasoning tags remain intact for the separate reasoning scrubber.
+        text = self._content_scrubber.feed(text)
+        if not text:
+            return
+        self._deliver_content(text)
+
+    def _deliver_content(self, text: str) -> None:
+        """Send already-sanitized content through the existing callback seam."""
+        if not text:
+            return
         fire_delta = getattr(self._agent, "_fire_stream_delta", None)
         if callable(fire_delta):
             fire_delta(text)
@@ -989,6 +1008,11 @@ class HermesRuntimeHostServices:
                 callback(text)
             except Exception:
                 pass
+
+    async def flush_content(self) -> None:
+        """Flush benign buffered content before a runtime terminal event."""
+        self._ensure_open_parent()
+        self._deliver_content(self._content_scrubber.flush())
 
     async def persist_state(self, state: RuntimeStateEnvelope) -> None:
         self._ensure_open_parent()

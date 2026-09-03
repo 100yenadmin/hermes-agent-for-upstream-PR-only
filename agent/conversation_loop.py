@@ -2505,7 +2505,9 @@ def run_conversation(
             runtime_final_response = (
                 None
                 if runtime_failure is not None or runtime_cancelled
-                else runtime_response.get("final_response")
+                else agent._strip_think_blocks(
+                    runtime_response.get("final_response")
+                )
             )
             result = finalize_turn(
                 agent,
