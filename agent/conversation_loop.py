@@ -2477,7 +2477,7 @@ def run_conversation(
             tool_schemas=runtime_tool_schemas,
             tool_inventory=build_runtime_tool_inventory(runtime_tool_schemas),
             session_state=runtime_session_state,
-            correlation_id=effective_task_id,
+            correlation_id=turn_id,
         )
         runtime_session = get_runtime_session(
             agent,

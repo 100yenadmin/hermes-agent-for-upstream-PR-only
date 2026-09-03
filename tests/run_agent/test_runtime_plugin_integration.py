@@ -13,6 +13,8 @@ from agent.runtime_api import (
     RuntimeFailedEvent,
     RuntimeFailure,
     RuntimeFailurePhase,
+    RuntimeUsageEvent,
+    RuntimeUsageReceipt,
 )
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 
@@ -194,6 +196,97 @@ def test_external_runtime_reply_is_persisted_once_by_host_finalization(
         ("user", "hello"),
         ("assistant", "external runtime reply"),
     ]
+
+
+def test_external_runtime_usage_correlation_is_scoped_to_each_user_turn(
+    monkeypatch, tmp_path
+):
+    from hermes_state import SessionDB
+
+    manager = PluginManager()
+    manager._discovered = True
+    context = PluginContext(PluginManifest(name="external-runtime"), manager)
+    correlation_ids = []
+
+    class _CorrelatedRuntime:
+        def preflight(self, request):
+            return None
+
+        async def run_turn(self, request, host):
+            correlation_ids.append(request.correlation_id)
+            receipt = RuntimeUsageReceipt(
+                runtime_id="external-correlation-runtime",
+                provider="openai",
+                model="synthetic-model",
+                billing_mode="subscription",
+                cost_status="known",
+                input_tokens=1,
+                output_tokens=1,
+                replay_safe=True,
+                correlation_id=request.correlation_id,
+            )
+            yield RuntimeUsageEvent(receipt=receipt)
+            # A same-turn retry must remain idempotent at the host receipt seam.
+            yield RuntimeUsageEvent(receipt=receipt)
+            yield RuntimeCompletedEvent(
+                result={
+                    "final_response": "correlated runtime reply",
+                    "messages": list(request.messages),
+                }
+            )
+
+        async def close(self):
+            return None
+
+    context.register_agent_runtime(
+        descriptor=RuntimeDescriptor(
+            runtime_id="external-correlation-runtime",
+            plugin_version="0.1.0",
+            runtime_api_min=RUNTIME_API_VERSION,
+            runtime_api_max=RUNTIME_API_VERSION,
+            required_host_capabilities=frozenset({"cancellation_v1"}),
+            provider_ids=frozenset({"openai"}),
+            api_modes=frozenset({"chat_completions"}),
+            session_state_schema_version=1,
+        ),
+        factory=_CorrelatedRuntime,
+    )
+
+    import hermes_cli.plugins as plugins_module
+
+    monkeypatch.setattr(plugins_module, "_plugin_manager", manager)
+    monkeypatch.setattr(
+        "agent.turn_context._maybe_title_session_at_turn_start",
+        lambda *_args, **_kwargs: None,
+    )
+    session_id = "external-correlation-session"
+    db = SessionDB(db_path=tmp_path / "correlation-state.db")
+    agent = run_agent.AIAgent(
+        api_key="synthetic-test-value",
+        base_url="https://test.invalid",
+        provider="openai",
+        model="synthetic-model",
+        api_mode="chat_completions",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+        session_id=session_id,
+        session_db=db,
+    )
+    agent._cached_system_prompt = "composed synthetic prompt"
+
+    first = agent.run_conversation("hello", task_id=session_id)
+    second = agent.run_conversation("again", task_id=session_id)
+
+    assert first["final_response"] == "correlated runtime reply"
+    assert second["final_response"] == "correlated runtime reply"
+    assert len(correlation_ids) == 2
+    assert all(correlation_ids)
+    assert correlation_ids[0] != correlation_ids[1]
+    receipts = db.list_runtime_usage_receipts(session_id)
+    assert len(receipts) == 2
+    assert [receipt.correlation_id for receipt in receipts] == correlation_ids
+    agent.close()
 
 
 def test_runtime_content_stream_is_visible_without_duplicate_final_persistence(
