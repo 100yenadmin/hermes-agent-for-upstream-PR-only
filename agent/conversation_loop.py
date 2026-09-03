@@ -2835,18 +2835,18 @@ def run_conversation(
             plugin_user_context=_plugin_user_context,
         )
         api_messages = []
-        for idx, msg in enumerate(messages):
+        for idx, msg in enumerate(effective_prompt_messages):
 
             # Structural clone, NOT msg.copy(): every in-place transform
             # below (canonicalize/repair, surrogate + non-ASCII sanitizers,
             # cache decoration) must be unable to reach the persisted
             # history through shared nested containers. See
             # _clone_message_for_send.
-            api_msg = _clone_message_for_send(effective_prompt_messages[idx])
+            api_msg = _clone_message_for_send(msg)
 
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved
-            agent._copy_reasoning_content_for_api(msg, api_msg)
+            agent._copy_reasoning_content_for_api(messages[idx], api_msg)
 
             # Remove 'reasoning' field - it's for trajectory storage only
             # We've copied it to 'reasoning_content' for the API above
