@@ -1,7 +1,7 @@
 # AgentRuntime v1 coupling map (Revision 4)
 
 Host implementation source before this documentation-only restamp:
-`a9f51a2efc89414e1000b20ca2b4336f847c854e`
+`e6398e75c24be9b3e22f024d621a0221414cfe65`
 
 The [canonical ADR](../adr/agent-runtime-v1.md) defines the rules. This map
 records the final ownership split; it is not a second contract.
@@ -19,7 +19,7 @@ records the final ownership split; it is not a second contract.
 | Runtime state and receipts | Session/runtime-keyed opaque state, validation, SQLite persistence, append-only usage receipts, correlated retry dedupe | Typed state and usage events plus provider classification | Payloads contain no credentials; host does not rewrite observed billing identity from a selection. |
 | Compaction | Descriptor ownership and typed lifecycle projection; host compressor when ownership is `HOST` | Actual native compaction when ownership is `RUNTIME_NATIVE` | Generic code branches on declared ownership, never a provider name. |
 | Failure, fallback, and cancellation | Host-observed effect/visibility evidence, replay gate, cancellation and exact-parent sealing | Explicit failure phase/replay classification and `close()` implementation | Any visible event or host side effect clears replay safety; fallback is never inferred from exception type. |
-| Session lifecycle and removal | One cached binding per exact parent session, close-once ordering, unload and rollback to built-in path | One runtime instance per binding and provider-private cleanup | Late calls after close or parent rebind fail closed; plugin removal leaves generic state inert. |
+| Session lifecycle and removal | One cached binding and continuously running asyncio loop per exact parent session, per-turn context/approval rebinding, close-once ordering, unload and rollback to built-in path | One runtime instance per binding and provider-private async cleanup on the same loop | Long-lived SDK readers never cross async-runtime contexts; late calls after close or parent rebind fail closed; stale per-turn callbacks are cleared; plugin removal leaves generic state inert. |
 | Provider policy and dependencies | Provider-neutral API only; no model, subscription, OAuth, dependency, Fable, or Claude policy | Provider SDK/dependency/version policy, auth, model selection, subscription handling, diagnostics, packaging | Provider policy cannot leak into generic Hermes core. |
 
 ## Generic background delivery sequence

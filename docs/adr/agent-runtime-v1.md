@@ -3,7 +3,7 @@
 Status: accepted and frozen for Revision 4
 
 Host implementation source before this documentation-only restamp:
-`a9f51a2efc89414e1000b20ca2b4336f847c854e`
+`e6398e75c24be9b3e22f024d621a0221414cfe65`
 
 Contract authority: [Hermes-owned parity issue #19](https://github.com/100yenadmin/hermes-claude-agent-sdk/issues/19)
 
@@ -160,6 +160,14 @@ provider name.
 
 One runtime and one host binding are cached for the exact parent Hermes session
 and reused across its turns. Per-turn dispatch does not close the runtime.
+Each binding owns one lifecycle-stable, continuously running asyncio loop. All
+turns and `close()` execute on that loop so a provider SDK's long-lived reader,
+task group, and subprocess lifecycle never cross async-runtime contexts and
+remain serviceable between gateway turns. The caller's `ContextVars` and
+thread-local approval/sudo callbacks are rebound for the duration of each turn
+and cleared afterward; the stable loop is not permission to retain stale
+per-turn security context.
+
 Changing the selection, descriptor, plugin ownership, or parent session closes
 the old binding before replacement. Closing seals the host first so late state,
 tool, content, or background calls fail closed, then closes the runtime exactly
