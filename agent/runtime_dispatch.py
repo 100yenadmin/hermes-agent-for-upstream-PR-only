@@ -1113,14 +1113,77 @@ class RuntimeSessionBinding:
         self.plugin_id = plugin_id
         self.parent_session_id = parent_session_id
         self._closed = False
+        self._closing = False
         self._close_lock = threading.Lock()
+        self._loop = asyncio.new_event_loop()
+        self._loop_ready = threading.Event()
+        self._loop_thread = threading.Thread(
+            target=self._run_loop,
+            name=f"hermes-runtime-{runtime.__class__.__name__}",
+            daemon=True,
+        )
+        self._loop_thread.start()
+        if not self._loop_ready.wait(timeout=5.0):
+            raise RuntimeExecutionError("runtime session loop did not start")
+
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop_ready.set()
+        try:
+            self._loop.run_forever()
+        finally:
+            pending = asyncio.all_tasks(self._loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                self._loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+            self._loop.close()
+
+    def _run(self, coroutine: Any, *, allow_closing: bool = False) -> Any:
+        with self._close_lock:
+            unavailable = self._closed or (
+                self._closing and not allow_closing
+            )
+        if (
+            unavailable
+            or self._loop.is_closed()
+            or not self._loop_thread.is_alive()
+            or threading.current_thread() is self._loop_thread
+        ):
+            close = getattr(coroutine, "close", None)
+            if callable(close):
+                close()
+            raise RuntimeExecutionError("runtime session loop is closed")
+        # run_coroutine_threadsafe carries the caller's ContextVars. The
+        # wrapper supplies the thread-local approval/sudo callbacks for the
+        # duration of this turn on the lifecycle-stable runtime loop.
+        from tools.thread_context import propagate_callbacks_to_async_thread
+
+        future = asyncio.run_coroutine_threadsafe(
+            propagate_callbacks_to_async_thread(coroutine),
+            self._loop,
+        )
+        return future.result()
+
+    def run_turn(self, request: RuntimeTurnRequest) -> RuntimeDispatchResult:
+        """Run every turn for this binding on one lifecycle-stable event loop."""
+        return self._run(
+            _collect_runtime_turn(
+                self.runtime,
+                request,
+                self.host,
+                self.descriptor,
+            )
+        )
 
     def close(self) -> None:
         """Close the host gate and runtime exactly once."""
         with self._close_lock:
-            if self._closed:
+            if self._closed or self._closing:
                 return
-            self._closed = True
+            self._closing = True
 
         async def _close() -> None:
             await self.host.close()
@@ -1131,9 +1194,16 @@ class RuntimeSessionBinding:
             except Exception:
                 pass
 
-        from model_tools import _run_async
-
-        _run_async(_close())
+        try:
+            self._run(_close(), allow_closing=True)
+        finally:
+            with self._close_lock:
+                self._closed = True
+                self._closing = False
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._loop_thread.join(timeout=5.0)
+            if self._loop_thread.is_alive():
+                raise RuntimeExecutionError("runtime session loop did not stop")
 
 
 def get_runtime_session(

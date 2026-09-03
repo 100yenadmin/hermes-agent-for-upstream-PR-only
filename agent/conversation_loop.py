@@ -2235,7 +2235,6 @@ def run_conversation(
         close_runtime_session,
         get_runtime_session,
         make_builtin_codex_registration,
-        run_runtime_sync,
     )
     from hermes_cli.plugins import discover_plugins, get_plugin_manager
 
@@ -2487,12 +2486,7 @@ def run_conversation(
             turn_messages=messages,
         )
         agent._last_effective_prompt_hash = request.effective_prompt_hash
-        dispatched = run_runtime_sync(
-            runtime_session.runtime,
-            request,
-            runtime_session.host,
-            descriptor=runtime_registration.descriptor,
-        )
+        dispatched = runtime_session.run_turn(request)
         # The built-in Codex adapter owns its projected persistence and must
         # retain its existing short-circuit. External runtimes only return an
         # immutable result envelope; host finalization owns the durable turn.

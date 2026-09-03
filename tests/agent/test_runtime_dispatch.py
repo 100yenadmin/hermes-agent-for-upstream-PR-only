@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
+import threading
 from collections.abc import AsyncIterator
 
 import pytest
@@ -1553,6 +1555,119 @@ def test_runtime_and_host_binding_are_reused_until_session_close():
     assert instances[0].close_calls == 1
 
 
+_RUNTIME_TURN_CONTEXT = contextvars.ContextVar(
+    "runtime_turn_context",
+    default="missing",
+)
+
+
+class _LoopAffineRuntime:
+    """Runtime double whose long-lived reader must stay on one event loop."""
+
+    def __init__(self):
+        self.loop_ids = []
+        self.context_values = []
+        self.approval_callbacks = []
+        self.reader_task = None
+        self.reader_wakeup = None
+        self.reader_observed = threading.Event()
+        self.close_loop_id = None
+
+    def preflight(self, request):
+        return None
+
+    async def _reader(self):
+        self.reader_wakeup = asyncio.Event()
+        await self.reader_wakeup.wait()
+        self.reader_observed.set()
+        await asyncio.Event().wait()
+
+    async def run_turn(self, request, host) -> AsyncIterator[object]:
+        loop = asyncio.get_running_loop()
+        self.loop_ids.append(id(loop))
+        self.context_values.append(_RUNTIME_TURN_CONTEXT.get())
+        from tools.terminal_tool import _get_approval_callback
+
+        self.approval_callbacks.append(_get_approval_callback())
+        if self.reader_task is None:
+            self.reader_task = asyncio.create_task(self._reader())
+        elif loop is not self.reader_task.get_loop() or self.reader_task.done():
+            yield RuntimeFailedEvent(
+                failure=RuntimeFailure(
+                    code="runtime_loop_affinity_lost",
+                    message="runtime loop affinity was lost",
+                    phase=RuntimeFailurePhase.BEFORE_VISIBLE_OUTPUT,
+                    replay_safe=False,
+                )
+            )
+            return
+        yield RuntimeCompletedEvent(result={"final_response": "done"})
+
+    async def close(self):
+        self.close_loop_id = id(asyncio.get_running_loop())
+        if self.reader_task is not None:
+            self.reader_task.cancel()
+            await asyncio.gather(self.reader_task, return_exceptions=True)
+
+
+def test_runtime_session_keeps_loop_affinity_across_async_gateway_turns():
+    from tools.terminal_tool import set_approval_callback
+
+    runtime = _LoopAffineRuntime()
+    agent = _RuntimeAgent()
+    registration = RuntimeRegistration(
+        descriptor=RuntimeDescriptor(
+            runtime_id="example-runtime",
+            plugin_version="0.1.0",
+            runtime_api_min=1,
+            runtime_api_max=1,
+            required_host_capabilities=frozenset(),
+            provider_ids=frozenset({"example"}),
+            api_modes=frozenset({"example_runtime"}),
+            session_state_schema_version=1,
+        ),
+        factory=lambda: runtime,
+        plugin_id="synthetic-plugin",
+    )
+    binding = get_runtime_session(agent, registration, task_id="turn-1")
+
+    def first_approval_callback(*_args, **_kwargs):
+        return True
+
+    def second_approval_callback(*_args, **_kwargs):
+        return True
+
+    async def gateway_turns():
+        try:
+            _RUNTIME_TURN_CONTEXT.set("first-turn")
+            set_approval_callback(first_approval_callback)
+            first = binding.run_turn(_request())
+            runtime.reader_task.get_loop().call_soon_threadsafe(
+                runtime.reader_wakeup.set
+            )
+            assert runtime.reader_observed.wait(timeout=1.0)
+            binding.host.refresh_turn("turn-2")
+            _RUNTIME_TURN_CONTEXT.set("second-turn")
+            set_approval_callback(second_approval_callback)
+            second = binding.run_turn(_request())
+            return first, second
+        finally:
+            set_approval_callback(None)
+
+    first, second = asyncio.run(gateway_turns())
+    close_runtime_session(agent)
+
+    assert first.response == {"final_response": "done"}
+    assert second.response == {"final_response": "done"}
+    assert len(set(runtime.loop_ids)) == 1
+    assert runtime.context_values == ["first-turn", "second-turn"]
+    assert runtime.approval_callbacks == [
+        first_approval_callback,
+        second_approval_callback,
+    ]
+    assert runtime.close_loop_id == runtime.loop_ids[0]
+
+
 def test_session_change_closes_old_runtime_before_rebinding():
     instances = []
 
@@ -1594,13 +1709,13 @@ def test_builtin_codex_session_refreshes_its_per_turn_runner():
         make_builtin_codex_registration(lambda: {"final_response": "first"}),
         task_id="turn-1",
     )
-    first_result = run_runtime_sync(first.runtime, _request(), first.host)
+    first_result = first.run_turn(_request())
     second = get_runtime_session(
         agent,
         make_builtin_codex_registration(lambda: {"final_response": "second"}),
         task_id="turn-2",
     )
-    second_result = run_runtime_sync(second.runtime, _request(), second.host)
+    second_result = second.run_turn(_request())
 
     assert first is second
     assert first_result.response == {"final_response": "first"}
