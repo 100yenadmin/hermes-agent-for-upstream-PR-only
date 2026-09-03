@@ -15,6 +15,8 @@ frozen Revision 4 host boundary, including:
   streaming, and typed terminal events;
 - one continuously running per-session async lifecycle loop with fresh caller
   context and approval callbacks rebound for every turn; and
+- a host-issued receipt correlation that is stable for retries within one
+  Hermes turn and distinct between turns, never the session-scoped task id; and
 - the honest at-least-once adapter boundary with idempotent durable consumers.
 
 Current implementation source before the documentation-only restamp:

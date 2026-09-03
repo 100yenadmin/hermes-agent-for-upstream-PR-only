@@ -145,11 +145,14 @@ new broker, daemon, datastore, or authentication boundary.
 
 The host persists `RuntimeStateEnvelope` by (Hermes session, `runtime_id`) and
 upserts only validated, bounded JSON. `RuntimeUsageReceipt` is an append-only
-host audit stream. A non-secret correlation id is its sole deduplication key;
-correlated retries are ignored, while receipts without a correlation id remain
-independent events. The legacy `model` field stays the runtime-observed
-billing/ledger identity; optional selected, effective, canonical, and bounded
-resolution fields do not cause the host to invent provider aliases or policy.
+host audit stream. A non-secret correlation id is its sole deduplication key.
+Hermes supplies an id that is stable for retries within one user turn and
+distinct between turns; a session-scoped task id is not a valid receipt
+correlation. Correlated retries are ignored, while receipts without a
+correlation id remain independent events. The legacy `model` field stays the
+runtime-observed billing/ledger identity; optional selected, effective,
+canonical, and bounded resolution fields do not cause the host to invent
+provider aliases or policy.
 
 Compaction ownership is descriptor-declared (`HOST` or `RUNTIME_NATIVE`). A
 runtime-native implementation emits typed lifecycle phases and the host merely
