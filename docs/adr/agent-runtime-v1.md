@@ -3,7 +3,7 @@
 Status: accepted and frozen for Revision 4
 
 Host implementation source before this documentation-only restamp:
-`0b1dea57f303d2db5d2e9099254a663e7cc8faa8`
+`a9f51a2efc89414e1000b20ca2b4336f847c854e`
 
 Contract authority: [Hermes-owned parity issue #19](https://github.com/100yenadmin/hermes-claude-agent-sdk/issues/19)
 
