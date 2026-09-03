@@ -306,7 +306,13 @@ class RuntimeFailure:
 
 @dataclass(frozen=True)
 class RuntimeTurnRequest:
-    """Immutable normalized input for one whole turn."""
+    """Immutable normalized input for one whole turn.
+
+    ``correlation_id`` is host-issued, stable across retries of this turn, and
+    distinct from both the Hermes session ID and every other turn. Runtime
+    usage persistence relies on that scope to deduplicate same-turn retries
+    without suppressing receipts from later turns in the same session.
+    """
 
     selection: RuntimeSelection
     messages: Sequence[Mapping[str, Any]]
