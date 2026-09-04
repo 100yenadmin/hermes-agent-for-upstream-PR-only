@@ -266,6 +266,22 @@ def test_announced_order_blocks_later_completion_until_earlier_call_is_admitted(
     assert committed == ["call_a", "call_b"]
 
 
+def test_terminal_settlement_admits_pending_announced_call_before_retirement(patched_executor):
+    _, starts, committed = patched_executor
+    agent = _FakeAgent([])
+    executor = AstraAsyncExecutor(agent, [], "task")
+    first, second = _tool("safe_a", "a"), _tool("safe_b", "b")
+    assert executor.admit(first) is True
+    final = _consume_codex_event_stream([
+        SimpleNamespace(type="response.output_item.added", output_index=1, item=second),
+        SimpleNamespace(type="response.completed", response=SimpleNamespace(id="resp", status="completed")),
+    ], model="gpt-6-astra", on_async_tool_announcement=executor.reserve)
+    assert executor.has_pending
+    assert executor.finish_stream(settled_calls=final.output) is True
+    assert starts == ["call_a", "call_b"]
+    assert committed == ["call_a", "call_b"]
+
+
 def test_publish_failure_recovers_once_without_reexecuting_handler(patched_executor, monkeypatch):
     _, starts, _ = patched_executor
     import agent.tool_executor as tool_executor

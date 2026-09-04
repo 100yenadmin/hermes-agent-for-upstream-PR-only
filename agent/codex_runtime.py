@@ -1024,7 +1024,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 raise
             executor = _astra_executor()
             if executor is not None and (executor.has_admitted or executor.has_pending or executor.failed):
-                if not executor.finish_stream(assistant_content=getattr(final, "output_text", "") or ""):
+                if not executor.finish_stream(
+                    assistant_content=getattr(final, "output_text", "") or "",
+                    settled_calls=getattr(final, "output", None),
+                ):
                     raise RuntimeError("Astra async tool execution did not reach a durable result boundary")
             elif executor is not None and executor.retire_empty():
                 agent._astra_async_executor = None

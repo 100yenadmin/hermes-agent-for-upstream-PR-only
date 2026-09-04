@@ -323,7 +323,7 @@ class AstraAsyncExecutor:
         self.agent._session_messages = self.messages
         return persisted
 
-    def finish_stream(self, assistant_content: str = "") -> bool:
+    def finish_stream(self, assistant_content: str = "", settled_calls: Any = None) -> bool:
         """Wait for all admitted jobs and publish results in original call order."""
         with self._lock:
             if self._closed:
@@ -331,6 +331,11 @@ class AstraAsyncExecutor:
             if getattr(self.agent, "_interrupt_requested", False):
                 self.abort_stream()
                 return False
+            # The assembler settles announced items that lack an output_item.done frame only when
+            # it builds the terminal response.  Admit those calls before retiring reservations.
+            for call in settled_calls or ():
+                if provider_async_marker(call):
+                    self.admit(call)
             self._stream_closed = True
             self._drain_admissions_locked()
             self._pending_calls.clear()
