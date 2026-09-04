@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import logging
 import copy
+import hashlib
+import json
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -203,6 +205,33 @@ def _json_value(value: Any) -> Any:
         return [_json_value(item) for item in value]
     values = getattr(value, "__dict__", None)
     return _json_value(values) if isinstance(values, dict) else None
+
+
+def astra_compaction_content_digest(messages: Any) -> Optional[str]:
+    """Hash the covered chat prefix while ignoring local-only sidecar fields.
+
+    Steering is intentionally injected into an existing tool result. A persisted
+    canonical window must therefore be bypassed if that covered result changed after
+    maintenance, including after a restart. Returning ``None`` fails open to the
+    ordinary full-transcript serializer when a fixture contains a non-JSON value.
+    """
+    if not isinstance(messages, list) or not all(isinstance(item, dict) for item in messages):
+        return None
+    comparable = []
+    for message in messages:
+        content = message.get("api_content")
+        if isinstance(content, str) and content:
+            message = {**message, "content": content}
+        comparable.append({
+            key: _json_value(value)
+            for key, value in message.items()
+            if key not in {"_row_id", "api_content", "display_kind", "display_metadata"}
+        })
+    try:
+        encoded = json.dumps(comparable, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _valid_astra_window(window: Any) -> bool:
@@ -399,6 +428,10 @@ def persist_astra_compaction_result(
         "version": ASTRA_COMPACTION_VERSION, "window": copy.deepcopy(result.window),
         "covered_boundary": dict(result.covered_boundary), "route": result.route,
     }
+    covered_digest = astra_compaction_content_digest(prefix)
+    if not covered_digest:
+        return False
+    metadata["covered_boundary"]["covered_digest"] = covered_digest
     merge = getattr(db, "merge_message_display_metadata", None)
     if not callable(merge):
         return False

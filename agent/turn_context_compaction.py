@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -142,6 +143,16 @@ def run_turn_start_compaction(
         messages=messages, active_system_prompt=active_system_prompt,
         conversation_history=conversation_history, current_turn_user_idx=current_turn_user_idx,
     )
+    # A resumed agent has no in-memory checkpoint until its durable carrier is read.  Hydrate
+    # it before the preflight duplicate-boundary check so restart cannot issue maintenance twice.
+    with suppress(Exception):
+        from agent.native_compaction import (
+            is_astra_native_compaction_eligible, refresh_astra_compaction_boundary,
+            restore_astra_compaction_state,
+        )
+        if is_astra_native_compaction_eligible(agent):
+            restore_astra_compaction_state(agent, messages)
+            refresh_astra_compaction_boundary(agent, messages)
     _idle_compaction(agent, out, system_message, user_message, effective_task_id)
     _preflight_compression(agent, out, system_message, user_message, effective_task_id)
     return out

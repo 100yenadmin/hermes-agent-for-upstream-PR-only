@@ -1413,11 +1413,17 @@ def _build_bedrock_kwargs(agent, api_messages, tools_for_api):
 def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id):
     from agent.codex_responses_adapter import classify_responses_route
     from agent.transports.codex import is_astra_reasoning_cache_eligible
-    from agent.native_compaction import native_compaction_context_management
+    from agent.native_compaction import (
+        is_astra_native_compaction_eligible, native_compaction_context_management,
+    )
     from agent.astra_async_tools import is_direct_astra
     from agent.turn_api_call import _should_stream
     is_codex_backend, is_xai_responses, is_github_responses = classify_responses_route(agent)
-    astra_compaction_state = getattr(agent, "_astra_native_compaction", None)
+    astra_compaction_enabled = is_astra_native_compaction_eligible(agent)
+    astra_compaction_state = (
+        getattr(agent, "_astra_native_compaction", None)
+        if astra_compaction_enabled else None
+    )
     astra_state = getattr(agent, "_astra_reasoning_state", None)
     if not isinstance(astra_state, dict):
         astra_state = {}
@@ -1463,6 +1469,7 @@ def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, re
         replay_encrypted_reasoning=bool(getattr(agent, "_codex_reasoning_replay_enabled", True)),
         context_management=context_management,
         astra_compaction_state=astra_compaction_state,
+        astra_compaction_enabled=astra_compaction_enabled,
         midstream_executor_active=bool(_should_stream(agent) and is_direct_astra(agent)))
     if astra_state:
         agent._astra_base_effort = astra_state.get("base_effort")

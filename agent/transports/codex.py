@@ -595,6 +595,7 @@ class ResponsesApiTransport(ProviderTransport):
         )
         astra_state = params.get("astra_state")
         astra_compaction_state = params.get("astra_compaction_state")
+        astra_compaction_enabled = params.get("astra_compaction_enabled") is True
         astra_update_effort = None
         if astra_eligible:
             from agent.codex_responses_adapter import astra_base_effort_for_message, configuration_update_for_message
@@ -638,13 +639,18 @@ class ResponsesApiTransport(ProviderTransport):
         # configuration-update markers retain their exact position.
         canonical_window = None
         boundary_count = None
-        if astra_eligible and isinstance(astra_compaction_state, dict):
+        if astra_eligible and astra_compaction_enabled and isinstance(astra_compaction_state, dict):
             candidate_window = astra_compaction_state.get("window")
             boundary = astra_compaction_state.get("covered_boundary") or {}
             candidate_count = boundary.get("message_count")
+            from agent.native_compaction import astra_compaction_content_digest
             if isinstance(candidate_window, list) and all(isinstance(item, dict) for item in candidate_window) \
                     and isinstance(candidate_count, int) and not isinstance(candidate_count, bool) \
-                    and 0 <= candidate_count <= len(payload_messages):
+                    and 0 <= candidate_count <= len(payload_messages) \
+                    and isinstance(boundary.get("covered_digest"), str) \
+                    and boundary["covered_digest"] == astra_compaction_content_digest(
+                        payload_messages[:candidate_count]
+                    ):
                 canonical_window = [dict(item) for item in candidate_window]
                 boundary_count = candidate_count
         if canonical_window is not None:
