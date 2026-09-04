@@ -1426,6 +1426,7 @@ def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, re
         api_mode=getattr(agent, "api_mode", None), api_key=getattr(agent, "api_key", None),
         auth_mode=getattr(agent, "auth_mode", "api_key"), provider=getattr(agent, "provider", None),
         is_subagent=getattr(agent, "is_subagent", False),
+        platform=getattr(agent, "platform", None), delegate_depth=getattr(agent, "_delegate_depth", 0),
         compression_checkpoint_required=getattr(agent, "compression_checkpoint_required", False),
     ):
         astra_state.clear()
@@ -1452,6 +1453,7 @@ def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, re
         timeout=agent._resolved_api_call_timeout(), request_overrides=request_overrides,
         api_mode=getattr(agent, "api_mode", None), api_key=getattr(agent, "api_key", None),
         auth_mode=getattr(agent, "auth_mode", "api_key"), is_subagent=getattr(agent, "is_subagent", False),
+        platform=getattr(agent, "platform", None), delegate_depth=getattr(agent, "_delegate_depth", 0),
         compression_checkpoint_required=getattr(agent, "compression_checkpoint_required", False),
         astra_state=astra_state,
         provider=getattr(agent, "provider", None), is_github_responses=is_github_responses,

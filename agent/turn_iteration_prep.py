@@ -32,13 +32,17 @@ def _reset_astra_segment(agent: Any) -> None:
     from agent.reasoning_effort import CODEX_ASTRA_EFFORTS
     from agent.transports.codex import _astra_effective_effort, is_astra_reasoning_cache_eligible
 
-    desired = getattr(agent, "_astra_effective_effort", None)
+    desired = (
+        getattr(agent, "_astra_pending_configuration_update", None)
+        or getattr(agent, "_astra_effective_effort", None)
+    )
     base = getattr(agent, "_astra_base_effort", None)
     eligible = is_astra_reasoning_cache_eligible(
         getattr(agent, "model", None), getattr(agent, "base_url", None),
         api_mode=getattr(agent, "api_mode", None), api_key=getattr(agent, "api_key", None),
         auth_mode=getattr(agent, "auth_mode", "api_key"), provider=getattr(agent, "provider", None),
         is_subagent=getattr(agent, "is_subagent", False),
+        platform=getattr(agent, "platform", None), delegate_depth=getattr(agent, "_delegate_depth", 0),
         compression_checkpoint_required=getattr(agent, "compression_checkpoint_required", False),
     )
     if eligible:
@@ -80,6 +84,7 @@ def _stage_astra_configuration_update(agent: Any, messages: Any) -> None:
         api_mode=getattr(agent, "api_mode", None), api_key=getattr(agent, "api_key", None),
         auth_mode=getattr(agent, "auth_mode", "api_key"), provider=getattr(agent, "provider", None),
         is_subagent=getattr(agent, "is_subagent", False),
+        platform=getattr(agent, "platform", None), delegate_depth=getattr(agent, "_delegate_depth", 0),
         compression_checkpoint_required=getattr(agent, "compression_checkpoint_required", False),
     ):
         agent._astra_reasoning_state = {}

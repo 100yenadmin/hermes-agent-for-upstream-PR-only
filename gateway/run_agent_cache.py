@@ -604,6 +604,8 @@ class GatewayAgentCacheMixin:
                     auth_mode=getattr(cached_agent, "auth_mode", "api_key"),
                     provider=getattr(cached_agent, "provider", None),
                     is_subagent=getattr(cached_agent, "is_subagent", False),
+                    platform=getattr(cached_agent, "platform", None),
+                    delegate_depth=getattr(cached_agent, "_delegate_depth", 0),
                     compression_checkpoint_required=getattr(cached_agent, "compression_checkpoint_required", False),
                 )
                 if eligible:
@@ -656,6 +658,31 @@ class GatewayAgentCacheMixin:
         self._spawn_release_thread(
             self._release_evicted_agent_soft, (agent,), f"agent-evict-{str(session_key)[:24]}", inline_fallback=True,
         )
+
+    def _arm_astra_segment_reset(self, session_key: str) -> None:
+        """Carry a manual-compaction effort segment across cached-agent eviction."""
+        state = self._session_state(session_key)
+        conversation = state.conversation
+        lock = getattr(self, "_agent_cache_lock", None)
+        if lock:
+            with lock:
+                cached = getattr(self, "_agent_cache", {}).get(session_key)
+        else:
+            cached = getattr(self, "_agent_cache", {}).get(session_key)
+        cached_agent = _first_agent(cached)
+        if cached_agent is not None:
+            from agent.turn_iteration_prep import _reset_astra_segment
+
+            _reset_astra_segment(cached_agent)
+            conversation.base_effort = getattr(cached_agent, "_astra_segment_base_seed", None)
+            conversation.effective_effort = (
+                getattr(cached_agent, "_astra_pending_configuration_update", None)
+                or conversation.base_effort
+            )
+            conversation.pending_configuration_update = getattr(
+                cached_agent, "_astra_pending_configuration_update", None
+            )
+        conversation.astra_force_new_segment = True
 
     def _spawn_release_thread(self, target, args: tuple, name: str, *, inline_fallback: bool) -> None:
         """Run a release on a daemon thread. ``inline_fallback`` runs it inline (best-effort) when no

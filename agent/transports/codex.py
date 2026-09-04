@@ -284,6 +284,7 @@ def _is_official_openai_responses_route(model: Any, base_url: Any) -> bool:
 def is_astra_reasoning_cache_eligible(
     model: Any, base_url: Any, *, api_mode: Any = "codex_responses", api_key: Any = None,
     auth_mode: Any = "api_key", provider: Any = None, is_subagent: bool = False,
+    platform: Any = None, delegate_depth: Any = 0,
     compression_checkpoint_required: bool = False,
 ) -> bool:
     """Gate cache-preserving effort updates to the exact direct single-agent Astra route."""
@@ -298,7 +299,12 @@ def is_astra_reasoning_cache_eligible(
         return False
     if str(provider or "").strip().lower() in {"openai-codex", "xai-oauth", "azure", "azure-foundry"}:
         return False
-    return not bool(is_subagent or compression_checkpoint_required)
+    delegated = str(platform or "").strip().lower() == "subagent"
+    try:
+        delegated = delegated or int(delegate_depth or 0) > 0
+    except (TypeError, ValueError):
+        delegated = True
+    return not bool(is_subagent or delegated or compression_checkpoint_required)
 
 
 def _astra_effective_effort(requested: Any) -> str:
@@ -584,6 +590,7 @@ class ResponsesApiTransport(ProviderTransport):
             model, params.get("base_url"), api_mode=params.get("api_mode", "codex_responses"),
             api_key=params.get("api_key"), auth_mode=params.get("auth_mode", "api_key"),
             provider=params.get("provider"), is_subagent=params.get("is_subagent") is True,
+            platform=params.get("platform"), delegate_depth=params.get("delegate_depth", 0),
             compression_checkpoint_required=params.get("compression_checkpoint_required") is True,
         )
         astra_state = params.get("astra_state")

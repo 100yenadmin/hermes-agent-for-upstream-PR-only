@@ -57,7 +57,12 @@ def is_astra_websocket_eligible(agent: Any, request: dict[str, Any] | None = Non
         return False
     if callable(getattr(agent, "_is_codex_backend", None)) and agent._is_codex_backend():
         return False
-    if getattr(agent, "is_subagent", False) or getattr(agent, "compression_checkpoint_required", False):
+    delegated = str(getattr(agent, "platform", "") or "").strip().lower() == "subagent"
+    try:
+        delegated = delegated or int(getattr(agent, "_delegate_depth", 0) or 0) > 0
+    except (TypeError, ValueError):
+        delegated = True
+    if getattr(agent, "is_subagent", False) or delegated or getattr(agent, "compression_checkpoint_required", False):
         return False
     request = request or {}
     if (request.get("context_management") or request.get("conversation") or request.get("conversation_id")

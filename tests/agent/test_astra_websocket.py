@@ -129,7 +129,7 @@ def test_eligibility_is_exact_and_excludes_unsupported_routes():
         {"base_url": "https://api.openai.com/v1/other"}, {"model": "gpt-5.6"},
         {"provider": "openai-codex"}, {"context_management": {"type": "compaction"}},
         {"previous_response_id": "resp_1"},
-        {"is_subagent": True}, {"api_key": ""},
+        {"is_subagent": True}, {"platform": "subagent"}, {"_delegate_depth": 1}, {"api_key": ""},
     ):
         request = {key: value for key, value in changes.items() if key in {"context_management", "previous_response_id"}}
         agent_changes = {key: value for key, value in changes.items() if key not in request}

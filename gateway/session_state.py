@@ -48,6 +48,7 @@ class ConversationState:
     effective_effort: Optional[str] = None
     pending_configuration_update: Optional[str] = None
     reasoning_change_requested: bool = False
+    astra_force_new_segment: bool = False
     service_tier_override: Any = _UNSET_TIER  # /fast: "priority" or None; _UNSET_TIER = absent
     last_resolved_model: str = ""  # last successfully-resolved non-empty model
     queued_events: List[Any] = field(default_factory=list)  # /queue overflow FIFO (head in adapter)

@@ -78,6 +78,8 @@ def test_configuration_update_preflight_is_strict_and_ladder_bounded():
         {"api_mode": "chat_completions"},
         {"model": "gpt-5.6"},
         {"is_subagent": True},
+        {"platform": "subagent"},
+        {"delegate_depth": 1},
         {"compression_checkpoint_required": True},
     ],
 )
@@ -134,7 +136,8 @@ def _astra_agent(**overrides):
     values = {
         "model": "gpt-6-astra", "base_url": _DIRECT, "api_mode": "codex_responses",
         "api_key": "fixture-key", "auth_mode": "api_key", "provider": "openai",
-        "is_subagent": False, "compression_checkpoint_required": False,
+        "is_subagent": False, "platform": "cli", "_delegate_depth": 0,
+        "compression_checkpoint_required": False,
         "reasoning_config": {"effort": "low"}, "_astra_reasoning_state": {"base_effort": "low"},
         "_astra_base_effort": "low", "_astra_effective_effort": "high",
         "_astra_pending_configuration_update": None,
@@ -262,3 +265,48 @@ def test_reasoning_change_reason_does_not_leak_when_no_agent_is_cached():
     runner._evict_cached_agent("empty-session")
 
     assert state.conversation.reasoning_change_requested is False
+
+
+def test_gateway_replay_binds_update_to_exact_duplicate_user_row():
+    from gateway.run import _build_gateway_agent_history
+
+    history = [
+        {"role": "user", "content": "same"},
+        {"role": "assistant", "content": "one"},
+        {"role": "user", "content": "same"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "same", "display_metadata": {
+            "astra_reasoning_base_effort": "low",
+            "astra_configuration_update": _UPDATE_HIGH,
+        }},
+    ]
+
+    replay, _ = _build_gateway_agent_history(history)
+
+    users = [message for message in replay if message["role"] == "user"]
+    assert "_astra_configuration_update" not in users[0]
+    assert "_astra_configuration_update" not in users[1]
+    assert users[2]["_astra_reasoning_base_effort"] == "low"
+    assert users[2]["_astra_configuration_update"] == _UPDATE_HIGH
+
+
+def test_manual_compaction_reset_survives_cached_agent_eviction():
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    session_key = "manual-compress"
+    agent = _astra_agent(
+        _astra_base_effort="low", _astra_effective_effort="low",
+        _astra_pending_configuration_update="high",
+    )
+    runner._agent_cache[session_key] = (agent, "fixture-signature")
+
+    runner._arm_astra_segment_reset(session_key)
+
+    conversation = runner._session_state(session_key).conversation
+    assert conversation.astra_force_new_segment is True
+    assert conversation.base_effort == "low"
+    assert conversation.effective_effort == "high"
+    assert conversation.pending_configuration_update == "high"
