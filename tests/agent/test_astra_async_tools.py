@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from agent.astra_async_tools import AstraAsyncExecutor, provider_async_marker
+from agent.astra_async_tools import AstraAsyncExecutor, is_direct_astra, provider_async_marker
 from agent.codex_responses_adapter import _response_tool_call, _responses_tools
 from agent.codex_runtime import _consume_codex_event_stream
 
@@ -66,6 +66,16 @@ def test_async_marker_spellings_survive_raw_and_normalized_paths(marker):
     assert provider_async_marker(normalized)
 
 
+@pytest.mark.parametrize(("base_url", "expected"), [
+    ("https://api.openai.com/v1", True),
+    ("https://evil.api.openai.com/v1", False),
+    ("https://api.openai.com.evil.test/v1", False),
+])
+def test_direct_astra_requires_exact_official_hostname(base_url, expected):
+    agent = SimpleNamespace(api_mode="codex_responses", model="gpt-6-astra", base_url=base_url)
+    assert is_direct_astra(agent) is expected
+
+
 class _FakeAgent:
     api_mode = "codex_responses"
     model = "gpt-6-astra"
@@ -113,7 +123,7 @@ def patched_executor(monkeypatch):
             self.name = call.name
             self.args = {}
             self.middleware_trace = []
-            self.parse_error = None
+            self.parse_error = "invalid arguments" if call.name == "malformed" else None
             self.scope_block = None
 
         def ref(self, task_id):
@@ -219,3 +229,67 @@ def test_interrupt_retirement_is_idempotent_and_does_not_re_admit(patched_execut
     assert executor.admit(call) is True
     executor.abort_stream()
     assert executor.admit(call) is False
+
+
+def test_parse_error_is_reported_without_handler_dispatch(patched_executor, monkeypatch):
+    _, starts, _ = patched_executor
+    import agent.tool_executor as tool_executor
+
+    invalid = []
+
+    def append_invalid(agent, messages, ref, parse_error):
+        invalid.append(ref.call_id)
+        messages.append({"role": "tool", "tool_call_id": ref.call_id, "content": parse_error})
+        return True
+
+    monkeypatch.setattr(tool_executor, "_append_invalid_arguments_result", append_invalid)
+    agent = _FakeAgent([])
+    executor = AstraAsyncExecutor(agent, [], "task")
+    assert executor.admit(_tool("malformed", "bad")) is True
+    assert executor.finish_stream() is True
+    assert starts == []
+    assert invalid == ["call_bad"]
+    assert agent._session_messages[-1]["content"] == "invalid arguments"
+
+
+def test_announced_order_blocks_later_completion_until_earlier_call_is_admitted(patched_executor):
+    _, starts, committed = patched_executor
+    agent = _FakeAgent([])
+    executor = AstraAsyncExecutor(agent, [], "task")
+    first, second = _tool("safe_a", "a"), _tool("safe_b", "b")
+    assert executor.reserve(first) is True
+    assert executor.reserve(second) is True
+    assert executor.admit(second) is True
+    assert starts == []
+    assert executor.admit(first) is True
+    assert executor.finish_stream() is True
+    assert committed == ["call_a", "call_b"]
+
+
+def test_publish_failure_recovers_once_without_reexecuting_handler(patched_executor, monkeypatch):
+    _, starts, _ = patched_executor
+    import agent.tool_executor as tool_executor
+
+    publish_calls = []
+
+    def fail_publish(agent, messages, ref, managed, **kwargs):
+        publish_calls.append(ref.call_id)
+        messages.append({"role": "tool", "tool_call_id": ref.call_id, "content": managed.result})
+        return False
+
+    monkeypatch.setattr(tool_executor, "_publish_sequential_result", fail_publish)
+    flushes = []
+    agent = _FakeAgent([])
+
+    def flush(messages):
+        flushes.append([row.copy() for row in messages])
+        return True
+
+    agent._flush_messages_to_session_db = flush
+    executor = AstraAsyncExecutor(agent, [], "task")
+    assert executor.admit(_tool("safe", "fail")) is True
+    assert executor.finish_stream() is True
+    assert starts == ["call_fail"]
+    assert publish_calls == ["call_fail"]
+    assert len(flushes) == 2
+    assert "[Orphan recovery:" in flushes[-1][-1]["content"]

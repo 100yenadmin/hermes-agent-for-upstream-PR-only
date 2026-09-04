@@ -28,9 +28,9 @@ def is_direct_astra(agent: Any) -> bool:
     model = str(getattr(agent, "model", "") or "").strip().lower().rsplit("/", 1)[-1]
     if model != "gpt-6-astra":
         return False
-    from utils import base_url_host_matches
+    from utils import base_url_hostname
 
-    return base_url_host_matches(str(getattr(agent, "base_url", "") or ""), "api.openai.com")
+    return base_url_hostname(str(getattr(agent, "base_url", "") or "")) == "api.openai.com"
 
 
 def provider_async_marker(tool_call: Any) -> bool:
@@ -68,6 +68,8 @@ class AstraAsyncExecutor:
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
         self._jobs: list[_AstraJob] = []
+        self._reservations: list[str] = []
+        self._pending_calls: dict[str, Any] = {}
         self._admitted_ids: set[str] = set()
         self._stream_closed = False
         self._closed = False
@@ -88,6 +90,11 @@ class AstraAsyncExecutor:
             return bool(self._jobs)
 
     @property
+    def has_pending(self) -> bool:
+        with self._lock:
+            return bool(self._reservations or self._pending_calls)
+
+    @property
     def failed(self) -> bool:
         with self._lock:
             return self._failed
@@ -105,7 +112,7 @@ class AstraAsyncExecutor:
     def retire_empty(self) -> bool:
         """Close an executor that admitted no calls so its turn-owned state cannot be reused."""
         with self._lock:
-            if self._jobs or self._closed:
+            if self._jobs or self._reservations or self._pending_calls or self._closed:
                 return False
             self._stream_closed = self._closed = True
         self._executor.shutdown(wait=True)
@@ -127,66 +134,106 @@ class AstraAsyncExecutor:
         tc = _assistant_tool_call_dict(self.agent, call, index)
         return {"role": "assistant", "content": None, "tool_calls": [tc], "finish_reason": "tool_calls"}
 
-    def admit(self, call: Any) -> bool:
-        """Persist one completed async call, then make it eligible for dispatch.
+    def _reservation_key(self, call: Any) -> str:
+        if isinstance(call, dict):
+            raw = call.get("call_id") or call.get("id") or call.get("response_item_id")
+        else:
+            raw = getattr(call, "call_id", None) or getattr(call, "id", None) or getattr(call, "response_item_id", None)
+        return str(raw or "").strip()
 
-        A duplicate call ID is an idempotent no-op.  Persistence is intentionally before the first
-        scheduler submission; a failed flush never reaches a tool handler.
-        """
+    def reserve(self, call: Any) -> bool:
+        """Record provider output order before arguments are complete or executable."""
         if not provider_async_marker(call):
             return False
         with self._lock:
             if self._closed or self._stream_closed:
                 return False
-            index = len(self._jobs)
-            if not getattr(call, "function", None):
-                setattr(call, "function", SimpleNamespace(
-                    name=getattr(call, "name", ""), arguments=getattr(call, "arguments", "{}") or "{}",
-                ))
-            call_id = self._call_id(call, index)
-            if call_id in self._admitted_ids:
+            key = self._reservation_key(call)
+            if not key or key in self._admitted_ids:
                 return True
-            try:
-                fragment = self._assistant_fragment(call, index)
-            except Exception:
-                self._failed = True
-                return False
-            self.messages.append(fragment)
-            try:
-                persisted = self.agent._flush_messages_to_session_db(self.messages) is True
-            except Exception:
-                persisted = False
-            if not persisted:
-                self.messages.pop()
-                self._failed = True
-                return False
-
-            # Bind the canonical ID back to this transient streamed object so the existing parser,
-            # middleware, and result pairing all see the same identity.
-            if not getattr(call, "id", None):
-                setattr(call, "id", call_id)
-            if not getattr(call, "call_id", None):
-                setattr(call, "call_id", call_id)
-            from agent.tool_executor import _parse_tool_call
-
-            try:
-                parsed = _parse_tool_call(self.agent, call)
-            except Exception:
-                self._failed = True
-                return False
-            job = _AstraJob(call=call, parsed=parsed, index=index)
-            self._jobs.append(job)
-            self._admitted_ids.add(call_id)
-            self.agent._session_messages = self.messages
-            self._pump_locked()
+            if key not in self._reservations:
+                self._reservations.append(key)
             return True
+
+    def _drain_admissions_locked(self) -> None:
+        while self._reservations:
+            key = self._reservations[0]
+            call = self._pending_calls.get(key)
+            if call is None:
+                return
+            self._pending_calls.pop(key, None)
+            self._reservations.pop(0)
+            if not self._admit_one_locked(call):
+                return
+
+    def admit(self, call: Any) -> bool:
+        """Queue one completed call and admit only the completed announced prefix."""
+        if not provider_async_marker(call):
+            return False
+        with self._lock:
+            if self._closed or self._stream_closed:
+                return False
+            key = self._reservation_key(call)
+            if not key:
+                key = f"anonymous:{len(self._reservations) + len(self._pending_calls)}"
+            if key in self._admitted_ids:
+                return True
+            if key not in self._reservations:
+                self._reservations.append(key)
+            self._pending_calls[key] = call
+            self._drain_admissions_locked()
+            return key in self._admitted_ids or key in self._pending_calls
+
+    def _admit_one_locked(self, call: Any) -> bool:
+        index = len(self._jobs)
+        if not getattr(call, "function", None):
+            setattr(call, "function", SimpleNamespace(
+                name=getattr(call, "name", ""), arguments=getattr(call, "arguments", "{}") or "{}",
+            ))
+        call_id = self._call_id(call, index)
+        if call_id in self._admitted_ids:
+            return True
+        try:
+            fragment = self._assistant_fragment(call, index)
+        except Exception:
+            self._failed = True
+            return False
+        self.messages.append(fragment)
+        try:
+            persisted = self.agent._flush_messages_to_session_db(self.messages) is True
+        except Exception:
+            persisted = False
+        if not persisted:
+            self.messages.pop()
+            self._failed = True
+            return False
+
+        # Bind the canonical ID back to this transient streamed object so the existing parser,
+        # middleware, and result pairing all see the same identity.
+        if not getattr(call, "id", None):
+            setattr(call, "id", call_id)
+        if not getattr(call, "call_id", None):
+            setattr(call, "call_id", call_id)
+        from agent.tool_executor import _parse_tool_call
+
+        try:
+            parsed = _parse_tool_call(self.agent, call)
+        except Exception:
+            self._failed = True
+            return False
+        job = _AstraJob(call=call, parsed=parsed, index=index, done=parsed.parse_error is not None)
+        self._jobs.append(job)
+        self._admitted_ids.add(call_id)
+        self.agent._session_messages = self.messages
+        self._pump_locked()
+        return True
 
     def _segments_locked(self) -> list[tuple[str, list[Any]]]:
         calls = [job.call for job in self._jobs]
         return _plan_tool_batch_segments(calls, execution_cwd=self._execution_cwd)
 
     def _submit_locked(self, job: _AstraJob) -> None:
-        if job.future is not None or self._closed:
+        if job.future is not None or self._closed or job.parsed.parse_error is not None:
             return
         job.future = self._executor.submit(propagate_context_to_thread(self._run_job), job)
         job.future.add_done_callback(lambda future, current=job: self._job_done(current, future))
@@ -209,7 +256,9 @@ class AstraAsyncExecutor:
                     return
                 offset += len(group)
                 continue
-            unstarted = next((job for job in group if job.future is None), None)
+            unstarted = next(
+                (job for job in group if job.future is None and job.parsed.parse_error is None), None,
+            )
             if unstarted is not None:
                 self._submit_locked(unstarted)
                 return
@@ -247,6 +296,33 @@ class AstraAsyncExecutor:
     def _all_done_locked(self) -> bool:
         return all(job.done for job in self._jobs)
 
+    def _recover_uncommitted_results(self, jobs: list[_AstraJob]) -> bool:
+        from agent.replay_cleanup import _DANGLING_NOTICES, _orphan_recovery
+        from agent.tool_dispatch_helpers import make_tool_result_message
+
+        uncommitted = [job for job in jobs if not job.committed]
+        for job in uncommitted:
+            ref = job.parsed.ref(self.effective_task_id)
+            if job.parsed.parse_error is not None:
+                content = job.parsed.parse_error
+                disposition = None
+            else:
+                disposition, content = _orphan_recovery(job.parsed.name, _DANGLING_NOTICES)
+            self.messages.append(make_tool_result_message(
+                job.parsed.name, content, ref.call_id, effect_disposition=disposition,
+            ))
+        if not uncommitted:
+            return True
+        try:
+            persisted = self.agent._flush_messages_to_session_db(self.messages) is True
+        except Exception:
+            persisted = False
+        if persisted:
+            for job in uncommitted:
+                job.committed = True
+        self.agent._session_messages = self.messages
+        return persisted
+
     def finish_stream(self, assistant_content: str = "") -> bool:
         """Wait for all admitted jobs and publish results in original call order."""
         with self._lock:
@@ -256,13 +332,15 @@ class AstraAsyncExecutor:
                 self.abort_stream()
                 return False
             self._stream_closed = True
+            self._drain_admissions_locked()
+            self._pending_calls.clear()
+            self._reservations.clear()
             self._pump_locked()
             while not self._all_done_locked():
                 if getattr(self.agent, "_interrupt_requested", False):
                     self.abort_stream()
                     return False
                 self._changed.wait(timeout=0.1)
-            self._closed = True
 
         from agent.tool_executor import (
             _append_invalid_arguments_result, _budget_for_agent, _finalize_tool_batch, _publish_sequential_result,
@@ -280,22 +358,41 @@ class AstraAsyncExecutor:
                     self._failed = True
             except Exception:
                 self._failed = True
+        if self._failed:
+            recovered = self._recover_uncommitted_results(self._jobs)
+            self._closed = True
+            self._finalized = recovered
+            self._executor.shutdown(wait=True)
+            return recovered
         budget = _budget_for_agent(self.agent)
-        for job in self._jobs:
+        for index, job in enumerate(self._jobs):
             ref = job.parsed.ref(self.effective_task_id)
             if job.parsed.parse_error is not None:
+                message_count = len(self.messages)
                 if not _append_invalid_arguments_result(self.agent, self.messages, ref, job.parsed.parse_error):
                     self._failed = True
-                    break
+                    del self.messages[message_count:]
+                    recovered = self._recover_uncommitted_results(self._jobs[index:])
+                    self._closed = True
+                    self._finalized = recovered
+                    self._executor.shutdown(wait=True)
+                    return recovered
                 job.committed = True
                 continue
+            message_count = len(self.messages)
             if not _publish_sequential_result(
                 self.agent, self.messages, ref, job.managed, tool_duration=job.duration,
                 index=job.index + 1, budget=budget,
             ):
                 self._failed = True
-                break
+                del self.messages[message_count:]
+                recovered = self._recover_uncommitted_results(self._jobs[index:])
+                self._closed = True
+                self._finalized = recovered
+                self._executor.shutdown(wait=True)
+                return recovered
             job.committed = True
+        self._closed = True
         if not self._failed and self._jobs:
             _finalize_tool_batch(self.agent, self.messages, self.effective_task_id, len(self._jobs), budget)
         self.agent._session_messages = self.messages
@@ -309,27 +406,16 @@ class AstraAsyncExecutor:
             if self._closed:
                 return
             self._stream_closed = True
-            self._closed = True
             for job in self._jobs:
                 if job.future is not None and not job.future.done():
                     job.future.cancel()
+            self._pending_calls.clear()
+            self._reservations.clear()
             if not self._aborted_results and self._jobs:
-                from agent.replay_cleanup import _DANGLING_NOTICES, _orphan_recovery
-                from agent.tool_dispatch_helpers import make_tool_result_message
-
-                for job in self._jobs:
-                    ref = job.parsed.ref(self.effective_task_id)
-                    disposition, content = _orphan_recovery(job.parsed.name, _DANGLING_NOTICES)
-                    self.messages.append(make_tool_result_message(
-                        job.parsed.name, content, ref.call_id, effect_disposition=disposition,
-                    ))
-                    try:
-                        if self.agent._flush_messages_to_session_db(self.messages) is not True:
-                            self._failed = True
-                    except Exception:
-                        self._failed = True
+                self._recover_uncommitted_results(self._jobs)
                 self.agent._session_messages = self.messages
                 self._aborted_results = True
+            self._closed = True
             self._changed.notify_all()
         self._executor.shutdown(wait=False, cancel_futures=True)
 

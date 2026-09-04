@@ -558,10 +558,11 @@ class _CodexResponseAssembler:
     saw_response_completed = False
 
     def __init__(self, *, model, on_text_delta, on_reasoning_delta, on_commentary_message, on_first_delta,
-                 on_async_tool_call=None):
+                 on_async_tool_call=None, on_async_tool_announcement=None):
         self.model, self.on_text_delta, self.on_reasoning_delta = model, on_text_delta, on_reasoning_delta
         self.on_commentary_message, self.on_first_delta = on_commentary_message, on_first_delta
         self.on_async_tool_call = on_async_tool_call
+        self.on_async_tool_announcement = on_async_tool_announcement
         self.output_items: List[Any] = []
         # output_index / first-observed sequence per output item, in lockstep, so settled pending calls merge
         # back in stream order.
@@ -616,6 +617,8 @@ class _CodexResponseAssembler:
                     "item": item, "arguments": str(_event_field(item, "arguments", "") or ""),
                     "output_index": announced_index, "sequence": announced_sequence,
                 }
+                if _provider_async_marker(item):
+                    self._safe(self.on_async_tool_announcement, "on_async_tool_announcement", item)
 
     def _on_text_delta(self, event: Any, event_type: str) -> None:
         delta_text = _event_field(event, "delta", "")
@@ -768,6 +771,7 @@ class _CodexResponseAssembler:
 def _consume_codex_event_stream(
     event_iter: Any, *, model: str, on_text_delta=None, on_reasoning_delta=None, on_commentary_message=None,
     on_first_delta=None, on_event=None, interrupt_check=None, on_async_tool_call=None,
+    on_async_tool_announcement=None,
 ) -> SimpleNamespace:
     """Consume a Codex Responses SSE stream into a Response-shaped ``SimpleNamespace`` (see
     :class:`_CodexResponseAssembler`; ``status`` is ``completed`` when the stream ended with content but no
@@ -781,7 +785,8 @@ def _consume_codex_event_stream(
     must not become a partial final response."""
     assembler = _CodexResponseAssembler(model=model, on_text_delta=on_text_delta, on_reasoning_delta=on_reasoning_delta,
                                         on_commentary_message=on_commentary_message, on_first_delta=on_first_delta,
-                                        on_async_tool_call=on_async_tool_call)
+                                        on_async_tool_call=on_async_tool_call,
+                                        on_async_tool_announcement=on_async_tool_announcement)
     for event in event_iter:
         if on_event is not None:
             try:
@@ -973,12 +978,14 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 async_executor = _astra_executor()
                 async_callback = getattr(async_executor, "admit", None)
                 async_callback = _fenced(async_callback) if callable(async_callback) else None
+                async_announcement = getattr(async_executor, "reserve", None)
+                async_announcement = _fenced(async_announcement) if callable(async_announcement) else None
                 final = _consume_codex_event_stream(
                     event_stream, model=model, on_text_delta=_fenced(_on_text_delta),
                     on_reasoning_delta=_fenced(lambda text: agent._fire_reasoning_delta(text)),
                     on_commentary_message=on_commentary_message, on_first_delta=on_first_delta,
                     on_event=_fenced(_on_event), interrupt_check=_interrupt_or_superseded,
-                    on_async_tool_call=async_callback,
+                    on_async_tool_call=async_callback, on_async_tool_announcement=async_announcement,
                 )
             except (InterruptedError, TimeoutError):
                 executor = _astra_executor()
@@ -1016,7 +1023,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 _log_failure(exc)
                 raise
             executor = _astra_executor()
-            if executor is not None and (executor.has_admitted or executor.failed):
+            if executor is not None and (executor.has_admitted or executor.has_pending or executor.failed):
                 if not executor.finish_stream(assistant_content=getattr(final, "output_text", "") or ""):
                     raise RuntimeError("Astra async tool execution did not reach a durable result boundary")
             elif executor is not None and executor.retire_empty():
