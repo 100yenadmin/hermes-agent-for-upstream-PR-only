@@ -20,6 +20,24 @@ from tui_gateway import server
 from tui_gateway.transport import bind_transport, reset_transport
 
 
+@pytest.mark.parametrize("agent, expected", [
+    (None, ["file"]),
+    (types.SimpleNamespace(enabled_toolsets=["file"]), ["file"]),
+    (types.SimpleNamespace(enabled_toolsets=[]), []),
+])
+def test_tools_show_preserves_tool_scope_during_deferred_build(monkeypatch, agent, expected):
+    import model_tools
+
+    seen = []
+    monkeypatch.setitem(server._sessions, "tool-inventory-test", {"agent": agent})
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kwargs: seen.append(kwargs["enabled_toolsets"]) or [])
+    reply = _dispatch_sync({"jsonrpc": "2.0", "id": 1, "method": "tools.show",
+                            "params": {"session_id": "tool-inventory-test"}})
+    assert reply["result"] == {"sections": [], "total": 0}
+    assert seen == [expected]
+
+
 def _dispatch_sync(req: dict, transport=None) -> dict | None:
     """Run one RPC to completion synchronously, regardless of pool routing.
 

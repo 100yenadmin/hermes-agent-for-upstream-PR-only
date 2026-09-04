@@ -1559,6 +1559,8 @@ def _(rid, params: dict) -> dict:
         from toolsets import get_all_toolsets, get_toolset_info
 
         session = _sessions.get(params.get("session_id", ""))
+        # New/cold sessions may not have an agent yet. None passed to tool
+        # definitions means unrestricted, not "use configured toolsets".
         enabled = (
             set(getattr(session["agent"], "enabled_toolsets", []) or [])
             if session
@@ -1592,7 +1594,7 @@ def _(rid, params: dict) -> dict:
         session = _sessions.get(params.get("session_id", ""))
         enabled = (
             getattr(session["agent"], "enabled_toolsets", None)
-            if session
+            if session and session.get("agent") is not None
             else _load_enabled_toolsets()
         )
         # Pre-assembly list: /tools is a discovery surface and must show
