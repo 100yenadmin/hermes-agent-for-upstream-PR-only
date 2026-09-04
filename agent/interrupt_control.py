@@ -57,6 +57,14 @@ def _ic_codex_method(agent, name: str):
     return method if callable(method) else None
 
 
+def _ic_astra_method(agent, name: str):
+    """Return a live direct-Astra WebSocket control hook, if this turn owns one."""
+    if getattr(agent, "api_mode", None) != "codex_responses":
+        return None
+    method = getattr(getattr(agent, "_astra_websocket_session", None), name, None)
+    return method if callable(method) else None
+
+
 def _ic_abort_active_request(agent, reason: str, failure_log: str) -> None:
     """Shut the registered in-flight request's sockets (cron turns register their client here)."""
     abort = getattr(agent, "_active_request_abort", None)
@@ -219,6 +227,18 @@ class InterruptControlMixin:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        _native_steer = _ic_astra_method(self, "request_steer")
+        if _native_steer is not None:
+            try:
+                return bool(_native_steer(cleaned))
+            except Exception:
+                # A post-dispatch socket outcome is ambiguous: never let the caller enqueue a duplicate.
+                session = getattr(self, "_astra_websocket_session", None)
+                if getattr(session, "delivery_uncertain", False):
+                    logger.warning("Astra WebSocket steer outcome is delivery-uncertain; suppressing resend")
+                    return True
+                logger.debug("Astra WebSocket steer failed before admission", exc_info=True)
+                return False
         with _ic_lock(self, "_pending_steer_lock"):
             existing = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
@@ -233,7 +253,7 @@ class InterruptControlMixin:
             return False
         cleaned = text.strip()
 
-        _native_steer = _ic_codex_method(self, "request_steer")
+        _native_steer = _ic_codex_method(self, "request_steer") or _ic_astra_method(self, "request_steer")
         if _native_steer is not None:
             with _ic_lock(self, "_pending_redirect_lock"):
                 if self._interrupt_requested:

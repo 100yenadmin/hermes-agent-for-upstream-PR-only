@@ -862,6 +862,18 @@ def _bypass_sdk_request_transform(stream_kwargs: dict) -> dict:
 
 def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
     """One streaming Responses API request over raw ``responses.create(stream=True)`` events."""
+    from agent.transports.astra_websocket_session import (
+        AstraPreDispatchError, is_astra_websocket_eligible, run_astra_websocket_stream,
+    )
+    if is_astra_websocket_eligible(agent, api_kwargs):
+        try:
+            # The WS API has implicit streaming and receives the already-built Responses body directly.
+            return run_astra_websocket_stream(
+                agent, _sanitize_consumer_codex_request(agent, api_kwargs), on_first_delta=on_first_delta,
+            )
+        except AstraPreDispatchError as exc:
+            # A connect failure before any request bytes were sent is the only safe native-WS fallback.
+            logger.warning("Astra WebSocket connect failed before dispatch; falling back to SSE: %s", exc)
     import httpx as _httpx
     from openai import APIConnectionError as _APIConnectionError
     from agent import relay_llm

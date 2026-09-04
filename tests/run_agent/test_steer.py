@@ -49,6 +49,18 @@ class TestSteerAcceptance:
         assert agent.steer("go ahead and check the logs") is True
         assert agent._pending_steer == "go ahead and check the logs"
 
+    def test_direct_astra_uses_live_websocket_session(self):
+        agent = _bare_agent()
+        agent.api_mode = "codex_responses"
+        calls = []
+        agent._astra_websocket_session = type(
+            "_AstraSession", (), {"request_steer": lambda self, text: calls.append(text) or True},
+        )()
+
+        assert agent.steer("use the second plan") is True
+        assert calls == ["use the second plan"]
+        assert agent._pending_steer is None
+
 
 
 
