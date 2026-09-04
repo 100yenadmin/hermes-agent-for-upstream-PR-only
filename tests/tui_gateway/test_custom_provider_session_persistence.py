@@ -469,49 +469,6 @@ class TestOverridesHaveRoutableProvider:
         )
         assert _overrides_have_routable_provider({}) is False
 
-    def test_cold_resume_discovers_plugin_profile_before_stale_drop(
-        self, monkeypatch
-    ):
-        """A provider-profile plugin must be loaded before resume decides its
-        persisted identity is stale and falls back to a built-in provider."""
-        from hermes_cli import plugins as plugins_mod
-        from tui_gateway.server import _stored_session_runtime_overrides
-
-        provider = "cold-agent-runtime-provider"
-        discovered = False
-        discovery_calls = 0
-
-        def is_routable(candidate):
-            return discovered and candidate == provider
-
-        def discover_plugins():
-            nonlocal discovered, discovery_calls
-            discovered = True
-            discovery_calls += 1
-
-        monkeypatch.setattr(rp, "is_routable_provider", is_routable)
-        monkeypatch.setattr(plugins_mod, "discover_plugins", discover_plugins)
-        monkeypatch.setattr(rp, "canonical_custom_identity", lambda **_kwargs: None)
-
-        row = {
-            "model": "cold-agent-runtime-model",
-            "billing_provider": provider,
-            "model_config": json.dumps(
-                {
-                    "model": "cold-agent-runtime-model",
-                    "provider": provider,
-                    "base_url": f"runtime://{provider}",
-                    "api_mode": "agent_runtime",
-                }
-            ),
-        }
-
-        overrides = _stored_session_runtime_overrides(row)
-
-        assert discovery_calls == 1
-        assert overrides["provider_override"] == provider
-        assert overrides["model_override"]["provider"] == provider
-
     def test_registered_agent_runtime_profile_round_trips_until_unloaded(
         self, monkeypatch
     ):

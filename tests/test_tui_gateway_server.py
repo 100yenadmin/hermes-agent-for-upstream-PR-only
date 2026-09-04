@@ -12611,6 +12611,63 @@ def test_prompt_submit_sanitizes_bracketed_paste_before_agent(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_prompt_submit_persists_resolved_runtime_before_provider_turn(monkeypatch):
+    """A lazy session must bind its resolved provider before the first call.
+
+    The initial row is created before deferred agent construction. Without this
+    refresh, a client that omits explicit provider fields persists only the
+    model and cold resume can auto-detect a different built-in provider.
+    """
+    order: list[str] = []
+
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
+            order.append("provider_turn")
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    agent = _Agent()
+    server._sessions["sid"] = _session(agent=agent)
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+        monkeypatch.setattr(server, "render_message", lambda _text, _cols: "")
+        monkeypatch.setattr(server, "_emit", lambda *args: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda *args, **kwargs: None)
+        monkeypatch.setattr(server, "_ensure_session_db_row", lambda *args, **kwargs: None)
+        monkeypatch.setattr(server, "_persist_branch_seed", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            server,
+            "_persist_live_session_runtime",
+            lambda session: order.append("persist_runtime"),
+        )
+
+        response = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "hi"},
+            }
+        )
+
+        assert response.get("result"), response.get("error")
+        assert order[:2] == ["persist_runtime", "provider_turn"]
+        assert order.count("persist_runtime") == 1
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
     """Regression guard: the backstop does not affect the happy path."""
 

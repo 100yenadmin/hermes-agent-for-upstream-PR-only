@@ -1044,6 +1044,12 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
+        # The row is created before deferred agent construction, so a standard
+        # client that omits explicit model/provider fields initially persists
+        # only its model. Bind the now-resolved runtime before the provider
+        # turn; otherwise a cold resume can auto-detect a different provider
+        # from the model name and silently leave the installed plugin route.
+        _persist_live_session_runtime(session)
         _run_prompt_submit(
             rid,
             sid,
