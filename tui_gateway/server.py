@@ -5554,6 +5554,27 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
 from hermes_state import _BARE_BILLING_PROVIDERS
 
 
+def _session_provider_is_routable(provider: str) -> bool:
+    """Resolve a persisted provider after one correctness-first plugin load.
+
+    ``session.resume`` reconstructs runtime overrides before the deferred agent
+    build.  On a cold process, provider-profile entry points may not have been
+    discovered yet; treating that transient absence as a removed provider
+    permanently drops the saved route before the later build can load it.
+    """
+    try:
+        from hermes_cli.runtime_provider import is_routable_provider
+
+        if is_routable_provider(provider):
+            return True
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+        return is_routable_provider(provider)
+    except Exception:
+        return False
+
+
 def _overrides_have_routable_provider(overrides: dict) -> bool:
     """Whether persisted runtime overrides still name a routable provider.
 
@@ -5570,12 +5591,7 @@ def _overrides_have_routable_provider(overrides: dict) -> bool:
         ).strip()
     if not provider:
         return False
-    try:
-        from hermes_cli.runtime_provider import is_routable_provider
-
-        return is_routable_provider(provider)
-    except Exception:
-        return False
+    return _session_provider_is_routable(provider)
 
 
 def _stored_session_runtime_overrides(row: dict | None) -> dict:
@@ -5699,13 +5715,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     # nothing names a real entry, drop the provider entirely so resume
     # falls back to the configured default rather than the broken route.
     if provider:
-        routable = False
-        try:
-            from hermes_cli.runtime_provider import is_routable_provider
-
-            routable = is_routable_provider(provider)
-        except Exception:
-            routable = False
+        routable = _session_provider_is_routable(provider)
         if not routable:
             healed = None
             try:
