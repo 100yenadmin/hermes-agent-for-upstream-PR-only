@@ -723,6 +723,13 @@ def _preflight_configuration_update(item: Dict[str, Any], idx: int, ctx: _Prefli
     return normalized
 
 
+def _preflight_compaction_trigger(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) -> Dict[str, Any]:
+    """Validate the beta maintenance marker; placement is checked below."""
+    if set(item) != {"type"}:
+        raise ValueError(f"Codex Responses input[{idx}] compaction_trigger has unsupported fields.")
+    return {"type": "compaction_trigger"}
+
+
 def _preflight_message(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) -> Dict[str, Any]:
     if item.get("role") != "assistant":
         raise ValueError(f"Codex Responses input[{idx}] message items must have role='assistant'.")
@@ -780,7 +787,7 @@ def _preflight_role_message(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) 
 _PREFLIGHT_ITEM_HANDLERS: Dict[str, Callable[..., Optional[Dict[str, Any]]]] = {
     "function_call": _preflight_function_call, "function_call_output": _preflight_function_call_output,
     "reasoning": _preflight_encrypted, "compaction": _preflight_encrypted, "message": _preflight_message,
-    "configuration_update": _preflight_configuration_update,
+    "configuration_update": _preflight_configuration_update, "compaction_trigger": _preflight_compaction_trigger,
 }
 
 
@@ -800,6 +807,10 @@ def _preflight_codex_input_items(
         normalized_item = (handler or _preflight_role_message)(item, idx, ctx)
         if normalized_item is not None:
             normalized.append(normalized_item)
+    trigger_indexes = [idx for idx, item in enumerate(raw_items)
+                       if isinstance(item, dict) and item.get("type") == "compaction_trigger"]
+    if trigger_indexes and trigger_indexes != [len(raw_items) - 1]:
+        raise ValueError("Codex Responses compaction_trigger must be the final input item.")
     return normalized
 
 

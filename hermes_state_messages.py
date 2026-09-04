@@ -608,6 +608,30 @@ class SessionMessagesMixin:
 
         return self._execute_write(_do)
 
+    def merge_message_display_metadata(self, session_id: str, message_row_id: int, metadata: Any) -> int:
+        """Merge JSON sidecar metadata onto one owned message row.
+
+        Native provider checkpoints are committed against their exact carrier row;
+        resolving by latest content would let duplicate user text or a concurrent
+        turn attach a canonical window to the wrong boundary.
+        """
+        if not session_id or not isinstance(message_row_id, int) or isinstance(message_row_id, bool):
+            return 0
+        if not isinstance(metadata, dict):
+            return 0
+
+        def _do(conn):
+            row = conn.execute(_DISPLAY_META_ROW_SQL, (message_row_id, session_id)).fetchone()
+            if row is None:
+                return 0
+            merged = self._decode_display_metadata(row[0]) or {}
+            merged.update(metadata)
+            conn.execute(_SET_DISPLAY_META_SQL, (
+                self._encode_display_metadata(merged), message_row_id))
+            return 1
+
+        return self._execute_write(_do)
+
     def _dedupe_display_generations(self, rows):
         """Collapse compaction generations so each logical message appears once (the protected tail is copied
         into each generation: same role/content/timestamp, different ``active``/id); prefer the live row, then

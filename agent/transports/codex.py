@@ -594,6 +594,7 @@ class ResponsesApiTransport(ProviderTransport):
             compression_checkpoint_required=params.get("compression_checkpoint_required") is True,
         )
         astra_state = params.get("astra_state")
+        astra_compaction_state = params.get("astra_compaction_state")
         astra_update_effort = None
         if astra_eligible:
             from agent.codex_responses_adapter import astra_base_effort_for_message, configuration_update_for_message
@@ -631,18 +632,43 @@ class ResponsesApiTransport(ProviderTransport):
             self.convert_tools(tools, async_tools=async_tools), params, is_xai_responses
         )
 
+        # Explicit Astra compaction returns a canonical Responses window.  Replace
+        # only the covered durable prefix; the live tail (current user/tool work)
+        # still goes through the normal serializer so duplicate text is harmless and
+        # configuration-update markers retain their exact position.
+        canonical_window = None
+        boundary_count = None
+        if astra_eligible and isinstance(astra_compaction_state, dict):
+            candidate_window = astra_compaction_state.get("window")
+            boundary = astra_compaction_state.get("covered_boundary") or {}
+            candidate_count = boundary.get("message_count")
+            if isinstance(candidate_window, list) and all(isinstance(item, dict) for item in candidate_window) \
+                    and isinstance(candidate_count, int) and not isinstance(candidate_count, bool) \
+                    and 0 <= candidate_count <= len(payload_messages):
+                canonical_window = [dict(item) for item in candidate_window]
+                boundary_count = candidate_count
+        if canonical_window is not None:
+            converted_input = canonical_window + self.convert_messages(
+                payload_messages[boundary_count:], is_xai_responses=is_xai_responses,
+                is_github_responses=is_github_responses, replay_encrypted_reasoning=replay_encrypted_reasoning,
+                base_url=params.get("base_url"), is_codex_backend=is_codex_backend,
+                context_management=None, astra_configuration_updates=astra_eligible,
+            )
+        else:
+            converted_input = self.convert_messages(
+                payload_messages, is_xai_responses=is_xai_responses, is_github_responses=is_github_responses,
+                replay_encrypted_reasoning=replay_encrypted_reasoning, base_url=params.get("base_url"),
+                is_codex_backend=is_codex_backend, context_management=context_management,
+                astra_configuration_updates=astra_eligible,
+            )
+
         # Lazy: provider plugins import this transport during model_metadata init.
         from agent.model_metadata import strip_codex_context_variant_suffix as _strip_ctx_variant
         kwargs = {
             # ``-900k`` picker variants are Hermes-side aliases; the backend knows only the base slug.
             "model": _strip_ctx_variant(model),
             "instructions": instructions,
-            "input": self.convert_messages(
-                payload_messages, is_xai_responses=is_xai_responses, is_github_responses=is_github_responses,
-                replay_encrypted_reasoning=replay_encrypted_reasoning, base_url=params.get("base_url"),
-                is_codex_backend=is_codex_backend, context_management=context_management,
-                astra_configuration_updates=astra_eligible,
-            ),
+            "input": converted_input,
             "store": False,
         }
         # ``tools`` MUST be omitted when empty: the openai SDK iterates it without a None guard.
