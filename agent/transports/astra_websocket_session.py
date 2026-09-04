@@ -330,7 +330,10 @@ class AstraWebSocketSession:
     def _is_duplicate(self, event: Any, event_type: str, response_id: str | None) -> bool:
         sequence_number = _event_field(event, "sequence_number")
         if sequence_number is not None:
-            sequence_key = str(sequence_number)
+            # Sequence numbers are monotonic only within one response generation; automatic successors may
+            # restart at zero/one on the same WebSocket. Scope the key before deciding whether to drop a frame.
+            sequence_scope = response_id or self._response_id or "session"
+            sequence_key = f"{sequence_scope}:{sequence_number}"
             if sequence_key in self._seen_sequences:
                 return True
             self._seen_sequences.add(sequence_key)
@@ -475,10 +478,16 @@ class AstraWebSocketSession:
                 # Claim terminal ownership before feeding the event.  A concurrent steer that observes
                 # terminal processing has begun must return False rather than dispatching after completion.
                 terminal_event = event_type in {"response.completed", "response.incomplete", "response.failed"}
-                terminal_waits_for_successor = self._await_successor or self._terminal_reason(event) == "steered"
-                if terminal_event and not terminal_waits_for_successor:
+                terminal_waits_for_successor = False
+                if terminal_event:
+                    # The wait decision and terminal claim are one linearization point. A steer can either
+                    # acquire this lock first (and force successor wait) or observe TERMINAL_PROCESSING and
+                    # return False; it cannot be admitted against a stale pre-lock snapshot.
                     with self._state_lock:
-                        if self._state in {"ACTIVE", "SUCCESSOR_CREATED", "ACCEPTED", "STEER_ADMITTED"}:
+                        terminal_waits_for_successor = self._await_successor or self._terminal_reason(event) == "steered"
+                        if terminal_waits_for_successor:
+                            pass
+                        elif self._state in {"ACTIVE", "SUCCESSOR_CREATED", "ACCEPTED", "STEER_ADMITTED"}:
                             self._set_state("TERMINAL_PROCESSING")
                 terminal = assembler.feed(event)
                 if terminal:

@@ -210,6 +210,47 @@ def test_terminal_processing_fences_late_steer_before_assembler_feed():
     assert outcome and outcome[0].status == "completed"
 
 
+def test_steer_interleaving_before_terminal_lock_waits_for_successor():
+    socket = FakeWebSocket()
+    socket.push(_created("r1"))
+    socket.push({"type": "response.completed", "response_id": "r1",
+                 "response": {"id": "r1", "status": "completed"}, "id": "complete-r1"})
+    agent = _agent()
+    session = AstraWebSocketSession(agent, connect=_connect_socket(socket))
+
+    def on_send(message, ws):
+        if message["type"] == "response.steer":
+            ws.push({"type": "response.steer.accepted", "id": "ack"})
+            ws.push(_created("r2"))
+            for frame in _completed("r2", "r2", "success"):
+                ws.push(frame)
+
+    socket._on_send = on_send
+    outcome = []
+    reason_started = threading.Event()
+    release_reason = threading.Event()
+
+    original_reason = session._terminal_reason
+
+    def blocked_reason(event):
+        reason_started.set()
+        release_reason.wait(timeout=2)
+        return original_reason(event)
+
+    session._terminal_reason = blocked_reason
+    worker = threading.Thread(target=lambda: outcome.append(
+        session.run({"model": "gpt-6-astra"}),
+    ))
+    worker.start()
+    assert reason_started.wait(timeout=2)
+    release_reason.set()
+    assert session.request_steer("arrived at the terminal boundary") is False
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert outcome and outcome[0].output_text == ""
+    assert not any(item["type"] == "response.steer" for item in socket.sent)
+
+
 def test_steer_acceptance_successor_and_predecessor_fencing():
     socket = FakeWebSocket()
     agent = _agent()
@@ -352,12 +393,52 @@ def test_duplicate_sequence_number_is_fenced_before_assembler_effects():
     assert result.output_text == "once"
 
 
+def test_successor_sequence_restart_does_not_drop_successor_frames():
+    socket = FakeWebSocket()
+    agent = _agent()
+    session = AstraWebSocketSession(agent, connect=_connect_socket(socket))
+
+    def on_send(message, ws):
+        # The provider can restart sequence numbering for a later response generation.
+        if message["type"] == "response.create":
+            if message.get("model") == "gpt-6-astra":
+                ws.push({**_created("r1"), "sequence_number": 1})
+        elif message["type"] == "response.steer":
+            ws.push({"type": "response.steer.accepted", "id": "ack", "sequence_number": 6})
+            ws.push({"type": "response.incomplete", "response_id": "r1", "response": {
+                "id": "r1", "status": "incomplete", "incomplete_details": {"reason": "steered"},
+            }, "id": "incomplete-r1", "sequence_number": 7})
+            ws.push({**_created("r2"), "sequence_number": 1})
+            successor = _completed("r2", "r2", "new")
+            for offset, frame in enumerate(successor, 2):
+                frame["sequence_number"] = offset
+                ws.push(frame)
+
+    socket._on_send = on_send
+    # Initial response is supplied by the callback; make the first turn wait for the active state.
+    worker = threading.Thread(target=lambda: session.run({"model": "gpt-6-astra"}))
+    worker.start()
+    deadline = time.time() + 2
+    while session.state != "ACTIVE" and time.time() < deadline:
+        time.sleep(0.005)
+    assert session.request_steer("new generation") is True
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert session.response_id == "r2"
+
+
 def test_interrupt_closes_lane_without_reconnect():
     socket = FakeWebSocket()
     agent = _agent()
     session = AstraWebSocketSession(agent, connect=_connect_socket(socket))
     socket.push(_created("r1"))
-    worker = threading.Thread(target=lambda: session.run({"model": "gpt-6-astra"}))
+    def run_interruptible():
+        try:
+            session.run({"model": "gpt-6-astra"})
+        except InterruptedError:
+            pass
+
+    worker = threading.Thread(target=run_interruptible)
     worker.start()
     deadline = time.time() + 2
     while session.state != "ACTIVE" and time.time() < deadline:
