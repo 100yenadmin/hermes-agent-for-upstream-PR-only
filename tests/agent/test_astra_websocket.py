@@ -151,6 +151,65 @@ def test_initial_create_uses_existing_body_without_stream():
                             "input": [{"role": "user", "content": "hi"}], "reasoning": {"effort": "low"}}]
 
 
+def test_terminal_ws_response_settles_pr2_async_executor_once():
+    socket = FakeWebSocket()
+    socket.push(_created("r1"))
+    socket.events.extend(_completed("r1", "r1"))
+    calls = []
+
+    class Executor:
+        has_admitted = True
+        has_pending = False
+        failed = False
+
+        def finish_stream(self, **kwargs):
+            calls.append(kwargs)
+            return True
+
+    agent = _agent(_astra_async_executor=Executor())
+    result = AstraWebSocketSession(agent, connect=_connect_socket(socket)).run({"model": "gpt-6-astra"})
+
+    assert result.status == "completed"
+    assert len(calls) == 1
+    assert calls[0]["assistant_content"] == "done"
+
+
+def test_terminal_processing_fences_late_steer_before_assembler_feed():
+    socket = FakeWebSocket()
+    socket.push(_created("r1"))
+    socket.push({"type": "response.completed", "response_id": "r1",
+                 "response": {"id": "r1", "status": "completed"}, "id": "complete"})
+    agent = _agent()
+    session = AstraWebSocketSession(agent, connect=_connect_socket(socket))
+    feed_started = threading.Event()
+    release_feed = threading.Event()
+
+    class BlockingAssembler:
+        def feed(self, event):
+            feed_started.set()
+            release_feed.wait(timeout=2)
+            return True
+
+        def result(self):
+            return SimpleNamespace(status="completed", output=[], output_text="", model="gpt-6-astra")
+
+    session._new_assembler = lambda _response_id: BlockingAssembler()
+    outcome = []
+
+    def run():
+        outcome.append(session.run({"model": "gpt-6-astra"}))
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert feed_started.wait(timeout=2)
+    assert session.request_steer("too late") is False
+    assert not any(item["type"] == "response.steer" for item in socket.sent)
+    release_feed.set()
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert outcome and outcome[0].status == "completed"
+
+
 def test_steer_acceptance_successor_and_predecessor_fencing():
     socket = FakeWebSocket()
     agent = _agent()
@@ -273,6 +332,23 @@ def test_duplicate_frames_do_not_duplicate_output_items():
     agent = _agent()
     result = AstraWebSocketSession(agent, connect=_connect_socket(socket)).run({"model": "gpt-6-astra"})
     assert len(result.output) == 1
+    assert result.output_text == "once"
+
+
+def test_duplicate_sequence_number_is_fenced_before_assembler_effects():
+    socket = FakeWebSocket()
+    socket.push(_created("r1"))
+    frames = _completed("r1", "r1", "once")
+    frames[1]["sequence_number"] = 17
+    duplicate = dict(frames[1])
+    duplicate["id"] = "different-event-id"
+    duplicate["delta"] = "duplicate"
+    duplicate["sequence_number"] = 17
+    socket.events.extend([frames[0], frames[1], duplicate, frames[2], frames[3]])
+    agent = _agent()
+
+    result = AstraWebSocketSession(agent, connect=_connect_socket(socket)).run({"model": "gpt-6-astra"})
+
     assert result.output_text == "once"
 
 

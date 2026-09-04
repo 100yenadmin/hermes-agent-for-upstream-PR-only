@@ -157,6 +157,7 @@ class AstraWebSocketSession:
         self._await_successor = False
         self._continuations: set[str] = set()
         self._seen_events: set[str] = set()
+        self._seen_sequences: set[str] = set()
         self._seen_items: set[tuple[str, str, str]] = set()
         self.delivery_uncertain = False
         self.last_error: Exception | None = None
@@ -327,6 +328,12 @@ class AstraWebSocketSession:
         self._await_successor = True
 
     def _is_duplicate(self, event: Any, event_type: str, response_id: str | None) -> bool:
+        sequence_number = _event_field(event, "sequence_number")
+        if sequence_number is not None:
+            sequence_key = str(sequence_number)
+            if sequence_key in self._seen_sequences:
+                return True
+            self._seen_sequences.add(sequence_key)
         event_id = _event_field(event, "event_id") or _event_field(event, "id")
         if event_id:
             key = str(event_id)
@@ -388,6 +395,20 @@ class AstraWebSocketSession:
         response = _event_field(event, "response")
         details = _event_field(response, "incomplete_details") or _event_field(event, "incomplete_details") or {}
         return str(_event_field(details, "reason", "") or "").strip().lower()
+
+    def _settle_async_executor(self, final: Any) -> None:
+        """Use the PR2 persist-before-execute settlement boundary for the final WS response."""
+        executor = getattr(self.agent, "_astra_async_executor", None)
+        if executor is None:
+            return
+        if getattr(executor, "has_admitted", False) or getattr(executor, "has_pending", False) or getattr(executor, "failed", False):
+            if not executor.finish_stream(
+                assistant_content=getattr(final, "output_text", "") or "",
+                settled_calls=getattr(final, "output", None),
+            ):
+                raise RuntimeError("Astra async tool execution did not reach a durable result boundary")
+        elif executor.retire_empty():
+            self.agent._astra_async_executor = None
 
     def run(self, request: dict[str, Any], *, on_first_delta: Callable[[], None] | None = None) -> Any:
         from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
@@ -451,13 +472,23 @@ class AstraWebSocketSession:
                     touch("receiving Astra WebSocket response")
                 if not stream_writer_is_current(self.agent, writer_token):
                     raise TimeoutError("Astra WebSocket stream was superseded")
+                # Claim terminal ownership before feeding the event.  A concurrent steer that observes
+                # terminal processing has begun must return False rather than dispatching after completion.
+                terminal_event = event_type in {"response.completed", "response.incomplete", "response.failed"}
+                terminal_waits_for_successor = self._await_successor or self._terminal_reason(event) == "steered"
+                if terminal_event and not terminal_waits_for_successor:
+                    with self._state_lock:
+                        if self._state in {"ACTIVE", "SUCCESSOR_CREATED", "ACCEPTED", "STEER_ADMITTED"}:
+                            self._set_state("TERMINAL_PROCESSING")
                 terminal = assembler.feed(event)
                 if terminal:
-                    if self._await_successor or self._terminal_reason(event) == "steered":
+                    if terminal_waits_for_successor:
                         continue
                     with self._state_lock:
                         self._set_state("COMPLETED" if event_type == "response.completed" else "EXPLICIT_FAILURE")
-                    return assembler.result()
+                    final = assembler.result()
+                    self._settle_async_executor(final)
+                    return final
         finally:
             self.close()
 
