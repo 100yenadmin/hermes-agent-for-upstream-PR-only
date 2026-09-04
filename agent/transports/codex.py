@@ -499,10 +499,12 @@ class ResponsesApiTransport(ProviderTransport):
             native_compaction_eligible=_native_compaction_active(kwargs.get("context_management")),
         )
 
-    def convert_tools(self, tools: Optional[list[dict[str, Any]]]) -> Any:
+    def convert_tools(self, tools: Optional[list[dict[str, Any]]], **kwargs) -> Any:
         """Convert OpenAI tool schemas to Responses API function definitions."""
         from agent.codex_responses_adapter import _responses_tools
 
+        if kwargs.get("async_tools") is True:
+            return _responses_tools(tools, async_tools=True)
         return _responses_tools(tools)
 
     def build_kwargs(
@@ -551,7 +553,18 @@ class ResponsesApiTransport(ProviderTransport):
         native_compaction_active = _native_compaction_active(context_management)
 
         reasoning_effort, reasoning_enabled = _resolve_reasoning(model, params)
-        response_tools, self._last_wire_aliases = _alias_wire_tools(self.convert_tools(tools), params, is_xai_responses)
+        # The marker is emitted only for exact direct Astra turns whose midstream executor
+        # was admitted by the caller.  Keep the internal hint out of returned kwargs so the
+        # normal Responses preflight contract remains unchanged.
+        async_tools = (
+            params.get("midstream_executor_active") is True
+            and str(model or "").strip().lower().rsplit("/", 1)[-1] == "gpt-6-astra"
+            and not is_codex_backend and not is_xai_responses and not is_github_responses
+            and _is_official_openai_responses_route(model, params.get("base_url"))
+        )
+        response_tools, self._last_wire_aliases = _alias_wire_tools(
+            self.convert_tools(tools, async_tools=async_tools), params, is_xai_responses
+        )
 
         # Lazy: provider plugins import this transport during model_metadata init.
         from agent.model_metadata import strip_codex_context_variant_suffix as _strip_ctx_variant
@@ -663,6 +676,8 @@ class ResponsesApiTransport(ProviderTransport):
                 provider_data = {
                     key: getattr(tc, key) for key in ("call_id", "response_item_id") if getattr(tc, key, None)
                 }
+                if getattr(tc, "async", False) is True or getattr(tc, "async_", False) is True:
+                    provider_data["async"] = True
                 has_fn = hasattr(tc, "function")
                 name = tc.function.name if has_fn else getattr(tc, "name", "")
                 # Undo only aliases THIS request emitted; the legacy map is for normalize-only call sites.
