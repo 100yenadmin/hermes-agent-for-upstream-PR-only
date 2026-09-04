@@ -17,6 +17,15 @@ from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
 logger = logging.getLogger(__name__)
 
+# Internal, durable marker for the stateless Responses ``configuration_update`` item.  The
+# marker is attached to the *following* user message so replay position is intrinsic.  It is
+# copied through the agent loop under this private key and mirrored into ``display_metadata``
+# by the staging helper; both are stripped before a provider sees the role message.
+ASTRA_CONFIGURATION_UPDATE_METADATA_KEY = "astra_configuration_update"
+ASTRA_CONFIGURATION_UPDATE_MARKER_KEY = "_astra_configuration_update"
+ASTRA_BASE_EFFORT_METADATA_KEY = "astra_reasoning_base_effort"
+ASTRA_BASE_EFFORT_MARKER_KEY = "_astra_reasoning_base_effort"
+
 
 def _classify_responses_issuer(
     *, is_xai_responses: bool = False, is_github_responses: bool = False, is_codex_backend: bool = False,
@@ -47,6 +56,52 @@ _OUTPUT_TEXT_TYPES = {"output_text", "text"}
 _ASSISTANT_IMAGE_PLACEHOLDER = "[Assistant image omitted during replay]"
 _INCOMPLETE_STATUSES = {"queued", "in_progress", "incomplete"}
 _RESPONSE_MESSAGE_STATUSES = {"completed", "incomplete", "in_progress"}
+
+
+def _normalize_configuration_update(item: Any) -> Optional[Dict[str, Any]]:
+    """Return the only supported Astra configuration-update shape, or ``None``.
+
+    Stored markers are treated as untrusted input.  The strict shape check prevents a
+    display/routing metadata object from becoming an arbitrary Responses item on replay.
+    """
+    if not isinstance(item, dict) or set(item) != {"type", "reasoning"} or item.get("type") != "configuration_update":
+        return None
+    reasoning = item.get("reasoning")
+    if not isinstance(reasoning, dict) or set(reasoning) != {"effort"}:
+        return None
+    effort = reasoning.get("effort")
+    from agent.reasoning_effort import CODEX_ASTRA_EFFORTS
+    if effort not in CODEX_ASTRA_EFFORTS:
+        return None
+    return {"type": "configuration_update", "reasoning": {"effort": effort}}
+
+
+def configuration_update_for_message(msg: Any) -> Optional[Dict[str, Any]]:
+    """Read a sanitized internal marker from a user message for Responses conversion.
+
+    ``display_metadata`` is the durable JSON sidecar.  The private top-level copy is used
+    while a live message is in the agent loop because display fields are removed from the
+    provider-bound chat message copy.
+    """
+    if not isinstance(msg, dict):
+        return None
+    marker = msg.get(ASTRA_CONFIGURATION_UPDATE_MARKER_KEY)
+    if marker is None:
+        metadata = msg.get("display_metadata")
+        marker = metadata.get(ASTRA_CONFIGURATION_UPDATE_METADATA_KEY) if isinstance(metadata, dict) else None
+    return _normalize_configuration_update(marker)
+
+
+def astra_base_effort_for_message(msg: Any) -> Optional[str]:
+    """Return a sanitized compatible-segment base effort from a user-message sidecar."""
+    if not isinstance(msg, dict):
+        return None
+    effort = msg.get(ASTRA_BASE_EFFORT_MARKER_KEY)
+    if effort is None:
+        metadata = msg.get("display_metadata")
+        effort = metadata.get(ASTRA_BASE_EFFORT_METADATA_KEY) if isinstance(metadata, dict) else None
+    from agent.reasoning_effort import CODEX_ASTRA_EFFORTS
+    return effort if effort in CODEX_ASTRA_EFFORTS else None
 
 # input[].id / function names longer than this are a non-retryable 400 ("string too
 # long"). Codex message ids can run 400+ chars; Hermes ``msg_...`` ids stay under the cap.
@@ -420,7 +475,7 @@ def _tool_output_items(msg: Dict[str, Any]) -> List[Dict[str, Any]]:
 def _chat_messages_to_responses_input(
     messages: List[Dict[str, Any]], *, is_xai_responses: bool = False, is_github_responses: bool = False,
     replay_encrypted_reasoning: bool = True, current_issuer_kind: Optional[str] = None,
-    native_compaction_eligible: bool = False,
+    native_compaction_eligible: bool = False, astra_configuration_updates: bool = False,
 ) -> List[Dict[str, Any]]:
     """Convert internal chat-style messages to Responses input items.
 
@@ -466,10 +521,19 @@ def _chat_messages_to_responses_input(
     # `function_call_output` wrapper) that no longer carries it (#90976).
     item_sources: List[Optional[Dict[str, Any]]] = []
     seen_item_ids: set = set()
+    # The newest base marker starts the current compatible segment. Older update
+    # markers must not leak across compaction/model boundaries or to non-Astra routes.
+    astra_segment_start = 0
+    if astra_configuration_updates:
+        astra_segment_start = max(
+            (idx for idx, msg in enumerate(messages)
+             if isinstance(msg, dict) and msg.get("role") == "user" and astra_base_effort_for_message(msg)),
+            default=0,
+        )
     def emit(new_items: List[Dict[str, Any]], msg: Dict[str, Any]) -> None:
         items.extend(new_items)
         item_sources.extend([msg] * len(new_items))
-    for msg in messages:
+    for msg_index, msg in enumerate(messages):
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
@@ -486,6 +550,11 @@ def _chat_messages_to_responses_input(
             if isinstance(content, list) else _str_or_empty(content)
         )
         if role == "user":
+            update = configuration_update_for_message(msg) if (
+                astra_configuration_updates and msg_index >= astra_segment_start
+            ) else None
+            if update and (not items or items[-1].get("type") != "configuration_update"):
+                emit([update], msg)
             emit([{"role": role, "content": content_parts or content_text}], msg)
             continue
         reasoning_items = [] if not replay_encrypted_reasoning else _replay_reasoning_items(
@@ -643,6 +712,17 @@ def _preflight_encrypted(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) -> 
     }
 
 
+def _preflight_configuration_update(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) -> Dict[str, Any]:
+    """Validate the exact Astra effort-update item; no provider extensions are accepted."""
+    normalized = _normalize_configuration_update(item)
+    if normalized is None:
+        raise ValueError(
+            f"Codex Responses input[{idx}] configuration_update must be "
+            "{type='configuration_update', reasoning={effort=<supported Astra level>}}."
+        )
+    return normalized
+
+
 def _preflight_message(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) -> Dict[str, Any]:
     if item.get("role") != "assistant":
         raise ValueError(f"Codex Responses input[{idx}] message items must have role='assistant'.")
@@ -700,6 +780,7 @@ def _preflight_role_message(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) 
 _PREFLIGHT_ITEM_HANDLERS: Dict[str, Callable[..., Optional[Dict[str, Any]]]] = {
     "function_call": _preflight_function_call, "function_call_output": _preflight_function_call_output,
     "reasoning": _preflight_encrypted, "compaction": _preflight_encrypted, "message": _preflight_message,
+    "configuration_update": _preflight_configuration_update,
 }
 
 

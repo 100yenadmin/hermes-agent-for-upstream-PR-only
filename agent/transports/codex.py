@@ -9,6 +9,7 @@ import json
 import logging
 import re
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 from agent.reasoning_effort import (
     ACTUAL_RELAY_EFFORTS, CODEX_ASTRA_EFFORTS, CODEX_LEGACY_EFFORTS,
@@ -280,6 +281,34 @@ def _is_official_openai_responses_route(model: Any, base_url: Any) -> bool:
     return base_url_hostname(str(base_url or "")).lower() == "api.openai.com"
 
 
+def is_astra_reasoning_cache_eligible(
+    model: Any, base_url: Any, *, api_mode: Any = "codex_responses", api_key: Any = None,
+    auth_mode: Any = "api_key", provider: Any = None, is_subagent: bool = False,
+    compression_checkpoint_required: bool = False,
+) -> bool:
+    """Gate cache-preserving effort updates to the exact direct single-agent Astra route."""
+    if str(api_mode or "") != "codex_responses" or not _is_astra_model(model):
+        return False
+    parsed = urlsplit(str(base_url or "").strip())
+    if parsed.scheme != "https" or parsed.hostname != "api.openai.com" or parsed.path.rstrip("/") != "/v1":
+        return False
+    if not isinstance(api_key, str) or not api_key.strip():
+        return False
+    if str(auth_mode or "api_key").strip().lower() not in {"", "api_key", "apikey"}:
+        return False
+    if str(provider or "").strip().lower() in {"openai-codex", "xai-oauth", "azure", "azure-foundry"}:
+        return False
+    return not bool(is_subagent or compression_checkpoint_required)
+
+
+def _astra_effective_effort(requested: Any) -> str:
+    """Normalize an internal request to Astra's supported wire ladder."""
+    normalized = str(requested or "").strip().lower()
+    if normalized in {"", "none", "minimal", "disabled", "off"}:
+        return "low"
+    return clamp_effort(requested, CODEX_ASTRA_EFFORTS)
+
+
 def _codex_efforts_for_route(model: Any, base_url: Any, *, is_codex_backend: bool = False) -> tuple[str, ...]:
     """Keep Astra's new vocabulary off unrelated Responses-compatible endpoints."""
     if _is_astra_model(model) and not (
@@ -298,10 +327,7 @@ def _sanitize_astra_request_kwargs(kwargs: dict[str, Any], model: Any, base_url:
         return
     reasoning = kwargs.get("reasoning")
     requested = reasoning.get("effort") if isinstance(reasoning, dict) else None
-    normalized = str(requested or "").strip().lower()
-    effort = "low" if normalized in {"", "none", "minimal", "disabled", "off"} else clamp_effort(
-        requested, CODEX_ASTRA_EFFORTS
-    )
+    effort = _astra_effective_effort(requested)
     kwargs["reasoning"] = {**(reasoning if isinstance(reasoning, dict) else {}), "effort": effort}
     kwargs["reasoning"].setdefault("summary", "auto")
     for key in ("temperature", "top_p", "top_logprobs", "logprobs"):
@@ -497,6 +523,7 @@ class ResponsesApiTransport(ProviderTransport):
             replay_encrypted_reasoning=bool(kwargs.get("replay_encrypted_reasoning", True)),
             current_issuer_kind=self._resolve_issuer_kind(kwargs),
             native_compaction_eligible=_native_compaction_active(kwargs.get("context_management")),
+            astra_configuration_updates=kwargs.get("astra_configuration_updates") is True,
         )
 
     def convert_tools(self, tools: Optional[list[dict[str, Any]]], **kwargs) -> Any:
@@ -553,6 +580,37 @@ class ResponsesApiTransport(ProviderTransport):
         native_compaction_active = _native_compaction_active(context_management)
 
         reasoning_effort, reasoning_enabled = _resolve_reasoning(model, params)
+        astra_eligible = is_astra_reasoning_cache_eligible(
+            model, params.get("base_url"), api_mode=params.get("api_mode", "codex_responses"),
+            api_key=params.get("api_key"), auth_mode=params.get("auth_mode", "api_key"),
+            provider=params.get("provider"), is_subagent=params.get("is_subagent") is True,
+            compression_checkpoint_required=params.get("compression_checkpoint_required") is True,
+        )
+        astra_state = params.get("astra_state")
+        astra_update_effort = None
+        if astra_eligible:
+            from agent.codex_responses_adapter import astra_base_effort_for_message, configuration_update_for_message
+            segment_start = 0
+            historical_base = None
+            for _index, _message in enumerate(messages or ()):
+                _base = astra_base_effort_for_message(_message)
+                if _base:
+                    historical_base = _base
+                    segment_start = _index
+                    astra_update_effort = None
+                _update = configuration_update_for_message(_message)
+                if _index >= segment_start and _update:
+                    astra_update_effort = _update["reasoning"]["effort"]
+            if isinstance(astra_state, dict):
+                base_effort = historical_base or astra_state.get("base_effort")
+                if base_effort not in CODEX_ASTRA_EFFORTS:
+                    base_effort = _astra_effective_effort(reasoning_effort)
+                    astra_state["base_effort"] = base_effort
+                astra_state["base_effort"] = base_effort
+                astra_state["effective_effort"] = astra_update_effort or base_effort
+                # The request-level field is deliberately fixed for the compatible segment;
+                # the per-user typed item carries an effort transition.
+                reasoning_effort = base_effort
         # The marker is emitted only for exact direct Astra turns whose midstream executor
         # was admitted by the caller.  Keep the internal hint out of returned kwargs so the
         # normal Responses preflight contract remains unchanged.
@@ -576,6 +634,7 @@ class ResponsesApiTransport(ProviderTransport):
                 payload_messages, is_xai_responses=is_xai_responses, is_github_responses=is_github_responses,
                 replay_encrypted_reasoning=replay_encrypted_reasoning, base_url=params.get("base_url"),
                 is_codex_backend=is_codex_backend, context_management=context_management,
+                astra_configuration_updates=astra_eligible,
             ),
             "store": False,
         }

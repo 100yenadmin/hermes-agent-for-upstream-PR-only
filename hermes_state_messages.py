@@ -583,6 +583,31 @@ class SessionMessagesMixin:
             ") AND content IS ?",
             (_scrub_surrogates(api_content), session_id, self._encode_content(content)))
 
+    def set_latest_user_display_metadata(self, session_id: str, content: Any, metadata: Any) -> int:
+        """Merge internal JSON metadata onto the newest active user row.
+
+        Used by request-local markers that are staged after the turn-start flush.  The
+        update is deliberately sidecar-only: message content, ordering, and schema stay
+        unchanged, while existing display metadata (reactions/timeline fields) survives.
+        """
+        if not session_id or not isinstance(metadata, dict):
+            return 0
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT id, display_metadata FROM messages WHERE session_id = ? AND role = 'user' "
+                "AND active = 1 AND content IS ? ORDER BY id DESC LIMIT 1",
+                (session_id, self._encode_content(content)),
+            ).fetchone()
+            if row is None:
+                return 0
+            merged = self._decode_display_metadata(row["display_metadata"]) or {}
+            merged.update(metadata)
+            conn.execute(_SET_DISPLAY_META_SQL, (self._encode_display_metadata(merged), row["id"]))
+            return 1
+
+        return self._execute_write(_do)
+
     def _dedupe_display_generations(self, rows):
         """Collapse compaction generations so each logical message appears once (the protected tail is copied
         into each generation: same role/content/timestamp, different ``active``/id); prefer the live row, then

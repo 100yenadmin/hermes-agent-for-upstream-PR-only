@@ -1302,6 +1302,49 @@ class TurnRunner:
         agent_history, observed_group_context = _build_gateway_agent_history(
             ctx.history, channel_prompt=ctx.channel_prompt, inject_timestamps=_message_timestamps_enabled(ctx.user_config),
         )
+        # ``_build_gateway_agent_history`` intentionally drops display-only metadata from
+        # ordinary user rows. Restore only the sanitized Astra update marker so the stateless
+        # Responses converter can replay it at the original user-message position.
+        from agent.codex_responses_adapter import (
+            ASTRA_BASE_EFFORT_MARKER_KEY, ASTRA_CONFIGURATION_UPDATE_MARKER_KEY,
+            astra_base_effort_for_message, configuration_update_for_message,
+        )
+        marker_cursor = 0
+        for stored in ctx.history or ():
+            if not isinstance(stored, dict) or stored.get("role") != "user":
+                continue
+            update_marker = configuration_update_for_message(stored)
+            base_marker = astra_base_effort_for_message(stored)
+            if update_marker is None and base_marker is None:
+                continue
+            stored_content = stored.get("content")
+            selected_idx = None
+            for idx in range(marker_cursor, len(agent_history)):
+                candidate = agent_history[idx]
+                if candidate.get("role") != "user" or (
+                    ASTRA_CONFIGURATION_UPDATE_MARKER_KEY in candidate
+                    or ASTRA_BASE_EFFORT_MARKER_KEY in candidate
+                ):
+                    continue
+                if candidate.get("content") == stored_content or (
+                    stored.get("api_content") and candidate.get("api_content") == stored.get("api_content")
+                ):
+                    selected_idx = idx
+                    break
+            if selected_idx is None:
+                selected_idx = next(
+                    (idx for idx in range(marker_cursor, len(agent_history))
+                     if agent_history[idx].get("role") == "user"
+                     and ASTRA_CONFIGURATION_UPDATE_MARKER_KEY not in agent_history[idx]
+                     and ASTRA_BASE_EFFORT_MARKER_KEY not in agent_history[idx]),
+                    None,
+                )
+            if selected_idx is not None:
+                if base_marker is not None:
+                    agent_history[selected_idx][ASTRA_BASE_EFFORT_MARKER_KEY] = base_marker
+                if update_marker is not None:
+                    agent_history[selected_idx][ASTRA_CONFIGURATION_UPDATE_MARKER_KEY] = update_marker
+                marker_cursor = selected_idx + 1
         # FTS write-corruption guard: if persistence failed silently the reloaded transcript is stale
         # while the SAME cached agent still holds the live conversation (same-session amnesia). Only
         # for a reused agent bound to this exact session_id.
