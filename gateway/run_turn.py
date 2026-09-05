@@ -2122,7 +2122,8 @@ class GatewayTurnMixin:
         try:
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(source=source, user_config=user_config)
-            if not runtime_kwargs.get("api_key"):
+            # Whole-turn runtimes own authentication; an empty API key is intentional.
+            if not runtime_kwargs.get("api_key") and runtime_kwargs.get("api_mode") != "agent_runtime":
                 await adapter.send(
                     source.chat_id,
                     f"❌ Background task {task_id} failed: no provider credentials configured.",
