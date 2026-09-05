@@ -23,10 +23,11 @@ logger = logging.getLogger(__name__)
 _STEERING_MODEL_CONFIG_KEY = "_astra_steering"
 _STEERING_JOURNAL_VERSION = 1
 _STEERING_JOURNAL_LIMIT = 16
-_STEERING_UNRESOLVED_STATES = frozenset({"prepared", "sent", "failed", "accepted", "ambiguous"})
+_STEERING_UNRESOLVED_STATES = frozenset({"prepared", "sent", "failed", "accepted", "ambiguous", "fallback_queued"})
 _STEERING_STATE_RANK = {
     "prepared": 10, "sent": 20, "failed": 25, "accepted": 30,
     "ambiguous": 40, "successor_created": 50, "fallback_queued": 60,
+    "fallback_delivered": 70,
 }
 
 
@@ -143,6 +144,51 @@ def _remove_pending(agent: Any, text: str) -> None:
             agent._pending_steer = "\n".join(parts) or None
 
 
+def _fallback_records_for_text(agent: Any, text: str) -> list[dict[str, Any]] | None:
+    db = getattr(agent, "_session_db", None)
+    getter = getattr(db, "get_session_model_config_value", None)
+    if not callable(getter):
+        return None
+    try:
+        raw = getter(str(getattr(agent, "session_id", "") or ""), _STEERING_MODEL_CONFIG_KEY, {})
+        entries = raw.get("entries", []) if isinstance(raw, dict) else []
+        records = [entry for entry in entries if isinstance(entry, dict) and entry.get("state") in {"failed", "fallback_queued"}]
+    except Exception:
+        return []
+    if not records:
+        return None
+    for record in records:
+        if str(record.get("text") or "").strip() == text:
+            return [record]
+    for count in range(2, len(records) + 1):
+        if "\n".join(str(item.get("text") or "") for item in records[:count]) == text:
+            return records[:count]
+    return []
+
+
+def durably_deliver_fallback_steer(
+    agent: Any, target: dict[str, Any], before_content: Any, delivered_content: Any, steer_text: str,
+) -> bool | None:
+    records = _fallback_records_for_text(agent, steer_text)
+    if records is None:
+        return None
+    if not records:
+        return False
+    db = getattr(agent, "_session_db", None)
+    persist = getattr(db, "persist_astra_steering_fallback", None)
+    tool_call_id = str(target.get("tool_call_id") or "").strip()
+    session_id = str(getattr(agent, "session_id", "") or "").strip()
+    if not session_id or not tool_call_id or not callable(persist):
+        return False
+    try:
+        delivered = bool(persist(session_id, target.get("_row_id"), tool_call_id,
+                                 before_content, delivered_content, records))
+    except Exception:
+        logger.warning("Astra fallback steering delivery could not be persisted", exc_info=True)
+        return False
+    return delivered
+
+
 def _parse_model_config(raw: Any) -> dict[str, Any]:
     if isinstance(raw, dict):
         return dict(raw)
@@ -247,19 +293,22 @@ class AstraWebSocketSession:
                      if isinstance(entry.get("generation", 0), int)),
                     default=0,
                 )
-            # An explicit provider failure is the sole state eligible for the legacy one-shot fallback.
             fallback_changed = False
             for entry in self._steering_receipts:
-                if entry.get("state") == "failed":
+                if entry.get("state") in {"failed", "fallback_queued"}:
+                    claimed = str(getattr(self.agent, "_astra_steer_drain_claim", "") or "")
                     text = str(entry.get("text") or "").strip()
+                    if claimed and text and (claimed == text or text in claimed.splitlines()):
+                        if entry.get("state") == "failed": entry["state"] = "fallback_queued"; fallback_changed = True
+                        setattr(self.agent, "_astra_steer_drain_claim", "")
+                        continue
                     if text:
                         pending = str(getattr(self.agent, "_pending_steer", "") or "")
                         if text not in pending.splitlines():
                             _append_pending(self.agent, text)
-                    # Claim the one legacy fallback durably before exposing a
-                    # fresh session to another restart, even when text is empty.
-                    entry["state"] = "fallback_queued"
-                    fallback_changed = True
+                    if entry.get("state") == "failed":
+                        entry["state"] = "fallback_queued"
+                        fallback_changed = True
             if fallback_changed:
                 self._persist_steering_receipts()
         except Exception as exc:
