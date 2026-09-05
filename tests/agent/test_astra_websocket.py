@@ -27,7 +27,8 @@ def _agent(**overrides):
         base_url="https://api.openai.com/v1", api_key="placeholder-key", auth_mode="api_key",
         is_subagent=False, compression_checkpoint_required=False, _interrupt_requested=False,
         _pending_steer=None, _pending_steer_lock=threading.Lock(), _session_messages=[],
-        _codex_streamed_text_parts=[],
+        _codex_streamed_text_parts=[], _session_db=FakeSessionDB(), session_id="synthetic-session",
+        _session_db_created=True,
     )
     values.update(overrides)
     values["_is_codex_backend"] = lambda: False
@@ -369,6 +370,7 @@ def test_explicit_steer_failure_keeps_one_legacy_pending_text():
     worker.join(timeout=2)
     assert agent._pending_steer == "legacy once"
     assert sum(item["type"] == "response.steer" for item in socket.sent) == 1
+    assert session._steering_receipts[-1]["state"] == "fallback_queued"
 
 
 def test_connect_failure_falls_back_but_send_or_recv_is_uncertain():
@@ -445,6 +447,22 @@ def test_restart_does_not_resend_accepted_or_ambiguous_steering():
     assert sent[0]["input"][0]["content"][0]["text"] == "new correction"
     assert sum(item["state"] == "ambiguous" for item in db.model_config["_astra_steering"]["entries"]) == 1
 
+    full_db = FakeSessionDB([
+        {"version": 1, "admission_id": str(index), "generation": index, "response_id": "r1",
+         "input": [{"role": "user", "content": [{"type": "input_text", "text": str(index)}]}],
+         "text": str(index), "state": "accepted"}
+        for index in range(1, 17)
+    ])
+    full_agent = _agent(_session_db=full_db)
+    full_session = AstraWebSocketSession(full_agent)
+    full_session._socket = FakeWebSocket()
+    full_session._response_id = "r2"
+    full_session._set_state("ACTIVE")
+    with pytest.raises(AstraSteeringPersistenceError):
+        full_session.request_steer("journal is full")
+    assert len(full_db.model_config["_astra_steering"]["entries"]) == 16
+    assert all(item["state"] == "accepted" for item in full_db.model_config["_astra_steering"]["entries"])
+
 
 def test_explicit_failure_requeues_once_after_restart():
     entry = {"version": 1, "admission_id": "failed", "generation": 1, "response_id": "r1",
@@ -476,6 +494,41 @@ def test_persistence_failure_before_steer_send_is_fail_closed():
         session.request_steer("must not dispatch")
     assert socket.sent == []
     assert agent._pending_steer is None
+
+
+def test_missing_or_noop_session_store_is_fail_closed_before_steer_send():
+    class NoOpDB(FakeSessionDB):
+        def patch_session_model_config(self, session_id, patch):
+            del session_id, patch
+
+    for db in (None, NoOpDB()):
+        socket = FakeWebSocket()
+        agent = _agent(_session_db=db)
+        session = AstraWebSocketSession(agent)
+        session._socket = socket
+        session._response_id = "r1"
+        session._set_state("ACTIVE")
+        with pytest.raises(AstraSteeringPersistenceError):
+            session.request_steer("must not dispatch")
+        assert socket.sent == []
+
+
+def test_redacted_steer_declines_before_dispatch(monkeypatch):
+    monkeypatch.setattr(
+        "agent.transports.astra_websocket_session._safe_steering_text",
+        lambda text: "[steering input redacted]",
+    )
+    socket = FakeWebSocket()
+    db = FakeSessionDB()
+    agent = _agent(_session_db=db)
+    session = AstraWebSocketSession(agent)
+    session._socket = socket
+    session._response_id = "r1"
+    session._set_state("ACTIVE")
+    with pytest.raises(AstraSteeringPersistenceError):
+        session.request_steer("credential-like steering input")
+    assert socket.sent == []
+    assert db.model_config["_astra_steering"]["entries"] == []
 
 
 def test_ambiguous_steer_send_retains_durable_no_resend_receipt():

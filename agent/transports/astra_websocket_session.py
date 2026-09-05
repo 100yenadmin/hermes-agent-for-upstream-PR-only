@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 _STEERING_MODEL_CONFIG_KEY = "_astra_steering"
 _STEERING_JOURNAL_VERSION = 1
 _STEERING_JOURNAL_LIMIT = 16
+_STEERING_UNRESOLVED_STATES = frozenset({"prepared", "sent", "failed", "accepted", "ambiguous"})
 _STEERING_STATE_RANK = {
     "prepared": 10, "sent": 20, "failed": 25, "accepted": 30,
     "ambiguous": 40, "successor_created": 50, "fallback_queued": 60,
@@ -214,6 +215,17 @@ class AstraWebSocketSession:
                     self._steering_persistence_error = exc
         return db
 
+    @staticmethod
+    def _steering_config_value(db: Any, session_id: str) -> Any:
+        getter = getattr(db, "get_session_model_config_value", None)
+        if callable(getter):
+            return getter(session_id, _STEERING_MODEL_CONFIG_KEY, {})
+        get_session = getattr(db, "get_session", None)
+        if not callable(get_session):
+            raise AstraSteeringPersistenceError("Astra session store lacks model metadata reads")
+        row = get_session(session_id) or {}
+        return _parse_model_config(row.get("model_config")).get(_STEERING_MODEL_CONFIG_KEY, {})
+
     def _load_steering_receipts(self) -> None:
         """Load only the bounded ownership journal; never reconstruct an in-flight send."""
         db = self._session_db()
@@ -221,16 +233,15 @@ class AstraWebSocketSession:
         if db is None or not session_id:
             return
         try:
-            getter = getattr(db, "get_session_model_config_value", None)
-            if callable(getter):
-                raw = getter(session_id, _STEERING_MODEL_CONFIG_KEY, {})
-            else:
-                row = db.get_session(session_id)
-                raw = _parse_model_config((row or {}).get("model_config")).get(_STEERING_MODEL_CONFIG_KEY, {})
+            raw = self._steering_config_value(db, session_id)
             entries = raw.get("entries", []) if isinstance(raw, dict) else []
             if isinstance(entries, list):
-                self._steering_receipts = [entry for entry in entries[-_STEERING_JOURNAL_LIMIT:]
-                                           if isinstance(entry, dict)]
+                loaded = [dict(entry) for entry in entries if isinstance(entry, dict)]
+                unresolved = any(entry.get("state") in _STEERING_UNRESOLVED_STATES for entry in loaded)
+                self._steering_receipts = (
+                    loaded if len(loaded) <= _STEERING_JOURNAL_LIMIT or unresolved
+                    else loaded[-_STEERING_JOURNAL_LIMIT:]
+                )
                 self._next_sequence = max(
                     (int(entry.get("generation", 0)) for entry in self._steering_receipts
                      if isinstance(entry.get("generation", 0), int)),
@@ -245,11 +256,10 @@ class AstraWebSocketSession:
                         pending = str(getattr(self.agent, "_pending_steer", "") or "")
                         if text not in pending.splitlines():
                             _append_pending(self.agent, text)
-                        # Claim the one legacy fallback durably before exposing a
-                        # fresh session to another restart. The current in-memory
-                        # failed path already owns its pending text.
-                        entry["state"] = "fallback_queued"
-                        fallback_changed = True
+                    # Claim the one legacy fallback durably before exposing a
+                    # fresh session to another restart, even when text is empty.
+                    entry["state"] = "fallback_queued"
+                    fallback_changed = True
             if fallback_changed:
                 self._persist_steering_receipts()
         except Exception as exc:
@@ -264,10 +274,7 @@ class AstraWebSocketSession:
         if self._steering_load_failed:
             raise AstraSteeringPersistenceError("Astra steering ownership journal could not be read") from self._steering_persistence_error
         if db is None or not session_id:
-            # Bare test doubles and legacy non-session callers retain the in-memory ABI.
-            if self._steering_persistence_error is not None:
-                raise AstraSteeringPersistenceError("Astra steering ownership journal is unavailable") from self._steering_persistence_error
-            return
+            raise AstraSteeringPersistenceError("Astra steering ownership journal is unavailable") from self._steering_persistence_error
         ensure = getattr(self.agent, "_ensure_db_session", None)
         if callable(ensure) and not bool(getattr(self.agent, "_session_db_created", True)):
             ensure()
@@ -277,12 +284,18 @@ class AstraWebSocketSession:
         if not callable(patch):
             raise AstraSteeringPersistenceError("Astra session store lacks model metadata patching")
         with self._steering_receipt_lock:
+            if len(self._steering_receipts) > _STEERING_JOURNAL_LIMIT:
+                raise AstraSteeringPersistenceError("Astra steering ownership journal exceeds its bounded limit")
             payload = {
                 "version": _STEERING_JOURNAL_VERSION,
                 "entries": [dict(entry) for entry in self._steering_receipts[-_STEERING_JOURNAL_LIMIT:]],
             }
         try:
             patch(session_id, {_STEERING_MODEL_CONFIG_KEY: payload})
+            stored = self._steering_config_value(db, session_id)
+            if not isinstance(stored, dict) or stored.get("version") != _STEERING_JOURNAL_VERSION \
+                    or stored.get("entries") != payload["entries"]:
+                raise AstraSteeringPersistenceError("Astra session metadata write was not durable")
             self._steering_persistence_error = None
         except Exception as exc:
             self._steering_persistence_error = exc
@@ -305,7 +318,9 @@ class AstraWebSocketSession:
 
     def _append_steering_receipt(self, sequence: int, text: str, previous_id: str) -> None:
         safe_text = _safe_steering_text(text)
-        wire_input = [{"role": "user", "content": [{"type": "input_text", "text": safe_text}]}]
+        if safe_text != text:
+            raise AstraSteeringPersistenceError("Astra steering input would be changed by redaction")
+        wire_input = [{"role": "user", "content": [{"type": "input_text", "text": text}]}]
         input_digest = hashlib.sha256(
             json.dumps(
                 [{"role": "user", "content": [{"type": "input_text", "text": text}]}],
@@ -317,6 +332,11 @@ class AstraWebSocketSession:
             f"{session_id}\0{sequence}\0{previous_id}".encode("utf-8", errors="surrogatepass")
         ).hexdigest()[:24]
         with self._steering_receipt_lock:
+            if (
+                len(self._steering_receipts) >= _STEERING_JOURNAL_LIMIT
+                and any(entry.get("state") in _STEERING_UNRESOLVED_STATES for entry in self._steering_receipts)
+            ):
+                raise AstraSteeringPersistenceError("Astra steering ownership journal is full of unresolved inputs")
             self._steering_receipts.append({
                 "version": _STEERING_JOURNAL_VERSION,
                 "admission_id": admission_id,
@@ -603,7 +623,8 @@ class AstraWebSocketSession:
                 self._await_successor = any(not item.failed and not item.accepted for item in self._steers.values())
                 self._set_state("ACTIVE")
             if sequence is not None:
-                self._record_steering_state(sequence, "failed")
+                # The explicit failure transfers ownership to the one-shot legacy queue.
+                self._record_steering_state(sequence, "fallback_queued")
         elif event_type == "response.steer.pending":
             self._set_state("PENDING_REQUIRED_INPUT")
             self._send_required_continuation(event)
