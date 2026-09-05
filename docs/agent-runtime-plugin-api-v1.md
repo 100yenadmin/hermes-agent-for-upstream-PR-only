@@ -24,7 +24,7 @@ The host capability `host_tool_request_id_v1` exposes the provider-neutral
 is optional and keyword-only for compatibility with existing two-argument
 callers; omitted IDs use a host-generated per-turn namespace.
 
-Current implementation source before the documentation-only restamp:
+Historical Revision 4 implementation source before its documentation-only restamp:
 `e6398e75c24be9b3e22f024d621a0221414cfe65`.
 
 Do not add requirements, provider policy, or implementation detail here; update

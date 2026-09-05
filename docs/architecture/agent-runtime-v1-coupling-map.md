@@ -1,10 +1,23 @@
 # AgentRuntime v1 coupling map (Revision 4)
 
-Host implementation source before this documentation-only restamp:
+Historical Revision 4 implementation source before its documentation restamp:
 `e6398e75c24be9b3e22f024d621a0221414cfe65`
 
 The [canonical ADR](../adr/agent-runtime-v1.md) defines the rules. This map
 records the final ownership split; it is not a second contract.
+
+## Upstream module layout
+
+The compatibility port targets upstream `006b1beb00d9d25230571d14277aca3d70e5e11f`.
+It preserves AgentRuntime v1 and the ownership rules below. Selection and
+host finalization now live in `agent/turn_runtime.py`, prompt projection in
+`agent/turn_context.py`, and runtime state/usage in the
+`hermes_state_runtime.py` mixin. Plugin teardown uses
+`hermes_cli/plugins_ledger.py`; completion delivery uses
+`gateway/run_notifications.py` and `gateway/run_turn.py`.
+No Claude-specific runtime, SDK, authentication, or orchestration code is added
+to core. This source port requires new CI and affected-path live evidence;
+the earlier candidate's receipts are not silently rebound to it.
 
 | Area | Hermes host owns | Runtime plugin owns | Boundary invariant |
 | --- | --- | --- | --- |

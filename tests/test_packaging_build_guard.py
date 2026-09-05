@@ -105,7 +105,10 @@ def test_wheel_ships_state_holder_module_and_imports_state(tmp_path):
 
     with zipfile.ZipFile(artifacts[0]) as wheel:
         shipped = set(wheel.namelist())
-    assert {"hermes_state_holders.py", "hermes_state_registry.py"} <= shipped
+    assert {
+        "hermes_state_holders.py", "hermes_state_registry.py",
+        "hermes_state_runtime.py", "agent/turn_runtime.py",
+    } <= shipped
 
     import_env = os.environ.copy()
     import_env["PYTHONPATH"] = str(artifacts[0])
