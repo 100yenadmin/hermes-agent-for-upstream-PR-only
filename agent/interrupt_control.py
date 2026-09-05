@@ -317,6 +317,4 @@ class InterruptControlMixin:
         with _ic_lock(self, "_pending_steer_lock"):
             text = _ic_slot(self, "_pending_steer_lock", "_pending_steer")
             self._pending_steer = None
-        if text:
-            self._astra_steer_drain_claim = text
         return text

@@ -3161,22 +3161,14 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     marker = format_steer_marker(steer_text)
     existing_content = target.get("content", "")
     if isinstance(existing_content, str):
-        delivered_content = existing_content + marker
+        target["content"] = existing_content + marker
     else:
         # Anthropic multimodal content blocks: preserve them and append a text block.
         try:
-            delivered_content = [*(existing_content or []), {"type": "text", "text": marker.lstrip()}]
+            target["content"] = [*(existing_content or []), {"type": "text", "text": marker.lstrip()}]
         except Exception:
             # Fall back to string replacement if content shape is unexpected.
-            delivered_content = f"{existing_content}{marker}"
-    target["content"] = delivered_content
-    from agent.transports.astra_websocket_session import durably_deliver_fallback_steer
-    if durably_deliver_fallback_steer(
-        agent, target, existing_content, delivered_content, steer_text
-    ) is False:
-        target["content"] = existing_content
-        _requeue_pending_steer(agent, steer_text)
-        return
+            target["content"] = f"{existing_content}{marker}"
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars): %s", len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),

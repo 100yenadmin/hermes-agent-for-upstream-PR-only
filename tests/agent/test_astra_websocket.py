@@ -464,7 +464,7 @@ def test_restart_does_not_resend_accepted_or_ambiguous_steering():
     assert all(item["state"] == "accepted" for item in full_db.model_config["_astra_steering"]["entries"])
 
 
-def test_explicit_failure_requeues_until_fallback_delivery():
+def test_explicit_failure_requeues_once_after_restart():
     entry = {"version": 1, "admission_id": "failed", "generation": 1, "response_id": "r1",
              "input": [{"role": "user", "content": [{"type": "input_text", "text": "retry once"}]}],
              "text": "retry once", "state": "failed"}
@@ -475,7 +475,7 @@ def test_explicit_failure_requeues_until_fallback_delivery():
     assert db.model_config["_astra_steering"]["entries"][0]["state"] == "fallback_queued"
     second = _agent(_session_db=db, session_id="synthetic-session", _session_db_created=True)
     AstraWebSocketSession(second)
-    assert second._pending_steer == "retry once"
+    assert second._pending_steer is None
 
 
 def test_persistence_failure_before_steer_send_is_fail_closed():
@@ -529,40 +529,6 @@ def test_redacted_steer_declines_before_dispatch(monkeypatch):
         session.request_steer("credential-like steering input")
     assert socket.sent == []
     assert db.model_config["_astra_steering"]["entries"] == []
-
-
-def test_live_failed_steer_reconstructs_then_delivers_once(tmp_path):
-    from hermes_state import SessionDB
-    from agent.turn_iteration_prep import _inject_steer_into_newest_tool_result
-    db = SessionDB(tmp_path / "state.db")
-    sid = "synthetic-fallback"
-    db.create_session(sid, source="cli", model="gpt-6-astra")
-    db.append_message(sid, "tool", "result", tool_call_id="call-fallback")
-    socket = FakeWebSocket()
-    agent = _agent(_session_db=db, session_id=sid)
-    session = AstraWebSocketSession(agent, connect=_connect_socket(socket))
-
-    def on_send(message, ws):
-        if message["type"] == "response.create":
-            ws.push(_created("r1"))
-        elif message["type"] == "response.steer":
-            ws.push({"type": "response.steer.failed", "id": "failed"})
-            ws.events.extend(_completed("r1", "r1"))
-    socket._on_send = on_send
-    worker = threading.Thread(target=lambda: session.run({"model": "gpt-6-astra"}))
-    worker.start()
-    deadline = time.time() + 2
-    while session.state != "ACTIVE" and time.time() < deadline:
-        time.sleep(0.005)
-    assert session.request_steer("retry once") is True
-    worker.join(2)
-    restarted = _agent(_session_db=db, session_id=sid, _session_messages=db.get_messages_as_conversation(sid, include_row_ids=True))
-    AstraWebSocketSession(restarted)
-    _inject_steer_into_newest_tool_result(restarted, restarted._session_messages, restarted._drain_pending_steer())
-    assert db.get_session_model_config_value(sid, "_astra_steering", {})["entries"][-1]["state"] == "fallback_delivered"
-    assert "retry once" in db.get_messages_as_conversation(sid)[-1]["content"]
-    assert AstraWebSocketSession(_agent(_session_db=db, session_id=sid)).agent._pending_steer is None
-    db.close()
 
 
 def test_ambiguous_steer_send_retains_durable_no_resend_receipt():

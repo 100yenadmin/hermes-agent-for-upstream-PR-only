@@ -38,7 +38,6 @@ _ACTIVE_IDS_SQL = "SELECT id FROM messages WHERE session_id = ? AND active = 1 O
 _SET_COUNTERS_SQL = "UPDATE sessions SET message_count = ?, tool_call_count = ?"
 _RESET_COUNTERS_SQL = "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?"
 _SET_DISPLAY_META_SQL = "UPDATE messages SET display_metadata = ? WHERE id = ?"
-_ASTRA_STEERING_FALLBACK_KEY = "_astra_steering_fallback"
 _ARCHIVE_ACTIVE_SQL = "UPDATE messages SET active = 0, compacted = 1 WHERE session_id = ? AND active = 1"
 _INVALID = object()  # _json_or sentinel where the fallback must be distinguishable from JSON null
 
@@ -333,67 +332,6 @@ class SessionMessagesMixin:
                 (_scrub_surrogates(display_kind), self._encode_display_metadata(display_metadata), row[0]))
             return True
         return self._execute_write(_do)
-
-    def persist_astra_steering_fallback(
-        self, session_id: str, message_row_id: Optional[int], tool_call_id: str,
-        expected_content: Any, delivered_content: Any, receipts: List[Dict[str, Any]],
-    ) -> bool:
-        if not session_id or not tool_call_id or not isinstance(receipts, list):
-            return False
-        requested = {
-            str(item.get("admission_id")): str(item.get("input_sha256") or "")
-            for item in receipts if isinstance(item, dict) and item.get("admission_id")
-        }
-        if not requested:
-            return False
-
-        def _do(conn):
-            identity = "id = ? AND " if isinstance(message_row_id, int) else ""
-            params = ((message_row_id, session_id, tool_call_id) if isinstance(message_row_id, int)
-                      else (session_id, tool_call_id))
-            row = conn.execute(
-                "SELECT id, content, display_metadata FROM messages WHERE " + identity +
-                "session_id = ? AND role = 'tool' AND tool_call_id = ? AND active = 1 "
-                "ORDER BY id DESC LIMIT 1", params).fetchone()
-            if row is None:
-                return False
-            current = self._decode_content(row["content"])
-            meta = self._decode_display_metadata(row["display_metadata"]) or {}
-            delivered = [item for item in meta.get(_ASTRA_STEERING_FALLBACK_KEY, [])
-                         if isinstance(item, dict)]
-            delivered_ids = {str(item.get("admission_id")) for item in delivered}
-            config_row = conn.execute("SELECT model_config FROM sessions WHERE id = ?", (session_id,)).fetchone()
-            if config_row is None:
-                return False
-            config = json.loads(config_row[0] or "{}")
-            steering = config.get("_astra_steering")
-            entries = steering.get("entries") if isinstance(steering, dict) else None
-            allowed = {"failed", "fallback_queued", "fallback_delivered"}
-            if not isinstance(entries, list) or any(
-                not any(isinstance(entry, dict) and str(entry.get("admission_id")) == admission_id
-                        and entry.get("state") in allowed for entry in entries)
-                for admission_id in requested
-            ):
-                return False
-            if current != delivered_content and current != expected_content:
-                return False
-
-            for admission_id, digest in requested.items():
-                if admission_id not in delivered_ids:
-                    delivered.append({"admission_id": admission_id, "input_sha256": digest})
-                for entry in entries:
-                    if isinstance(entry, dict) and str(entry.get("admission_id")) == admission_id:
-                        entry["state"] = "fallback_delivered"
-            meta[_ASTRA_STEERING_FALLBACK_KEY] = delivered[-16:]
-            config["_astra_steering"] = steering
-            conn.execute(
-                "UPDATE messages SET content = ?, display_metadata = ? WHERE id = ?",
-                (self._encode_content(delivered_content), self._encode_display_metadata(meta), row["id"]),
-            )
-            conn.execute("UPDATE sessions SET model_config = ? WHERE id = ?", (json.dumps(config), session_id))
-            return True
-
-        return bool(self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S))
 
     def _reaction_list(self, meta: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Well-formed (dict) reactions stored under ``REACTIONS_METADATA_KEY``."""

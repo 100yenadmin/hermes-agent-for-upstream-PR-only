@@ -140,22 +140,13 @@ def _inject_steer_into_newest_tool_result(agent: Any, messages: Any, steer_text:
             marker = format_steer_marker(steer_text)
             existing = _sm.get("content", "")
             if isinstance(existing, str):
-                delivered_content = existing + marker
+                _sm["content"] = existing + marker
             else:
                 # Multimodal content blocks — append a text block.
-                try:
+                with suppress(Exception):
                     blocks = list(existing) if existing else []
                     blocks.append({"type": "text", "text": marker})
-                    delivered_content = blocks
-                except Exception:
-                    delivered_content = existing
-            _sm["content"] = delivered_content
-            from agent.transports.astra_websocket_session import durably_deliver_fallback_steer
-            if durably_deliver_fallback_steer(agent, _sm, existing, delivered_content, steer_text) is False:
-                _sm["content"] = existing
-                from agent.agent_runtime_helpers import _requeue_pending_steer
-                _requeue_pending_steer(agent, steer_text)
-                return
+                    _sm["content"] = blocks
             logger.debug(
                 "Pre-API-call steer drain: injected into tool msg at index %d", _si
             )
