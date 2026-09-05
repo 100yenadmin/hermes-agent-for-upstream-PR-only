@@ -9,7 +9,8 @@ from tests.agent.test_astra_websocket import FakeWebSocket, _connect_socket, _cr
 
 
 @pytest.mark.parametrize("persistence_fails", [False, True])
-def test_pending_steer_settles_real_executor_before_one_continuation(monkeypatch, tmp_path, persistence_fails):
+@pytest.mark.parametrize("with_effort_update", [False, True])
+def test_pending_steer_settles_real_executor_before_one_continuation(monkeypatch, tmp_path, persistence_fails, with_effort_update):
     from agent.astra_async_tools import AstraAsyncExecutor
     from agent import tool_executor
     from agent.transports.astra_websocket_session import AstraWebSocketSession, AstraProtocolError
@@ -27,7 +28,22 @@ def test_pending_steer_settles_real_executor_before_one_continuation(monkeypatch
         session_db=db, quiet_mode=True, skip_memory=True, skip_context_files=True, skip_background_review=True,
     )
     messages = [{"role": "user", "content": "Use the read tool"}]
+    if with_effort_update:
+        messages = [
+            {"role": "user", "content": "Start low", "_astra_reasoning_base_effort": "low"},
+            {"role": "assistant", "content": "Ready"},
+            {**messages[0], "_astra_configuration_update": {"type": "configuration_update", "reasoning": {"effort": "high"}}},
+        ]
     assert agent._flush_messages_to_session_db(messages) is True
+    request = agent._get_transport().build_kwargs(
+        model=agent.model, messages=messages, tools=[], base_url=agent.base_url, api_key=agent.api_key,
+        provider=agent.provider, reasoning_config={"effort": "high"}, astra_state={"base_effort": "low"} if with_effort_update else {},
+    )
+    request["max_output_tokens"] = 4096
+    request["reasoning"]["summary"] = "concise"
+    assert request["reasoning"]["effort"] == ("low" if with_effort_update else "high")
+    if with_effort_update:
+        assert request["input"][-2]["type"] == "configuration_update"
     started, release = threading.Event(), threading.Event()
     starts, outcomes, errors = [], [], []
     original_flush = agent._flush_messages_to_session_db
@@ -72,7 +88,7 @@ def test_pending_steer_settles_real_executor_before_one_continuation(monkeypatch
             assert len(saved) == 1 and saved[0]["content"] == "durable result"
             assert message["input"] == [{"type": "function_call_output", "call_id": "call_live", "output": "durable result"}]
             assert message["max_output_tokens"] == 4096
-            assert message["reasoning"] == {"effort": "high", "summary": "concise"}
+            assert message["reasoning"] == request["reasoning"]
             ws.push(_created("r2"))
             for event in _completed("r2", "r2", "continued"):
                 ws.push(event)
@@ -82,8 +98,7 @@ def test_pending_steer_settles_real_executor_before_one_continuation(monkeypatch
 
     def run():
         try:
-            outcomes.append(session.run({"model": "gpt-6-astra", "input": [{"role": "user", "content": "Use the read tool"}],
-                                         "max_output_tokens": 4096, "reasoning": {"effort": "high", "summary": "concise"}}))
+            outcomes.append(session.run(request))
         except Exception as exc:
             errors.append(exc)
 
