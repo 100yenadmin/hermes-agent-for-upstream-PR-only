@@ -508,6 +508,16 @@ class AstraWebSocketSession:
         if required is None:
             response = _event_field(event, "response")
             required = _event_field(response, "required_input")
+        executor = getattr(self.agent, "_astra_async_executor", None)
+        settle_required = getattr(executor, "settle_required", None)
+        if callable(settle_required):
+            required_items = required if isinstance(required, list) else ()
+            call_ids = [
+                str(item.get("call_id") or item.get("id") or "").strip()
+                for item in required_items if isinstance(item, dict)
+            ]
+            if isinstance(required, list) and not settle_required(call_ids):
+                raise AstraProtocolError("Astra async tool results were not durably settled")
         input_items = self._fill_required_input(required)
         settings = {k: v for k, v in self._request.items() if k not in {"type", "input", "stream", "previous_response_id"}}
         self._send({"type": "response.create", **settings, "previous_response_id": parent, "input": input_items})
