@@ -67,6 +67,7 @@ class AstraAsyncExecutor:
         self.api_call_count = api_call_count
         self._lock = threading.RLock()
         self._changed = threading.Condition(self._lock)
+        self._settlement_lock = threading.Lock()
         self._jobs: list[_AstraJob] = []
         self._reservations: list[str] = []
         self._pending_calls: dict[str, Any] = {}
@@ -296,6 +297,107 @@ class AstraAsyncExecutor:
     def _all_done_locked(self) -> bool:
         return all(job.done for job in self._jobs)
 
+    @staticmethod
+    def _canonical_call_id(value: Any) -> str:
+        return str(value or "").split("|", 1)[0].strip()
+
+    def _job_call_ids(self, job: _AstraJob) -> set[str]:
+        ref = job.parsed.ref(self.effective_task_id)
+        return {
+            call_id for call_id in (
+                self._canonical_call_id(ref.call_id),
+                self._canonical_call_id(getattr(job.call, "call_id", None)),
+                self._canonical_call_id(getattr(job.call, "id", None)),
+            ) if call_id
+        }
+
+    def _required_jobs_locked(self, call_ids: Any) -> Optional[list[_AstraJob]]:
+        required = {self._canonical_call_id(call_id) for call_id in call_ids or ()}
+        required.discard("")
+        if not required:
+            return []
+        positions = {
+            call_id: index
+            for index, job in enumerate(self._jobs)
+            for call_id in self._job_call_ids(job)
+        }
+        if not required.issubset(positions):
+            return None
+        # Publishing in assistant-call order requires every earlier job.  The scheduler's
+        # segmented barriers also require those predecessors to have completed first.
+        return list(self._jobs[:max(positions[call_id] for call_id in required) + 1])
+
+    def _wait_for_jobs(self, jobs: list[_AstraJob]) -> bool:
+        while True:
+            abort = False
+            with self._lock:
+                if all(job.committed for job in jobs):
+                    return True
+                if self._closed or self._failed:
+                    return False
+                if getattr(self.agent, "_interrupt_requested", False):
+                    abort = True
+                elif all(job.done for job in jobs):
+                    return True
+                else:
+                    self._pump_locked()
+                    self._changed.wait(timeout=0.1)
+            if abort:
+                self.abort_stream()
+                return False
+
+    def _publish_jobs(self, jobs: list[_AstraJob], *, finalize: bool = False) -> bool:
+        """Persist one ordered job prefix, skipping rows already committed by settlement."""
+        if not jobs:
+            return True
+        from agent.tool_executor import (
+            _append_invalid_arguments_result, _budget_for_agent, _finalize_tool_batch, _publish_sequential_result,
+        )
+
+        selected = {id(job) for job in jobs}
+        ordered = [job for job in self._jobs if id(job) in selected]
+        budget = _budget_for_agent(self.agent)
+        for index, job in enumerate(ordered):
+            if job.committed:
+                continue
+            ref = job.parsed.ref(self.effective_task_id)
+            message_count = len(self.messages)
+            if job.parsed.parse_error is not None:
+                published = _append_invalid_arguments_result(self.agent, self.messages, ref, job.parsed.parse_error)
+            else:
+                published = _publish_sequential_result(
+                    self.agent, self.messages, ref, job.managed, tool_duration=job.duration,
+                    index=job.index + 1, budget=budget,
+                )
+            if not published:
+                self._failed = True
+                del self.messages[message_count:]
+                recovered = self._recover_uncommitted_results(ordered[index:])
+                self.agent._session_messages = self.messages
+                return recovered
+            job.committed = True
+        if finalize and not self._failed and self._jobs:
+            _finalize_tool_batch(self.agent, self.messages, self.effective_task_id, len(self._jobs), budget)
+        self.agent._session_messages = self.messages
+        return True
+
+    def settle_required(self, call_ids: Any) -> bool:
+        """Wait for required calls and ordered predecessors, then durably publish them once.
+
+        This is the PR3 pending-steer boundary.  It never exposes an in-memory managed result;
+        callers may construct required input only after this returns ``True`` and read the
+        canonical persisted tool rows from ``agent._session_messages``.
+        """
+        with self._settlement_lock:
+            with self._lock:
+                jobs = self._required_jobs_locked(call_ids)
+            if jobs is None or not self._wait_for_jobs(jobs):
+                return False
+            published = self._publish_jobs(jobs)
+            # A recovery notice is durable, but it is not the requested tool result.  Keep
+            # pending continuation fail-closed after a canonical publication failure.
+            return published and not self.failed
+
     def _recover_uncommitted_results(self, jobs: list[_AstraJob]) -> bool:
         from agent.replay_cleanup import _DANGLING_NOTICES, _orphan_recovery
         from agent.tool_dispatch_helpers import make_tool_result_message
@@ -325,85 +427,53 @@ class AstraAsyncExecutor:
 
     def finish_stream(self, assistant_content: str = "", settled_calls: Any = None) -> bool:
         """Wait for all admitted jobs and publish results in original call order."""
-        with self._lock:
-            if self._closed:
-                return self._finalized
-            if getattr(self.agent, "_interrupt_requested", False):
-                self.abort_stream()
-                return False
-            # The assembler settles announced items that lack an output_item.done frame only when
-            # it builds the terminal response.  Admit those calls before retiring reservations.
-            for call in settled_calls or ():
-                if provider_async_marker(call):
-                    self.admit(call)
-            self._stream_closed = True
-            self._drain_admissions_locked()
-            self._pending_calls.clear()
-            self._reservations.clear()
-            self._pump_locked()
-            while not self._all_done_locked():
+        with self._settlement_lock:
+            with self._lock:
+                if self._closed:
+                    return self._finalized
                 if getattr(self.agent, "_interrupt_requested", False):
                     self.abort_stream()
                     return False
-                self._changed.wait(timeout=0.1)
+                # The assembler settles announced items that lack an output_item.done frame only when
+                # it builds the terminal response.  Admit those calls before retiring reservations.
+                for call in settled_calls or ():
+                    if provider_async_marker(call):
+                        self.admit(call)
+                self._stream_closed = True
+                self._drain_admissions_locked()
+                self._pending_calls.clear()
+                self._reservations.clear()
+                self._pump_locked()
+                while not self._all_done_locked():
+                    if getattr(self.agent, "_interrupt_requested", False):
+                        self.abort_stream()
+                        return False
+                    self._changed.wait(timeout=0.1)
 
-        from agent.tool_executor import (
-            _append_invalid_arguments_result, _budget_for_agent, _finalize_tool_batch, _publish_sequential_result,
-        )
-        if assistant_content:
-            from agent.chat_completion_helpers import build_assistant_message
+            if assistant_content:
+                from agent.chat_completion_helpers import build_assistant_message
 
-            text_message = build_assistant_message(
-                self.agent, SimpleNamespace(content=assistant_content, tool_calls=[]), "tool_calls",
-            )
-            text_message.pop("tool_calls", None)
-            self.messages.append(text_message)
-            try:
-                if self.agent._flush_messages_to_session_db(self.messages) is not True:
+                text_message = build_assistant_message(
+                    self.agent, SimpleNamespace(content=assistant_content, tool_calls=[]), "tool_calls",
+                )
+                text_message.pop("tool_calls", None)
+                self.messages.append(text_message)
+                try:
+                    if self.agent._flush_messages_to_session_db(self.messages) is not True:
+                        self._failed = True
+                except Exception:
                     self._failed = True
-            except Exception:
-                self._failed = True
-        if self._failed:
-            recovered = self._recover_uncommitted_results(self._jobs)
-            self._closed = True
-            self._finalized = recovered
-            self._executor.shutdown(wait=True)
-            return recovered
-        budget = _budget_for_agent(self.agent)
-        for index, job in enumerate(self._jobs):
-            ref = job.parsed.ref(self.effective_task_id)
-            if job.parsed.parse_error is not None:
-                message_count = len(self.messages)
-                if not _append_invalid_arguments_result(self.agent, self.messages, ref, job.parsed.parse_error):
-                    self._failed = True
-                    del self.messages[message_count:]
-                    recovered = self._recover_uncommitted_results(self._jobs[index:])
-                    self._closed = True
-                    self._finalized = recovered
-                    self._executor.shutdown(wait=True)
-                    return recovered
-                job.committed = True
-                continue
-            message_count = len(self.messages)
-            if not _publish_sequential_result(
-                self.agent, self.messages, ref, job.managed, tool_duration=job.duration,
-                index=job.index + 1, budget=budget,
-            ):
-                self._failed = True
-                del self.messages[message_count:]
-                recovered = self._recover_uncommitted_results(self._jobs[index:])
+            if self._failed:
+                recovered = self._recover_uncommitted_results(self._jobs)
                 self._closed = True
                 self._finalized = recovered
                 self._executor.shutdown(wait=True)
                 return recovered
-            job.committed = True
-        self._closed = True
-        if not self._failed and self._jobs:
-            _finalize_tool_batch(self.agent, self.messages, self.effective_task_id, len(self._jobs), budget)
-        self.agent._session_messages = self.messages
-        self._finalized = not self._failed
-        self._executor.shutdown(wait=True)
-        return self._finalized
+            finalized = self._publish_jobs(self._jobs, finalize=True)
+            self._closed = True
+            self._finalized = finalized
+            self._executor.shutdown(wait=True)
+            return self._finalized
 
     def abort_stream(self) -> None:
         """Retire scheduling after interruption/stream failure without retrying handlers."""
