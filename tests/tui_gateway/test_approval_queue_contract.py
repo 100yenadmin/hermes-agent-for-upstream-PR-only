@@ -79,7 +79,8 @@ def _resolved(_request: Mapping[str, Any]) -> Mapping[str, Any]:
 def test_once_deny_once_uses_public_gateway_protocol_without_provider_calls(
     server, monkeypatch
 ):
-    from tools import approval
+    from tools import approval, approval_context
+    from tools.approval_gateway_wait import _await_gateway_decision
 
     sid = "synthetic-ui-session"
     session_key = "synthetic-runtime-session"
@@ -90,7 +91,7 @@ def test_once_deny_once_uses_public_gateway_protocol_without_provider_calls(
         "tool_progress_mode": "all",
         "transport": transport,
     }
-    monkeypatch.setattr(approval, "_get_approval_timeout", lambda: 5)
+    monkeypatch.setattr(approval_context, "_get_approval_timeout", lambda: 5)
 
     trace = GatewayApprovalTrace(session_id=sid)
     execution_counts = [0, 0, 0]
@@ -99,7 +100,7 @@ def test_once_deny_once_uses_public_gateway_protocol_without_provider_calls(
     try:
         for index, expected_choice in enumerate(EXPECTED_CHOICES):
             def _wait_for_decision(turn_index: int = index) -> None:
-                decision = approval._await_gateway_decision(
+                decision = _await_gateway_decision(
                     session_key,
                     lambda data: server._emit_approval_request(sid, data),
                     {

@@ -126,7 +126,11 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
             self.entered = threading.Event()
             self.release = threading.Event()
             self.calls = 0
+            self.token_flushes = 0
             self._lock = threading.Lock()
+
+        def flush_token_counts(self):
+            self.token_flushes += 1
 
         def append_message(self, **kwargs):
             with self._lock:
@@ -178,6 +182,7 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
     assert not normal.is_alive()
     assert not direct.is_alive()
     assert db.rows == ["exactly once"]
+    assert db.token_flushes == 1
 
 
 def test_malformed_memory_config_still_builds_default_store():
@@ -1771,7 +1776,7 @@ class TestExecuteToolCalls:
         )
 
         with patch(
-            "run_agent.handle_function_call", return_value="canonical result"
+            "model_tools.handle_function_call", return_value="canonical result"
         ) as dispatch:
             result = _run_async(host.execute_tool("web_search", {"q": "runtime"}))
 
