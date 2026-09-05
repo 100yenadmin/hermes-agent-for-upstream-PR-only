@@ -341,7 +341,7 @@ def test_pending_required_input_continues_once_from_saved_result():
     assert sum(item["type"] == "response.steer" for item in socket.sent) == 1
 
 
-def test_explicit_steer_failure_keeps_one_legacy_pending_text():
+def test_explicit_steer_failure_keeps_one_legacy_redirect():
     socket = FakeWebSocket()
     agent = _agent()
     session = AstraWebSocketSession(agent, connect=_connect_socket(socket))
@@ -368,9 +368,10 @@ def test_explicit_steer_failure_keeps_one_legacy_pending_text():
         time.sleep(0.005)
     assert session.request_steer("legacy once") is True
     worker.join(timeout=2)
-    assert agent._pending_steer == "legacy once"
+    assert agent._pending_steer is None
+    assert agent._pending_redirect == "legacy once"
     assert sum(item["type"] == "response.steer" for item in socket.sent) == 1
-    assert session._steering_receipts[-1]["state"] == "fallback_queued"
+    assert session._steering_receipts[-1]["state"] == "failed"
 
 
 def test_connect_failure_falls_back_but_send_or_recv_is_uncertain():
@@ -464,18 +465,20 @@ def test_restart_does_not_resend_accepted_or_ambiguous_steering():
     assert all(item["state"] == "accepted" for item in full_db.model_config["_astra_steering"]["entries"])
 
 
-def test_explicit_failure_requeues_once_after_restart():
+def test_explicit_failure_restores_redirect_until_durable_delivery():
     entry = {"version": 1, "admission_id": "failed", "generation": 1, "response_id": "r1",
              "input": [{"role": "user", "content": [{"type": "input_text", "text": "retry once"}]}],
              "text": "retry once", "state": "failed"}
     db = FakeSessionDB([entry])
     first = _agent(_session_db=db, session_id="synthetic-session", _session_db_created=True)
     AstraWebSocketSession(first)
-    assert first._pending_steer == "retry once"
-    assert db.model_config["_astra_steering"]["entries"][0]["state"] == "fallback_queued"
+    assert first._pending_redirect == "retry once"
+    assert db.model_config["_astra_steering"]["entries"][0]["state"] == "failed"
+    AstraWebSocketSession(first)
+    assert first._pending_redirect == "retry once"
     second = _agent(_session_db=db, session_id="synthetic-session", _session_db_created=True)
     AstraWebSocketSession(second)
-    assert second._pending_steer is None
+    assert second._pending_redirect == "retry once"
 
 
 def test_persistence_failure_before_steer_send_is_fail_closed():

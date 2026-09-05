@@ -23,10 +23,11 @@ logger = logging.getLogger(__name__)
 _STEERING_MODEL_CONFIG_KEY = "_astra_steering"
 _STEERING_JOURNAL_VERSION = 1
 _STEERING_JOURNAL_LIMIT = 16
-_STEERING_UNRESOLVED_STATES = frozenset({"prepared", "sent", "failed", "accepted", "ambiguous"})
+_STEERING_UNRESOLVED_STATES = frozenset({"prepared", "sent", "failed", "accepted", "ambiguous", "fallback_queued"})
 _STEERING_STATE_RANK = {
     "prepared": 10, "sent": 20, "failed": 25, "accepted": 30,
     "ambiguous": 40, "successor_created": 50, "fallback_queued": 60,
+    "fallback_delivered": 70,
 }
 
 
@@ -155,6 +156,58 @@ def _parse_model_config(raw: Any) -> dict[str, Any]:
     return {}
 
 
+def _queue_failed_redirects(agent: Any, entries: list[dict[str, Any]]) -> None:
+    """Keep exact admission identities on Hermes' internal redirect queue until persistence."""
+    lock = getattr(agent, "_pending_redirect_lock", None) or threading.RLock()
+    with lock:
+        queued = getattr(agent, "_astra_pending_redirect_receipts", None) or []
+        drained = getattr(agent, "_astra_drained_redirect_receipts", None) or []
+        known = {item["admission_id"] for item in [*queued, *drained]}
+        for entry in entries:
+            if entry.get("state") not in {"failed", "fallback_queued"}:
+                continue
+            admission_id, text = entry.get("admission_id"), entry.get("text")
+            if not admission_id or not isinstance(text, str) or not text or admission_id in known:
+                continue
+            existing = getattr(agent, "_pending_redirect", None)
+            agent._pending_redirect = f"{existing}\n\n[Additional user correction]\n{text}" if existing else text
+            queued.append({"admission_id": admission_id, "input_sha256": entry.get("input_sha256", "")})
+            known.add(admission_id)
+        agent._astra_pending_redirect_receipts = queued
+
+
+def restore_astra_fallback_redirects(agent: Any) -> None:
+    """Restore before iteration preparation, including after a crash with no tool result."""
+    if not is_astra_websocket_eligible(agent):
+        return
+    session_id = str(getattr(agent, "session_id", "") or "")
+    if getattr(agent, "_astra_fallback_restore_session", None) == session_id:
+        return
+    getter = getattr(getattr(agent, "_session_db", None), "get_session_model_config_value", None)
+    if not session_id or not callable(getter):
+        return
+    raw = getter(session_id, _STEERING_MODEL_CONFIG_KEY, {})
+    entries = raw.get("entries", []) if isinstance(raw, dict) else []
+    _queue_failed_redirects(agent, [entry for entry in entries if isinstance(entry, dict)])
+    agent._astra_fallback_restore_session = session_id
+
+
+def confirm_astra_redirect_persisted(agent: Any, receipts: list[dict[str, Any]]) -> None:
+    """Do not send another request until the user row and its acknowledgement are durable."""
+    if not receipts:
+        return
+    getter = getattr(getattr(agent, "_session_db", None), "get_session_model_config_value", None)
+    if not callable(getter):
+        raise AstraSteeringPersistenceError("Astra fallback redirect has no durable session store")
+    raw = getter(agent.session_id, _STEERING_MODEL_CONFIG_KEY, {})
+    entries = raw.get("entries", []) if isinstance(raw, dict) else []
+    saved = {entry.get("admission_id") for entry in entries
+             if isinstance(entry, dict) and entry.get("state") == "fallback_delivered"}
+    if any(receipt["admission_id"] not in saved for receipt in receipts):
+        raise AstraSteeringPersistenceError("Astra fallback redirect was not durably delivered")
+    agent._astra_drained_redirect_receipts = []
+
+
 def _safe_steering_text(text: str) -> str:
     """Keep the journal useful without copying credential-like text into metadata."""
     try:
@@ -247,21 +300,7 @@ class AstraWebSocketSession:
                      if isinstance(entry.get("generation", 0), int)),
                     default=0,
                 )
-            # An explicit provider failure is the sole state eligible for the legacy one-shot fallback.
-            fallback_changed = False
-            for entry in self._steering_receipts:
-                if entry.get("state") == "failed":
-                    text = str(entry.get("text") or "").strip()
-                    if text:
-                        pending = str(getattr(self.agent, "_pending_steer", "") or "")
-                        if text not in pending.splitlines():
-                            _append_pending(self.agent, text)
-                    # Claim the one legacy fallback durably before exposing a
-                    # fresh session to another restart, even when text is empty.
-                    entry["state"] = "fallback_queued"
-                    fallback_changed = True
-            if fallback_changed:
-                self._persist_steering_receipts()
+            _queue_failed_redirects(self.agent, self._steering_receipts)
         except Exception as exc:
             self._steering_persistence_error = exc
             self._steering_load_failed = True
@@ -301,7 +340,7 @@ class AstraWebSocketSession:
             self._steering_persistence_error = exc
             raise AstraSteeringPersistenceError("Astra steering ownership admission could not be persisted") from exc
 
-    def _record_steering_state(self, sequence: int, state: str) -> None:
+    def _record_steering_state(self, sequence: int, state: str) -> bool:
         with self._steering_receipt_lock:
             for entry in reversed(self._steering_receipts):
                 if entry.get("generation") == sequence:
@@ -311,10 +350,12 @@ class AstraWebSocketSession:
                     break
             try:
                 self._persist_steering_receipts()
+                return True
             except Exception:
                 # A pre-dispatch record already exists. Never turn an accepted/ambiguous
                 # wire outcome into a retry merely because its later state stamp failed.
                 logger.warning("Astra steering ownership state update failed", exc_info=True)
+                return False
 
     def _append_steering_receipt(self, sequence: int, text: str, previous_id: str) -> None:
         safe_text = _safe_steering_text(text)
@@ -620,11 +661,15 @@ class AstraWebSocketSession:
                 if pending is not None:
                     pending.failed = True
                     sequence = pending.sequence
+                    _remove_pending(self.agent, pending.text)
                 self._await_successor = any(not item.failed and not item.accepted for item in self._steers.values())
                 self._set_state("ACTIVE")
             if sequence is not None:
-                # The explicit failure transfers ownership to the one-shot legacy queue.
-                self._record_steering_state(sequence, "fallback_queued")
+                # Redirect stays internal to the agent loop even when there is no tool
+                # result. Its user row acknowledges this receipt in one DB transaction.
+                if not self._record_steering_state(sequence, "failed"):
+                    raise AstraSteeringPersistenceError("Astra rejection could not be persisted")
+                _queue_failed_redirects(self.agent, self._steering_receipts)
         elif event_type == "response.steer.pending":
             self._set_state("PENDING_REQUIRED_INPUT")
             self._send_required_continuation(event)
