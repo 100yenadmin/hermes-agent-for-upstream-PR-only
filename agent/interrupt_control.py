@@ -310,6 +310,9 @@ class InterruptControlMixin:
         with _ic_lock(self, "_pending_redirect_lock"):
             text = _ic_slot(self, "_pending_redirect_lock", "_pending_redirect")
             self._pending_redirect = None
+            if text and getattr(self, "_astra_pending_redirect_receipts", None):
+                self._astra_drained_redirect_receipts = self._astra_pending_redirect_receipts
+                self._astra_pending_redirect_receipts = []
         return text
 
     def _drain_pending_steer(self) -> Optional[str]:
