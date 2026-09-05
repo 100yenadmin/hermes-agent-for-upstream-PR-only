@@ -252,8 +252,18 @@ def begin_iteration(
             original_user_message = (
                 f"{original_user_message}\n\n" f"User correction during the turn: {_redirect_text}"
             )
-        agent._persist_session(messages, conversation_history)
-        confirm_astra_redirect_persisted(agent, _astra_receipts)
+        try:
+            agent._persist_session(messages, conversation_history)
+            confirm_astra_redirect_persisted(agent, _astra_receipts)
+        except Exception:
+            if _astra_receipts:
+                # The CLI can keep this agent after discarding the failed turn's
+                # messages. Re-read durable truth on retry: the transaction may
+                # have rolled back OR committed before a readback failure. Never
+                # blindly requeue the text and risk delivering it twice.
+                agent._astra_fallback_restore_session = None
+                agent._astra_drained_redirect_receipts = []
+            raise
 
     # Reset per-turn checkpoint dedup so each iteration can take one snapshot.
     agent._checkpoint_mgr.new_turn()
