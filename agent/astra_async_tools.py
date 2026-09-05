@@ -2,8 +2,8 @@
 
 The provider can finish an ``async`` function-call item before the Responses stream reaches its
 terminal frame.  This module admits those items into the existing tool middleware while keeping
-their assistant fragments durable and delaying tool-result rows until the complete stream has
-settled.  It is intentionally an internal coordinator: ordinary providers never instantiate it.
+their assistant fragments durable. Tool-result rows settle in order at stream completion or when
+steering requires a durable prefix. Ordinary providers never instantiate this internal coordinator.
 """
 
 from __future__ import annotations
