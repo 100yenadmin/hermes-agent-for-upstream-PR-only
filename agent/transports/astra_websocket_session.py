@@ -7,6 +7,7 @@ the existing Responses assembler; the socket is only a transport for the provide
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -17,6 +18,19 @@ from urllib.parse import urlsplit
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
+
+
+_STEERING_MODEL_CONFIG_KEY = "_astra_steering"
+_STEERING_JOURNAL_VERSION = 1
+_STEERING_JOURNAL_LIMIT = 16
+_STEERING_STATE_RANK = {
+    "prepared": 10, "sent": 20, "failed": 25, "accepted": 30,
+    "ambiguous": 40, "successor_created": 50, "fallback_queued": 60,
+}
+
+
+class AstraSteeringPersistenceError(RuntimeError):
+    """The durable steering admission record could not be written before dispatch."""
 
 
 class AstraPreDispatchError(RuntimeError):
@@ -128,6 +142,28 @@ def _remove_pending(agent: Any, text: str) -> None:
             agent._pending_steer = "\n".join(parts) or None
 
 
+def _parse_model_config(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return dict(value) if isinstance(value, dict) else {}
+    return {}
+
+
+def _safe_steering_text(text: str) -> str:
+    """Keep the journal useful without copying credential-like text into metadata."""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(text)
+    except Exception:
+        return "[steering input redacted]"
+
+
 @dataclass
 class _Steer:
     sequence: int
@@ -161,6 +197,138 @@ class AstraWebSocketSession:
         self._seen_items: set[tuple[str, str, str]] = set()
         self.delivery_uncertain = False
         self.last_error: Exception | None = None
+        self._steering_receipts: list[dict[str, Any]] = []
+        self._steering_receipt_lock = threading.RLock()
+        self._steering_persistence_error: Exception | None = None
+        self._steering_load_failed = False
+        self._load_steering_receipts()
+
+    def _session_db(self) -> Any:
+        db = getattr(self.agent, "_session_db", None)
+        if db is None:
+            acquire = getattr(self.agent, "_get_session_db_for_recall", None)
+            if callable(acquire):
+                try:
+                    db = acquire()
+                except Exception as exc:
+                    self._steering_persistence_error = exc
+        return db
+
+    def _load_steering_receipts(self) -> None:
+        """Load only the bounded ownership journal; never reconstruct an in-flight send."""
+        db = self._session_db()
+        session_id = str(getattr(self.agent, "session_id", "") or "")
+        if db is None or not session_id:
+            return
+        try:
+            getter = getattr(db, "get_session_model_config_value", None)
+            if callable(getter):
+                raw = getter(session_id, _STEERING_MODEL_CONFIG_KEY, {})
+            else:
+                row = db.get_session(session_id)
+                raw = _parse_model_config((row or {}).get("model_config")).get(_STEERING_MODEL_CONFIG_KEY, {})
+            entries = raw.get("entries", []) if isinstance(raw, dict) else []
+            if isinstance(entries, list):
+                self._steering_receipts = [entry for entry in entries[-_STEERING_JOURNAL_LIMIT:]
+                                           if isinstance(entry, dict)]
+                self._next_sequence = max(
+                    (int(entry.get("generation", 0)) for entry in self._steering_receipts
+                     if isinstance(entry.get("generation", 0), int)),
+                    default=0,
+                )
+            # An explicit provider failure is the sole state eligible for the legacy one-shot fallback.
+            fallback_changed = False
+            for entry in self._steering_receipts:
+                if entry.get("state") == "failed":
+                    text = str(entry.get("text") or "").strip()
+                    if text:
+                        pending = str(getattr(self.agent, "_pending_steer", "") or "")
+                        if text not in pending.splitlines():
+                            _append_pending(self.agent, text)
+                        # Claim the one legacy fallback durably before exposing a
+                        # fresh session to another restart. The current in-memory
+                        # failed path already owns its pending text.
+                        entry["state"] = "fallback_queued"
+                        fallback_changed = True
+            if fallback_changed:
+                self._persist_steering_receipts()
+        except Exception as exc:
+            self._steering_persistence_error = exc
+            self._steering_load_failed = True
+            logger.warning("Astra steering ownership journal read failed; native steering is disabled")
+
+    def _persist_steering_receipts(self) -> None:
+        """Atomically replace the small journal in the existing session model metadata."""
+        db = self._session_db()
+        session_id = str(getattr(self.agent, "session_id", "") or "")
+        if self._steering_load_failed:
+            raise AstraSteeringPersistenceError("Astra steering ownership journal could not be read") from self._steering_persistence_error
+        if db is None or not session_id:
+            # Bare test doubles and legacy non-session callers retain the in-memory ABI.
+            if self._steering_persistence_error is not None:
+                raise AstraSteeringPersistenceError("Astra steering ownership journal is unavailable") from self._steering_persistence_error
+            return
+        ensure = getattr(self.agent, "_ensure_db_session", None)
+        if callable(ensure) and not bool(getattr(self.agent, "_session_db_created", True)):
+            ensure()
+            if not bool(getattr(self.agent, "_session_db_created", False)):
+                raise AstraSteeringPersistenceError("Astra session row is not durable")
+        patch = getattr(db, "patch_session_model_config", None)
+        if not callable(patch):
+            raise AstraSteeringPersistenceError("Astra session store lacks model metadata patching")
+        with self._steering_receipt_lock:
+            payload = {
+                "version": _STEERING_JOURNAL_VERSION,
+                "entries": [dict(entry) for entry in self._steering_receipts[-_STEERING_JOURNAL_LIMIT:]],
+            }
+        try:
+            patch(session_id, {_STEERING_MODEL_CONFIG_KEY: payload})
+            self._steering_persistence_error = None
+        except Exception as exc:
+            self._steering_persistence_error = exc
+            raise AstraSteeringPersistenceError("Astra steering ownership admission could not be persisted") from exc
+
+    def _record_steering_state(self, sequence: int, state: str) -> None:
+        with self._steering_receipt_lock:
+            for entry in reversed(self._steering_receipts):
+                if entry.get("generation") == sequence:
+                    old_state = str(entry.get("state") or "prepared")
+                    if _STEERING_STATE_RANK.get(state, 0) >= _STEERING_STATE_RANK.get(old_state, 0):
+                        entry["state"] = state
+                    break
+            try:
+                self._persist_steering_receipts()
+            except Exception:
+                # A pre-dispatch record already exists. Never turn an accepted/ambiguous
+                # wire outcome into a retry merely because its later state stamp failed.
+                logger.warning("Astra steering ownership state update failed", exc_info=True)
+
+    def _append_steering_receipt(self, sequence: int, text: str, previous_id: str) -> None:
+        safe_text = _safe_steering_text(text)
+        wire_input = [{"role": "user", "content": [{"type": "input_text", "text": safe_text}]}]
+        input_digest = hashlib.sha256(
+            json.dumps(
+                [{"role": "user", "content": [{"type": "input_text", "text": text}]}],
+                ensure_ascii=False, separators=(",", ":"),
+            ).encode("utf-8", errors="surrogatepass")
+        ).hexdigest()
+        session_id = str(getattr(self.agent, "session_id", "") or "")
+        admission_id = hashlib.sha256(
+            f"{session_id}\0{sequence}\0{previous_id}".encode("utf-8", errors="surrogatepass")
+        ).hexdigest()[:24]
+        with self._steering_receipt_lock:
+            self._steering_receipts.append({
+                "version": _STEERING_JOURNAL_VERSION,
+                "admission_id": admission_id,
+                "generation": sequence,
+                "response_id": previous_id,
+                "input": wire_input,
+                "input_sha256": input_digest,
+                "text": safe_text,
+                "state": "prepared",
+            })
+            del self._steering_receipts[:-_STEERING_JOURNAL_LIMIT]
+        self._persist_steering_receipts()
 
     @property
     def state(self) -> str:
@@ -208,17 +376,36 @@ class AstraWebSocketSession:
             if self._socket is None or self._state not in {"ACTIVE", "SUCCESSOR_CREATED", "ACCEPTED"} or not self._response_id:
                 return False
             previous_id = self._response_id
+            previous_state = self._state
+            previous_await_successor = self._await_successor
             sequence = self._append_steer(cleaned)
+            try:
+                # Ownership is durable before any provider bytes leave the socket.
+                self._append_steering_receipt(sequence, cleaned, previous_id)
+            except Exception:
+                with self._steering_receipt_lock:
+                    self._steering_receipts = [
+                        entry for entry in self._steering_receipts
+                        if entry.get("generation") != sequence
+                    ]
+                self._steers.pop(sequence, None)
+                self._await_successor = previous_await_successor
+                self._set_state(previous_state)
+                _remove_pending(self.agent, cleaned)
+                raise
+            wire_input = [{"role": "user", "content": [{"type": "input_text", "text": cleaned}]}]
         try:
             # Responses steering deliberately has a tiny wire shape. In particular, stream_id is never sent.
             self._send({
                 "type": "response.steer", "previous_response_id": previous_id,
-                "input": [{"role": "user", "content": [{"type": "input_text", "text": cleaned}]}],
+                "input": wire_input,
             })
         except AstraDeliveryUncertainError:
             # The provider may have accepted the input; leaving it in Hermes' fallback queue could duplicate it.
             _remove_pending(self.agent, cleaned)
+            self._record_steering_state(sequence, "ambiguous")
             raise
+        self._record_steering_state(sequence, "sent")
         return bool(sequence)
 
     def request_interrupt(self) -> None:
@@ -370,26 +557,43 @@ class AstraWebSocketSession:
                 return
             if not self._await_successor:
                 return
+            predecessor_id = self._response_id
+            successor_sequences = [
+                item.sequence for item in self._steers.values()
+                if item.previous_response_id == predecessor_id and not item.failed
+            ]
             self._response_id = response_id
             self._assemblers[response_id] = self._new_assembler(response_id)
             self._await_successor = False
             self._set_state("SUCCESSOR_CREATED")
+        # A successor is the provider's durable ownership receipt. Once observed,
+        # reconstruction must never put these steer inputs back in the fallback queue.
+        for sequence in successor_sequences:
+            self._record_steering_state(sequence, "successor_created")
 
     def _steer_event(self, event: Any, event_type: str) -> None:
         if event_type == "response.steer.accepted":
+            sequence = None
             with self._state_lock:
                 pending = next((item for item in self._steers.values() if not item.accepted and not item.failed), None)
                 if pending is not None:
                     pending.accepted = True
+                    sequence = pending.sequence
                     _remove_pending(self.agent, pending.text)
                 self._set_state("ACCEPTED")
+            if sequence is not None:
+                self._record_steering_state(sequence, "accepted")
         elif event_type == "response.steer.failed":
+            sequence = None
             with self._state_lock:
                 pending = next((item for item in self._steers.values() if not item.accepted and not item.failed), None)
                 if pending is not None:
                     pending.failed = True
+                    sequence = pending.sequence
                 self._await_successor = any(not item.failed and not item.accepted for item in self._steers.values())
                 self._set_state("ACTIVE")
+            if sequence is not None:
+                self._record_steering_state(sequence, "failed")
         elif event_type == "response.steer.pending":
             self._set_state("PENDING_REQUIRED_INPUT")
             self._send_required_continuation(event)
