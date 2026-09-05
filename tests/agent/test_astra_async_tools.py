@@ -309,3 +309,65 @@ def test_publish_failure_recovers_once_without_reexecuting_handler(patched_execu
     assert publish_calls == ["call_fail"]
     assert len(flushes) == 2
     assert "[Orphan recovery:" in flushes[-1][-1]["content"]
+
+
+def test_settle_required_persists_ordered_prefix_once_and_finish_stream_is_idempotent(patched_executor, monkeypatch):
+    _, starts, committed = patched_executor
+    import agent.tool_executor as tool_executor
+
+    persisted = []
+    agent = _FakeAgent(persisted)
+
+    def publish(agent, messages, ref, managed, **kwargs):
+        committed.append(ref.call_id)
+        messages.append({"role": "tool", "tool_call_id": ref.call_id, "content": managed.result})
+        assert agent._flush_messages_to_session_db(messages) is True
+        return True
+
+    monkeypatch.setattr(tool_executor, "_publish_sequential_result", publish)
+    executor = AstraAsyncExecutor(agent, [], "task")
+    executor.admit(_tool("safe_a", "a"))
+    executor.admit(_tool("unsafe", "b"))
+    last = _tool("safe_c", "c")
+    executor.admit(last)
+
+    assert executor.settle_required([last.call_id]) is True
+    assert committed == ["call_a", "call_b", "call_c"]
+    assert [row["tool_call_id"] for row in persisted[-1] if row.get("role") == "tool"] == committed
+    assert executor.settle_required([last.call_id]) is True
+    assert committed == ["call_a", "call_b", "call_c"]
+
+    assert executor.finish_stream() is True
+    assert executor.finish_stream() is True
+    assert committed == ["call_a", "call_b", "call_c"]
+    assert [row["tool_call_id"] for row in agent._session_messages if row.get("role") == "tool"] == committed
+    assert starts.count("call_c") == 1
+
+
+def test_settle_required_persistence_failure_never_reexecutes_or_exposes_result(patched_executor, monkeypatch):
+    _, starts, _ = patched_executor
+    import agent.tool_executor as tool_executor
+
+    persisted = []
+    agent = _FakeAgent(persisted)
+
+    def flush(messages):
+        if any(row.get("role") == "tool" for row in messages):
+            return False
+        persisted.append([row.copy() for row in messages])
+        return True
+
+    agent._flush_messages_to_session_db = flush
+
+    def publish(agent, messages, ref, managed, **kwargs):
+        messages.append({"role": "tool", "tool_call_id": ref.call_id, "content": managed.result})
+        return agent._flush_messages_to_session_db(messages)
+
+    monkeypatch.setattr(tool_executor, "_publish_sequential_result", publish)
+    executor = AstraAsyncExecutor(agent, [], "task")
+    call = _tool("safe", "no-durable-result")
+    assert executor.admit(call) is True
+
+    assert executor.settle_required([call.call_id]) is False
+    assert starts == [call.call_id]
+    assert all(not any(row.get("role") == "tool" for row in batch) for batch in persisted)

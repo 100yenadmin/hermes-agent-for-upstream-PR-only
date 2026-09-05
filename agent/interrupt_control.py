@@ -253,7 +253,10 @@ class InterruptControlMixin:
             return False
         cleaned = text.strip()
 
-        _native_steer = _ic_codex_method(self, "request_steer") or _ic_astra_method(self, "request_steer")
+        _native_steer = _ic_codex_method(self, "request_steer")
+        _astra_redirect = _native_steer is None
+        if _astra_redirect:
+            _native_steer = _ic_astra_method(self, "request_steer")
         if _native_steer is not None:
             with _ic_lock(self, "_pending_redirect_lock"):
                 if self._interrupt_requested:
@@ -261,6 +264,12 @@ class InterruptControlMixin:
             try:
                 return bool(_native_steer(cleaned))
             except Exception:
+                # A post-dispatch socket outcome is ambiguous: the gateway must not
+                # turn the same correction into an interrupt/requeue duplicate.
+                session = getattr(self, "_astra_websocket_session", None) if _astra_redirect else None
+                if getattr(session, "delivery_uncertain", False):
+                    logger.warning("Astra WebSocket redirect outcome is delivery-uncertain; suppressing resend")
+                    return True
                 logger.debug("Codex app-server turn/steer failed", exc_info=True)
                 return False
 
