@@ -553,6 +553,10 @@ export function useGatewayBoot({
       }
     }
 
+    // Primary callbacks outlive boot adoption and registry route changes, so
+    // keep their source scope aligned with the socket's current profile.
+    let sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
+
     // Adopt the profile the primary (window) backend booted as, so same-profile
     // resumes are no-op swaps and reconnects target the right backend.
     // Best-effort: a missing preference means "default". Shared by boot + soft
@@ -575,6 +579,7 @@ export function useGatewayBoot({
         }
 
         const key = normalizeProfileKey(profileKey)
+        sourceProfile = key
         $activeGatewayProfile.set(key)
         setPrimaryGateway(gateway, key)
         void ensureGatewayForProfile(key)
@@ -583,7 +588,9 @@ export function useGatewayBoot({
           return false
         }
 
-        $activeGatewayProfile.set(normalizeProfileKey(override))
+        const key = normalizeProfileKey(override)
+        sourceProfile = key
+        $activeGatewayProfile.set(key)
       }
 
       return true
@@ -805,9 +812,10 @@ export function useGatewayBoot({
     }
 
     const gateway = adoptedFromHmr ? survivor!.gateway : new HermesGateway()
+    sourceProfile = normalizeProfileKey(survivor?.profile ?? $activeGatewayProfile.get())
 
     callbacksRef.current.onGatewayReady(gateway)
-    setPrimaryGateway(gateway, survivor?.profile ?? normalizeProfileKey($activeGatewayProfile.get()))
+    setPrimaryGateway(gateway, sourceProfile)
     // Secondary (background-profile) sockets funnel into the same handler.
     // Record each event's source scope first: registry-tagged events feed the
     // (connectionId, profile) keep-set so two sources exposing the same
@@ -841,6 +849,10 @@ export function useGatewayBoot({
       // own backend sat healthy and idle.
       onActiveRouteChanged: profile => {
         const key = normalizeProfileKey(profile)
+
+        if (activeGateway() === gateway) {
+          sourceProfile = key
+        }
 
         if (normalizeProfileKey($activeGatewayProfile.get()) !== key) {
           $activeGatewayProfile.set(key)
@@ -907,8 +919,6 @@ export function useGatewayBoot({
         scheduleReconnect()
       }
     })
-
-    const sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
 
     const offEvent = gateway.onEvent(event => {
       const connectionId = activeGatewayConnectionId()

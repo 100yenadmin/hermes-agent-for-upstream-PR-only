@@ -166,6 +166,10 @@ class FakeWebSocket {
     // 'silent': swallow — a healthy socket answers, a half-open one never does.
   }
 
+  message(frame: unknown) {
+    this.emit('message', { data: JSON.stringify(frame) })
+  }
+
   private emit(type: string, ev: unknown) {
     for (const fn of this.listeners[type] ?? []) {
       fn(ev)
@@ -248,17 +252,21 @@ function fakeDesktop() {
 
 function Harness({
   beforeConnectionSwitch = () => undefined,
+  handleGatewayEvent = () => undefined,
+  handleServerRequest = () => false,
   refreshHermesConfig = async () => undefined,
   refreshSessions
 }: {
   beforeConnectionSwitch?: () => void
+  handleGatewayEvent?: Parameters<typeof useGatewayBoot>[0]['handleGatewayEvent']
+  handleServerRequest?: Parameters<typeof useGatewayBoot>[0]['handleServerRequest']
   refreshHermesConfig?: (force?: boolean, shouldPublish?: () => boolean) => Promise<void>
   refreshSessions?: (shouldPublish?: () => boolean) => Promise<void>
 } = {}) {
   useGatewayBoot({
     beforeConnectionSwitch,
-    handleGatewayEvent: () => undefined,
-    handleServerRequest: () => false,
+    handleGatewayEvent,
+    handleServerRequest,
     onConnectionReady: () => undefined,
     onGatewayReady: () => undefined,
     refreshHermesConfig,
@@ -574,6 +582,69 @@ describe('primary failure foreground isolation', () => {
 })
 
 describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => {
+  it('scopes primary traffic to the non-default profile adopted after the socket connects', async () => {
+    const desktop = fakeDesktop()
+    desktop.profile.get = vi.fn(async () => ({ profile: 'writer' }))
+
+    const events: Array<{ profile?: string }> = []
+
+    const requests: Array<{ profile: string }> = []
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+    render(
+      <Harness
+        handleGatewayEvent={event => events.push(event)}
+        handleServerRequest={request => {
+          requests.push(request)
+
+          return true
+        }}
+      />
+    )
+    await flushAsync()
+
+    act(() => {
+      FakeWebSocket.instances[0]?.message({
+        jsonrpc: '2.0',
+        method: 'event',
+        params: { type: 'session.updated', session_id: 's-1' }
+      })
+      FakeWebSocket.instances[0]?.message({
+        id: 'srq-1',
+        jsonrpc: '2.0',
+        method: 'clarify',
+        params: { session_id: 's-1' }
+      })
+    })
+
+    expect.soft(events).toContainEqual(expect.objectContaining({ profile: 'writer' }))
+    expect.soft(requests).toContainEqual(expect.objectContaining({ profile: 'writer' }))
+
+    events.length = 0
+    requests.length = 0
+    vi.useRealTimers()
+    await ensureGatewayProfile('coder')
+    vi.useFakeTimers()
+
+    expect(isActivePrimary()).toBe(false)
+    act(() => {
+      FakeWebSocket.instances[0]?.message({
+        jsonrpc: '2.0',
+        method: 'event',
+        params: { type: 'session.updated', session_id: 's-2' }
+      })
+      FakeWebSocket.instances[0]?.message({
+        id: 'srq-2',
+        jsonrpc: '2.0',
+        method: 'clarify',
+        params: { session_id: 's-2' }
+      })
+    })
+
+    expect.soft(events).toContainEqual(expect.objectContaining({ profile: 'writer' }))
+    expect.soft(requests).toContainEqual(expect.objectContaining({ profile: 'writer' }))
+  })
+
   it('INITIAL boot against a dead VPS: getConnection hangs (waitForHermes) → app sits in the connecting combo, then fails', async () => {
     // The report's actual path: a fresh launch pointed at an unreachable VPS.
     // startHermes()'s remote branch awaits waitForHermes() for 45s before it
