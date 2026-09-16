@@ -27,18 +27,18 @@ STABLE_TAG_STRATEGIES = {"stable-tags", "stable_tags", "stable-tag", "tags"}
 UPDATE_CHANNELS = {"main", "release"}
 
 
-def normalize_update_channel(value: Any, *, default: str = "main") -> str:
-    """Normalize a user-facing update channel to ``main`` or ``release``."""
-    normalized_default = default if default in UPDATE_CHANNELS else "main"
+def normalize_update_channel(value: Any, *, default: str = "release") -> str:
+    """Normalize stable/beta (and historical release/main) to one internal channel."""
+    normalized_default = default if default in UPDATE_CHANNELS else "release"
     raw = str(value or "").strip().lower()
-    if raw in {"release", *STABLE_TAG_STRATEGIES}:
+    if raw in {"release", "stable", *STABLE_TAG_STRATEGIES}:
         return "release"
-    if raw in {"main", "branch", "fast", "fast-track", "fast_track"}:
+    if raw in {"main", "beta", "branch", "fast", "fast-track", "fast_track"}:
         return "main"
     return normalized_default
 
 
-def configured_update_channel(config: dict[str, Any] | None, *, default: str = "main") -> str:
+def configured_update_channel(config: dict[str, Any] | None, *, default: str = "release") -> str:
     """Return the canonical update channel from an effective config mapping."""
     updates = config.get("updates", {}) if isinstance(config, dict) else {}
     if not isinstance(updates, dict):
@@ -70,9 +70,12 @@ def stable_update_config(config: dict[str, Any] | None) -> dict[str, str]:
 
 
 def _run_git(repo_dir: Path, args: list[str], *, timeout: float = 10.0) -> subprocess.CompletedProcess[str]:
+    # Embedded/source builds may have no checkout. Git ref probes can still use
+    # the process cwd for the canonical remote, but never fail over to main.
+    cwd = str(repo_dir) if (Path(repo_dir) / ".git").exists() else None
     return subprocess.run(
         ["git", *args],
-        cwd=str(repo_dir),
+        cwd=cwd,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -203,7 +206,7 @@ def _official_tag_commit(repo_dir: Path, tag: str) -> tuple[Optional[str], Optio
     return commit, None if commit else f"Official release tag '{tag}' was not found in the official repository."
 
 
-def official_release_status(repo_dir: Path) -> dict[str, Any]:
+def official_release_status(repo_dir: Path, *, current_sha: str | None = None) -> dict[str, Any]:
     """Return exact-pin status against the latest published GitHub Release."""
     latest_tag, error = resolve_published_release_tag()
     target_commit = None
@@ -212,7 +215,7 @@ def official_release_status(repo_dir: Path) -> dict[str, Any]:
     status: dict[str, Any] = {
         "mode": "official-releases",
         "current_release_tag": None,
-        "head": resolve_commit(Path(repo_dir), "HEAD"),
+        "head": (str(current_sha).strip().lower() if current_sha else resolve_commit(Path(repo_dir), "HEAD")),
         "latest_tag": None,
         "target_tag": None,
         "target_commit": None,

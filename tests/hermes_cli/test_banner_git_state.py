@@ -17,8 +17,13 @@ def test_format_banner_version_label_on_upstream_main():
     assert "local" not in value
 
 
-def test_get_git_banner_state_reads_origin_and_head(tmp_path):
-    from hermes_cli import banner
+def test_get_git_banner_state_reads_origin_and_head(tmp_path, monkeypatch):
+    from hermes_cli import banner, update_channel
+
+    record_root = tmp_path / "hermes-root"
+    record_root.mkdir()
+    monkeypatch.setattr(update_channel, "get_default_hermes_root", lambda: record_root)
+    update_channel.write_channel_record("beta", record_root)
 
     repo_dir = tmp_path / "repo"
     (repo_dir / ".git").mkdir(parents=True)

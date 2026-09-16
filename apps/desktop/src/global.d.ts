@@ -566,6 +566,8 @@ declare global {
         apply: (opts?: DesktopUpdateApplyOptions) => Promise<DesktopUpdateApplyResult>
         getBranch: () => Promise<{ branch: string }>
         setBranch: (name: string) => Promise<{ branch: string }>
+        getTrack: () => Promise<{ channel: 'stable' | 'beta'; recordPath: string }>
+        setTrack: (track: 'stable' | 'beta') => Promise<{ channel: 'stable' | 'beta'; recordPath: string }>
         onProgress: (callback: (payload: DesktopUpdateProgress) => void) => () => void
       }
       uninstall: {
@@ -699,6 +701,10 @@ export interface DesktopUpdateCommit {
 export interface DesktopUpdateStatus {
   supported: boolean
   updateAvailable?: boolean
+  /** Update channel of the checked target: 'stable' (official releases) or 'beta' (main). */
+  channel?: 'stable' | 'beta'
+  /** Legacy salvage field; the store normalizes it from channel. */
+  track?: 'release' | 'main'
   branch?: string
   currentBranch?: string
   reason?: string
@@ -712,6 +718,10 @@ export interface DesktopUpdateStatus {
   /** Backend only: the version string the backend reports for itself. */
   currentVersion?: string
   targetSha?: string
+  /** Stable channel: the release tag targetRelease names. */
+  targetRelease?: string
+  currentRelease?: string | null
+  releases?: Array<{ body: string; name: string; publishedAt: string; sha: string; tag: string; url: string }>
   commits?: DesktopUpdateCommit[]
   dirty?: boolean
   fetchedAt?: number

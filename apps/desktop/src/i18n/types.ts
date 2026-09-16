@@ -805,6 +805,13 @@ export interface Translations {
       releaseTrackHint: (version: string) => string
       unknownVersion: string
       branchCommit: (branch: string, commit: string) => string
+      channel: string
+      channelDesc: string
+      channelStable: string
+      channelStableDesc: string
+      channelBeta: string
+      channelBetaDesc: string
+      channelPersistOnlyNote: string
       never: string
       justNow: string
       minAgo: (count: number) => string

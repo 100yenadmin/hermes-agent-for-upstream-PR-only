@@ -11,6 +11,25 @@ from hermes_cli.main import cmd_update, PROJECT_ROOT
 from hermes_cli import main_web_build
 from hermes_cli import main_install_repair
 from hermes_cli import update_cmd
+import pytest
+
+from hermes_cli import update_channel
+
+pytestmark = pytest.mark.stable_channel_default
+
+
+@pytest.fixture
+def beta_channel_record(tmp_path, monkeypatch):
+    """Pin the branch (beta) pipeline for branch-flow tests.
+
+    The stable channel is the default when no record exists; these tests
+    exercise the branch machinery, so they need the beta record present.
+    """
+    record_root = tmp_path / "hermes-root"
+    record_root.mkdir()
+    monkeypatch.setattr(update_channel, "get_default_hermes_root", lambda: record_root)
+    update_channel.write_channel_record("beta", record_root)
+    return record_root
 
 
 def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
@@ -264,7 +283,13 @@ class TestUpdateManagedPythonEnvIsolation:
 
 
 class TestCmdUpdateBranchFallback:
-    """cmd_update falls back to main when current branch has no remote counterpart."""
+    """cmd_update branch fallback when remote branch doesn't exist."""
+
+    @pytest.fixture(autouse=True)
+    def _beta_pipeline(self, beta_channel_record):
+        """These tests pin the historical branch behaviour; the stable channel is
+        the new default, so give them the beta record explicitly."""
+        return beta_channel_record
 
 
 
@@ -557,6 +582,12 @@ class TestCmdUpdateMigrationPrompt:
     yes looked like a no-op.
     """
 
+    @pytest.fixture(autouse=True)
+    def _beta_pipeline(self, beta_channel_record):
+        """Branch-pipeline tests pin the historical branch behaviour; the stable
+        channel is the new default, so give them the beta record explicitly."""
+        return beta_channel_record
+
     def test_version_bump_only_applies_silently_without_prompt(
         self, mock_args, capsys
     ):
@@ -709,6 +740,12 @@ class TestCmdUpdateProfileSkillSync:
     from the seed_profile_skills loop, leaving it on stale skill content.
     """
 
+    @pytest.fixture(autouse=True)
+    def _beta_pipeline(self, beta_channel_record):
+        """Branch-pipeline tests pin the historical branch behaviour; the stable
+        channel is the new default, so give them the beta record explicitly."""
+        return beta_channel_record
+
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_active_profile_included_in_skill_sync(
@@ -783,6 +820,12 @@ class TestCmdUpdateBranchFlag:
     The CLI default stays 'main'; --branch lets callers pick a different
     target without monkey-patching the implementation.
     """
+
+    @pytest.fixture(autouse=True)
+    def _beta_pipeline(self, beta_channel_record):
+        """Branch-pipeline tests pin the historical branch behaviour; the stable
+        channel is the new default, so give them the beta record explicitly."""
+        return beta_channel_record
 
     def _branch_side_effect(self, current_branch, target_branch, *, checkout_fails=False, track_fails=False, commit_count="0"):
         """Mock side-effect that knows about checkout/track behavior.
@@ -874,6 +917,12 @@ class TestCmdUpdateCheckBranchFlag:
     friendlier behavior: detect-the-missing-ref before rev-list, exit 1
     with a clear message.
     """
+
+    @pytest.fixture(autouse=True)
+    def _beta_pipeline(self, beta_channel_record):
+        """Branch-mode checks need the beta record: with no record the stable
+        channel is the default and --check resolves official releases instead."""
+        return beta_channel_record
 
     def _check_side_effect(
         self,
@@ -1019,22 +1068,22 @@ class TestResolveReleaseRequest:
     """``--release`` parsing: absent vs. bare vs. explicit tag."""
 
     def test_absent_returns_none(self):
-        from hermes_cli.main import _resolve_release_request
+        from hermes_cli.update_cmd_release import _resolve_release_request
 
         assert _resolve_release_request(SimpleNamespace(release=None)) is None
 
     def test_bare_flag_means_latest(self):
-        from hermes_cli.main import _resolve_release_request, RELEASE_LATEST
+        from hermes_cli.update_cmd_release import RELEASE_LATEST, _resolve_release_request
 
         assert _resolve_release_request(SimpleNamespace(release="latest")) == RELEASE_LATEST
 
     def test_blank_collapses_to_latest(self):
-        from hermes_cli.main import _resolve_release_request, RELEASE_LATEST
+        from hermes_cli.update_cmd_release import RELEASE_LATEST, _resolve_release_request
 
         assert _resolve_release_request(SimpleNamespace(release="   ")) == RELEASE_LATEST
 
     def test_explicit_tag_preserved(self):
-        from hermes_cli.main import _resolve_release_request
+        from hermes_cli.update_cmd_release import _resolve_release_request
 
         assert _resolve_release_request(SimpleNamespace(release="v2026.5.29")) == "v2026.5.29"
 
@@ -1292,6 +1341,12 @@ termux = ["rich>=14"]
 class TestNodeRuntimeNpmResolution:
     """Regression tests for #30271 — WSL must not run Windows npm against the
     Linux checkout, and a failed Node refresh must not report success."""
+
+    @pytest.fixture(autouse=True)
+    def _beta_pipeline(self, beta_channel_record):
+        """Branch-pipeline tests pin the historical branch behaviour; the stable
+        channel is the new default, so give them the beta record explicitly."""
+        return beta_channel_record
 
 
 
