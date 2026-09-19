@@ -1,0 +1,2130 @@
+{
+  "advanced_offline_sha": "d3ae318d37de4ad1199ab385cfc8e67f6ce3c4aa",
+  "claim_class": "advisory",
+  "control_sha": "00570550f37e9082676955d50f65c7d9ba846cc9",
+  "counter_lines": {
+    "astra-proof-counter.txt": 1,
+    "gateway-proof-counter.txt": 1
+  },
+  "elapsed_to_last_dispatch_seconds": 1274.2980659008026,
+  "request_count": 59,
+  "request_limit": 60,
+  "requests": [
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {},
+      "instructions_sha256": null,
+      "method": "GET",
+      "model": null,
+      "number": 1,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "account_discovery",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {},
+      "instructions_sha256": null,
+      "method": "GET",
+      "model": null,
+      "number": 2,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "cli_tool",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {
+        "user": 1
+      },
+      "instructions_sha256": null,
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 3,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "cli_tool",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {
+        "user": 1
+      },
+      "instructions_sha256": null,
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 4,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/responses",
+      "reasoning": null,
+      "scenario": "cli_tool",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {
+        "function_call": 1,
+        "function_call_output": 1,
+        "user": 1
+      },
+      "instructions_sha256": null,
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 5,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "cli_tool",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {},
+      "instructions_sha256": null,
+      "method": "GET",
+      "model": null,
+      "number": 6,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "cli_resume",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {
+        "function_call": 1,
+        "function_call_output": 1,
+        "message": 1,
+        "user": 2
+      },
+      "instructions_sha256": null,
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 7,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "cli_resume",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 8,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "gateway_initial",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {
+        "user": 1
+      },
+      "instructions_sha256": "9adcf0c7a84b1d759d3e97f07a55584a055431f673856e1c6d3678a686aebd5e",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 9,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "gateway_initial",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {
+        "function_call": 1,
+        "function_call_output": 1,
+        "user": 1
+      },
+      "instructions_sha256": "9adcf0c7a84b1d759d3e97f07a55584a055431f673856e1c6d3678a686aebd5e",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 10,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "gateway_initial",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 11,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "gateway_resume",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {
+        "function_call": 1,
+        "function_call_output": 1,
+        "message": 1,
+        "user": 2
+      },
+      "instructions_sha256": "9adcf0c7a84b1d759d3e97f07a55584a055431f673856e1c6d3678a686aebd5e",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 12,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "gateway_resume",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 13,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "cli_image",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {
+        "user": 1
+      },
+      "instructions_sha256": "e8fd072d764a1d6bf198b818cff96414d8bf6702e583f3ebb0c4a3296b1a543c",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 14,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "high",
+        "summary": "auto"
+      },
+      "scenario": "cli_image",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 15,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "native_1_first",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": [
+        {
+          "compact_threshold": 16000,
+          "type": "compaction"
+        }
+      ],
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {
+        "assistant": 121,
+        "function_call": 120,
+        "function_call_output": 120,
+        "user": 2
+      },
+      "instructions_sha256": "e8fd072d764a1d6bf198b818cff96414d8bf6702e583f3ebb0c4a3296b1a543c",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 16,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "native_1_first",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 17,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "native_1_resume",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": [
+        {
+          "compact_threshold": 16000,
+          "type": "compaction"
+        }
+      ],
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {
+        "compaction": 1,
+        "message": 1,
+        "user": 3
+      },
+      "instructions_sha256": "e8fd072d764a1d6bf198b818cff96414d8bf6702e583f3ebb0c4a3296b1a543c",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 18,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "native_1_resume",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": [
+        {
+          "compact_threshold": 16000,
+          "type": "compaction"
+        }
+      ],
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {
+        "compaction": 1,
+        "function_call": 1,
+        "function_call_output": 1,
+        "message": 1,
+        "user": 3
+      },
+      "instructions_sha256": "e8fd072d764a1d6bf198b818cff96414d8bf6702e583f3ebb0c4a3296b1a543c",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 19,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "native_1_resume",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 20,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "local_1_first",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {
+        "assistant": 121,
+        "function_call": 120,
+        "function_call_output": 120,
+        "user": 2
+      },
+      "instructions_sha256": "e8fd072d764a1d6bf198b818cff96414d8bf6702e583f3ebb0c4a3296b1a543c",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 21,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "local_1_first",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 4.680054664611816,
+      "usage": {
+        "input_tokens": 20442,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 77,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 20519
+      }
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 22,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "local_1_resume",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {
+        "user": 1
+      },
+      "instructions_sha256": "75357d685f238b6afd7738be9786fdafde641eb6ca9a3be7471939715a68a4de",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 23,
+      "output_type_counts": {
+        "message": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "local_1_resume",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 72.7482852935791,
+      "usage": {
+        "input_tokens": 7180,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 2373,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 9553
+      }
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {
+        "assistant": 5,
+        "function_call": 4,
+        "function_call_output": 4,
+        "message": 1,
+        "user": 3
+      },
+      "instructions_sha256": "e8fd072d764a1d6bf198b818cff96414d8bf6702e583f3ebb0c4a3296b1a543c",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 24,
+      "output_type_counts": {
+        "function_call": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "local_1_resume",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 4.1671857833862305,
+      "usage": {
+        "input_tokens": 6724,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 22,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 6746
+      }
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {
+        "assistant": 5,
+        "function_call": 5,
+        "function_call_output": 5,
+        "message": 1,
+        "user": 3
+      },
+      "instructions_sha256": "e8fd072d764a1d6bf198b818cff96414d8bf6702e583f3ebb0c4a3296b1a543c",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 25,
+      "output_type_counts": {
+        "message": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "local_1_resume",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 6.762763977050781,
+      "usage": {
+        "input_tokens": 6778,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 6528
+        },
+        "output_tokens": 77,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 6855
+      }
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 26,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "gateway_steer",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {
+        "user": 1
+      },
+      "instructions_sha256": "9adcf0c7a84b1d759d3e97f07a55584a055431f673856e1c6d3678a686aebd5e",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 27,
+      "output_type_counts": {
+        "function_call": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "gateway_steer",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 2.8779611587524414,
+      "usage": {
+        "input_tokens": 3320,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 31,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 3351
+      }
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": null,
+      "input_type_counts": {
+        "function_call": 1,
+        "function_call_output": 1,
+        "user": 2
+      },
+      "instructions_sha256": "9adcf0c7a84b1d759d3e97f07a55584a055431f673856e1c6d3678a686aebd5e",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 28,
+      "output_type_counts": {
+        "message": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "gateway_steer",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 4.224339962005615,
+      "usage": {
+        "input_tokens": 3444,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 3200
+        },
+        "output_tokens": 5,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 3449
+      }
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 29,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "independent_tools",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {
+        "user": 1
+      },
+      "instructions_sha256": "e8fd072d764a1d6bf198b818cff96414d8bf6702e583f3ebb0c4a3296b1a543c",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 30,
+      "output_type_counts": {
+        "function_call": 2
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "independent_tools",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 3.357008934020996,
+      "usage": {
+        "input_tokens": 3379,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 52,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 3431
+      }
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {
+        "function_call": 2,
+        "function_call_output": 2,
+        "user": 1
+      },
+      "instructions_sha256": "e8fd072d764a1d6bf198b818cff96414d8bf6702e583f3ebb0c4a3296b1a543c",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 31,
+      "output_type_counts": {
+        "message": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "independent_tools",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 3.549616813659668,
+      "usage": {
+        "input_tokens": 3489,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 3200
+        },
+        "output_tokens": 8,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 3497
+      }
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 32,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "local_2_first",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {
+        "assistant": 121,
+        "function_call": 120,
+        "function_call_output": 120,
+        "user": 2
+      },
+      "instructions_sha256": "e8fd072d764a1d6bf198b818cff96414d8bf6702e583f3ebb0c4a3296b1a543c",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 33,
+      "output_type_counts": {
+        "message": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "local_2_first",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 5.902847051620483,
+      "usage": {
+        "input_tokens": 20442,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 77,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 20519
+      }
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 34,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "local_2_resume",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {
+        "user": 1
+      },
+      "instructions_sha256": "75357d685f238b6afd7738be9786fdafde641eb6ca9a3be7471939715a68a4de",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 35,
+      "output_type_counts": {
+        "message": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "local_2_resume",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 70.10733318328857,
+      "usage": {
+        "input_tokens": 7178,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 2268,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 9446
+      }
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {
+        "assistant": 5,
+        "function_call": 4,
+        "function_call_output": 4,
+        "message": 1,
+        "user": 3
+      },
+      "instructions_sha256": "e8fd072d764a1d6bf198b818cff96414d8bf6702e583f3ebb0c4a3296b1a543c",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 36,
+      "output_type_counts": {
+        "function_call": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "local_2_resume",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 2.6660590171813965,
+      "usage": {
+        "input_tokens": 6618,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 3200
+        },
+        "output_tokens": 21,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 6639
+      }
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {
+        "assistant": 5,
+        "function_call": 5,
+        "function_call_output": 5,
+        "message": 1,
+        "user": 3
+      },
+      "instructions_sha256": "e8fd072d764a1d6bf198b818cff96414d8bf6702e583f3ebb0c4a3296b1a543c",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 37,
+      "output_type_counts": {
+        "message": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "local_2_resume",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 4.310121297836304,
+      "usage": {
+        "input_tokens": 6670,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 6528
+        },
+        "output_tokens": 77,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 6747
+      }
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 38,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "native_2_first",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": [
+        "c37110891757d0afb568f2c8c5a22ab585291969d33e1a2c6a8b770000676b76"
+      ],
+      "context_management": [
+        {
+          "compact_threshold": 16000,
+          "type": "compaction"
+        }
+      ],
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {
+        "assistant": 121,
+        "function_call": 120,
+        "function_call_output": 120,
+        "user": 2
+      },
+      "instructions_sha256": "e8fd072d764a1d6bf198b818cff96414d8bf6702e583f3ebb0c4a3296b1a543c",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 39,
+      "output_type_counts": {
+        "compaction": 1,
+        "message": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "native_2_first",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 16.1918728351593,
+      "usage": {
+        "input_tokens": 19529,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 413,
+        "output_tokens_details": {
+          "reasoning_tokens": 299
+        },
+        "total_tokens": 19942
+      }
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 40,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "native_2_resume",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": [
+        {
+          "compact_threshold": 16000,
+          "type": "compaction"
+        }
+      ],
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [
+        "c37110891757d0afb568f2c8c5a22ab585291969d33e1a2c6a8b770000676b76"
+      ],
+      "input_type_counts": {
+        "compaction": 1,
+        "message": 1,
+        "user": 3
+      },
+      "instructions_sha256": "e8fd072d764a1d6bf198b818cff96414d8bf6702e583f3ebb0c4a3296b1a543c",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 41,
+      "output_type_counts": {
+        "function_call": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "native_2_resume",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 2.7341482639312744,
+      "usage": {
+        "input_tokens": 5978,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 3200
+        },
+        "output_tokens": 21,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 5999
+      }
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": [
+        {
+          "compact_threshold": 16000,
+          "type": "compaction"
+        }
+      ],
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [
+        "c37110891757d0afb568f2c8c5a22ab585291969d33e1a2c6a8b770000676b76"
+      ],
+      "input_type_counts": {
+        "compaction": 1,
+        "function_call": 1,
+        "function_call_output": 1,
+        "message": 1,
+        "user": 3
+      },
+      "instructions_sha256": "e8fd072d764a1d6bf198b818cff96414d8bf6702e583f3ebb0c4a3296b1a543c",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 42,
+      "output_type_counts": {
+        "message": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "native_2_resume",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 5.941626787185669,
+      "usage": {
+        "input_tokens": 6030,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 5888
+        },
+        "output_tokens": 114,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 6144
+      }
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 43,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "astra-eval-native-3_gateway_initial",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": [
+        {
+          "compact_threshold": 16000,
+          "type": "compaction"
+        }
+      ],
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {
+        "assistant": 121,
+        "user": 2
+      },
+      "instructions_sha256": "9adcf0c7a84b1d759d3e97f07a55584a055431f673856e1c6d3678a686aebd5e",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 44,
+      "output_type_counts": {
+        "message": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "astra-eval-native-3_gateway_initial",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 6.679966926574707,
+      "usage": {
+        "input_tokens": 5048,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 77,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 5125
+      }
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 45,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "astra-eval-native-3_gateway_initial",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": [
+        "caa3310e47fca93a376408ee9ba9a6984d706d71e41b91eca78e655d951047ec"
+      ],
+      "context_management": [
+        {
+          "compact_threshold": 16000,
+          "type": "compaction"
+        }
+      ],
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {
+        "assistant": 121,
+        "function_call": 120,
+        "function_call_output": 120,
+        "user": 2
+      },
+      "instructions_sha256": "9adcf0c7a84b1d759d3e97f07a55584a055431f673856e1c6d3678a686aebd5e",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 46,
+      "output_type_counts": {
+        "compaction": 1,
+        "message": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "astra-eval-native-3_gateway_initial",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 13.43165111541748,
+      "usage": {
+        "input_tokens": 19429,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 310,
+        "output_tokens_details": {
+          "reasoning_tokens": 233
+        },
+        "total_tokens": 19739
+      }
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 47,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "astra-eval-native-3_gateway_resume",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": [
+        {
+          "compact_threshold": 16000,
+          "type": "compaction"
+        }
+      ],
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [
+        "caa3310e47fca93a376408ee9ba9a6984d706d71e41b91eca78e655d951047ec"
+      ],
+      "input_type_counts": {
+        "compaction": 1,
+        "message": 1,
+        "user": 3
+      },
+      "instructions_sha256": "9adcf0c7a84b1d759d3e97f07a55584a055431f673856e1c6d3678a686aebd5e",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 48,
+      "output_type_counts": {
+        "function_call": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "astra-eval-native-3_gateway_resume",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 2.667281150817871,
+      "usage": {
+        "input_tokens": 5807,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 3200
+        },
+        "output_tokens": 21,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 5828
+      }
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": [
+        {
+          "compact_threshold": 16000,
+          "type": "compaction"
+        }
+      ],
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [
+        "caa3310e47fca93a376408ee9ba9a6984d706d71e41b91eca78e655d951047ec"
+      ],
+      "input_type_counts": {
+        "compaction": 1,
+        "function_call": 1,
+        "function_call_output": 1,
+        "message": 1,
+        "user": 3
+      },
+      "instructions_sha256": "9adcf0c7a84b1d759d3e97f07a55584a055431f673856e1c6d3678a686aebd5e",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 49,
+      "output_type_counts": {
+        "message": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "astra-eval-native-3_gateway_resume",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 6.3237011432647705,
+      "usage": {
+        "input_tokens": 5859,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 5632
+        },
+        "output_tokens": 77,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 5936
+      }
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 50,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "astra-eval-local-3_gateway_initial",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {
+        "assistant": 121,
+        "function_call": 120,
+        "function_call_output": 120,
+        "user": 2
+      },
+      "instructions_sha256": "9adcf0c7a84b1d759d3e97f07a55584a055431f673856e1c6d3678a686aebd5e",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 51,
+      "output_type_counts": {
+        "message": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "astra-eval-local-3_gateway_initial",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 7.112397909164429,
+      "usage": {
+        "input_tokens": 20408,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 77,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 20485
+      }
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 52,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "astra-eval-local-3_gateway_resume",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {
+        "user": 1
+      },
+      "instructions_sha256": "75357d685f238b6afd7738be9786fdafde641eb6ca9a3be7471939715a68a4de",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 53,
+      "output_type_counts": {
+        "message": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "astra-eval-local-3_gateway_resume",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 79.232980966568,
+      "usage": {
+        "input_tokens": 7178,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 2587,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 9765
+      }
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {
+        "assistant": 5,
+        "function_call": 4,
+        "function_call_output": 4,
+        "message": 1,
+        "user": 3
+      },
+      "instructions_sha256": "9adcf0c7a84b1d759d3e97f07a55584a055431f673856e1c6d3678a686aebd5e",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 54,
+      "output_type_counts": {
+        "function_call": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "astra-eval-local-3_gateway_resume",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 2.293562889099121,
+      "usage": {
+        "input_tokens": 6903,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 3200
+        },
+        "output_tokens": 21,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 6924
+      }
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {
+        "assistant": 5,
+        "function_call": 5,
+        "function_call_output": 5,
+        "message": 1,
+        "user": 3
+      },
+      "instructions_sha256": "9adcf0c7a84b1d759d3e97f07a55584a055431f673856e1c6d3678a686aebd5e",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 55,
+      "output_type_counts": {
+        "message": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "astra-eval-local-3_gateway_resume",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 4.5491437911987305,
+      "usage": {
+        "input_tokens": 7004,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 6784
+        },
+        "output_tokens": 77,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 7081
+      }
+    },
+    {
+      "checkpoint_sha256": null,
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {},
+      "instructions_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "method": "GET",
+      "model": null,
+      "number": 56,
+      "output_type_counts": {},
+      "path": "/backend-api/codex/models",
+      "reasoning": null,
+      "scenario": "sequential_tools",
+      "terminal_event": null,
+      "total_elapsed_seconds": null,
+      "usage": null
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {
+        "user": 1
+      },
+      "instructions_sha256": "e8fd072d764a1d6bf198b818cff96414d8bf6702e583f3ebb0c4a3296b1a543c",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 57,
+      "output_type_counts": {
+        "function_call": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "sequential_tools",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 2.8050901889801025,
+      "usage": {
+        "input_tokens": 3391,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 20,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 3411
+      }
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {
+        "function_call": 1,
+        "function_call_output": 1,
+        "user": 1
+      },
+      "instructions_sha256": "e8fd072d764a1d6bf198b818cff96414d8bf6702e583f3ebb0c4a3296b1a543c",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 58,
+      "output_type_counts": {
+        "function_call": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "sequential_tools",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 2.736722946166992,
+      "usage": {
+        "input_tokens": 3441,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 22,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 3463
+      }
+    },
+    {
+      "checkpoint_sha256": [],
+      "context_management": null,
+      "error_class": null,
+      "http_status": 200,
+      "input_checkpoint_sha256": [],
+      "input_type_counts": {
+        "function_call": 2,
+        "function_call_output": 2,
+        "user": 1
+      },
+      "instructions_sha256": "e8fd072d764a1d6bf198b818cff96414d8bf6702e583f3ebb0c4a3296b1a543c",
+      "method": "POST",
+      "model": "gpt-6-astra",
+      "number": 59,
+      "output_type_counts": {
+        "message": 1
+      },
+      "path": "/backend-api/codex/responses",
+      "reasoning": {
+        "effort": "low",
+        "summary": "auto"
+      },
+      "scenario": "sequential_tools",
+      "terminal_event": "response.completed",
+      "total_elapsed_seconds": 1.8649001121520996,
+      "usage": {
+        "input_tokens": 3495,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 8,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 3503
+      }
+    }
+  ],
+  "sessions": {
+    "cli_baseline": {
+      "archived_rows": 0,
+      "durable_rows": 6,
+      "fresh_call_ids_unique": true,
+      "fresh_results_have_calls": true,
+      "fresh_terminal_results": 1,
+      "fresh_tool_batch_sizes": [
+        1
+      ],
+      "historical_call_reexecution_observed": false,
+      "original_synthetic_prefix_preserved": null,
+      "persisted_checkpoint_sha256": [],
+      "retained_facts": null,
+      "session_usage_rows": [
+        {
+          "api_call_count": 3,
+          "cache_read_tokens": 6528,
+          "cache_write_tokens": 0,
+          "input_tokens": 3814,
+          "output_tokens": 75
+        },
+        {
+          "api_call_count": 1,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "input_tokens": 295,
+          "output_tokens": 102
+        }
+      ]
+    },
+    "independent_tools": {
+      "archived_rows": 0,
+      "durable_rows": 5,
+      "fresh_call_ids_unique": true,
+      "fresh_results_have_calls": true,
+      "fresh_terminal_results": 2,
+      "fresh_tool_batch_sizes": [
+        2
+      ],
+      "historical_call_reexecution_observed": false,
+      "original_synthetic_prefix_preserved": null,
+      "persisted_checkpoint_sha256": [],
+      "retained_facts": null,
+      "session_usage_rows": [
+        {
+          "api_call_count": 2,
+          "cache_read_tokens": 3200,
+          "cache_write_tokens": 0,
+          "input_tokens": 3668,
+          "output_tokens": 60
+        }
+      ]
+    },
+    "local_1": {
+      "archived_rows": 244,
+      "durable_rows": 260,
+      "fresh_call_ids_unique": true,
+      "fresh_results_have_calls": true,
+      "fresh_terminal_results": 1,
+      "fresh_tool_batch_sizes": [
+        1
+      ],
+      "historical_call_reexecution_observed": false,
+      "original_synthetic_prefix_preserved": true,
+      "persisted_checkpoint_sha256": [],
+      "retained_facts": 12,
+      "session_usage_rows": [
+        {
+          "api_call_count": 3,
+          "cache_read_tokens": 6528,
+          "cache_write_tokens": 0,
+          "input_tokens": 27416,
+          "output_tokens": 176
+        },
+        {
+          "api_call_count": 1,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "input_tokens": 7180,
+          "output_tokens": 2373
+        }
+      ]
+    },
+    "local_2": {
+      "archived_rows": 244,
+      "durable_rows": 260,
+      "fresh_call_ids_unique": true,
+      "fresh_results_have_calls": true,
+      "fresh_terminal_results": 1,
+      "fresh_tool_batch_sizes": [
+        1
+      ],
+      "historical_call_reexecution_observed": false,
+      "original_synthetic_prefix_preserved": true,
+      "persisted_checkpoint_sha256": [],
+      "retained_facts": 12,
+      "session_usage_rows": [
+        {
+          "api_call_count": 3,
+          "cache_read_tokens": 9728,
+          "cache_write_tokens": 0,
+          "input_tokens": 24002,
+          "output_tokens": 175
+        },
+        {
+          "api_call_count": 1,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "input_tokens": 7178,
+          "output_tokens": 2268
+        }
+      ]
+    },
+    "local_3_gateway": {
+      "archived_rows": 244,
+      "durable_rows": 260,
+      "fresh_call_ids_unique": true,
+      "fresh_results_have_calls": true,
+      "fresh_terminal_results": 1,
+      "fresh_tool_batch_sizes": [
+        1
+      ],
+      "historical_call_reexecution_observed": false,
+      "original_synthetic_prefix_preserved": true,
+      "persisted_checkpoint_sha256": [],
+      "retained_facts": 12,
+      "session_usage_rows": [
+        {
+          "api_call_count": 3,
+          "cache_read_tokens": 9984,
+          "cache_write_tokens": 0,
+          "input_tokens": 24331,
+          "output_tokens": 175
+        },
+        {
+          "api_call_count": 1,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "input_tokens": 7178,
+          "output_tokens": 2587
+        }
+      ]
+    },
+    "native_1": {
+      "archived_rows": 0,
+      "durable_rows": 248,
+      "fresh_call_ids_unique": true,
+      "fresh_results_have_calls": true,
+      "fresh_terminal_results": 1,
+      "fresh_tool_batch_sizes": [
+        1
+      ],
+      "historical_call_reexecution_observed": false,
+      "original_synthetic_prefix_preserved": true,
+      "persisted_checkpoint_sha256": [
+        "8d978c066885651e93b2bc1da9580eafc0a5560e67cb12ddab531197859686f5"
+      ],
+      "retained_facts": 12,
+      "session_usage_rows": [
+        {
+          "api_call_count": 3,
+          "cache_read_tokens": 8960,
+          "cache_write_tokens": 0,
+          "input_tokens": 22303,
+          "output_tokens": 456
+        }
+      ]
+    },
+    "native_2": {
+      "archived_rows": 0,
+      "durable_rows": 248,
+      "fresh_call_ids_unique": true,
+      "fresh_results_have_calls": true,
+      "fresh_terminal_results": 1,
+      "fresh_tool_batch_sizes": [
+        1
+      ],
+      "historical_call_reexecution_observed": false,
+      "original_synthetic_prefix_preserved": true,
+      "persisted_checkpoint_sha256": [
+        "c37110891757d0afb568f2c8c5a22ab585291969d33e1a2c6a8b770000676b76"
+      ],
+      "retained_facts": 12,
+      "session_usage_rows": [
+        {
+          "api_call_count": 3,
+          "cache_read_tokens": 9088,
+          "cache_write_tokens": 0,
+          "input_tokens": 22449,
+          "output_tokens": 548
+        }
+      ]
+    },
+    "native_3_gateway": {
+      "archived_rows": 0,
+      "durable_rows": 248,
+      "fresh_call_ids_unique": true,
+      "fresh_results_have_calls": true,
+      "fresh_terminal_results": 1,
+      "fresh_tool_batch_sizes": [
+        1
+      ],
+      "historical_call_reexecution_observed": false,
+      "original_synthetic_prefix_preserved": true,
+      "persisted_checkpoint_sha256": [
+        "caa3310e47fca93a376408ee9ba9a6984d706d71e41b91eca78e655d951047ec"
+      ],
+      "retained_facts": 12,
+      "session_usage_rows": [
+        {
+          "api_call_count": 3,
+          "cache_read_tokens": 8832,
+          "cache_write_tokens": 0,
+          "input_tokens": 22263,
+          "output_tokens": 408
+        }
+      ]
+    },
+    "sequential_tools": {
+      "archived_rows": 0,
+      "durable_rows": 6,
+      "fresh_call_ids_unique": true,
+      "fresh_results_have_calls": true,
+      "fresh_terminal_results": 2,
+      "fresh_tool_batch_sizes": [
+        1,
+        1
+      ],
+      "historical_call_reexecution_observed": false,
+      "original_synthetic_prefix_preserved": null,
+      "persisted_checkpoint_sha256": [],
+      "retained_facts": null,
+      "session_usage_rows": [
+        {
+          "api_call_count": 3,
+          "cache_read_tokens": 0,
+          "cache_write_tokens": 0,
+          "input_tokens": 10327,
+          "output_tokens": 50
+        }
+      ]
+    }
+  },
+  "suite": "Astra subscription-first compatibility v1",
+  "trials": {
+    "local_1": {
+      "first_input_items": 363,
+      "ordinary_instructions_unchanged": true,
+      "output_tokens": 2549,
+      "provider_input_tokens_including_cache": 41124,
+      "provider_responses": 4,
+      "request_numbers": [
+        21,
+        23,
+        24,
+        25
+      ],
+      "resumed_input_items": 17,
+      "summed_response_seconds": 88.35828971862793
+    },
+    "local_2": {
+      "first_input_items": 363,
+      "ordinary_instructions_unchanged": true,
+      "output_tokens": 2443,
+      "provider_input_tokens_including_cache": 40908,
+      "provider_responses": 4,
+      "request_numbers": [
+        33,
+        35,
+        36,
+        37
+      ],
+      "resumed_input_items": 17,
+      "summed_response_seconds": 82.98636054992676
+    },
+    "local_3_gateway": {
+      "first_input_items": 363,
+      "ordinary_instructions_unchanged": true,
+      "output_tokens": 2762,
+      "provider_input_tokens_including_cache": 41493,
+      "provider_responses": 4,
+      "request_numbers": [
+        51,
+        53,
+        54,
+        55
+      ],
+      "resumed_input_items": 17,
+      "summed_response_seconds": 93.18808555603027
+    },
+    "native_1": {
+      "first_input_items": 363,
+      "ordinary_instructions_unchanged": true,
+      "output_tokens": 456,
+      "provider_input_tokens_including_cache": 31263,
+      "provider_responses": 3,
+      "request_numbers": [
+        16,
+        18,
+        19
+      ],
+      "resumed_input_items": 5,
+      "summed_response_seconds": null
+    },
+    "native_2": {
+      "first_input_items": 363,
+      "ordinary_instructions_unchanged": true,
+      "output_tokens": 548,
+      "provider_input_tokens_including_cache": 31537,
+      "provider_responses": 3,
+      "request_numbers": [
+        39,
+        41,
+        42
+      ],
+      "resumed_input_items": 5,
+      "summed_response_seconds": 24.867647886276245
+    },
+    "native_3_gateway": {
+      "first_input_items": 363,
+      "ordinary_instructions_unchanged": true,
+      "output_tokens": 408,
+      "provider_input_tokens_including_cache": 31095,
+      "provider_responses": 3,
+      "request_numbers": [
+        46,
+        48,
+        49
+      ],
+      "resumed_input_items": 5,
+      "summed_response_seconds": 22.422633409500122
+    }
+  }
+}
