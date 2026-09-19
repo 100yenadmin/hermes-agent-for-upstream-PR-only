@@ -1194,36 +1194,43 @@ agent:
   # that review kind. Leave a field unset (null / missing) to keep the
   # shipped default — these are *opt-in* overrides, not new defaults.
   #
+  # Two forms per kind ("memory", "skill", "combined"):
+  #   memory: |            inline prompt text
+  #   memory_file: path    read the prompt from a file (edit prompts without
+  #                        touching config.yaml; picked up on the next review)
+  # Relative *_file paths resolve against YOUR profile home (~/.hermes or
+  # ~/.hermes/profiles/<name>), never the working directory. Files are read
+  # once per review (one stable snapshot), capped at 64 KiB, and must be
+  # regular UTF-8 text files.
+  #
   # Resolution chain (first hit wins):
-  #   1. agent instance attribute (per-subclass / per-test override)
-  #   2. this config block
-  #   3. module-level constant in `agent/background_review.py`
+  #   1. programmatic per-agent override (subclass / test patch)
+  #   2. inline string in this block
+  #   3. *_file path in this block
+  #   4. module-level constant in `agent/background_review.py`
   #
   # Use ``memory``  to retune what counts as memory-worthy.
   # Use ``skill``   to retune the skill-create / patch / library-shape ladder.
   # Use ``combined`` when both review kinds fire in the same fork.
-  # Set a field to "" (empty string) to disable that review variant
-  # explicitly — the fork will skip work for that kind.
+  # Set an inline field to "" (empty string) to disable that review variant
+  # explicitly — automatic reviews skip that kind; /refine still runs on the
+  # shipped default. An empty FILE is an error, not a disable: the affected
+  # review is skipped with a warning, as is a configured file that is
+  # missing/unreadable/non-UTF-8/oversized — never silently replaced by the
+  # default you replaced.
   #
   # Safety: this only changes the user-message the background review fork
   # receives. The main-conversation system prompt and per-conversation prompt
   # cache are untouched (per AGENTS.md "Per-conversation prompt caching is
-  # sacred"). Three reasons it is NOT a new core tool:
-  #   - The escape-hatch is per-turn and only fires from one call site
-  #     (`agent._spawn_background_review`). It does not ship on every API
-  #     call.
-  # - Override applies to a prompt that the existing review fork already
-  #   consumes; nothing new fires when the override is unset.
+  # sacred"), and the review fork's tool whitelist, write approvals and
+  # protected-file boundaries are enforced separately and unchanged.
   # review_prompts:
   #   memory: |
   #     Review the conversation above. Save ONLY durable user facts to memory
   #     (persona, preferences, persistent environment facts). One-shot tool
   #     failures and transient task notes do NOT belong in memory.
   #     If nothing qualifies, say "Nothing to save." and stop.
-  #   skill: |
-  #     Update the skill library. Be active on durable lessons only:
-  #     technique, recurring user preference, or wrong/outdated skill.
-  #     Skip session-one-off fixes and environment failures.
+  #   skill_file: prompts/skill-review.md
   #   combined: |
   #     Two things. Memory: durable user facts only. Skills: durable lessons
   #     from this session. Skip one-offs on both sides.
