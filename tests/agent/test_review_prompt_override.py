@@ -73,10 +73,13 @@ def _write_home_config(home: Path, review_prompts: Dict[str, Any]) -> None:
             lines.append(f"    {key}: {value}")  # non-string scalars (error-path tests)
         elif value == "":
             lines.append(f'    {key}: ""')
-        elif "\n" in value or ": " in value or value.strip() != value:
-            lines.append(f"    {key}: |")
-            for ln in value.splitlines():
-                lines.append(f"      {ln}")
+        elif value.strip() == "" or value != value.strip() or ": " in value or "\n" in value:
+            # quote whitespace-only / padded values (YAML trims unquoted spaces);
+            # colon/newline-bearing values use a single-quoted scalar
+            lines.append(f'    {key}: {value!r}' if "\n" not in value else f"    {key}: |")
+            if "\n" in value:
+                for ln in value.splitlines():
+                    lines.append(f"      {ln}")
         else:
             lines.append(f"    {key}: {value}")
     (home / "config.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -199,6 +202,29 @@ class TestExplicitDisable:
         activate({"memory": ""})
         assert _resolve_review_prompt(
             _FakeAgent(), "memory", explicit=True) == _MEMORY_REVIEW_PROMPT
+
+    def test_whitespace_only_inline_is_an_error_not_a_disable(self, home_env, caplog):
+        """Mirror of the whitespace-only FILE case: an inline value of spaces is a broken
+        override, not the "" disable — error-skip with a warning (MAJOR-1 review finding:
+        it previously slipped past the sentinel and spawned a prompt-less review)."""
+        _home, activate = home_env
+        activate({"memory": "   "})
+        with caplog.at_level("WARNING"):
+            out = _resolve_review_prompt(_FakeAgent(), "memory")
+        assert out is None
+        assert any("whitespace-only" in r.message for r in caplog.records)
+
+    def test_whitespace_only_inline_explicit_falls_back_to_default(self, home_env):
+        _home, activate = home_env
+        activate({"memory": "   "})
+        assert _resolve_review_prompt(
+            _FakeAgent(), "memory", explicit=True) == _MEMORY_REVIEW_PROMPT
+
+    def test_empty_path_string_is_unset_not_error(self, home_env):
+        """DEFAULT_CONFIG seeds "" for *_file slots; an empty path string means unset."""
+        _home, activate = home_env
+        activate({"memory_file": ""})
+        assert _resolve_review_prompt(_FakeAgent(), "memory") == _MEMORY_REVIEW_PROMPT
 
     def test_spawn_returns_none_none_on_disable(self, home_env):
         _home, activate = home_env

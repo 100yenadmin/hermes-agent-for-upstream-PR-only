@@ -1256,13 +1256,9 @@ def _run_review_in_thread(
         _set_thread_approval_callback(None)
 
 
-# (review_memory, review_skills) -> prompt attribute name; skills-only is also the default.
-_PROMPT_NAME_BY_SCOPE = {
-    (True, True): "_COMBINED_REVIEW_PROMPT", (True, False): "_MEMORY_REVIEW_PROMPT",
-    (False, True): "_SKILL_REVIEW_PROMPT", (False, False): "_SKILL_REVIEW_PROMPT",
-}
-
-# (review_memory, review_skills) -> config-side kind; mirrors _PROMPT_NAME_BY_SCOPE.
+# (review_memory, review_skills) -> config-side kind; skills-only is also the default.
+# The prompt attribute name follows via _REVIEW_PROMPT_BY_KIND — one table chain, one edit
+# point when a review kind is added.
 _REVIEW_KIND_BY_SCOPE = {
     (True, True): "combined", (True, False): "memory",
     (False, True): "skill", (False, False): "skill",
@@ -1340,24 +1336,37 @@ def _resolve_review_prompt(agent: Any, kind: str, explicit: bool = False) -> Opt
                 return default
             # Same edge-strip as *_file content: a YAML block scalar's trailing newline is
             # syntax, not intent — and files/inline get identical treatment.
-            return inline.strip()
+            stripped = inline.strip()
+            if not stripped:
+                # Whitespace-only inline ≈ whitespace-only file: invalid override, error-skip
+                # with a warning (mirrors the file path), NOT the "" disable sentinel.
+                logger.warning(
+                    "background_review: agent.review_prompts.%s is whitespace-only — an empty "
+                    "override is NOT a disable; use %s: \"\" in config.yaml to turn this "
+                    "review off. %s", kind, kind,
+                    "Explicit /refine runs with the shipped default" if explicit else "Skipping this review")
+                return None if not explicit else default
+            return stripped
         if inline is not None:
             _warn_prompt_override_error(
-                kind, f"inline value is {type(inline).__name__}, expected a string", explicit, default)
+                kind, f"inline value is {type(inline).__name__}, expected a string", explicit)
             if not explicit:
                 return None
             return default
         file_raw = rp_cfg.get(f"{kind}_file")
-        if isinstance(file_raw, str) and file_raw.strip():
-            file_prompt = _read_review_prompt_file(agent, kind, file_raw)
-            if file_prompt is None:  # actionable diagnostic already logged
-                if not explicit:
-                    return None
-                return default
-            return file_prompt
-        if file_raw is not None and not (isinstance(file_raw, str) and not file_raw.strip()):
+        if isinstance(file_raw, str):
+            if file_raw.strip():
+                file_prompt = _read_review_prompt_file(agent, kind, file_raw)
+                if file_prompt is None:  # actionable diagnostic already logged
+                    if not explicit:
+                        return None
+                    return default
+                return file_prompt
+            # An empty/whitespace-only path string is UNSET, not an error (DEFAULT_CONFIG
+            # seeds "" for the *_file slots; ``hermes config unset`` leaves "").
+        elif file_raw is not None:
             _warn_prompt_override_error(
-                kind, f"{kind}_file is {type(file_raw).__name__}, expected a path string", explicit, default)
+                kind, f"{kind}_file is {type(file_raw).__name__}, expected a path string", explicit)
             if not explicit:
                 return None
             return default
@@ -1379,8 +1388,9 @@ def _review_prompts_config_block() -> Optional[Dict[str, Any]]:
         return rp if isinstance(rp, dict) else None
     except (ImportError, OSError, ValueError) as exc:
         # ImportError: hermes_cli.config unavailable in odd contexts. OSError: config file
-        # unreadable. ValueError: yaml/json parse error. Anything else is a bug we'd rather
-        # see than swallow.
+        # unreadable. (The loader never raises on a YAML parse error — it serves
+        # last-known-good/defaults internally — so these arms cover exotic loader failures
+        # only; anything else is a bug we'd rather see than swallow.)
         logger.warning(
             "background_review: could not read config (%s); using module-level prompt defaults", exc)
         return None
@@ -1401,8 +1411,6 @@ def _read_review_prompt_file(agent: Any, kind: str, raw_path: str) -> Optional[s
     from hermes_constants import get_hermes_home
     import stat as stat_module
     raw_path = raw_path.strip()
-    if not raw_path:
-        return None  # unreachable via callers; strip() already guards
     try:
         base = _agent_home(agent) or get_hermes_home()
     except Exception:
@@ -1451,7 +1459,7 @@ def _read_review_prompt_file(agent: Any, kind: str, raw_path: str) -> Optional[s
     return stripped
 
 
-def _warn_prompt_override_error(kind: str, detail: str, explicit: bool, default: str) -> None:
+def _warn_prompt_override_error(kind: str, detail: str, explicit: bool) -> None:
     logger.warning(
         "background_review: invalid agent.review_prompts.%s override (%s) — %s",
         kind, detail,
