@@ -2,9 +2,7 @@ name: boardstate
 title: Boardstate
 repo: https://github.com/100yenadmin/boardstate-hermes-plugin
 sha: 958b5d07e4f95964b4345933b6fbdd7828a9b24d
-description: 'A live board the agent builds for you: a Board tab in the Hermes dashboard and a Desktop page where the agent lays out tabs and widgets
-  (notes, markdown, tables, charts, KPI cards, live Hermes data, approvals) through 19 native boardstate_* tools. Runs a local Node >= 20 sidecar on loopback
-  with a per-spawn nonce; no network access unless you opt in to operator-gated connectors.'
+description: "A live board the agent builds for you: a Board tab in the Hermes dashboard and a Desktop page where the agent lays out tabs and widgets (notes, markdown, tables, charts, KPI cards, live Hermes data, approvals) through 19 native boardstate_* tools. Runs a local Node >= 20 sidecar on loopback with a per-spawn nonce; no network access unless you opt in to operator-gated connectors. Disclosure — spawns a local Node.js ≥20 sidecar (from PATH/HERMES_NODE_BIN, nothing downloaded) on 127.0.0.1 on first use; state under HERMES_HOME/boardstate-state/. Reads the dashboard's loopback session token from Hermes internals (web_server._SESSION_TOKEN) and passes it to the sidecar for live usage/sessions/cron widgets; mounts one token-gated static route for approved widget assets. No outbound network unless you author boardstate.connectors.json (stdio/HTTP MCP connectors); connector actions need operator approval."
 maintainer: 100yenadmin
 tier: community
 category: desktop
