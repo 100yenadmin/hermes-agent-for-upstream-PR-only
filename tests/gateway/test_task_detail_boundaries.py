@@ -169,6 +169,9 @@ async def test_two_registered_profiles_same_canonical_id_and_distinct_credential
     cfg = json.loads(json.dumps(r.config))
     for grant in cfg['kanban']['read_grants']:
         grant.update(profile='other', bot_id=654321)
+    settings = cfg['plugins']['entries']['hermes-telegram-experience']['settings']
+    for route in settings['scope']['routes']:
+        route['profile'] = 'other'
     (other/'config.yaml').write_text(yaml.safe_dump(cfg))
     token = '654321:another-synthetic-token-for-slice-four'
     adapter = f.TelegramAdapter(f.PlatformConfig(enabled=True, token=token, typing_indicator=False))

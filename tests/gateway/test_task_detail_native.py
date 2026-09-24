@@ -72,7 +72,8 @@ def config(r, **changes):
                     scope=dict(
                         routes=[dict(profile='default', platform='telegram', chat_id='-100', thread_id='7')],
                         task_resources=[dict(board='default', task_id=r.tid),
-                                        dict(board='default', task_id=r.btid)],
+                                        dict(board='default', task_id=r.btid),
+                                        dict(board='other', task_id=r.tid)],
                     ))
     settings.update(changes.pop('settings', {}))
     r.config = dict(plugins=dict(enabled=['hermes-telegram-experience'], entries={

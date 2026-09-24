@@ -32,6 +32,14 @@ def loaded_plugin(tmp_path, monkeypatch):
     (home / "config.yaml").write_text(
         "plugins:\n  enabled: [hermes-telegram-experience]\n  entries:\n"
         "    hermes-telegram-experience:\n      settings:\n        enabled: true\n"
+        "        scope:\n"
+        "          routes:\n"
+        "            - {profile: default, platform: telegram, chat_id: '-100', thread_id: '7'}\n"
+        "            - {profile: default, platform: telegram, chat_id: '-100123', thread_id: '11'}\n"
+        "            - {profile: default, platform: telegram, chat_id: '-100123', thread_id: '22'}\n"
+        "            - {profile: default, platform: telegram, chat_id: '-100789', thread_id: '44'}\n"
+        "            - {profile: default, platform: telegram, chat_id: '-100456', thread_id: '33'}\n"
+        "          task_resources: []\n"
     )
     manager = get_plugin_manager()
     manager.discover_and_load()

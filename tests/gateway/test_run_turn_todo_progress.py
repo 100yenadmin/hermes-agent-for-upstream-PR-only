@@ -49,7 +49,7 @@ class BotBoundary:
         return SimpleNamespace(message_id=kwargs.get("message_id", len(self.calls))) if self.receipt else True
 
 
-def load(home, monkeypatch, *, enabled=True, setting=True):
+def load(home, monkeypatch, *, enabled=True, setting=True, profile="a"):
     home.mkdir(exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     (home / "config.yaml").write_text(
@@ -57,7 +57,7 @@ def load(home, monkeypatch, *, enabled=True, setting=True):
         f"  entries:\n    hermes-telegram-experience:\n      settings:\n        enabled: {str(setting).lower()}\n"
         "        scope:\n"
         "          routes:\n"
-        "            - {profile: a, platform: telegram, chat_id: '-100', thread_id: '7'}\n"
+        f"            - {{profile: {profile}, platform: telegram, chat_id: '-100', thread_id: '7'}}\n"
         "          task_resources: []\n"
     )
     manager = get_plugin_manager()
@@ -381,7 +381,7 @@ async def test_disconnect_then_new_adapter_gets_new_epoch(lane):
 async def test_profile_a_b_a_deliveries_cannot_edit_each_others_message(lane, tmp_path, monkeypatch):
     assert publish(lane, "profile A")
     assert (await lane.source.deliver("profile A first")).message_id == "1"
-    manager_b = load(tmp_path / "b", monkeypatch)
+    manager_b = load(tmp_path / "b", monkeypatch, profile="b")
     store_b = TodoStore()
     todo_tool([{"id": "b", "content": "profile B", "status": "pending"}], store=store_b)
     binding_b = replace(lane.binding, profile="b", profile_home=str(manager_b.home_path), session_id="session-b")

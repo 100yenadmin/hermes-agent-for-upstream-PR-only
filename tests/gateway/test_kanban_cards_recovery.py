@@ -26,7 +26,17 @@ async def child(home, mode):
     os.environ['HERMES_HOME'] = str(home)
     path = home/'board.db'
     os.environ['HERMES_KANBAN_DB'] = str(path)
-    h.config(home)
+    with closing(h.kbc.connect(path)) as c:
+        row = c.execute('SELECT id FROM tasks').fetchone()
+        if row:
+            tid = row[0]
+            h.kb.add_comment(c, tid, 'synthetic', 'reopened process canonical revision')
+            # Deterministic lease-clock advance after the old process has died.
+            c.execute('UPDATE kanban_delivery_receipts SET lease_expires_at=0 WHERE state="pending"')
+        else:
+            tid = h.kb.create_task(c, title='synthetic restart task')
+            h.notify.add_notify_sub(c, task_id=tid, platform='telegram', chat_id='-100', thread_id='7', notifier_profile='default')
+    h.config(home, task_id=tid)
     manager = h.get_plugin_manager(); manager.discover_and_load()
     bot = h.Bot()
     if mode == 'unknown': bot.failure = h.TimedOut('synthetic uncertainty')
@@ -38,16 +48,6 @@ async def child(home, mode):
     adapter = h.TelegramAdapter(h.PlatformConfig(enabled=True, token='123:synthetic', typing_indicator=False))
     adapter._bot = bot
     runner = h.Runner(home, adapter)
-    with closing(h.kbc.connect(path)) as c:
-        row = c.execute('SELECT id FROM tasks').fetchone()
-        if row:
-            tid = row[0]
-            h.kb.add_comment(c, tid, 'synthetic', 'reopened process canonical revision')
-            # Deterministic lease-clock advance after the old process has died.
-            c.execute('UPDATE kanban_delivery_receipts SET lease_expires_at=0 WHERE state="pending"')
-        else:
-            tid = h.kb.create_task(c, title='synthetic restart task')
-            h.notify.add_notify_sub(c, task_id=tid, platform='telegram', chat_id='-100', thread_id='7', notifier_profile='default')
     r = SimpleNamespace(home=home,path=path,manager=manager,bot=bot,adapter=adapter,runner=runner,tid=tid)
     # Exercise the actual watcher, stopping its clock after one production tick.
     real_sleep = asyncio.sleep

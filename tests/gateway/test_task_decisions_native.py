@@ -3,9 +3,11 @@ Only network socket/HTTP/update origin and synthetic configuration are fixtures.
 """
 import asyncio
 from contextlib import closing
+import importlib
 import importlib.util
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 from urllib.parse import parse_qs
 
@@ -15,6 +17,16 @@ pytest.importorskip(
     "hermes_telegram_experience",
     reason="optional external-plugin integration; exercised by plugin repository CI",
 )
+
+# tests/gateway/conftest.py installs a Telegram MagicMock when the optional SDK
+# has not been imported yet. This installed-plugin contract needs the real SDK
+# dispatcher, so replace only that process-local test double before importing it.
+mocked_telegram = sys.modules.get('telegram')
+if mocked_telegram is not None and getattr(mocked_telegram, '__file__', None) is None:
+    for module_name in tuple(sys.modules):
+        if module_name == 'telegram' or module_name.startswith('telegram.'):
+            sys.modules.pop(module_name, None)
+    importlib.invalidate_caches()
 from telegram import Update
 from gateway.config import Platform, PlatformConfig
 from gateway.run import GatewayRunner

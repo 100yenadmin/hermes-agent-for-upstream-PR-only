@@ -56,11 +56,14 @@ class TaskReadService:
     """
     def __init__(self, ctx, scope):
         from hermes_constants import get_hermes_home
+        from hermes_cli.profiles import profile_matches_home
         self.home = Path(get_hermes_home()).resolve()
         profiles = {route.profile for route in scope.routes}
         if len(profiles) != 1:
             raise ValueError("task detail scope must name exactly one runtime profile")
         self.profile = next(iter(profiles))
+        if not profile_matches_home(self.profile, self.home):
+            raise ValueError("task detail scope profile must match its owning API-server profile")
         self.scope = scope
         self.plugin_id = ctx.plugin_id
         self.active = True

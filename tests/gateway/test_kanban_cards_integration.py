@@ -62,14 +62,11 @@ class Runner(GatewayKanbanWatchersMixin):
     def _authorization_adapter(self, platform, profile): return self.adapters.get(platform)
 
 
-def config(home, cards=True, quiet=False, enabled=True, *, profile='default', board='default',
-           task_id=None, chat_ids=('-100', '-200')):
-    if task_id is None:
-        prior = yaml.safe_load((home/'config.yaml').read_text())
-        task_id = prior['plugins']['entries']['hermes-telegram-experience']['settings']['scope']['task_resources'][0]['task_id']
+def config(home, cards=True, quiet=False, enabled=True, *, task_id, profile='default',
+           board='default', routes=(('-100', '7'), ('-100', '8'), ('-200', '7'))):
     scope = {
-        'routes': [dict(profile=profile, platform='telegram', chat_id=chat, thread_id='7')
-                   for chat in chat_ids],
+        'routes': [dict(profile=profile, platform='telegram', chat_id=chat, thread_id=thread)
+                   for chat, thread in routes],
         'task_resources': [dict(board=board, task_id=task_id)],
     }
     payload = dict(plugins=dict(enabled=['hermes-telegram-experience'], entries={

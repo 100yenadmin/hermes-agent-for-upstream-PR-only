@@ -34,7 +34,20 @@ async def manager(tmp_path, monkeypatch):
     home = tmp_path / 'synthetic-profile'
     home.mkdir()
     monkeypatch.setenv('HERMES_HOME', str(home))
-    (home / 'config.yaml').write_text('plugins:\n  enabled: [hermes-telegram-experience]\n  entries:\n    hermes-telegram-experience:\n      settings:\n        enabled: true\n')
+    topics = ['7', '8', '71', '72', '73',
+              *(str(topic) for topic in range(100, 132)),
+              '941', '942', '951', '952', '961', '962']
+    scope = {
+        'routes': [dict(profile='default', platform='telegram', chat_id='-100', thread_id=topic)
+                   for topic in topics],
+        'task_resources': [],
+    }
+    import yaml
+    (home / 'config.yaml').write_text(yaml.safe_dump({
+        'plugins': {'enabled': ['hermes-telegram-experience'], 'entries': {
+            'hermes-telegram-experience': {'settings': {'enabled': True, 'scope': scope}},
+        }},
+    }))
     manager = get_plugin_manager()
     manager.discover_and_load()
     assert manager._live_todo_registration.active

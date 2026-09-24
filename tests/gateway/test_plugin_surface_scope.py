@@ -10,7 +10,7 @@ from gateway.config import Platform
 from gateway.kanban_surfaces import register_task_cards, subscription_registration
 from gateway.live_todo import TodoBinding, TodoSource, open_live_todo, register_live_todo
 from gateway.surface_scope import parse_surface_scope
-from gateway.task_read import TaskReadDenied, TaskReadService
+from gateway.task_read import TaskReadDenied, TaskReadService, register_task_detail
 
 
 def _scope(*, chat_id="-1000000000001", thread_id="7", task_id="t_12345678"):
@@ -147,7 +147,7 @@ def test_card_scope_denies_before_surface_collection(monkeypatch, tmp_path):
 def test_task_read_is_independently_resource_scoped(tmp_path, monkeypatch):
     parsed = parse_surface_scope(_scope(), require_tasks=True)
     ctx = SimpleNamespace(plugin_id="synthetic-plugin")
-    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     service = TaskReadService(ctx, parsed)
     app = object()
     owner = SimpleNamespace(config=SimpleNamespace(token="synthetic-token"), _bot=object(),
@@ -165,3 +165,22 @@ def test_task_read_is_independently_resource_scoped(tmp_path, monkeypatch):
 
     with pytest.raises(TaskReadDenied):
         service._authorize(app, "synthetic-init-data", ("default", "synthetic", "t_87654321", 1))
+
+
+def test_task_read_registration_rejects_scope_for_different_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    scope = _scope()
+    scope["routes"][0]["profile"] = "other"
+    callbacks = []
+    manager = SimpleNamespace()
+    ctx = SimpleNamespace(
+        plugin_id="synthetic-plugin",
+        _manager=manager,
+        on_unload=lambda callback: callbacks.append(callback),
+    )
+
+    with pytest.raises(ValueError, match="must match its owning API-server profile"):
+        register_task_detail(ctx, scope=scope)
+
+    assert not hasattr(manager, "_task_read_registration")
+    assert callbacks == []

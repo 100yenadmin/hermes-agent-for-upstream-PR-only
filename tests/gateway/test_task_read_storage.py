@@ -29,6 +29,7 @@ async def test_get_cold_baseline_and_latest_committed_wal_preserve_canonical_dat
     r = rig
     with closing(sqlite3.connect(r.path)) as conn:
         conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        journal_mode = str(conn.execute('PRAGMA journal_mode').fetchone()[0]).lower()
         canonical = rows(conn)
     # This baseline precedes ANY inspection helper's read-only open.
     cold = inventory(r.path.parent)
@@ -36,23 +37,27 @@ async def test_get_cold_baseline_and_latest_committed_wal_preserve_canonical_dat
     writer = sqlite3.connect(r.path) if live_wal else None
     try:
         if writer:
-            writer.execute('PRAGMA wal_autocheckpoint=0')
+            if journal_mode == 'wal':
+                writer.execute('PRAGMA wal_autocheckpoint=0')
             writer.execute('UPDATE tasks SET title=? WHERE id=?', ('Latest committed WAL title', r.tid))
             writer.commit()
             canonical = rows(writer)
-            assert r.path.with_name(r.path.name + '-wal').stat().st_size > 0
+            if journal_mode == 'wal':
+                assert r.path.with_name(r.path.name + '-wal').stat().st_size > 0
         before = inventory(r.path.parent)
         response = await f.http(r.app, headers=r.headers)
         after = inventory(r.path.parent)
         assert response.status == 200
         assert after[r.path.name] == before[r.path.name]
-        assert set(after) - set(before) <= {r.path.name + '-wal', r.path.name + '-shm'}
+        sidecars = ({r.path.name + '-wal', r.path.name + '-shm'}
+                    if journal_mode == 'wal' else set())
+        assert set(after) - set(before) <= sidecars
         with closing(sqlite3.connect(r.path.as_uri() + '?mode=ro', uri=True)) as conn:
             assert rows(conn) == canonical
         if live_wal:
             assert json.loads(response.text)['title'] == 'Latest committed WAL title'
         else:
-            assert set(after) - set(before) == {r.path.name + '-wal', r.path.name + '-shm'}
+            assert set(after) - set(before) == sidecars
     finally:
         if writer:
             writer.close()
