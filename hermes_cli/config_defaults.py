@@ -899,6 +899,10 @@ DEFAULT_CONFIG = {
         # updates; false routes it to reasoning (visible only with show_reasoning).
         "show_commentary": True,
         "tool_progress_command": False,  # enable /verbose command in messaging gateway
+        # Read-only Telegram projection of the committed todo_list snapshot. It is process-local,
+        # active-run-only, and independent from text tool progress. Explicit display.tool_progress: off
+        # remains a hard quiet gate. Per-platform via display.platforms.<platform>.task_progress.
+        "task_progress": False,
         # display.tool_progress_overrides is deprecated (use display.platforms); a user-set value is
         # still honored at runtime and folded into platforms by migration.
         "tool_preview_length": 0,  # max chars for tool call previews (0 = no limit)
@@ -1848,6 +1852,13 @@ DEFAULT_CONFIG = {
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.
     "kanban": {
+        # Explicit exact actor/profile/board/task/action grants for native decisions.
+        # Pairing or bot administration alone grants no task mutation authority.
+        "decision_grants": [],
+        # Viewing is independent of callback decisions; exact actor/bot/profile/
+        # board/task/incarnation/permissions grants only, no wildcard authority.
+        "read_grants": [],
+        "read_max_age_seconds": 300,
         # Auto-subscribe the originating gateway/TUI session to completion + block events when
         # kanban_create is called from a session with a persistent delivery channel. Disable for
         # profiles that prefer explicit kanban_notify-subscribe calls per task.

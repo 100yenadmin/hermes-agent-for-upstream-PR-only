@@ -1688,7 +1688,10 @@ def _dispatch_profile_allowlist(normalize_profile_name) -> Optional[frozenset]:
             type(exc).__name__, exc,
         )
         return frozenset()
-    if not isinstance(kanban, Mapping) or "dispatch_profiles" not in kanban:
+    if not isinstance(kanban, Mapping):
+        # Strict overlays retain malformed sections; presence is not an absent allowlist.
+        return frozenset()
+    if "dispatch_profiles" not in kanban:
         return None
     raw = kanban["dispatch_profiles"]
     if raw is None or (isinstance(raw, str) and not raw.strip()):

@@ -1421,6 +1421,42 @@ HERMES_TELEGRAM_NOTIFICATIONS=all
 
 Unknown values log a warning and fall back to `important`.
 
+## Live task progress (optional)
+
+The separately installed `hermes-telegram-experience` plugin can show the current session `todo_list` as one read-only message in an explicitly scoped Telegram chat or topic. This candidate requires host capability version 2 (`live_todo_capability`, and version 2 of `task_card_capability`, `task_read_capability`, or `task_decision_capability` when those surfaces are enabled) plus the fenced Telegram transport patch. It is disabled by default, live-run-only, and a final answer never marks tasks complete.
+
+After installing the package in the same isolated interpreter as this host, explicitly enable it in that profile's config:
+
+```yaml
+plugins:
+  enabled: [hermes-telegram-experience]
+  entries:
+    hermes-telegram-experience:
+      settings:
+        enabled: true
+        scope:
+          routes:
+            - profile: default
+              platform: telegram
+              chat_id: "-1000000000001" # synthetic example
+              thread_id: "7"             # use null for the exact no-topic route
+          task_resources:
+            - board: default
+              task_id: t_0123abcd         # synthetic canonical task ID
+```
+
+Every route is an exact `(profile, platform, chat_id, thread_id)` tuple. `thread_id: null` means the exact no-topic route; it is not a wildcard. Task resources are exact `(board, task_id)` tuples. Missing, malformed, duplicate, or wildcard-like scope fails closed before a surface is registered. A todo-only configuration may use an empty `task_resources` list; durable cards and task detail require at least one resource. Out-of-scope subscriptions continue through the ordinary notification path without card receipt ownership.
+
+The scope is only an admission boundary. It does not grant task reads or decisions. Those permissions remain separate, explicit entries under `kanban.read_grants` and `kanban.decision_grants`, and the host rechecks both the scope and the matching grant. Merge these keys with existing plugin settings rather than replacing them. The earlier experimental `display.task_progress` switch is retained for compatibility with the preserved candidate settings, but no longer activates a core UI controller. The plugin setting above is now the opt-in authority. An explicit `display.tool_progress: off` (or Telegram override) remains a hard quiet gate. Muted turns and scheduled heartbeats are suppressed too.
+
+Updates coalesce and edit one message; an empty list clears its task body without claiming completion. Deleted/uneditable messages are not recreated. An ambiguous dispatched call quarantines that profile/topic surface for the process lifetime; no blind retry or overlapping successor. Config-only disable is a **requested** stop until plugin unload/restart makes it effective. Unload/disconnect/run end revoke new admissions before bounded settlement/cancellation. Already-dispatched calls cannot be unsent.
+
+Admission travels through the existing SDK and adapter-owned HTTP/1 transport: fallback, connection, pool and write-flow-control waits are followed by a fence before synchronous request-byte enqueue. Enqueued bytes remain potentially dispatched even if no receipt arrives; verified late receipts settle the stopped attempt without reviving its writer. Ordinary connection recovery remains enabled. Optional presenter construction/close errors are logged and do not replace the normal final-answer or host cleanup paths.
+
+Finished unknown surfaces retain only immutable binding/receipt/token metadata and primitive fencing fields, not completed turns or clients. Still-unsettled attempts retain their live state until actual termination. The process reserves at most 4096 active, unsettled or quarantined surface slots. Capacity exhaustion refuses new surfaces across profiles; it never evicts ambiguity to authorize recreation. Known settled surfaces release their slots. If all slots are quarantined, new projection admission remains closed for the process lifetime; restarting does not reconcile remote bubbles.
+
+Restart does not recover or replay the live-run projection. A crash may leave a stale bubble showing its last revision. See the standalone package README for isolated installation, upgrade, rollback and verification instructions; live runtime changes require separate authorization.
+
 ## Status messages edited in place
 
 The Telegram adapter routes recurring agent status callbacks (e.g. "Compressing context…", "Calling tool…") through `send_or_update_status()`, which keeps a `{(chat_id, status_key) → message_id}` cache and **edits the existing bubble** on subsequent emits instead of appending a new one each time. Distinct `status_key` values get their own messages; distinct chats never collide. If the edit fails (e.g. the user deleted the message, or it's older than Telegram allows for edits), the cache entry is dropped and the next emit posts a fresh message and re-caches its ID. No config required — this is the default Telegram behavior. Other adapters that don't implement `send_or_update_status` fall through to plain `send()` unchanged.

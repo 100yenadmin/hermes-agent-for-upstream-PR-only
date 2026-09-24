@@ -1057,10 +1057,83 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     notifier_profile TEXT,
     delivery_mode TEXT NOT NULL DEFAULT 'notify',
     delivery_metadata TEXT,
+    binding_token TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     last_ping_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
+);
+
+-- A delivery receipt is transport metadata, not another task authority.  The
+-- creation-event id is the immutable incarnation of a task id; it prevents a
+-- deleted task id that is later reused from inheriting an old message receipt.
+-- ``pending`` with an expired owner is deliberately reconciled as ``unknown``
+-- by the surface layer rather than replayed blindly after a crash.
+CREATE TABLE IF NOT EXISTS kanban_delivery_receipts (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id               TEXT NOT NULL,
+    task_incarnation      INTEGER NOT NULL,
+    desired_revision      INTEGER NOT NULL,
+    delivered_revision    INTEGER,
+    platform              TEXT NOT NULL,
+    chat_id               TEXT NOT NULL,
+    thread_id             TEXT NOT NULL DEFAULT '',
+    notifier_profile      TEXT,
+    routing_metadata      TEXT,
+    destination_message_id TEXT,
+    destination_profile   TEXT,
+    renderer_version      TEXT,
+    renderer_hash         TEXT,
+    owner_epoch           INTEGER NOT NULL DEFAULT 0,
+    owner_id              TEXT,
+    lease_expires_at      INTEGER,
+    attempt_id            TEXT,
+    attempted_revision    INTEGER,
+    attempt_owner_id      TEXT,
+    retry_at              REAL NOT NULL DEFAULT 0,
+    failure_count         INTEGER NOT NULL DEFAULT 0,
+    binding_token         TEXT,
+    profile_key           TEXT NOT NULL DEFAULT '',
+    surface_kind          TEXT NOT NULL DEFAULT 'task_card',
+    attempt_count          INTEGER NOT NULL DEFAULT 0,
+    state                 TEXT NOT NULL DEFAULT 'pending',
+    retry_disposition     TEXT,
+    last_error            TEXT,
+    replacement_budget    INTEGER NOT NULL DEFAULT 1,
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL,
+    UNIQUE (profile_key, task_id, task_incarnation, platform, chat_id, thread_id, surface_kind),
+    CHECK (state IN ('pending', 'sent', 'unknown', 'failed', 'deleted'))
+);
+
+CREATE TABLE IF NOT EXISTS kanban_action_records (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    token                 TEXT NOT NULL UNIQUE,
+    task_id               TEXT NOT NULL,
+    task_incarnation      INTEGER NOT NULL,
+    expected_revision     INTEGER NOT NULL,
+    expected_task_status  TEXT NOT NULL,
+    board_identity        TEXT NOT NULL,
+    profile               TEXT NOT NULL,
+    telegram_principal    INTEGER NOT NULL,
+    origin_chat_id        TEXT NOT NULL,
+    origin_thread_id      TEXT NOT NULL DEFAULT '',
+    origin_message_id     TEXT NOT NULL,
+    action_kind           TEXT NOT NULL,
+    action_payload        TEXT NOT NULL,
+    conflict_key          TEXT,
+    expires_at            INTEGER NOT NULL,
+    idempotency_key       TEXT NOT NULL,
+    state                 TEXT NOT NULL DEFAULT 'pending',
+    claim_epoch           INTEGER NOT NULL DEFAULT 0,
+    claim_owner           TEXT,
+    claim_attempt_id      TEXT,
+    claim_expires_at      INTEGER,
+    result                TEXT,
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL,
+    UNIQUE (board_identity, idempotency_key),
+    CHECK (state IN ('pending', 'claimed', 'completed', 'failed', 'unknown', 'expired', 'rejected'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
@@ -1072,6 +1145,10 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_receipts_lane          ON kanban_delivery_receipts(task_id, task_incarnation, platform, chat_id, thread_id);
+CREATE INDEX IF NOT EXISTS idx_receipts_state         ON kanban_delivery_receipts(state, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_actions_task           ON kanban_action_records(task_id, task_incarnation, expected_revision);
+CREATE INDEX IF NOT EXISTS idx_actions_conflict       ON kanban_action_records(board_identity, conflict_key, state);
 """
 
 
@@ -3641,11 +3718,11 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(conn: sqlite3.Connection, task_id: str, *, allow_nested: bool = False) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=allow_nested):
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
