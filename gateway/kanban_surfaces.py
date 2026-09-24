@@ -20,7 +20,11 @@ from gateway.live_todo import DeliveryOutcome, DeliveryStatus, TodoRegistration
 from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_surface as receipts
 
 logger = logging.getLogger(__name__)
-_SCOPE_DECLINED = object()
+
+@dataclass(frozen=True)
+class _ScopeDeclined:
+    manager: object
+    registration: object
 
 
 @dataclass(frozen=True)
@@ -88,7 +92,7 @@ def subscription_registration(runner, sub, board, *, distinguish_scope_decline=F
             sub.get("thread_id") or None, board, sub["task_id"],
         ):
             return reg
-        return _SCOPE_DECLINED if distinguish_scope_decline else None
+        return _ScopeDeclined(manager, reg) if distinguish_scope_decline else None
     finally:
         reset_hermes_home_override(token)
 
@@ -147,11 +151,18 @@ async def offer_surface(runner, delivery, adapter):
     reg = subscription_registration(
         runner, sub, snapshot.board, distinguish_scope_decline=True,
     )
-    if reg is _SCOPE_DECLINED:
+    if isinstance(reg, _ScopeDeclined):
         # Collection belonged to an older registration. A live replacement that
         # explicitly excludes this destination returns passive delivery to the
         # notifier; unload/unavailable states below retain the no-fallback fence.
-        return False
+        declined = reg
+        reg = declined.registration
+        with reg.lock:
+            if (not reg.active
+                    or getattr(declined.manager, "_task_card_registration", None) is not reg
+                    or _quiet(reg.profile_home)):
+                return True
+            return False
     if reg is None:
         return True
     if _quiet(reg.profile_home):

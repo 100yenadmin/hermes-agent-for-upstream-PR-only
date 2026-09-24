@@ -220,7 +220,8 @@ async def test_quiet_disable_reenable_and_normal_handoff(rig):
 
 
 @pytest.mark.asyncio
-async def test_narrowed_active_replacement_declines_late_surface_handoff(rig):
+@pytest.mark.parametrize('fence', ['none', 'quiet', 'unload', 'replacement'])
+async def test_narrowed_active_replacement_declines_late_surface_handoff(rig, monkeypatch, fence):
     with closing(kbc.connect(rig.path)) as c:
         kb.block_task(c, rig.tid, reason='ordinary notifier handoff', kind='needs_input')
     deliveries = await asyncio.to_thread(
@@ -232,17 +233,32 @@ async def test_narrowed_active_replacement_declines_late_surface_handoff(rig):
     # Replace the active consumer after collection with an exact scope that no
     # longer owns this resource. The already-claimed terminal event must return
     # to the ordinary notifier, without constructing a plugin card source.
-    config(rig.home, task_id='t_deadbeef')
+    config(rig.home, task_id='t_deadbeef', quiet=fence == 'quiet')
     rig.manager.discover_and_load(force=True)
     replacement = rig.manager._task_card_registration
     assert replacement.active and not replacement.sources
+
+    # Deterministically let lifecycle changes win after lookup and before the
+    # handoff's locked admission, as an executor-thread reload can do.
+    from gateway import kanban_surfaces
+    lookup = kanban_surfaces.subscription_registration
+    def lookup_then_fence(*args, **kwargs):
+        result = lookup(*args, **kwargs)
+        if fence == 'unload':
+            rig.manager.unload('hermes-telegram-experience')
+        elif fence == 'replacement':
+            config(rig.home, task_id=rig.tid)
+            rig.manager.discover_and_load(force=True)
+        return result
+    monkeypatch.setattr(kanban_surfaces, 'subscription_registration', lookup_then_fence)
 
     await _KanbanNotification(
         rig.runner, deliveries[0], platform_cls=Platform, sub_fail_counts={},
     ).deliver()
 
-    assert len(rig.bot.sent) == 1
-    assert 'blocked' in rig.bot.sent[0]['text'].lower()
+    assert len(rig.bot.sent) == (1 if fence == 'none' else 0)
+    if fence == 'none':
+        assert 'blocked' in rig.bot.sent[0]['text'].lower()
     assert not replacement.sources
 
 
