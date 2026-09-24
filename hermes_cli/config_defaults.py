@@ -1911,6 +1911,11 @@ DEFAULT_CONFIG = {
         # root profile named "default", so on a shared kanban.db every home can otherwise claim
         # default-assigned cards.
         "dispatch_profiles": None,
+        # Optional embedded-dispatcher board admission. Omit this key from the
+        # user config to preserve the historical all-board sweep. Once present,
+        # only an exact non-empty list of active board slugs is admitted; an
+        # empty, malformed or unresolved value admits none.
+        "dispatch_boards": None,
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": True,

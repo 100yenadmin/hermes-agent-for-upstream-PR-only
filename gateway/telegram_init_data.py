@@ -12,6 +12,10 @@ class InitDataDenied(ValueError):
     """No untrusted payload in error text."""
 
 
+class InitDataExpired(InitDataDenied):
+    """The signature was valid but the bounded credential age elapsed."""
+
+
 def _unique(pairs):
     result = {}
     for key, value in pairs:
@@ -57,7 +61,9 @@ def verify_init_data(raw, bot_token, *, now, max_age=300, future_skew=30):
         if not re.fullmatch(r'[1-9][0-9]{0,11}', stamp):
             raise InitDataDenied("invalid initialization data")
         stamp = int(stamp)
-        if not now - max_age <= stamp <= now + future_skew:
+        if stamp < now - max_age:
+            raise InitDataExpired("expired")
+        if stamp > now + future_skew:
             raise InitDataDenied("invalid initialization data")
         def reject_constant(_):
             raise InitDataDenied("invalid initialization data")
@@ -67,5 +73,7 @@ def verify_init_data(raw, bot_token, *, now, max_age=300, future_skew=30):
                 or not 0 < user['id'] < 2**53 or user.get('is_bot', False) is not False):
             raise InitDataDenied("invalid initialization data")
         return {'actor': user['id'], 'bot_id': int(bot_token.split(':', 1)[0]), 'auth_date': stamp}
+    except InitDataExpired:
+        raise
     except (ValueError, TypeError, UnicodeError, RecursionError):
         raise InitDataDenied("invalid initialization data") from None

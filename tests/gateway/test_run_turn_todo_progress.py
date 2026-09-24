@@ -100,10 +100,12 @@ def test_rendering_preserves_status_nesting_unicode_and_bounds():
         *({"id": str(i), "content": "🙂" * 500} for i in range(100)),
     ]
     text = render_todo_progress({"todos": todos, "revision": 9})
-    for marker in ("[ ] p:", "[>] i:", "[x] c:", "[~] x:", "  [ ] child:", "omitted"):
+    for marker in ("Conversation steps", "○ (no description)", "◉ (no description)",
+                   "✓ (no description)", "– (no description) (cancelled)",
+                   "  ○ 子 _*<>", "omitted"):
         assert marker in text
     assert len(text.encode("utf-16-le")) // 2 <= 4096
-    assert "No active tasks" in render_todo_progress({"todos": [], "revision": 10})
+    assert render_todo_progress({"todos": [], "revision": 10}) == "Conversation steps\nNo steps yet"
     deep = {"todos": [{"id": str(i), "parent": str(i-1)} for i in range(20)]}
     assert "deep nesting flattened" in render_todo_progress(deep)
     raw = render_todo_progress({"todos": [{"id": str(i), "content": "*" * 310} for i in range(60)]},

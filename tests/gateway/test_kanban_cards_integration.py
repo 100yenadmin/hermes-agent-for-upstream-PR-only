@@ -119,7 +119,9 @@ def receipt(rig):
 
 def advance(rig):
     with closing(kbc.connect(rig.path)) as c:
-        kb.add_comment(c,rig.tid,'synthetic','new canonical event')
+        task = kb.get_task(c, rig.tid)
+        assert task is not None
+        assert kb.edit_task(c, rig.tid, title=task.title + ' revised')
         return receipts.get_task_source(c,rig.tid).current_revision
 
 
@@ -162,7 +164,7 @@ async def test_duplicate_ticks_reordering_and_committed_states(rig):
     assert len(rig.bot.sent)==1 and not rig.bot.edited
     with closing(kbc.connect(rig.path)) as c: kb.block_task(c,rig.tid,reason='synthetic blocker',kind='needs_input')
     d=await tick(rig)
-    assert 'Blocked' in rig.bot.edited[-1]['text']
+    assert rig.bot.edited[-1]['text'] == 'Synthetic title\nWaiting'
     with closing(kbc.connect(rig.path)) as c:
         kb.complete_task(c,rig.tid,summary='synthetic verified fixture result')
     await tick(rig)
@@ -172,6 +174,34 @@ async def test_duplicate_ticks_reordering_and_committed_states(rig):
     assert receipt(rig).delivered_revision==latest
     assert 'Completed' in rig.bot.edited[-1]['text']
     assert len(rig.bot.sent)==1
+
+
+@pytest.mark.asyncio
+async def test_comment_payload_coalesces_then_block_edits_same_card(rig):
+    await tick(rig)
+    first = receipt(rig)
+    assert first.state == 'sent' and first.destination_message_id == '701'
+
+    rig.bot.edit_failure = BadRequest('Bad Request: message is not modified')
+    with closing(kbc.connect(rig.path)) as c:
+        kb.add_comment(c, rig.tid, 'synthetic', 'new canonical event')
+        comment_revision = receipts.get_task_source(c, rig.tid).current_revision
+    await tick(rig)
+    after_comment = receipt(rig)
+    assert after_comment.state == 'sent'
+    assert after_comment.delivered_revision == comment_revision
+    assert not rig.bot.edited
+
+    rig.bot.edit_failure = None
+    with closing(kbc.connect(rig.path)) as c:
+        kb.block_task(c, rig.tid, reason='synthetic blocker', kind='needs_input')
+        blocked_revision = receipts.get_task_source(c, rig.tid).current_revision
+    await tick(rig)
+    after_block = receipt(rig)
+    assert after_block.delivered_revision == blocked_revision
+    assert len(rig.bot.sent) == 1 and len(rig.bot.edited) == 1
+    assert rig.bot.edited[0]['message_id'] == 701
+    assert 'Waiting' in rig.bot.edited[0]['text']
 
 
 @pytest.mark.asyncio

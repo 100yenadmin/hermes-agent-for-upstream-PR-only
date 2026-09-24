@@ -879,6 +879,18 @@ class PluginContext:
 
     task_read_capability = 2
 
+    work_presentation_capability = 1
+
+    def register_work_presentation(self, *, scope):
+        """Register authored proposal/task publication for this profile."""
+        from gateway.work_presentation import register_work_presentation
+        return register_work_presentation(self, scope=scope)
+
+    def get_work_presentation(self):
+        """Return the registered service only on its current trusted route."""
+        from gateway.work_presentation import get_work_presentation
+        return get_work_presentation(self)
+
     def register_task_detail(self, *, scope):
         """Host-owned Telegram principal, exact read grant and canonical projection.
 

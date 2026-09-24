@@ -1421,9 +1421,13 @@ HERMES_TELEGRAM_NOTIFICATIONS=all
 
 Unknown values log a warning and fall back to `important`.
 
-## Live task progress (optional)
+## Useful plans and task progress (optional)
 
-The separately installed `hermes-telegram-experience` plugin can show the current session `todo_list` as one read-only message in an explicitly scoped Telegram chat or topic. This candidate requires host capability version 2 (`live_todo_capability`, and version 2 of `task_card_capability`, `task_read_capability`, or `task_decision_capability` when those surfaces are enabled) plus the fenced Telegram transport patch. It is disabled by default, live-run-only, and a final answer never marks tasks complete.
+The separately installed `hermes-telegram-experience` plugin can show the current session
+`todo_list`, publish an authored plan brief, and present canonical task state in an explicitly
+scoped Telegram chat or topic. It requires host capability version 2 for the live todo/card/read/
+decision surfaces and `work_presentation_capability = 1` for authored briefs. It is disabled by
+default, and a final answer never marks a canonical task complete.
 
 After installing the package in the same isolated interpreter as this host, explicitly enable it in that profile's config:
 
@@ -1434,22 +1438,41 @@ plugins:
     hermes-telegram-experience:
       settings:
         enabled: true
+        durable_cards: true
+        task_detail: true
+        work_briefs: true
         scope:
           routes:
             - profile: default
               platform: telegram
               chat_id: "-1000000000001" # synthetic example
               thread_id: "7"             # use null for the exact no-topic route
-          task_resources:
-            - board: default
-              task_id: t_0123abcd         # synthetic canonical task ID
+          task_resources: []              # exact legacy resources may be listed here
 ```
 
-Every route is an exact `(profile, platform, chat_id, thread_id)` tuple. `thread_id: null` means the exact no-topic route; it is not a wildcard. Task resources are exact `(board, task_id)` tuples. Missing, malformed, duplicate, or wildcard-like scope fails closed before a surface is registered. A todo-only configuration may use an empty `task_resources` list; durable cards and task detail require at least one resource. Out-of-scope subscriptions continue through the ordinary notification path without card receipt ownership.
+Every route is an exact `(profile, platform, chat_id, thread_id)` tuple. `thread_id: null` means
+the exact no-topic route; it is not a wildcard. Task resources are exact `(board, task_id)` tuples.
+Missing, malformed, duplicate, or wildcard-like scope fails closed before a surface is registered.
+With `work_briefs: true`, proposals and their linked published tasks use the exact route and do not
+need one YAML edit per task. Exact resources remain available for legacy card/detail registration.
+Out-of-scope subscriptions continue through the ordinary notification path without card receipt
+ownership.
 
-The scope is only an admission boundary. It does not grant task reads or decisions. Those permissions remain separate, explicit entries under `kanban.read_grants` and `kanban.decision_grants`, and the host rechecks both the scope and the matching grant. Merge these keys with existing plugin settings rather than replacing them. The earlier experimental `display.task_progress` switch is retained for compatibility with the preserved candidate settings, but no longer activates a core UI controller. The plugin setting above is now the opt-in authority. An explicit `display.tool_progress: off` (or Telegram override) remains a hard quiet gate. Muted turns and scheduled heartbeats are suppressed too.
+The scope is only an admission boundary. It does not grant task reads or decisions. Work-brief
+reads require signed Mini App data, the configured bot to be a current group administrator, the
+requester to be a current group member, and unchanged route/resource identity across projection.
+Group readers do not inherit controls. A trusted publication can derive a control only for its
+exact initiating actor, task incarnation, route, message and current control generation. Legacy
+`kanban.read_grants` and `kanban.decision_grants` remain available when work briefs are not
+registered. Merge these keys with existing plugin settings rather than replacing them.
 
-Updates coalesce and edit one message; an empty list clears its task body without claiming completion. Deleted/uneditable messages are not recreated. An ambiguous dispatched call quarantines that profile/topic surface for the process lifetime; no blind retry or overlapping successor. Config-only disable is a **requested** stop until plugin unload/restart makes it effective. Unload/disconnect/run end revoke new admissions before bounded settlement/cancellation. Already-dispatched calls cannot be unsent.
+Updates coalesce and edit one message; an empty list clears its task body without claiming
+completion. Equivalent confirmed payloads may advance a local revision only for the same resource,
+incarnation, destination and message. Ambiguous calls remain quarantined and never become success
+from a Telegram "not modified" response alone. Deleted/uneditable messages are not recreated.
+Config-only disable is a **requested** stop until plugin unload/restart makes it effective.
+Unload/disconnect/run end revoke new admissions before bounded settlement/cancellation.
+Already-dispatched calls cannot be unsent.
 
 Admission travels through the existing SDK and adapter-owned HTTP/1 transport: fallback, connection, pool and write-flow-control waits are followed by a fence before synchronous request-byte enqueue. Enqueued bytes remain potentially dispatched even if no receipt arrives; verified late receipts settle the stopped attempt without reviving its writer. Ordinary connection recovery remains enabled. Optional presenter construction/close errors are logged and do not replace the normal final-answer or host cleanup paths.
 

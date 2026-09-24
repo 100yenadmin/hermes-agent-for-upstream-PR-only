@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, replace
 from enum import Enum
+import hashlib
+import json
 import logging
 import threading
 from uuid import uuid4
@@ -26,6 +28,20 @@ class DeliveryOutcome:
     message_id: str | None = None
     reason: str = ""
     retry_after: float | None = None
+
+
+def rendered_payload_hash(text: str, rows=()) -> str:
+    """Digest the exact bounded text and normalized inline-button payload.
+
+    A confirmed message may satisfy a newer source revision only when this
+    complete wire-visible payload is byte-equivalent.  Resource, route and
+    destination identity remain the owning receipt/source's responsibility.
+    """
+    payload = {"text": text, "rows": rows}
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -320,6 +336,27 @@ def register_live_todo(ctx, factory, *, scope):
     manager._live_todo_registration = registration
     ctx.on_unload(registration.close)
     return registration
+
+
+def route_bound_live_source(*, profile_home, profile, chat_id, thread_id, bot_id):
+    """Return the one admitted live Telegram source for an exact route.
+
+    This is a process-local transport bridge for another host-owned surface;
+    callers receive no credential or adapter lookup by caller-supplied route.
+    Ambiguity and stale sources fail closed.
+    """
+    matches = []
+    with _surfaces_lock:
+        for source in _surfaces.values():
+            binding = source.binding
+            bot = getattr(source.client, "id", None)
+            if (binding.profile_home == str(profile_home)
+                    and binding.profile == profile and binding.platform == "telegram"
+                    and binding.chat_id == str(chat_id)
+                    and binding.thread_id == (str(thread_id) if thread_id else None)
+                    and bot == bot_id and source.admitted()):
+                matches.append(source)
+    return matches[0] if len(matches) == 1 else None
 
 
 def open_live_todo(runner, disp, ctx):

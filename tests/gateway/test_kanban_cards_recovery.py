@@ -30,7 +30,9 @@ async def child(home, mode):
         row = c.execute('SELECT id FROM tasks').fetchone()
         if row:
             tid = row[0]
-            h.kb.add_comment(c, tid, 'synthetic', 'reopened process canonical revision')
+            task = h.kb.get_task(c, tid)
+            assert task is not None
+            assert h.kb.edit_task(c, tid, title=task.title + ' reopened')
             # Deterministic lease-clock advance after the old process has died.
             c.execute('UPDATE kanban_delivery_receipts SET lease_expires_at=0 WHERE state="pending"')
         else:

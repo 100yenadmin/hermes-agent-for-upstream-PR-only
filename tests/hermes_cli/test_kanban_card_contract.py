@@ -103,9 +103,9 @@ def test_plugin_renderer_bounded_sanitized_status_and_pure():
     from hermes_telegram_experience.cards import render_task_card
     snapshot=TaskCardSnapshot('a','board','t_test',1,2,'review','secret=synthetic https://example.invalid /Users/synthetic/file '+('😀'*5000),'worker',1)
     text=render_task_card(snapshot)
-    assert 'In review (not completed)' in text and 'Snapshot 1:2' in text
+    assert text.endswith('\nIn review')
     assert 'example.invalid' not in text and '/Users/' not in text and 'secret=synthetic' not in text
     assert len(text.encode('utf-16-le'))//2<=4096
-    assert 'Blocked' in render_task_card(replace(snapshot,status='blocked'))
+    assert render_task_card(replace(snapshot,status='blocked')).endswith('\nWaiting')
     assert 'Completed' in render_task_card(replace(snapshot,status='done'))
     assert snapshot.revision==2 and snapshot.status=='review'

@@ -241,7 +241,8 @@ async def test_init_data_denials_do_not_read_or_mutate(rig, monkeypatch, case):
         pytest.fail('Unauthorized request reached resource projection')
     monkeypatch.setattr(r.service, '_project', forbidden)
     response = await http(r.app, headers={**r.headers, 'X-Telegram-Init-Data':values[case]})
-    assert response.status == 403 and json.loads(response.text) == {'error':'unavailable'}
+    expected = {'error': 'expired'} if case == 'expired' else {'error': 'unavailable'}
+    assert response.status == 403 and json.loads(response.text) == expected
     assert db_state(r) == before
     assert {p.name: p.read_bytes() for p in r.path.parent.glob('kanban.db*')} == files
 

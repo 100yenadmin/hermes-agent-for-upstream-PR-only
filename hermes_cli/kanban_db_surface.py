@@ -47,6 +47,8 @@ def migrate_delivery_receipts(conn):
             conn.execute("CREATE INDEX idx_receipts_lane ON kanban_delivery_receipts(task_id, task_incarnation, platform, chat_id, thread_id)")
             conn.execute("CREATE INDEX idx_receipts_state ON kanban_delivery_receipts(state, lease_expires_at)")
     from hermes_cli.sqlite_util import add_column_if_missing
+    if columns:
+        add_column_if_missing(conn, "kanban_delivery_receipts", "control_hash", "control_hash TEXT")
     if conn.execute("PRAGMA table_info(kanban_notify_subs)").fetchone() is not None:
         add_column_if_missing(conn, "kanban_notify_subs", "binding_token", "binding_token TEXT")
         conn.execute("UPDATE kanban_notify_subs SET binding_token=lower(hex(randomblob(16))) WHERE binding_token IS NULL")
@@ -65,7 +67,7 @@ def quarantine_delivery(conn, lease):
     with _write_scope(conn):
         conn.execute("UPDATE kanban_delivery_receipts SET state='unknown', owner_id=NULL, "
                      "lease_expires_at=NULL, retry_disposition='reconcile_required', "
-                     "failure_count=failure_count+1 "
+                     "failure_count=failure_count+1, renderer_hash=NULL, control_hash=NULL "
                      "WHERE id=? AND state='pending' AND attempt_id=? AND owner_epoch=?",
                      (lease.receipt.id, lease.attempt_id, lease.owner_epoch))
 
@@ -128,6 +130,7 @@ class DeliveryReceipt:
     destination_profile: Optional[str]
     renderer_version: Optional[str]
     renderer_hash: Optional[str]
+    control_hash: Optional[str]
     owner_epoch: int
     owner_id: Optional[str]
     lease_expires_at: Optional[int]
@@ -169,6 +172,7 @@ class DeliveryReceipt:
             destination_profile=row["destination_profile"],
             renderer_version=row["renderer_version"],
             renderer_hash=row["renderer_hash"],
+            control_hash=row["control_hash"],
             owner_epoch=int(row["owner_epoch"]),
             owner_id=row["owner_id"],
             lease_expires_at=(
@@ -478,6 +482,22 @@ def claim_delivery_receipt(
             raise DeliveryReceiptNotDue("newer demand superseded this snapshot")
         if float(row["retry_at"]) > stamp:
             raise DeliveryReceiptNotDue("receipt retry_after has not elapsed")
+        if (state == "failed" and row["failure_count"] >= 1
+                and row["retry_disposition"] == "exhausted"
+                and row["last_error"] == "known message unchanged"
+                and row["destination_message_id"] is not None
+                and row["attempted_revision"] is not None
+                and int(row["desired_revision"]) > int(row["attempted_revision"])):
+            # A deterministic known-message rejection cannot have created a
+            # duplicate. A later rendered revision gets one fresh bounded
+            # attempt budget; the same revision can never reset itself.
+            conn.execute(
+                "UPDATE kanban_delivery_receipts SET failure_count=0, "
+                "retry_disposition='safe_retry' WHERE id=?",
+                (receipt_id,),
+            )
+            row = _receipt_row(conn, receipt_id)
+            state = "failed"
         if state in {"unknown", "failed"} and row["failure_count"] >= 3:
             raise DeliveryReceiptNotRetryable("delivery recovery budget exhausted")
         if state == "unknown" and row["destination_message_id"] is not None:
@@ -485,7 +505,8 @@ def claim_delivery_receipt(
             # old attempt is fenced by the next claim epoch. Unknown creates,
             # including replacements, have no ID and remain quarantined.
             conn.execute("UPDATE kanban_delivery_receipts SET state='failed', "
-                         "owner_id=NULL, lease_expires_at=NULL, retry_disposition='safe_retry' WHERE id=?",
+                         "owner_id=NULL, lease_expires_at=NULL, retry_disposition='safe_retry', "
+                         "renderer_hash=NULL, control_hash=NULL WHERE id=?",
                          (receipt_id,))
             row = _receipt_row(conn, receipt_id)
             state = "failed"
@@ -499,6 +520,7 @@ def claim_delivery_receipt(
                            failure_count = failure_count + 1,
                            retry_disposition = 'reconcile_required',
                            last_error = 'delivery owner lease expired; remote outcome is unknown',
+                           renderer_hash = NULL, control_hash = NULL,
                            updated_at = ?
                      WHERE id = ? AND state = 'pending' AND owner_epoch = ?
                     """,
@@ -554,6 +576,49 @@ def claim_delivery_receipt(
         receipt=receipt, owner_id=owner_id, owner_epoch=new_epoch,
         attempt_id=attempt_id, desired_revision=receipt.attempted_revision,
     )
+
+
+def confirm_equivalent_delivery(
+    conn: sqlite3.Connection,
+    receipt_id: int,
+    *,
+    desired_revision: int,
+    renderer_hash: str,
+    message_id: str,
+    now: Optional[int] = None,
+) -> DeliveryReceipt:
+    """Advance a known message when its full rendered payload is unchanged.
+
+    This is local equivalence to an earlier confirmed send, not settlement of
+    the newer transport attempt.  Unknown, pending, deleted and never-sent
+    receipts remain fenced.
+    """
+    desired_revision = int(desired_revision)
+    renderer_hash = _text(renderer_hash, field="renderer_hash")
+    message_id = _text(message_id, field="message_id")
+    stamp = _now(now)
+    with _write_scope(conn):
+        row = _receipt_row(conn, receipt_id)
+        get_task_source(
+            conn, row["task_id"], expected_revision=desired_revision,
+            task_incarnation=row["task_incarnation"],
+        )
+        if (int(row["desired_revision"]) != desired_revision
+                or row["state"] != "sent"
+                or row["owner_id"] not in {None, ""}
+                or row["destination_message_id"] != message_id
+                or row["delivered_revision"] is None
+                or row["renderer_hash"] != renderer_hash):
+            raise DeliveryReceiptNotDue("receipt has no equivalent confirmed payload")
+        conn.execute(
+            "UPDATE kanban_delivery_receipts SET state='sent', delivered_revision=?, "
+            "retry_disposition='delivered', last_error=NULL, failure_count=0, updated_at=? "
+            "WHERE id=?",
+            (desired_revision, stamp, int(receipt_id)),
+        )
+    receipt = get_delivery_receipt(conn, receipt_id)
+    assert receipt is not None
+    return receipt
 
 
 def record_delivery_outcome(
@@ -634,6 +699,7 @@ def record_delivery_outcome(
         params.extend([
             str(message_id) if message_id is not None else None,
             destination_profile, retry_disposition, error, stamp, failures,
+            state, state,
             int(receipt_id), owner_id, int(owner_epoch), attempt_id,
             desired_revision,
         ])
@@ -649,7 +715,9 @@ def record_delivery_outcome(
                    destination_message_id = COALESCE(?, destination_message_id),
                    destination_profile = COALESCE(?, destination_profile),
                    owner_id = NULL, lease_expires_at = NULL,
-                   retry_disposition = ?, last_error = ?, updated_at = ?, failure_count = ?
+                   retry_disposition = ?, last_error = ?, updated_at = ?, failure_count = ?,
+                   renderer_hash = CASE WHEN ? = 'unknown' THEN NULL ELSE renderer_hash END,
+                   control_hash = CASE WHEN ? = 'unknown' THEN NULL ELSE control_hash END
              WHERE id = ? AND {guard}
                AND owner_epoch = ? AND attempt_id = ?
                AND attempted_revision = ? {expiry_guard}

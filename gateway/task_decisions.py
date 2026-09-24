@@ -41,6 +41,13 @@ class TaskDecisions:
             kanban = config.get("kanban", {})
             grants = kanban.get("decision_grants", []) if isinstance(kanban, dict) else []
             grants = grants if isinstance(grants, list) else []
+            plugins = config.get("plugins", {}) if isinstance(config.get("plugins", {}), dict) else {}
+            settings = plugins.get("entries", {}).get(self.registration.plugin_id, {}).get("settings", {})
+            automatic = bool(
+                self.registration.plugin_id in plugins.get("enabled", [])
+                and self.registration.plugin_id not in plugins.get("disabled", [])
+                and isinstance(settings, dict) and settings.get("enabled") is True
+                and settings.get("decisions") is True and settings.get("work_briefs") is True)
             policy_paths = [Path(self.registration.profile_home) / "config.yaml"]
             managed_dir = managed_scope.get_managed_dir()
             if managed_dir is not None:
@@ -54,13 +61,13 @@ class TaskDecisions:
                 except OSError:
                     file_identity.append((str(policy_path), None))
             digest = hashlib.sha256(json.dumps(
-                [grants, file_identity], sort_keys=True, default=str).encode()).hexdigest()
+                [grants, automatic, file_identity], sort_keys=True, default=str).encode()).hexdigest()
             if digest != self.policy_digest:
                 self.policy_digest = digest
                 # Stable while the same current file/policy is in force, but a malformed edit
                 # and its later repair have new file identity and cannot revive an old token.
                 self.policy_epoch = digest
-            return grants
+            return grants, automatic
         finally:
             reset_hermes_home_override(scope)
 
@@ -68,16 +75,47 @@ class TaskDecisions:
         snapshot = source.data["snapshot"]
         required = dict(profile=snapshot.profile, board=snapshot.board, task_id=snapshot.task_id,
                         actions=["unblock_needs_input"])
-        grants = [g for g in self._grants() if isinstance(g, dict)
+        configured, automatic = self._grants()
+        grants = [g for g in configured if isinstance(g, dict)
                   and all(g.get(k) == v for k, v in required.items())
                   and isinstance(g.get("id"), str) and g["id"]
                   and type(g.get("actor")) is int and g["actor"] > 0]
-        return grants[0] if len(grants) == 1 else None
+        if len(grants) == 1:
+            return grants[0]
+        if grants or not automatic or snapshot.publication_stale:
+            return None
+        audience = source.data.get("publication_audience")
+        if (audience is None or audience.profile != snapshot.profile
+                or audience.platform != "telegram" or audience.bot_id != getattr(source.client, "id", None)
+                or audience.chat_id != str(source.sub["chat_id"])
+                or audience.thread_id != (str(source.sub.get("thread_id")) if source.sub.get("thread_id") else None)
+                or type(audience.actor_id) is not int or audience.actor_id <= 0):
+            return None
+        # Same internal shape as a configured grant so execution keeps one
+        # exact-principal, exact-revision authorization path.
+        return dict(id="published-task", actor=audience.actor_id,
+                    profile=snapshot.profile, board=snapshot.board, task_id=snapshot.task_id,
+                    actions=["unblock_needs_input"])
 
     def observe(self, source):
         key = (source.data["db_path"], source.data["receipt_id"])
         if key in self.bindings or len(self.bindings) < 4096:
             self.bindings[key] = source
+
+    @staticmethod
+    def _scope_allows(source):
+        snapshot = source.data["snapshot"]
+        audience = source.data.get("publication_audience")
+        dynamic = bool(audience and audience.bot_id == getattr(source.client, "id", None)
+                       and source.registration.scope.allows_route(
+                           audience.profile, audience.platform, audience.chat_id, audience.thread_id)
+                       and audience.profile == source.sub["notifier_profile"]
+                       and audience.chat_id == str(source.sub["chat_id"])
+                       and audience.thread_id == (str(source.sub.get("thread_id"))
+                                                  if source.sub.get("thread_id") else None))
+        return dynamic or source.registration.scope.allows_card(
+            source.sub["notifier_profile"], source.sub["platform"], source.sub["chat_id"],
+            source.sub.get("thread_id") or None, snapshot.board, snapshot.task_id)
 
     def _binding_current(self, source, conn):
         from gateway.kanban_surfaces import _quiet
@@ -86,9 +124,7 @@ class TaskDecisions:
         snapshot = source.data["snapshot"]
         return (self.registration.active and not _quiet(self.registration.profile_home)
                 and source.registration is self.registration
-                and self.registration.scope.allows_card(
-                    source.sub["notifier_profile"], source.sub["platform"], source.sub["chat_id"],
-                    source.sub.get("thread_id") or None, snapshot.board, snapshot.task_id)
+                and self._scope_allows(source)
                 and source.adapter._bot is source.client
                 and source.adapter._live_todo_epoch == source.epoch
                 and source._subscription_current(conn)
@@ -156,9 +192,7 @@ class TaskDecisions:
         identity = canonical_identity(s, runner=source.runner, adapter=source.adapter)
         if (identity is None or identity.adapter() is not source.adapter
                 or identity.runtime_profile != source.sub["notifier_profile"]
-                or not self.registration.scope.allows_card(
-                    identity.runtime_profile, "telegram", s.chat_id, s.thread_id,
-                    source.data["snapshot"].board, source.sub["task_id"])
+                or not self._scope_allows(source)
                 or Path(identity.runtime_home).resolve() != Path(self.registration.profile_home).resolve()
                 or source.adapter._is_sender_authorized(s.user_id, s.chat_type, s.chat_id,
                                                        thread_id=s.thread_id) is not True):
@@ -209,7 +243,7 @@ class TaskDecisions:
                                         or (record.state != "completed" and r.delivered_revision != record.expected_revision)):
                                     raise actions.ActionAuthorizationError("confirmed card required")
                                 # The keyboard and text must have a verified exact settlement.
-                                if record.state != "completed" and r.renderer_hash != hashlib.sha256(record.token.encode()).hexdigest():
+                                if record.state != "completed" and r.control_hash != hashlib.sha256(record.token.encode()).hexdigest():
                                     raise actions.ActionAuthorizationError("control delivery not confirmed")
                             return actions.execute_blocker_choice(conn, token, authorize=authorize, **route)
                         except (actions.ActionRecordError, receipts.DeliveryReceiptError):

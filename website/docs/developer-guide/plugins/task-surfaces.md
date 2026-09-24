@@ -5,19 +5,22 @@ title: Scoped task surfaces
 # Scoped task surfaces
 
 These optional host interfaces let an external presentation plugin render live todo progress,
-durable canonical task cards, bounded blocker decisions and read-only task detail. They do not
-add a model tool, polling loop or task database. The Telegram Experience plugin is the concrete
-consumer; its renderers and browser assets remain outside the host repository.
+authored proposal briefs, durable canonical task cards, bounded blocker decisions and read-only
+detail. They do not add a model tool, polling loop or task database. The Telegram Experience
+plugin is the concrete consumer; its tools, renderers and browser assets remain outside the host
+repository.
 
 ## Registration and ownership
 
 `PluginContext` exposes four local capability versions, each currently `2`:
 `live_todo_capability`, `task_card_capability`, `task_decision_capability` and
-`task_read_capability`. A consumer checks the capability it needs before registering; it must
-not fall back to monkey-patching an unsupported host.
+`task_read_capability`. It also exposes `work_presentation_capability = 1`. A consumer checks the
+capability it needs before registering; it must not fall back to monkey-patching an unsupported
+host.
 
 | Registration | Ownership |
 | --- | --- |
+| `register_work_presentation(scope=...)` | Host validates bounded authored proposals and task publications, binds them to trusted ingress and exact runs, and owns proposal lifecycle/delivery state. The plugin supplies state and rendering. |
 | `register_live_todo(factory, scope=...)` | Host binds one live run and transport; plugin renders todo snapshots. |
 | `register_task_cards(factory, scope=...)` | Host owns canonical snapshots, subscription generation, receipt leases and reconciliation. |
 | `register_task_decisions(callback_prefix="task:")` | Requires the same plugin's active card registration; host authenticates native callbacks and performs the bounded transition. |
@@ -36,7 +39,8 @@ Rebuilding the native client still wires the current factories afresh.
 
 ## Exact admission scope
 
-Both keys are required, including for a todo-only consumer:
+Routes are always required. Exact task resources are optional for authored work briefs and
+todo-only consumers; legacy card/detail registration still requires them:
 
 ```yaml
 scope:
@@ -45,29 +49,44 @@ scope:
       platform: telegram
       chat_id: "-1000000000001"
       thread_id: "7"
-  task_resources:
-    - board: default
-      task_id: t_0123abcd
+  task_resources: []
 ```
 
-These are synthetic examples. Profile, platform, chat and topic match exactly. A null topic is
-an exact no-topic route, never a wildcard. Missing, invalid or duplicate entries deny registration.
-Todo-only use can supply an empty task resource list; cards/detail need an explicit resource.
-The host checks scope before todo binding, card receipt/cursor ownership, and transport admission.
-Out-of-scope subscriptions retain their existing ordinary notification path.
+These are synthetic examples. Profile, platform, chat and topic match exactly. A null topic is an
+exact no-topic route, never a wildcard. Missing, invalid or duplicate entries deny registration.
+The host checks scope before todo binding, card receipt/cursor ownership, proposal transport and
+read admission. A work-presentation registration can create cards for its own exact published
+tasks without adding each task to YAML. Out-of-scope subscriptions retain their existing ordinary
+notification path.
 
-Scope does not grant reads or actions. `kanban.decision_grants` authorizes one actor and exact
-profile/board/task for `unblock_needs_input`; native actor, topic, message, receipt and current
-policy must still match. Replayed or revoked controls cannot repeat a canonical transition.
-`kanban.read_grants` separately binds the actor, profile, board, task incarnation and read
-permission. Telegram-signed initData establishes identity, not resource authority.
+Scope does not grant reads or actions. With `work_briefs: true`, a signed read additionally
+requires the configured bot to be an administrator and the requesting actor to be a current
+member of the exact group. Membership and route/resource identity are checked before and after
+projection, without a positive cross-request cache. Read authority never grants actions.
+
+When decisions are enabled, a trusted publication can derive one exact blocker action grant for
+its initiating actor, task incarnation, route, message and current control generation. Missing or
+ambiguous initiators deny controls. Existing `kanban.decision_grants` and `kanban.read_grants`
+remain the compatibility path when authored work presentation is not registered. Telegram-signed
+initData establishes identity, not resource authority.
+
+Proposal approval binds the stored source digest, proposal incarnation and revision and requires
+that exact revision to have confirmed delivery to its durable card. A pending, failed or unknown
+edit cannot be approved as though it were displayed. Approval does not rewrite the authored brief.
 
 ## Persistence and recovery
 
-Durable receipts and action audit records use the existing canonical board database. A sent card
-is reconciled by its verified message ID. Ambiguous dispatched attempts are quarantined rather
-than blindly resent. Legacy ambiguous receipt migration does not invent a successful send.
-Live todo bubbles are run-scoped and are not reconstructed after a process crash.
+Task publications are explicit bounded payloads on canonical task events; arbitrary bodies,
+comments, transcripts and raw results are never projected. Proposal records use the registering
+plugin's existing state facade. Durable task receipts and action audit records use the existing
+canonical board database. No second task store or polling loop is introduced.
+
+A sent card is reconciled by its verified message ID and normalized full rendered payload. Action
+controls use a separate hash populated only by confirmed transport settlement. Ambiguous attempts
+clear confirmed equivalence and remain quarantined rather than being blindly resent. A newer
+revision can recover only the bounded, positively classified known-message/not-modified case.
+Legacy receipt migration does not invent a successful send or action authority. Live todo bubbles
+are run-scoped and are not reconstructed after a process crash.
 
 Read-only detail excludes task bodies, transcripts and arbitrary metadata. It never mutates
 canonical task/event/action data; normal SQLite read-only WAL access may create coordination files.

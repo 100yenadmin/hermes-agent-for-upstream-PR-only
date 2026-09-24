@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import closing
 from dataclasses import dataclass
+import hashlib
 import logging
 import math
 from pathlib import Path
@@ -38,14 +39,26 @@ class TaskCardSnapshot:
     title: str
     assignee: str
     updated_at: int
+    presentation: dict | None = None
+    steps: tuple = ()
+    published_at: int | None = None
+    publication_stale: bool = True
 
 
 def register_task_cards(ctx, factory, *, scope):
     if not callable(factory):
         raise ValueError("task card factory must be callable")
     from gateway.surface_scope import parse_surface_scope
-    parsed_scope = parse_surface_scope(scope, require_tasks=True)
+    parsed_scope = parse_surface_scope(scope, require_tasks=False)
     manager = ctx._manager
+    if not parsed_scope.task_resources:
+        work = getattr(manager, "_work_presentation_registration", None)
+        if (work is None or not work.active or work.plugin_id != ctx.plugin_id
+                or work.scope != parsed_scope):
+            raise ValueError(
+                "task cards require at least one exact task resource unless matching work "
+                "presentation is active"
+            )
     current = getattr(manager, "_task_card_registration", None)
     if current is not None and current.active:
         if current.plugin_id == ctx.plugin_id:
@@ -87,10 +100,13 @@ def subscription_registration(runner, sub, board, *, distinguish_scope_decline=F
         reg = getattr(manager, "_task_card_registration", None)
         if reg is None or not reg.active:
             return None
+        work = getattr(manager, "_work_presentation_registration", None)
         if reg.scope.allows_card(
             sub["notifier_profile"], sub["platform"], sub["chat_id"],
             sub.get("thread_id") or None, board, sub["task_id"],
-        ):
+        ) or (work is not None and work.active and work.plugin_id == reg.plugin_id
+              and reg.scope.allows_route(sub["notifier_profile"], sub["platform"],
+                                         sub["chat_id"], sub.get("thread_id") or None)):
             return reg
         return _ScopeDeclined(manager, reg) if distinguish_scope_decline else None
     finally:
@@ -111,15 +127,23 @@ def _quiet(home):
 
 def collect_surface(conn, board, sub, registration):
     """Read one committed snapshot and persist its desire in the same transaction."""
-    if not registration.scope.allows_card(
-        sub["notifier_profile"], sub["platform"], sub["chat_id"],
-        sub.get("thread_id") or None, board, sub["task_id"],
-    ):
-        return None
     with kb.write_txn(conn, allow_nested=bool(conn.in_transaction)):
         source = receipts.get_task_source(conn, sub["task_id"])
         task = kb.get_task(conn, sub["task_id"])
         event = conn.execute("SELECT created_at FROM task_events WHERE id=?", (source.current_revision,)).fetchone()
+        from hermes_cli.kanban_publication import project_task_publication
+        publication = project_task_publication(conn, task.id, source.current_revision)
+        legacy = registration.scope.allows_card(
+            sub["notifier_profile"], sub["platform"], sub["chat_id"],
+            sub.get("thread_id") or None, board, sub["task_id"])
+        audience = publication["audience"] if publication else None
+        dynamic = bool(audience and registration.scope.allows_route(
+            audience.profile, audience.platform, audience.chat_id, audience.thread_id)
+            and audience.profile == sub["notifier_profile"]
+            and audience.chat_id == str(sub["chat_id"])
+            and audience.thread_id == (str(sub.get("thread_id")) if sub.get("thread_id") else None))
+        if not legacy and not dynamic:
+            return None
         receipt = receipts.ensure_delivery_receipt(
             conn, task_id=task.id, task_incarnation=source.task_incarnation,
             desired_revision=source.current_revision, platform=sub["platform"],
@@ -131,10 +155,15 @@ def collect_surface(conn, board, sub, registration):
                      (sub["binding_token"], receipt.id))
         snapshot = TaskCardSnapshot(sub["notifier_profile"], board, task.id,
                                     source.task_incarnation, source.current_revision,
-                                    task.status, task.title, task.assignee or "", int(event[0]))
+                                    task.status, task.title, task.assignee or "", int(event[0]),
+                                    publication["presentation"] if publication else None,
+                                    tuple(publication["steps"]) if publication else (),
+                                    publication["published_at"] if publication else None,
+                                    publication["publication_stale"] if publication else True)
         path = conn.execute("PRAGMA database_list").fetchone()[2]
     return dict(snapshot=snapshot, receipt_id=receipt.id, db_path=str(Path(path).resolve()),
-                binding_token=sub["binding_token"])
+                binding_token=sub["binding_token"],
+                publication_audience=publication["audience"] if publication else None)
 
 
 async def offer_surface(runner, delivery, adapter):
@@ -217,8 +246,8 @@ class CardHandle:
         service = getattr(self.__source.registration, "decisions", None)
         return service.controls(self.__source, snapshot) if service else ()
 
-    async def deliver(self, snapshot, text, *, controls=()):
-        return await self.__source.deliver(snapshot, text, controls=controls)
+    async def deliver(self, snapshot, text, *, controls=(), links=()):
+        return await self.__source.deliver(snapshot, text, controls=controls, links=links)
 
 
 class CardSource:
@@ -263,7 +292,15 @@ class CardSource:
                     or self.adapter._live_todo_epoch != self.epoch or _quiet(self.registration.profile_home)):
                 return False
             snapshot = self.data["snapshot"]
-            if not self.registration.scope.allows_card(
+            audience = self.data.get("publication_audience")
+            dynamic = bool(audience and audience.bot_id == getattr(self.client, "id", None)
+                           and self.registration.scope.allows_route(
+                               audience.profile, audience.platform, audience.chat_id, audience.thread_id)
+                           and audience.profile == self.sub["notifier_profile"]
+                           and audience.chat_id == str(self.sub["chat_id"])
+                           and audience.thread_id == (str(self.sub.get("thread_id"))
+                                                      if self.sub.get("thread_id") else None))
+            if not dynamic and not self.registration.scope.allows_card(
                 self.sub["notifier_profile"], self.sub["platform"], self.sub["chat_id"],
                 self.sub.get("thread_id") or None, snapshot.board, snapshot.task_id,
             ):
@@ -286,7 +323,7 @@ class CardSource:
                             and r.lease_expires_at > time.time())
             return True
 
-    async def deliver(self, snapshot, text, *, controls=()):
+    async def deliver(self, snapshot, text, *, controls=(), links=()):
         if not self.admitted():
             return DeliveryOutcome(DeliveryStatus.REJECTED, reason="stopped card source")
         # Validate snapshot revision before claiming; do not send old text as a newer attempt.
@@ -294,14 +331,27 @@ class CardSource:
             r = receipts.get_delivery_receipt(conn, self.data["receipt_id"])
             if r is None or snapshot.revision != r.desired_revision:
                 return DeliveryOutcome(DeliveryStatus.SKIPPED, reason="coalesced newer demand")
-            import hashlib
-            control_key = hashlib.sha256(controls[0][1].encode()).hexdigest() if controls else None
+            if type(links) not in {tuple, list} or len(links) > 4:
+                return DeliveryOutcome(DeliveryStatus.REJECTED, reason="invalid links")
+            clean_links = []
+            for link in links:
+                from urllib.parse import urlsplit
+                try:
+                    parsed = urlsplit(link.get("url")) if isinstance(link, dict) else None
+                except (TypeError, ValueError):
+                    parsed = None
+                if (type(link) is not dict or set(link) != {"label", "url"}
+                        or not isinstance(link["label"], str) or not 1 <= len(link["label"]) <= 80
+                        or not isinstance(link["url"], str) or len(link["url"]) > 2048
+                        or parsed is None or parsed.scheme != "https" or not parsed.hostname
+                        or parsed.username is not None or parsed.password is not None
+                        or any(c.isspace() for c in link["url"])):
+                    return DeliveryOutcome(DeliveryStatus.REJECTED, reason="invalid links")
+                clean_links.append(dict(text=link["label"], url=link["url"]))
             service = getattr(self.registration, "decisions", None)
             if controls:
                 if service is None or tuple((c[0], c[1]) for c in controls) != service.controls(self, snapshot):
                     return DeliveryOutcome(DeliveryStatus.REJECTED, reason="invalid controls")
-                if r.renderer_hash == control_key:
-                    return DeliveryOutcome(DeliveryStatus.SKIPPED, reason="controls already delivered")
             # Preserve the read-only wire shape. Explicit empty markup is needed
             # only on a known message that may have received decision controls.
             had_controls = bool(r.destination_message_id and conn.execute(
@@ -311,14 +361,36 @@ class CardSource:
             clear_controls = bool(r.renderer_hash and not controls
                                   and (service is None or not service.controls(self, snapshot)))
             self.reply_markup = [] if had_controls else None
+            rows = []
+            if clean_links:
+                rows.append(clean_links)
             if controls and service is not None:
-                self.reply_markup = [[dict(text=c[2], callback_data=service.callback_prefix + c[1]) for c in controls]]
+                rows.append([dict(text=c[2], callback_data=service.callback_prefix + c[1]) for c in controls])
+            if rows:
+                self.reply_markup = rows
+            from gateway.live_todo import rendered_payload_hash
+            renderer_key = rendered_payload_hash(text, rows)
+            if (r.destination_message_id and r.delivered_revision is not None
+                    and r.renderer_hash == renderer_key and r.state == "sent"):
+                try:
+                    receipts.confirm_equivalent_delivery(
+                        conn, r.id, desired_revision=snapshot.revision,
+                        renderer_hash=renderer_key,
+                        message_id=r.destination_message_id,
+                    )
+                except receipts.DeliveryReceiptError:
+                    pass
+                else:
+                    self.message_id = r.destination_message_id
+                    return DeliveryOutcome(
+                        DeliveryStatus.SKIPPED, reason="confirmed card payload unchanged")
             try:
                 if r.state == "deleted" and r.replacement_budget > 0:
                     receipts.authorize_delivery_replacement(conn, r.id, desired_revision=r.desired_revision)
                 self.lease = receipts.claim_delivery_receipt(
                     conn, r.id, owner_id=self.registration.token, lease_seconds=30,
-                    expected_revision=snapshot.revision, refresh=bool(controls) or clear_controls)
+                    expected_revision=snapshot.revision,
+                    refresh=bool(controls) or bool(clean_links) or clear_controls)
             except receipts.DeliveryReceiptError as exc:
                 return DeliveryOutcome(DeliveryStatus.SKIPPED, reason=type(exc).__name__)
             self.message_id = self.lease.receipt.destination_message_id
@@ -336,12 +408,14 @@ class CardSource:
             self._settle(lease, DeliveryOutcome(DeliveryStatus.UNKNOWN, reason="transport exception"))
             raise
         else:
-            self._settle(lease, outcome, control_key=control_key)
+            control_key = (hashlib.sha256(controls[0][1].encode()).hexdigest()
+                           if len(controls) == 1 else None)
+            self._settle(lease, outcome, renderer_key=renderer_key, control_key=control_key)
             return outcome
         finally:
             self.lease = None
 
-    def _settle(self, lease, outcome, *, control_key=None):
+    def _settle(self, lease, outcome, *, renderer_key=None, control_key=None):
         # Host-owned evidence path intentionally survives source/registration stop.
         status = outcome.status
         state = {DeliveryStatus.DELIVERED: "sent", DeliveryStatus.UNKNOWN: "unknown"}.get(status, "failed")
@@ -369,8 +443,20 @@ class CardSource:
             conn.execute("UPDATE kanban_delivery_receipts SET retry_at=? WHERE id=?",
                          (math.ceil(time.time() + max(0.5, delay or 0)) if safe else 0, lease.receipt.id))
             if state == "sent":
-                conn.execute("UPDATE kanban_delivery_receipts SET renderer_hash=? WHERE id=?",
-                             (control_key, lease.receipt.id))
+                # Payload equivalence and action authority are separate facts.
+                # Both become trusted only in the exact confirmed settlement.
+                conn.execute(
+                    "UPDATE kanban_delivery_receipts SET renderer_hash=?, control_hash=? WHERE id=?",
+                    (renderer_key, control_key, lease.receipt.id),
+                )
+            else:
+                # A token that was not positively delivered must never become
+                # authority on a later retry or equivalent-payload shortcut.
+                conn.execute(
+                    "DELETE FROM kanban_action_records WHERE task_id=? AND expected_revision=? "
+                    "AND state='pending' AND json_extract(action_payload, '$.receipt_id')=?",
+                    (self.sub["task_id"], lease.desired_revision, lease.receipt.id),
+                )
         self.last_outcome = outcome
         if expired:
             # Late evidence settles the receipt, never renews this writer's lease.

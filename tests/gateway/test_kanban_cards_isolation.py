@@ -130,18 +130,18 @@ async def test_two_profiles_two_boards_effective_config_and_explicit_authority(m
     h.config(r.homes['alpha'], profile='alpha', board='south', task_id=r.tid)
     await watcher(r, monkeypatch)
     assert len(r.bots['alpha'].sent) == 1
-    assert 'south' in r.bots['alpha'].sent[0]['text']
-    assert 'Profile: alpha' in r.bots['alpha'].sent[0]['text']
-    assert all('north' in m['text'] and 'Profile: default' in m['text'] for m in r.bots['default'].sent)
+    expected_card = 'Same task-like name\nQueued'
+    assert r.bots['alpha'].sent[0]['text'] == expected_card
+    assert all(m['text'] == expected_card for m in r.bots['default'].sent)
     with closing(h.kbc.connect(board='south')) as c:
-        h.kb.add_comment(c, r.tid, 'synthetic', 'only south advances')
+        assert h.kb.edit_task(c, r.tid, title='Same task-like name south')
     await watcher(r, monkeypatch)
     assert len(r.bots['alpha'].edited) == 1 and not r.bots['default'].edited
     assert r.bots['alpha'].edited[0]['message_id'] == 701
     # A -> B -> A effective config does not grant a second profile the first's state.
     h.config(r.homes['alpha'], quiet=True, profile='alpha', board='south', task_id=r.tid)
     with closing(h.kbc.connect(board='north')) as c:
-        h.kb.add_comment(c, r.tid, 'synthetic', 'only north advances')
+        assert h.kb.edit_task(c, r.tid, title='Same task-like name north')
     await watcher(r, monkeypatch)
     assert len(r.bots['default'].edited) == 2 and len(r.bots['alpha'].edited) == 1
     assert all(m['chat_id'] != -300 for b in r.bots.values() for m in b.sent + b.edited)
@@ -175,7 +175,7 @@ async def test_stale_writer_fenced_across_profile_and_incarnation(multiplex, mon
             assert not source.admitted()
             h.notify.remove_notify_sub(c, task_id=r.tid, platform='telegram', chat_id='-100', thread_id='7')
             subscribe(c, r.tid, 'default')
-            h.kb.add_comment(c, r.tid, 'synthetic', 'new desired revision')
+            assert h.kb.edit_task(c, r.tid, title='Same task-like name rebound')
         else:
             assert h.kb.delete_task(c, r.tid)
             assert h.kb.create_task(c, title='Same task-like name', board='north') == r.tid

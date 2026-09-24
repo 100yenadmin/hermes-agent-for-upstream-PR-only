@@ -1084,6 +1084,7 @@ CREATE TABLE IF NOT EXISTS kanban_delivery_receipts (
     destination_profile   TEXT,
     renderer_version      TEXT,
     renderer_hash         TEXT,
+    control_hash          TEXT,
     owner_epoch           INTEGER NOT NULL DEFAULT 0,
     owner_id              TEXT,
     lease_expires_at      INTEGER,
@@ -1337,6 +1338,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    publication: Optional[dict] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1451,25 +1453,30 @@ def create_task(
                 )
                 for pid in parents:
                     _link(conn, pid, task_id)
+                created_payload = {
+                    "assignee": assignee,
+                    "status": task_status,
+                    "parents": list(parents),
+                    "creator_task_id": creator_task_id,
+                    "tenant": tenant,
+                    "workspace_kind": workspace_kind,
+                    "workspace_path": workspace_path,
+                    "branch_name": branch_name,
+                    "project_id": project_id,
+                    "skills": list(skills_list) if skills_list else None,
+                    "goal_mode": bool(goal_mode) or None,
+                    "model_override": model_override,
+                    "provider_override": provider_override,
+                }
+                if publication is not None:
+                    if publication.get("run_id") is not None:
+                        raise ValueError("created task publication cannot bind a worker run")
+                    created_payload["publication"] = publication
                 _append_event(
                     conn,
                     task_id,
                     "created",
-                    {
-                        "assignee": assignee,
-                        "status": task_status,
-                        "parents": list(parents),
-                        "creator_task_id": creator_task_id,
-                        "tenant": tenant,
-                        "workspace_kind": workspace_kind,
-                        "workspace_path": workspace_path,
-                        "branch_name": branch_name,
-                        "project_id": project_id,
-                        "skills": list(skills_list) if skills_list else None,
-                        "goal_mode": bool(goal_mode) or None,
-                        "model_override": model_override,
-                        "provider_override": provider_override,
-                    },
+                    created_payload,
                 )
                 if task_status == "blocked":
                     _append_event(
@@ -2802,6 +2809,7 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
+    publication: Optional[dict] = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2888,9 +2896,14 @@ def complete_task(
         event_summary = handoff_summary
         if prior_status == "review" and not event_summary:
             event_summary = _REVIEW_APPROVED_NOTE
+        completed_payload = _completed_event_payload(result, event_summary, verified_cards, metadata)
+        if publication is not None:
+            if run_id is None or publication.get("run_id") != run_id:
+                raise ValueError("completion publication does not match the closing run")
+            completed_payload["publication"] = publication
         _append_event(
             conn, task_id, "completed",
-            _completed_event_payload(result, event_summary, verified_cards, metadata),
+            completed_payload,
             run_id=run_id,
         )
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
@@ -3285,6 +3298,7 @@ def edit_task(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    publication: Optional[dict] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
@@ -3326,6 +3340,8 @@ def block_task(
             ).rowcount
             if classified != 1:
                 return False
+            if publication is not None:
+                raise ValueError("parked task classification cannot publish worker progress")
             _append_event(conn, task_id, "blocked", {
                 "kind": kind, "reason": reason, "classified_in_place": True,
             })
@@ -3366,6 +3382,10 @@ def block_task(
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
         )
+        if publication is not None:
+            if run_id is None or publication.get("run_id") != run_id:
+                raise ValueError("block publication does not match the closing run")
+            payload["publication"] = publication
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
         if kind == "dependency":

@@ -104,9 +104,11 @@ def parse_surface_scope(value: Any, *, require_tasks: bool) -> TelegramSurfaceSc
     The same immutable value may be shared by independent todo, card, decision and
     detail grants. Possessing a scope never grants one of those capabilities.
     """
-    scope = _exact_mapping(value, {"routes", "task_resources"}, "surface scope")
+    if type(value) is not dict or set(value) not in ({"routes"}, {"routes", "task_resources"}):
+        raise ValueError("surface scope must contain routes and optional task_resources")
+    scope = value
     routes = tuple(_parse_route(item) for item in _bounded_list(scope["routes"], "scope routes"))
-    raw_resources = scope["task_resources"]
+    raw_resources = scope.get("task_resources", [])
     if type(raw_resources) is not list or len(raw_resources) > 4096:
         raise ValueError("scope task_resources must be a list of at most 4096 entries")
     resources = tuple(_parse_resource(item) for item in raw_resources)

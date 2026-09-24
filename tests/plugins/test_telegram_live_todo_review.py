@@ -86,8 +86,8 @@ async def test_real_worker_commit_handoff_and_snapshot_stability(manager):
     assert threads and all(t != threading.get_ident() for t in threads)
     await asyncio.to_thread(h._execute_todo, agent, 'worker-2', {'id': 'a', 'content': 'latest worker', 'status': 'completed'})
     await h._wait_until(lambda: len(bot.edited) == 1)
-    assert 'revision 1' in bot.sent[0]['text'] and 'from worker' in bot.sent[0]['text']
-    assert 'revision 2' in bot.edited[0]['text'] and 'latest worker' in bot.edited[0]['text']
+    assert bot.sent[0]['text'] == 'Conversation steps\n○ from worker'
+    assert bot.edited[0]['text'] == 'Conversation steps\n✓ latest worker'
     assert len(bot.sent) == 1 and bot.edited[0]['message_id'] == int(source.message_id)
     await source.finish()
     await task

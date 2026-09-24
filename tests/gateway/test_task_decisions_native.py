@@ -156,7 +156,7 @@ async def test_native_positive_duplicate_and_coalesced_keyboard(rig,monkeypatch)
     token=rows[0]['token']
     with closing(kbc.connect(r.path)) as c:
         receipt=receipts.list_delivery_receipts(c,task_id=r.tid)[0]
-        assert receipt.state=='sent' and receipt.renderer_hash
+        assert receipt.state=='sent' and receipt.renderer_hash and receipt.control_hash
     await tick(r,monkeypatch)
     assert len([s for s in r.sockets if b'/editMessageText ' in s.buffer])==1
     await r.app.process_update(callback(r,token))
@@ -409,7 +409,7 @@ async def test_keyboard_removal_uses_confirmed_same_id_transport(rig, monkeypatc
     assert len(wire_payloads(r,'sendMessage'))==1
     with closing(kbc.connect(r.path)) as c:
         receipt=receipts.list_delivery_receipts(c,task_id=r.tid)[0]
-        assert receipt.state=='sent' and receipt.renderer_hash is None
+        assert receipt.state=='sent' and receipt.renderer_hash and receipt.control_hash is None
     await r.app.process_update(callback(r,old))
     assert readback(r)[0]=='blocked' and not readback(r)[1]
     before=len(wire_payloads(r,'editMessageText'))
@@ -427,7 +427,8 @@ async def test_decision_disabled_wire_omits_markup_on_create_and_edit(rig, monke
     r.manager.unload('hermes-telegram-experience');r.manager.discover_and_load(force=True)
     r.adapter._wire_plugin_handlers(r.app)
     await tick(r,monkeypatch)
-    with closing(kbc.connect(r.path)) as c:kb.add_comment(c,r.tid,'synthetic','new revision')
+    with closing(kbc.connect(r.path)) as c:
+        assert kb.edit_task(c, r.tid, title='Synthetic input decision revised')
     await tick(r,monkeypatch)
     assert all('reply_markup' not in p for method in ('sendMessage','editMessageText') for p in wire_payloads(r,method))
     assert len(wire_payloads(r,'sendMessage'))==len(wire_payloads(r,'editMessageText'))==1

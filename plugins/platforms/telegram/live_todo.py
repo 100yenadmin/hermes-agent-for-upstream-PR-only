@@ -109,8 +109,15 @@ class LiveTodoTransportMixin:
                     deleted = (getattr(source, "durable_card", False) and source.message_id is not None
                                and isinstance(exc, BadRequest)
                                and "message to edit not found" in str(exc).lower())
-                    outcome = DeliveryOutcome(rejected, reason=("known message deleted" if deleted
-                                                               else "Telegram refused operation"))
+                    unchanged = (getattr(source, "durable_card", False) and source.message_id is not None
+                                 and isinstance(exc, BadRequest)
+                                 and "message is not modified" in str(exc).lower())
+                    outcome = DeliveryOutcome(
+                        rejected,
+                        reason=("known message deleted" if deleted else
+                                "known message unchanged" if unchanged else
+                                "Telegram refused operation"),
+                    )
                 else:
                     outcome = DeliveryOutcome(DeliveryStatus.UNKNOWN, reason="unconfirmed dispatch")
             finally:
