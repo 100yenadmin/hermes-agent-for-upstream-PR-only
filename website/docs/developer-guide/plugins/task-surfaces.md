@@ -27,6 +27,13 @@ Factories receive host-owned delivery handles, not bot credentials or an unrestr
 Unload callbacks revoke new admissions, including cleanup after a failed plugin registration.
 A configuration-only disable is not a substitute for unloading/restarting the running consumer.
 
+A plugin that removes its own native handlers during unload can register its platform factory
+with `reload_safe=True` (also supported by `register_telegram_handler`). The host then keys wiring
+to that registration generation, allowing the replacement to wire once on the same native client.
+This is an explicit cleanup contract: the plugin must remove its old handlers. The default remains
+qualname-based deduplication across rediscovery, preserving existing plugins that do not own cleanup.
+Rebuilding the native client still wires the current factories afresh.
+
 ## Exact admission scope
 
 Both keys are required, including for a todo-only consumer:
