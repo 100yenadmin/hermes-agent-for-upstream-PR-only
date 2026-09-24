@@ -20,6 +20,7 @@ from gateway.live_todo import DeliveryOutcome, DeliveryStatus, TodoRegistration
 from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_surface as receipts
 
 logger = logging.getLogger(__name__)
+_SCOPE_DECLINED = object()
 
 
 @dataclass(frozen=True)
@@ -62,7 +63,7 @@ class CardRegistration(TodoRegistration):
         self.lanes = {}
 
 
-def subscription_registration(runner, sub, board):
+def subscription_registration(runner, sub, board, *, distinguish_scope_decline=False):
     # Legacy unowned subscriptions remain on the ordinary notifier path.
     if (sub.get("platform") != "telegram" or not sub.get("notifier_profile")
             or sub.get("delivery_mode") == "wake"):
@@ -82,10 +83,12 @@ def subscription_registration(runner, sub, board):
         reg = getattr(manager, "_task_card_registration", None)
         if reg is None or not reg.active:
             return None
-        return reg if reg.scope.allows_card(
+        if reg.scope.allows_card(
             sub["notifier_profile"], sub["platform"], sub["chat_id"],
             sub.get("thread_id") or None, board, sub["task_id"],
-        ) else None
+        ):
+            return reg
+        return _SCOPE_DECLINED if distinguish_scope_decline else None
     finally:
         reset_hermes_home_override(token)
 
@@ -141,7 +144,14 @@ async def offer_surface(runner, delivery, adapter):
         return False
     sub = delivery["sub"]
     snapshot = data["snapshot"]
-    reg = subscription_registration(runner, sub, snapshot.board)
+    reg = subscription_registration(
+        runner, sub, snapshot.board, distinguish_scope_decline=True,
+    )
+    if reg is _SCOPE_DECLINED:
+        # Collection belonged to an older registration. A live replacement that
+        # explicitly excludes this destination returns passive delivery to the
+        # notifier; unload/unavailable states below retain the no-fallback fence.
+        return False
     if reg is None:
         return True
     if _quiet(reg.profile_home):

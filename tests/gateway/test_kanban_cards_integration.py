@@ -220,6 +220,33 @@ async def test_quiet_disable_reenable_and_normal_handoff(rig):
 
 
 @pytest.mark.asyncio
+async def test_narrowed_active_replacement_declines_late_surface_handoff(rig):
+    with closing(kbc.connect(rig.path)) as c:
+        kb.block_task(c, rig.tid, reason='ordinary notifier handoff', kind='needs_input')
+    deliveries = await asyncio.to_thread(
+        _notifier_collect, rig.runner, kb, notifier_profile='default',
+        gc_due=False, gc_retention_days=30,
+    )
+    assert len(deliveries) == 1 and deliveries[0]['surface'] is not None
+
+    # Replace the active consumer after collection with an exact scope that no
+    # longer owns this resource. The already-claimed terminal event must return
+    # to the ordinary notifier, without constructing a plugin card source.
+    config(rig.home, task_id='t_deadbeef')
+    rig.manager.discover_and_load(force=True)
+    replacement = rig.manager._task_card_registration
+    assert replacement.active and not replacement.sources
+
+    await _KanbanNotification(
+        rig.runner, deliveries[0], platform_cls=Platform, sub_fail_counts={},
+    ).deliver()
+
+    assert len(rig.bot.sent) == 1
+    assert 'blocked' in rig.bot.sent[0]['text'].lower()
+    assert not replacement.sources
+
+
+@pytest.mark.asyncio
 async def test_actual_watcher_tick_not_a_private_loader_shortcut(rig,monkeypatch):
     real=asyncio.sleep
     async def clock(delay):
