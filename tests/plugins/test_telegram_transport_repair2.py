@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
-import os
+import select
+import socket
 from types import SimpleNamespace
 import threading
 
@@ -13,6 +14,10 @@ import pytest
 
 from plugins.platforms.telegram import telegram_network
 from plugins.platforms.telegram import transport_admission as wire
+
+# "any": the OS lanes select only platforms-marked files, and the readiness
+# probe falls back to select() on Windows.
+pytestmark = pytest.mark.platforms("any")
 
 
 class AdmissionSource:
@@ -156,9 +161,10 @@ async def test_uninstrumented_transport_is_never_reported_as_unsent():
     ],
 )
 async def test_closed_or_readable_streams_expire_from_the_pool(state):
-    read_fd, write_fd = os.pipe()
+    # A socket pair, not os.pipe(): Windows select() accepts only sockets.
+    read_sock, write_sock = socket.socketpair()
     reader = asyncio.StreamReader()
-    fd = read_fd
+    fd = read_sock.fileno()
     if state == "eof":
         reader.feed_eof()
     elif state == "error":
@@ -168,9 +174,10 @@ async def test_closed_or_readable_streams_expire_from_the_pool(state):
     elif state == "none-fd":
         fd = None
     elif state == "bad-fd":
-        os.close(read_fd)
+        read_sock.close()
     elif state == "ready":
-        os.write(write_fd, b"x")
+        write_sock.send(b"x")
+        select.select([read_sock], [], [], 2)  # bounded wait for delivery
     writer = SimpleNamespace(
         is_closing=lambda: state == "closing",
         get_extra_info=lambda name: (
@@ -182,9 +189,8 @@ async def test_closed_or_readable_streams_expire_from_the_pool(state):
             "is_readable"
         ) is (state != "idle")
     finally:
-        if state != "bad-fd":
-            os.close(read_fd)
-        os.close(write_fd)
+        read_sock.close()
+        write_sock.close()
 
 
 @pytest.mark.asyncio

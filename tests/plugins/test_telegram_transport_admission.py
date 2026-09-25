@@ -17,6 +17,10 @@ import pytest
 
 from plugins.platforms.telegram import transport_admission as wire
 
+# "any": the OS lanes select only platforms-marked files, and socket
+# readiness timing differs per host.
+pytestmark = pytest.mark.platforms("any")
+
 
 class AdmissionSource:
     def __init__(self) -> None:
@@ -87,6 +91,16 @@ class SocketWriter:
 
     async def wait_closed(self) -> None:
         return None
+
+
+async def _wait_until(
+    predicate, *, timeout: float = 2.0, interval: float = 0.01
+) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate() and loop.time() < deadline:
+        await asyncio.sleep(interval)
+    assert predicate(), f"condition not met within {timeout}s"
 
 
 @contextmanager
@@ -282,21 +296,19 @@ async def test_idle_buffered_response_retires_connection(
         return reader, writer
 
     monkeypatch.setattr(wire.asyncio, "open_connection", capture_admission_reader)
+    transport = transport_factory()
     try:
-        async with httpx.AsyncClient(
-            transport=transport_factory(), timeout=2
-        ) as client:
+        async with httpx.AsyncClient(transport=transport, timeout=2) as client:
             first = await client.get(f"http://127.0.0.1:{port}/first")
             allow_idle_response.set()
             await asyncio.wait_for(idle_response_sent.wait(), 2)
             if admission_readers:
-                async with asyncio.timeout(2):
-                    while not admission_readers[0]._buffer:
-                        await asyncio.sleep(0)
+                await _wait_until(lambda: admission_readers[0]._buffer)
             else:
-                # The stock backend leaves the idle response on the socket,
-                # where its readiness probe can observe it.
-                await asyncio.sleep(0.05)
+                # The stock backend leaves the idle response on the socket;
+                # wait until the pool's own readiness probe observes it.
+                [idle] = transport._pool.connections
+                await _wait_until(idle.has_expired)
             second = await client.get(f"http://127.0.0.1:{port}/second")
 
         assert [first.status_code, second.status_code] == [200, 200]
