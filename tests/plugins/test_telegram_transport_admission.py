@@ -1,7 +1,8 @@
-"""Request-write admission tests with synthetic socket I/O only.
+"""Request-write admission tests with synthetic and loopback socket I/O.
 
 The real HTTPX/httpcore request path runs above the fake asyncio stream.  This
-keeps the admission/write boundary under test without contacting Telegram.
+keeps the admission/write boundary under test without contacting Telegram;
+loopback TCP covers connection reuse and peer-visible cleanup.
 """
 
 from __future__ import annotations
@@ -223,3 +224,162 @@ async def test_request_without_admission_keeps_ordinary_http_behavior(monkeypatc
     assert response.text == "ok"
     assert writer.writes[0].startswith(b"GET ")
     assert wire.operation_admission.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transport_factory",
+    [
+        pytest.param(
+            lambda: httpx.AsyncHTTPTransport(),
+            id="httpx",
+        ),
+        pytest.param(
+            lambda: wire.AdmissionHTTPTransport(trust_env=False),
+            id="admission",
+        ),
+    ],
+)
+async def test_idle_buffered_response_retires_connection(
+    monkeypatch, transport_factory
+):
+    allow_idle_response = asyncio.Event()
+    idle_response_sent = asyncio.Event()
+    connection_count = 0
+    writers: set[asyncio.StreamWriter] = set()
+    admission_readers: list[asyncio.StreamReader] = []
+
+    async def handle_connection(reader, writer):
+        nonlocal connection_count
+        connection_count += 1
+        connection_number = connection_count
+        writers.add(writer)
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            await writer.drain()
+            if connection_number == 1:
+                await allow_idle_response.wait()
+                writer.write(
+                    b"HTTP/1.1 408 Request Timeout\r\n"
+                    b"Content-Length: 0\r\n\r\n"
+                )
+                await writer.drain()
+                idle_response_sent.set()
+                await reader.read()
+        finally:
+            writers.discard(writer)
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle_connection, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    original_open_connection = asyncio.open_connection
+
+    async def capture_admission_reader(*args, **kwargs):
+        reader, writer = await original_open_connection(*args, **kwargs)
+        admission_readers.append(reader)
+        return reader, writer
+
+    monkeypatch.setattr(wire.asyncio, "open_connection", capture_admission_reader)
+    try:
+        async with httpx.AsyncClient(
+            transport=transport_factory(), timeout=2
+        ) as client:
+            first = await client.get(f"http://127.0.0.1:{port}/first")
+            allow_idle_response.set()
+            await asyncio.wait_for(idle_response_sent.wait(), 2)
+            if admission_readers:
+                async with asyncio.timeout(2):
+                    while not admission_readers[0]._buffer:
+                        await asyncio.sleep(0)
+            else:
+                # The stock backend leaves the idle response on the socket,
+                # where its readiness probe can observe it.
+                await asyncio.sleep(0.05)
+            second = await client.get(f"http://127.0.0.1:{port}/second")
+
+        assert [first.status_code, second.status_code] == [200, 200]
+        assert connection_count == 2
+    finally:
+        for writer in list(writers):
+            writer.close()
+        await asyncio.gather(
+            *(writer.wait_closed() for writer in list(writers)),
+            return_exceptions=True,
+        )
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_revocation_before_tls_closes_connected_stream_without_writing(
+    monkeypatch,
+):
+    peer_eof = asyncio.Event()
+    peer_bytes = bytearray()
+    writers: set[asyncio.StreamWriter] = set()
+    client_writers: list[asyncio.StreamWriter] = []
+
+    async def handle_connection(reader, writer):
+        writers.add(writer)
+        try:
+            while data := await reader.read(4096):
+                peer_bytes.extend(data)
+        finally:
+            peer_eof.set()
+            writers.discard(writer)
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle_connection, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    source = AdmissionSource()
+    original_open_connection = asyncio.open_connection
+
+    async def capture_client_stream(*args, **kwargs):
+        reader, writer = await original_open_connection(*args, **kwargs)
+        client_writers.append(writer)
+        return reader, writer
+
+    monkeypatch.setattr(wire.asyncio, "open_connection", capture_client_stream)
+
+    async def revoke_at_tls_start(name, info):
+        if name == "connection.start_tls.started":
+            with source.registration.lock, source.lock:
+                source.active = False
+
+    try:
+        with admitted_operation(source) as admission:
+            request = httpx.Request(
+                "GET",
+                f"https://127.0.0.1:{port}/prewrite",
+                extensions={"trace": revoke_at_tls_start},
+            )
+            async with httpx.AsyncClient(
+                transport=wire.AdmissionHTTPTransport(
+                    verify=False, trust_env=False
+                ),
+                timeout=2,
+            ) as client:
+                with pytest.raises(wire.AdmissionRevoked):
+                    await client.send(request)
+            await asyncio.wait_for(peer_eof.wait(), 2)
+
+        assert peer_bytes == b""
+        assert admission.dispatched is False
+    finally:
+        for writer in client_writers:
+            writer.close()
+        await asyncio.gather(
+            *(writer.wait_closed() for writer in client_writers),
+            return_exceptions=True,
+        )
+        for writer in list(writers):
+            writer.close()
+        await asyncio.gather(
+            *(writer.wait_closed() for writer in list(writers)),
+            return_exceptions=True,
+        )
+        server.close()
+        await server.wait_closed()

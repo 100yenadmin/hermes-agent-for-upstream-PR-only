@@ -119,8 +119,8 @@ class AdmissionStream(httpcore.AsyncNetworkStream):
             raise
 
     async def start_tls(self, ssl_context, server_hostname=None, timeout=None):
-        check_admission()
         try:
+            check_admission()
             async with asyncio.timeout(timeout):
                 await self.writer.start_tls(
                     ssl_context,
@@ -142,9 +142,11 @@ class AdmissionStream(httpcore.AsyncNetworkStream):
     def get_extra_info(self, info):
         if info == "is_readable":
             # Error-driven connection_lost sets an exception, not EOF.  Closed
-            # idle streams must expire instead of poisoning the pool scan.
+            # idle streams and eagerly buffered peer data must expire instead
+            # of poisoning the pool scan or becoming the next response.
             if (
-                self.reader.at_eof()
+                self.reader._buffer
+                or self.reader.at_eof()
                 or self.reader.exception() is not None
                 or self.writer.is_closing()
             ):
