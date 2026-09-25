@@ -4,8 +4,9 @@ repo: https://github.com/electricsheephq/lcm-x
 sha: b9ad016e0a7c1a1d6dad4eb41217b81e248fa4cd
 description: 'Lossless context memory engine: instead of lossy compaction, LCM-X keeps every turn in a local SQLite store (lcm.db)
   and builds a recoverable DAG of summaries over it, with 15 lcm_* tools to search, recall and expand earlier context. Select it
-  with context.engine: lcm-x. Upgrading from hermes-lcm: add hermes-lcm-x to plugins.enabled (the install script prints the
-  steps; the old engine name lcm keeps working with a deprecation warning); lcm.db and the lcm: config block are unchanged.
+  with context.engine: lcm-x. Upgrading from hermes-lcm (breaking in v0.24.0): stop Hermes, then in plugins.enabled replace
+  hermes-lcm with hermes-lcm-x and run exactly one LCM copy (the install script prints the steps; the old engine name lcm
+  still resolves with a deprecation warning); lcm.db and the lcm: config block are unchanged.
   Summaries use the model Hermes is configured with. Disclosure — optional semantic recall (embeddings_enabled, off by
   default) sends message text to the embedding provider you configure (Voyage via VOYAGE_API_KEY, or an OpenAI-compatible
   endpoint, or a local Ollama); for known cloud providers the provider-bound copy is privacy-transformed by default
