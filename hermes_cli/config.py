@@ -1538,7 +1538,7 @@ def _merge_partial_save(raw: dict, override: dict) -> dict:
     return result
 
 
-def _deep_merge(base: dict, override: dict) -> dict:
+def _deep_merge(base: dict, override: dict, *, preserve_null: bool = False) -> dict:
     """Recursively merge *override* into *base*: dict-over-dict recurses (so overriding one leaf
     keeps sibling defaults), and ``None`` over a dict section is ignored.
 
@@ -1550,8 +1550,8 @@ def _deep_merge(base: dict, override: dict) -> dict:
     for key, value in override.items():
         over_dict = isinstance(result.get(key), dict)
         if over_dict and isinstance(value, dict):
-            result[key] = _deep_merge(result[key], value)
-        elif not (over_dict and value is None):
+            result[key] = _deep_merge(result[key], value, preserve_null=preserve_null)
+        elif preserve_null or not (over_dict and value is None):
             result[key] = value
     return result
 
