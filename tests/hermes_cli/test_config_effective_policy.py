@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 import hermes_yaml as yaml
 
@@ -49,3 +51,23 @@ def test_strict_read_treats_empty_managed_root_as_no_policy(policy_homes, manage
     (home / "config.yaml").write_text("kanban: {dispatch_profiles: [default]}\n")
     (managed / "config.yaml").write_text(managed_body)
     assert load_user_config_effective(fail_closed=True)["kanban"] == {"dispatch_profiles": ["default"]}
+
+
+def test_strict_read_skips_fail_open_managed_snapshot_read(policy_homes, caplog):
+    """The env-ref snapshot read honours ``fail_closed``: a strict read of a broken managed file
+    raises without first logging the fail-open "IGNORING" warning; ordinary reads still warn."""
+    from hermes_cli.config_effective import load_user_config_effective
+    home, managed = policy_homes
+    (home / "config.yaml").write_text("kanban: {dispatch_profiles: [default]}\n")
+    (managed / "config.yaml").write_text("kanban: [unterminated")
+    caplog.set_level(logging.WARNING, logger="hermes_cli.managed_scope")
+
+    def ignoring():
+        return [r for r in caplog.records if "IGNORING this managed file" in r.getMessage()]
+
+    with pytest.raises(yaml.YAMLError):
+        load_user_config_effective(fail_closed=True)
+    assert ignoring() == []
+    caplog.clear()
+    assert load_user_config_effective()["kanban"] == {"dispatch_profiles": ["default"]}
+    assert ignoring()  # the ordinary read still fails open, loudly

@@ -123,7 +123,7 @@ def load_user_config_effective(
             )
 
         env_snapshot = _config._env_ref_snapshot(raw)
-        managed = managed_scope.load_managed_config()
+        managed = managed_scope.load_managed_config(fail_closed=fail_closed)
         if managed:
             _config._env_ref_snapshot(managed, env_snapshot)
         effective = _effective(raw, fail_closed=fail_closed)
