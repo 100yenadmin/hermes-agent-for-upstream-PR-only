@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
+import sys
 from types import SimpleNamespace
 import threading
 
@@ -247,6 +248,14 @@ async def test_request_without_admission_keeps_ordinary_http_behavior(monkeypatc
         pytest.param(
             lambda: httpx.AsyncHTTPTransport(),
             id="httpx",
+            # The Windows proactor loop drains the idle 408 into the
+            # StreamReader buffer, so httpcore's socket-readiness probe can
+            # never see it and the stock pool reuses the connection there.
+            marks=pytest.mark.skipif(
+                sys.platform == "win32",
+                reason="stock httpcore cannot observe a response already "
+                "buffered in user space by the proactor loop",
+            ),
         ),
         pytest.param(
             lambda: wire.AdmissionHTTPTransport(trust_env=False),
@@ -305,8 +314,9 @@ async def test_idle_buffered_response_retires_connection(
             if admission_readers:
                 await _wait_until(lambda: admission_readers[0]._buffer)
             else:
-                # The stock backend leaves the idle response on the socket;
-                # wait until the pool's own readiness probe observes it.
+                # On selector loops the idle response stays on the socket until
+                # read, so the pool's own readiness probe observes it (the
+                # admission transport also checks its reader buffer instead).
                 [idle] = transport._pool.connections
                 await _wait_until(idle.has_expired)
             second = await client.get(f"http://127.0.0.1:{port}/second")
