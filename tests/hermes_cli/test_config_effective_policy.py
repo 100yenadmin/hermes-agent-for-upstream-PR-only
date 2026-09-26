@@ -71,3 +71,17 @@ def test_strict_read_skips_fail_open_managed_snapshot_read(policy_homes, caplog)
     caplog.clear()
     assert load_user_config_effective()["kanban"] == {"dispatch_profiles": ["default"]}
     assert ignoring()  # the ordinary read still fails open, loudly
+
+
+def test_strict_null_section_denies_fallback_chain_without_crashing(policy_homes):
+    """A managed ``null`` over a whole section is a denial for strict readers, and the strict
+    fallback-chain consumer reads it as an empty chain; ordinary reads keep the user section (#58277)."""
+    from hermes_cli.config_effective import load_user_config_effective
+    from hermes_cli.fallback_config import get_fallback_chain
+    home, managed = policy_homes
+    (home / "config.yaml").write_text("fallback_model: {provider: openrouter, model: user/fallback}\n")
+    (managed / "config.yaml").write_text("fallback_model:\n")
+    strict = load_user_config_effective(fail_closed=True)
+    assert strict["fallback_model"] is None and get_fallback_chain(strict) == []
+    ordinary = load_user_config_effective()
+    assert [e["model"] for e in get_fallback_chain(ordinary)] == ["user/fallback"]
