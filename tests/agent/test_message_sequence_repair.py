@@ -63,7 +63,9 @@ def test_repair_preserves_user_content_when_one_side_empty():
 
     AIAgent._repair_message_sequence(agent, messages)
 
-    assert messages == [{"role": "user", "content": "real message"}]
+    assert len(messages) == 1
+    assert messages[0]["role"] == "user"
+    assert messages[0]["content"] == "real message"
 
 
 def test_repair_does_not_rewind_ongoing_dialog_tool_pair():

@@ -600,6 +600,7 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
             )
             had_api_sidecar = "api_content" in prev
             prev["content"] = merged_content
+            prev["_merged_turn_tail"] = new_content
             # Merged content invalidates the api_content sidecar; drop it so replay cannot use stale bytes.
             drop_stale_api_content(prev)
             # Pop the persist marker only when the durable row actually changed: a merge that

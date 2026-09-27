@@ -78,6 +78,20 @@ def _override_replaces_content(msg: Dict, content: Any, override: Any) -> bool:
     )
 
 
+def _content_with_persist_override(msg: Dict, content: Any, override: Any) -> Any:
+    """Replace only a merged incoming half; keep its marker aligned for repeated applications."""
+    tail = msg.get("_merged_turn_tail")
+    if (
+        "_merged_turn_tail" in msg
+        and isinstance(content, str) and isinstance(tail, str) and isinstance(override, str)
+        and content.endswith(tail)
+    ):
+        content = content[:len(content) - len(tail)] + override
+        msg["_merged_turn_tail"] = override
+        return content
+    return override
+
+
 def durable_user_row_content(agent, msg: Dict, content: Any, api_content: Any) -> Tuple[Any, Any]:
     """``(content, api_content)`` as the current turn's user row is written: the persist override is the
     clean transcript, the live content is what the wire sent — so when they differ and nothing else was
@@ -85,9 +99,10 @@ def durable_user_row_content(agent, msg: Dict, content: Any, api_content: Any) -
     matches the row the flush wrote."""
     override = getattr(agent, "_persist_user_message_override", None)
     if _override_replaces_content(msg, content, override):
-        if api_content is None and isinstance(content, str) and content != override:
+        replacement = _content_with_persist_override(msg, content, override)
+        if api_content is None and isinstance(content, str) and content != replacement:
             api_content = content
-        content = override
+        content = replacement
     return content, api_content
 
 
@@ -395,7 +410,7 @@ class SessionPersistenceMixin:
         if not (isinstance(msg, dict) and msg.get("role") == "user"):
             return
         if _override_replaces_content(msg, msg.get("content"), override):
-            msg["content"] = override
+            msg["content"] = _content_with_persist_override(msg, msg.get("content"), override)
         if timestamp is not None:
             msg["timestamp"] = timestamp
         if platform_id is not None:  # load-bearing for restart drain-window recovery dedup (has_platform_message_id)
