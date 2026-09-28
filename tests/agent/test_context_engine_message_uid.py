@@ -286,6 +286,77 @@ def test_a_superseded_verification_candidate_is_not_a_witness_constituent():
     assert final["_absorbed_row_ids"] == [7]
 
 
+_CALL = {"id": "call_1", "type": "function", "function": {"name": "t", "arguments": "{}"}}
+
+
+@pytest.mark.parametrize("earlier, later, witnessed", [
+    ([{"type": "text", "text": "kept"}], "DROPPED", False),
+    ("kept", [{"type": "text", "text": "DROPPED"}], False),
+    ([{"type": "text", "text": "kept"}], [{"type": "text", "text": "DROPPED"}], False),
+    ("kept", "joined", True),
+    ("", [{"type": "text", "text": "taken over"}], True),
+    ([{"type": "text", "text": "kept"}], "", True),
+    ([{"type": "text", "text": "kept"}], None, True),
+])
+def test_an_assistant_merge_names_the_later_turn_only_when_its_content_survives(earlier, later, witnessed):
+    """Regression for review F2: alternation repair leaves a non-empty later content out when either side is
+    multimodal; the row is retired either way, but only a fold that kept the text is a witness constituent."""
+    from agent.agent_runtime_helpers import _merge_consecutive_assistants
+
+    first = {"role": "assistant", "content": earlier, "message_uid": "a" * UID_LEN, "_row_id": 1}
+    second = {"role": "assistant", "content": later, "message_uid": "b" * UID_LEN, "_row_id": 2}
+
+    merged, repairs = _merge_consecutive_assistants([first, second])
+
+    assert repairs == 1 and merged == [first] and first["_absorbed_row_ids"] == [2]
+    assert "DROPPED" not in str(first["content"])
+    assert first.get("_absorbed_message_uids") == (["b" * UID_LEN] if witnessed else None)
+
+
+def test_a_partial_carry_over_is_not_a_witness_but_a_kept_text_is():
+    """Tool calls and reasoning carried over while the text is left out: no witness. The text kept while the
+    later reasoning is not carried (the survivor has its own): a witness, because the message's text lives on."""
+    from agent.agent_runtime_helpers import _merge_consecutive_assistants
+
+    first = {"role": "assistant", "content": "kept", "message_uid": "a" * UID_LEN}
+    second = {"role": "assistant", "content": [{"type": "text", "text": "DROPPED"}], "message_uid": "b" * UID_LEN,
+              "reasoning_content": "why", "tool_calls": [_CALL], "_absorbed_message_uids": ["c" * UID_LEN]}
+    _merge_consecutive_assistants([first, second])
+    assert first["tool_calls"] == [_CALL] and first["reasoning_content"] == "why"
+    assert "_absorbed_message_uids" not in first
+
+    first = {"role": "assistant", "content": "kept", "message_uid": "a" * UID_LEN, "reasoning_content": "own"}
+    second = {"role": "assistant", "content": "joined", "message_uid": "b" * UID_LEN, "reasoning_content": "why"}
+    _merge_consecutive_assistants([first, second])
+    assert first["content"] == "kept\njoined" and first["reasoning_content"] == "own"
+    assert first["_absorbed_message_uids"] == ["b" * UID_LEN]
+
+
+@pytest.mark.parametrize("earlier, witnessed", [([{"type": "text", "text": "kept"}], False), ("kept", True)])
+def test_the_assistant_merge_witness_is_still_true_after_a_restart(db, earlier, witnessed):
+    """Flush two assistant turns, repair (the merge), flush the survivor, restore: the stored witness names the
+    later turn only when its text is in the stored composite."""
+    from agent.agent_runtime_helpers import repair_message_sequence
+
+    sid = "20260929_090000_f2"
+    db.create_session(sid, "cli", model="test/model")
+    agent = _make_agent(db, sid)
+    agent._session_db_created = True
+    survivor = {"role": "assistant", "content": earlier}
+    later = {"role": "assistant", "content": "LATER TEXT"}
+    messages = [{"role": "user", "content": "q"}, survivor, later]
+    agent._persist_user_message_idx = 0
+    agent._persist_session(messages, conversation_history=None)
+
+    repair_message_sequence(agent, messages)
+    agent._persist_session(messages, conversation_history=None)
+
+    restored = db.get_messages_as_conversation(sid)
+    stored = next(m for m in restored if m["message_uid"] == survivor["message_uid"])
+    assert ("LATER TEXT" in str(stored["content"])) is witnessed
+    assert stored.get("_absorbed_message_uids") == ([later["message_uid"]] if witnessed else None)
+
+
 def test_assistant_merge_keeps_the_absorbed_turns_tool_call_uids():
     from agent.agent_runtime_helpers import _merge_consecutive_assistants
 

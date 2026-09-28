@@ -380,8 +380,12 @@ def _is_codex_interim(m: Dict) -> bool:
     )
 
 
-def _merge_assistant_into(prev: Dict, msg: Dict) -> None:
-    """Fold a consecutive assistant ``msg`` into ``prev`` (union tool_calls, concat text)."""
+def _merge_assistant_into(prev: Dict, msg: Dict) -> bool:
+    """Fold a consecutive assistant ``msg`` into ``prev`` (union tool_calls, concat text).
+
+    Returns whether ``msg``'s content lives on in ``prev``: False when a non-empty later content was left
+    out because either side is multimodal (list) content. Tool calls are always unioned; a later turn's
+    reasoning is carried only when ``prev`` has none."""
     from agent.context_compressor import _DB_PERSISTED_MARKER
 
     prev_calls = list(prev.get("tool_calls") or [])
@@ -413,6 +417,7 @@ def _merge_assistant_into(prev: Dict, msg: Dict) -> None:
     prev_content = prev.get("content")
     new_content = msg.get("content")
     content_rewritten = False
+    content_kept = True
     if isinstance(prev_content, str) and isinstance(new_content, str):
         joined = "\n".join(p for p in (prev_content.strip(), new_content.strip()) if p)
         prev["content"] = joined
@@ -423,6 +428,9 @@ def _merge_assistant_into(prev: Dict, msg: Dict) -> None:
     elif not prev_content and new_content is not None:
         prev["content"] = new_content
         content_rewritten = new_content != prev_content
+    else:
+        # Neither branch copied the later content; that loses text only when there was some.
+        content_kept = not (new_content.strip() if isinstance(new_content, str) else new_content)
     # Carry reasoning_content from the later turn only if the earlier lacks it (strict thinking
     # providers need one on the merged tool-call turn).
     reasoning_carried = False
@@ -450,6 +458,7 @@ def _merge_assistant_into(prev: Dict, msg: Dict) -> None:
     # keeps the pre-merge row. The caller recomputes the flush cursor for the surviving sequence.
     if content_rewritten or calls_changed or reasoning_carried:
         prev.pop(_DB_PERSISTED_MARKER, None)
+    return content_kept
 
 
 def _remember_absorbed_row(survivor: Dict[str, Any], dropped: Dict[str, Any], *, folded: bool = True) -> None:
@@ -473,8 +482,9 @@ def _remember_absorbed_row(survivor: Dict[str, Any], dropped: Dict[str, Any], *,
         for row_id in ids:
             if row_id not in absorbed:
                 absorbed.append(row_id)
-    # The uid witness claims the dropped dict's TEXT lives on in the survivor: only a fold earns it. A
-    # superseded row (``folded=False``) is retired like any absorbed row but its content is discarded.
+    # The uid witness claims the dropped dict's TEXT lives on in the survivor: only a fold that kept it earns
+    # it. A superseded row, or a later turn whose content the assistant merge left out (``folded=False``), is
+    # retired like any absorbed row but named by nothing.
     if folded:
         record_absorbed_message(survivor, dropped)
 
@@ -495,8 +505,7 @@ def _merge_consecutive_assistants(messages: List[Dict]) -> Tuple[List[Dict], int
                 _remember_absorbed_row(msg, prev, folded=False)
                 collapsed[-1] = msg
             else:
-                _merge_assistant_into(prev, msg)
-                _remember_absorbed_row(prev, msg)
+                _remember_absorbed_row(prev, msg, folded=_merge_assistant_into(prev, msg))
             repairs += 1
             continue
         collapsed.append(msg)
