@@ -1057,7 +1057,7 @@ def _build_recovery_footer(session_id: str, turns: List[Dict[str, Any]]) -> str:
     first, last = (_message_ref(turns[0]), _message_ref(turns[-1])) if turns else ("", "")
     span = (
         f" The region spans {first} … {last} ({region_len} messages): "
-        f"session_search(ref='{first}', window=20) opens its start, then scroll forward."
+        f"session_search(ref='{first}', window=10) opens its start, then scroll forward."
     ) if first and last else ""
     return (
         "\n\n" + _LEAN_RECOVERY_HEADING + "\n"

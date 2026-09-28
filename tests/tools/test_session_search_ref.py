@@ -111,6 +111,29 @@ class TestWindow:
         assert not any("output demoted at compaction" in (c or "") for c in contents)
         assert len(ids) == len(set(ids)) == 7
 
+    def test_large_neighbours_are_capped_but_the_anchor_is_whole(self, db):
+        from tools.session_search_tool import _READ_MAX_CONTENT
+        stored = _compacted_session(db)
+        db.append_message("s_live", role="tool", content="late " + BIG_OUTPUT, tool_name="terminal",
+                          tool_call_id="call_1")
+        late = _rows(db, "s_live")[-1]
+        # Anchor on the big output: whole. Its big neighbour (a later row) is capped at the read-shape cap.
+        result = _call(db, ref="m:" + stored[5]["message_uid"][:12], window=20)
+        by_id = {m["id"]: m for m in result["messages"]}
+        assert by_id[stored[5]["id"]]["content"] == BIG_OUTPUT and "content_truncated" not in by_id[stored[5]["id"]]
+        neighbour = by_id[late["id"]]
+        assert neighbour["content_truncated"] is True and neighbour["original_content_chars"] == len(late["content"])
+        assert len(neighbour["content"]) == _READ_MAX_CONTENT + 1
+        # Anchored on the neighbour instead, it comes back whole.
+        whole = _call(db, ref="m:" + late["message_uid"][:12], window=1)
+        assert next(m for m in whole["messages"] if m.get("anchor"))["content"] == late["content"]
+
+    def test_hint_offers_a_larger_window_or_scroll(self, db):
+        stored = _compacted_session(db)
+        hint = _call(db, ref="m:" + stored[0]["message_uid"][:12])["hint"]
+        assert hint == ("More context: repeat with a larger window (max 20), or scroll with "
+                        "session_search(session_id='s_live', around_message_id=<first or last id above>).")
+
     def test_window_is_clamped_like_scroll(self, db):
         stored = _compacted_session(db)
         result = _call(db, ref="m:" + stored[0]["message_uid"][:12], window=0)

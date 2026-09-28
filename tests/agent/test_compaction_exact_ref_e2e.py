@@ -202,14 +202,15 @@ def _two_compactions(db):
     _seed(db, rounds=12, prefix="later", start=0)
     db.append_message(session_id=SESSION_ID, role="user", content="And the later checks?")
     second = _compress(agent, db.get_messages_as_conversation(SESSION_ID, include_row_ids=True))
-    second_range = _REF_RE.findall(_section(_summary_text(second), _LEAN_RECOVERY_HEADING))[:2]
+    second_footer = _section(_summary_text(second), _LEAN_RECOVERY_HEADING)
+    second_range = _REF_RE.findall(second_footer)[:2]
     summary_one = next(r for r in _rows(db) if isinstance(r["content"], str)
                        and first_range[0] in r["content"] and _LEAN_RECOVERY_HEADING in r["content"])
-    return first_range, second_range, summary_one
+    return first_range, second_range, summary_one, second_footer
 
 
 def test_a_second_compaction_footer_range_spans_the_first_summary_row(db):
-    first_range, (start_ref, end_ref), summary_one = _two_compactions(db)
+    first_range, (start_ref, end_ref), summary_one, _footer = _two_compactions(db)
     start, end = db.resolve_message_ref(start_ref), db.resolve_message_ref(end_ref)
     assert start["session_id"] == end["session_id"] == SESSION_ID
     assert start["id"] < summary_one["id"] < end["id"]
@@ -218,15 +219,23 @@ def test_a_second_compaction_footer_range_spans_the_first_summary_row(db):
     assert level_two["id"] < summary_one["id"]
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Premise gap on this base: the lean in-place handoff is MERGED into the first carried-tail message "
-    "(_MERGED_PRIOR_CONTEXT_HEADER) and the merged row keeps that tail message's message_uid, so the summary "
-    "text has no uid of its own; its ref resolves to the pre-merge original. Needs an identity decision."))
-def test_the_first_summary_resolves_by_its_own_ref_two_level_walk(db):
-    first_range, _second_range, summary_one = _two_compactions(db)
-    walked = _anchor(_search(db, ref="m:" + summary_one["message_uid"][:12]))
-    assert walked["id"] == summary_one["id"]
-    assert _REF_RE.findall(_section(walked["content"], _LEAN_RECOVERY_HEADING))[:2] == first_range
+def test_the_second_footer_start_reaches_a_first_generation_summarized_original(db):
+    # The merged handoff carrier keeps its tail message's uid (#126307), so the first summary has no ref of
+    # its own. What the model CAN do: open the second footer's region start and reach the first generation's
+    # summarized originals (compacted=1) from there, in the window or by scrolling from one of its rows.
+    _first_range, _second_range, summary_one, footer = _two_compactions(db)
+    rows = {r["id"]: r for r in _rows(db)}
+    generation_one = {i for i, r in rows.items() if i < summary_one["id"] and (r["active"], r["compacted"]) == (0, 1)}
+    [opened_call] = [c for c in _emitted_calls(footer) if "ref" in c]
+    opened = _search(db, **opened_call)
+    window_ids = [m["id"] for m in opened["messages"]]
+    reached = generation_one.intersection(window_ids)
+    if not reached:
+        compacted_in_window = [i for i in window_ids if rows[i]["compacted"] == 1]
+        assert compacted_in_window, window_ids
+        scrolled = _search(db, session_id=SESSION_ID, around_message_id=compacted_in_window[0], window=20)
+        reached = generation_one.intersection(m["id"] for m in scrolled["messages"])
+    assert reached, (window_ids, sorted(generation_one)[:5])
 
 
 def test_a_transcript_without_uids_emits_todays_exact_text(db):
@@ -274,7 +283,7 @@ def test_anchor_index_does_not_harvest_our_own_refs_as_commits():
 def test_redaction_leaves_refs_intact():
     from agent.context_compressor import _redact_compaction_text
     text = ("> [m:3f2a9c1e0b7d] quoted words\nThe region spans m:0123456789ab … m:abcdefabcdef (40 messages); "
-            "session_search(ref='m:0123456789ab', window=20)")
+            "session_search(ref='m:0123456789ab', window=10)")
     assert _redact_compaction_text(text) == text
 
 
@@ -291,4 +300,4 @@ def test_helpers_fall_back_when_the_uid_is_absent_or_not_hex():
     assert "> bye" in _build_verbatim_user_section(turns)
     footer = _build_recovery_footer("sid", turns)
     assert "m:3f2a9c1e0b7d" not in footer  # the last message carries no uid: no range sentence
-    assert _build_recovery_footer("sid", turns[:1] * 2).count("session_search(ref='m:3f2a9c1e0b7d', window=20)") == 1
+    assert _build_recovery_footer("sid", turns[:1] * 2).count("session_search(ref='m:3f2a9c1e0b7d', window=10)") == 1

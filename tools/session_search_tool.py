@@ -612,9 +612,13 @@ def _ref_window(db, ref: str, window: int, profile: Optional[str]) -> str:
         mode="ref", ref="m:" + ref.strip().lower().removeprefix("m:"), session_id=owning,
         link=_session_link(owning, profile), session_meta=_session_meta_block(_get_session_meta(db, owning)),
         around_message_id=row_id, window=window,
-        messages=[_shape_message(m, anchor_id=row_id) for m in messages],
+        # The anchor is exact recovery (uncapped, like scroll); neighbours take the read-shape cap so one ref
+        # call next to other large tool outputs cannot flood the context.
+        messages=[_shape_message(m, anchor_id=row_id, max_content_len=None if m.get("id") == row_id
+                                 else _READ_MAX_CONTENT) for m in messages],
         messages_before=view.get("messages_before", 0), messages_after=view.get("messages_after", 0),
-        hint=f"More context: session_search(session_id='{owning}', around_message_id=<first or last id above>).",
+        hint=("More context: repeat with a larger window (max 20), or scroll with "
+              f"session_search(session_id='{owning}', around_message_id=<first or last id above>)."),
         **extra)
 
 
