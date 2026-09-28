@@ -172,6 +172,35 @@ class TestDispatchAndIsolation:
         assert named["link"] == "@session:work/s_far"
 
 
+    def test_a_slash_session_id_never_switches_a_refs_store(self, db, tmp_path, monkeypatch):
+        import tools.session_search_tool as tool_module
+        stored = _compacted_session(db)
+        requested = []
+        real_resolve = tool_module._resolve_profile_db
+        monkeypatch.setattr(tool_module, "_resolve_profile_db",
+                            lambda profile: requested.append(profile) or real_resolve(profile))
+        ref = "m:" + stored[3]["message_uid"][:12]
+        result = _call(db, ref=ref, session_id="work/abc")
+        assert result["mode"] == "ref" and result["session_id"] == "s_live"
+        assert "work" not in result["link"] and requested == [None]
+
+        # An explicit profile= still routes the ref to that store.
+        other_home = tmp_path / "work_home"
+        other_home.mkdir()
+        other = SessionDB(other_home / "state.db")
+        other.create_session("s_far", source="cli")
+        other.append_message("s_far", role="user", content="far message")
+        far_uid = _rows(other, "s_far")[0]["message_uid"]
+        other.close()
+        from hermes_cli import profiles as profiles_mod
+        monkeypatch.setattr(profiles_mod, "normalize_profile_name", lambda n: n)
+        monkeypatch.setattr(profiles_mod, "validate_profile_name", lambda n: None)
+        monkeypatch.setattr(profiles_mod, "profile_exists", lambda n: True)
+        monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: other_home)
+        routed = _call(db, ref="m:" + far_uid[:12], session_id="work/abc", profile="work")
+        assert routed["session_id"] == "s_far" and requested[-1] == "work"
+
+
 class TestErrors:
     @pytest.mark.parametrize("ref", ["m:abc", "m:not-hex-at-all", "x:0123456789ab"])
     def test_invalid(self, db, ref):

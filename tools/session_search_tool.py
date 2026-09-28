@@ -627,9 +627,11 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
               after=None, before=None, exclude_session_ids=None, ref=None) -> str:
     """Mode dispatch (see module docstring); ref wins over everything, then scroll when an anchor is set.
     Profile DBs opened here are appended to *owned_dbs* for the caller to close."""
+    has_ref = isinstance(ref, str) and bool(ref.strip())
     # A raw `@session:<profile>/<id>` link as session_id: ids never contain "/", so
-    # split on it and adopt the embedded profile only when none was passed.
-    if isinstance(session_id, str) and "/" in session_id:
+    # split on it and adopt the embedded profile only when none was passed. Not for a ref:
+    # it resolves in the EXPLICIT profile's store only, so a stray link cannot switch stores.
+    if not has_ref and isinstance(session_id, str) and "/" in session_id:
         emb_profile, _, emb_id = session_id.partition("/")
         if emb_id:
             session_id = emb_id
@@ -644,7 +646,7 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
     if profile_db is not None:
         db, current_session_id = profile_db, None
         owned_dbs.append(profile_db)
-    if isinstance(ref, str) and ref.strip():
+    if has_ref:
         return _ref_window(db, ref, window, profile)
     if isinstance(session_id, str) and session_id.strip():
         if around_message_id is not None:

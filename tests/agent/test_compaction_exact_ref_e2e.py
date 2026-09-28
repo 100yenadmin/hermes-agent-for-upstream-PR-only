@@ -23,7 +23,6 @@ from agent.context_compressor import (
 )
 from agent.message_metadata import MESSAGE_UID
 from hermes_state import SessionDB
-from tools.session_search_tool import session_search
 
 TAIL_NEEDLE = "TAILMARK_3141"
 MID_NEEDLE = "MIDMARK_2718"
@@ -54,7 +53,12 @@ def _emitted_calls(text: str) -> list:
 
 
 def _search(db, **kwargs):
-    return json.loads(session_search(**kwargs, db=db, current_session_id=SESSION_ID))
+    """Run a call exactly as a model's tool call runs: through the inline executor, not the function."""
+    from types import SimpleNamespace
+    from agent.inline_tool_executors import INLINE_TOOL_EXECUTORS, InlineToolContext
+    agent = SimpleNamespace(_get_session_db_for_recall=lambda: db, session_id=SESSION_ID)
+    return json.loads(INLINE_TOOL_EXECUTORS["session_search"](
+        agent, kwargs, InlineToolContext(effective_task_id="task", tool_call_id="call")))
 
 
 def _anchor(result):
