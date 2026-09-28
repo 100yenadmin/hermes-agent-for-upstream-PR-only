@@ -16,8 +16,16 @@ from typing import Any, MutableMapping, Optional, TypeVar
 DB_ROW_SNAPSHOT = "_db_row_snapshot"
 CANONICAL_ROW = "_canonical_row"
 REPAIR_BOOKKEEPING_FIELDS = frozenset({DB_ROW_SNAPSHOT, CANONICAL_ROW})
+# The durable per-message id (``messages.message_uid``): minted once at the row's first insert and kept by
+# every host copy of that logical message (in-place compaction generation, rotation child, concurrent-tail
+# clone, replace re-issue, rewrite in place). Unlike ``_row_id`` (a physical id re-issued per copy, opt-in on
+# restore) it is restored unconditionally, so context engines can key on it across restarts and boundaries.
+MESSAGE_UID = "message_uid"
+# Live-only bookkeeping on a consecutive-user merge survivor: the ``message_uid`` of each absorbed row, in
+# absorption order (the uid sibling of ``_absorbed_row_ids``). The survivor keeps the FIRST constituent's uid.
+ABSORBED_MESSAGE_UIDS = "_absorbed_message_uids"
 PERSISTENCE_ONLY_MESSAGE_FIELDS = frozenset(
-    {"timestamp", "display_kind", "display_metadata", "_row_id"}
+    {"timestamp", "display_kind", "display_metadata", "_row_id", MESSAGE_UID, ABSORBED_MESSAGE_UIDS}
 ) | REPAIR_BOOKKEEPING_FIELDS
 
 _Message = TypeVar("_Message", bound=MutableMapping[str, Any])
