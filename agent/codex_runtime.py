@@ -104,7 +104,7 @@ def _drain_then_handoff(
     state["drain_done"] = False
     state["drain_owns_close"] = False
     drained = threading.Event()
-    release_hold = _handoff_step(hold_fn) if hold_fn is not None else None  # before any reader exists
+    release_hold: Callable[[], None] | None = None  # set inside the guarded region, right before the thread starts
 
     def _release_client_hold() -> None:
         if release_hold is not None:
@@ -138,6 +138,9 @@ def _drain_then_handoff(
 
     thread = threading.Thread(target=_drain, name="codex-post-terminal-drain", daemon=True)
     try:
+        # The hold is taken inside the guarded region: an exception between here and ``start()`` reaches the
+        # release below (no reader exists yet), and nothing acquired before the region can be leaked.
+        release_hold = _handoff_step(hold_fn) if hold_fn is not None else None  # before any reader exists
         thread.start()
         if drained.wait(budget):
             _release_client_hold()

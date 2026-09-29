@@ -377,11 +377,12 @@ def test_real_httpx_stream_shutdown_wakes_reader_without_releasing_fd():
     ours, theirs = _socket.socketpair()
     try:
         response = httpx.Response(200, extensions={"network_stream": SyncStream(ours)})
-        woke = threading.Event()
+        entering, woke = threading.Event(), threading.Event()
         received = {}
 
         def _reader():
             try:
+                entering.set()  # event-based sync (AGENTS.md flake policy): the next statement blocks in recv
                 received["data"] = ours.recv(1)
             except OSError as exc:  # pragma: no cover — a shut-down socket returns b"" rather than raising
                 received["error"] = exc
@@ -389,7 +390,8 @@ def test_real_httpx_stream_shutdown_wakes_reader_without_releasing_fd():
 
         reader = threading.Thread(target=_reader, name="blocked-reader", daemon=True)
         reader.start()
-        assert not woke.wait(0.2), "reader must be blocked before the shutdown"
+        assert entering.wait(2.0), "reader must reach recv"
+        assert not woke.is_set(), "nothing was sent: the reader is blocked in recv"
 
         assert codex_runtime._shutdown_stream_socket(SimpleNamespace(response=response)) is True
         assert woke.wait(2.0), "SHUT_RDWR must wake the reader"
