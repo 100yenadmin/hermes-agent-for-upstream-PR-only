@@ -1323,9 +1323,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         # Under a live Relay loop the managed wrapper's close() cannot reach the provider response
         # (the loop is still running the drain); on timeout the raw stream captured at stream creation
         # is closed too — by the drain thread, after its iteration ends.
+        # Explicit request client or the implicit shared one (summary drains): both are closed by paths that
+        # run after this call returns (worker release, agent_close, replacement) — hold whichever we stream on.
         hold_fn = None
-        if client is not None and callable(getattr(agent, "_hold_request_openai_client", None)):
-            hold_fn = lambda: agent._hold_request_openai_client(active_client)  # noqa: E731 — bound late
+        if callable(getattr(agent, "_hold_openai_client", None)):
+            hold_fn = lambda: agent._hold_openai_client(active_client)  # noqa: E731 — bound late
         return _drain_then_handoff(_drain, event_stream, writer_token.get("raw_stream"), budget,
                                    _close_event_stream, agent._client_log_context, handoff_state=writer_token,
                                    hold_fn=hold_fn)

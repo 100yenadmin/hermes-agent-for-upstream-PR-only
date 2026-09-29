@@ -13,8 +13,8 @@ Two invariants, both proven red on the unfixed code:
   no socket found, the wrapper owning its raw stream, a failing socket shutdown, a raising logging
   filter, an interrupt on the owner thread during the wait or inside ``Thread.start``, a thread that
   never launched), every stream is closed exactly once, only by the thread
-  that iterated it, the socket is only ever ``shutdown()``, never ``close()``d, and the request
-  client's release/close waits for that last reader too (a pool close releases its FD as well).
+  that iterated it, the socket is only ever ``shutdown()``, never ``close()``d, and the client's
+  release/close (worker release, or agent close of the shared client) waits for that last reader too.
 * ``test_real_httpx_stream_shutdown_wakes_reader_without_releasing_fd`` — on the real httpx/httpcore
   stream shape, the owner-side wake-up finds the socket and unblocks a reader without releasing its FD.
 """
@@ -206,22 +206,29 @@ class _FakeAgent(ClientLifecycleMixin):
 
 
 def _run(monkeypatch, *, budget: float, release: threading.Event, sock: _FakeSocket | None,
-         wrapper_cls=_ManagedWrapper, expect_raise=None):
+         wrapper_cls=_ManagedWrapper, expect_raise=None, implicit_client: bool = False):
     _ManagedWrapper.instances.clear()
     raw = _HeldOpenRawStream(release, sock)
     client, agent = _FakeClient(raw), _FakeAgent()
     monkeypatch.setattr(relay_llm, "stream", wrapper_cls)
     monkeypatch.setattr(codex_runtime, "_stream_drain_timeout", lambda: budget)
     request = {"model": "gpt-5-codex", "input": [{"role": "user", "content": "Ping"}], "store": False}
+    if implicit_client:
+        agent.client = client  # the summary drain passes no client: the shared primary client is used
+    client_arg = None if implicit_client else client
     if expect_raise is not None:
         with pytest.raises(expect_raise):
-            codex_runtime.run_codex_stream(agent, request, client=client)
+            codex_runtime.run_codex_stream(agent, request, client=client_arg)
     else:
-        final = codex_runtime.run_codex_stream(agent, request, client=client)
+        final = codex_runtime.run_codex_stream(agent, request, client=client_arg)
         assert final.status == "completed" and final.id == "resp_drain_fd"
     (wrapper,) = _ManagedWrapper.instances
-    # What the request worker does right after run_codex_stream returns: release/close the request client.
-    agent._close_request_openai_client(client, reason="request_complete")
+    if implicit_client:
+        # What agent close does right after a max-iteration summary (run_agent._drop_shared_client).
+        agent._close_openai_client(client, reason="agent_close", shared=True)
+    else:
+        # What the request worker does right after run_codex_stream returns: release/close the request client.
+        agent._close_request_openai_client(client, reason="request_complete")
     return raw, wrapper, client
 
 
@@ -245,6 +252,10 @@ def _no_lingering_drain_threads():
 _HANDOFF = {
     # the drain outlives the budget: the owner thread shuts the socket down and hands the close over
     "timeout": dict(budget=0.05, sock=_FakeSocket, wrapper=_ManagedWrapper, raises=None, handoff=True),
+    # same, streaming on the agent's shared client (no client argument, as the max-iteration summary does):
+    # agent close must not close that client's pool while the drain thread still reads
+    "implicit_client": dict(budget=0.05, sock=_FakeSocket, wrapper=_ManagedWrapper, raises=None, handoff=True,
+                            implicit=True),
     # no socket under the stream: still hand off (a lingering daemon thread beats corruption) + WARNING
     "no_socket": dict(budget=0.05, sock=lambda: None, wrapper=_ManagedWrapper, raises=None, handoff=True),
     # a wrapper that closes its own raw stream (ManagedLlmStream does) must not have it closed again
@@ -321,7 +332,8 @@ def test_close_ownership_contract(monkeypatch, caplog, scenario):
         # DEBUG enabled so the fallback diagnostics emit records too (a raising filter hits them as well).
         with caplog.at_level(logging.DEBUG, logger="agent.codex_runtime"):
             raw, wrapper, client = _run(monkeypatch, budget=spec["budget"], release=release, sock=sock,
-                                        wrapper_cls=spec["wrapper"], expect_raise=spec["raises"])
+                                        wrapper_cls=spec["wrapper"], expect_raise=spec["raises"],
+                                        implicit_client=spec.get("implicit", False))
         if spec["handoff"]:
             # The iteration is still blocked: the owner thread closed nothing and woke the reader FD-safely;
             # the worker's client release is deferred (a pool close would release the reader's FD too).
