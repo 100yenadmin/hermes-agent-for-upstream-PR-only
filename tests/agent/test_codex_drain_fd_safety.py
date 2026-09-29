@@ -239,10 +239,13 @@ def test_drain_ending_as_timeout_fires_closes_each_stream_exactly_once(monkeypat
         _join_drain_threads()
         assert len(wrapper.closes) == 1
         owner = threading.current_thread().name
-        if wrapper.closes == [_DRAIN_THREAD]:  # handed off: drain thread closes raw too; owner only shut down
-            assert raw.closes == [_DRAIN_THREAD]
+        # Branch on the socket, not on who closed: a shutdown means the owner handed off, so ONLY the drain
+        # thread may close; no shutdown means the drain finished first and ONLY the owner may close.
+        if "shutdown" in sock.names():
             assert sock.names() == ["settimeout", "shutdown"]
-        else:  # drain finished first: normal path, owner closes the wrapper once
+            assert wrapper.closes == [_DRAIN_THREAD]
+            assert raw.closes == [_DRAIN_THREAD]
+        else:
             assert wrapper.closes == [owner]
             assert raw.closes == []
         assert "close" not in sock.names()

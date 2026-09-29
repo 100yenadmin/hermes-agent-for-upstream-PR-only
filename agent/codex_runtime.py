@@ -98,9 +98,11 @@ def _drain_then_handoff(
                 close_here = state["handed_off"]
             drained.set()
             if close_here:
-                if raw_stream is not None and raw_stream is not event_stream:
-                    close_fn(raw_stream)
+                # The iteration is over, so the managed wrapper's close() reaches its provider resources;
+                # close the captured raw stream afterwards only if the wrapper did not already close it.
                 close_fn(event_stream)
+                if raw_stream is not None and raw_stream is not event_stream and not _stream_closed(raw_stream):
+                    close_fn(raw_stream)
 
     threading.Thread(target=_drain, name="codex-post-terminal-drain", daemon=True).start()
     if drained.wait(budget):
@@ -109,19 +111,35 @@ def _drain_then_handoff(
         if state["drain_done"]:
             return False  # finished as the budget expired; the caller closes, as on the normal path
         state["handed_off"] = True
-        # Under the lock so the drain thread cannot close (release the FD) mid-shutdown.
-        shut = _shutdown_stream_socket(raw_stream, event_stream)
-    logger.warning(
-        "Codex Responses stream remained open %.1fs after a terminal response (agent.stream_drain_timeout); "
-        "closing it and returning the completed response instead of retrying. %s",
-        budget, log_context(),
-    )
-    if not shut:
+        # From here the drain thread owns the close: nothing below may raise past this function, or the
+        # caller would fall back to its own close() and recreate the owner-thread race.
+        try:
+            # Under the lock so the drain thread cannot close (release the FD) mid-shutdown.
+            shut = _shutdown_stream_socket(raw_stream, event_stream)
+        except Exception:
+            shut = False
+            logger.debug("Codex post-terminal drain socket shutdown failed", exc_info=True)
+    try:
         logger.warning(
-            "Codex Responses post-terminal drain found no socket to shut down; the drain thread will close "
-            "the stream when the provider closes it. %s", log_context(),
+            "Codex Responses stream remained open %.1fs after a terminal response (agent.stream_drain_timeout); "
+            "closing it and returning the completed response instead of retrying. %s",
+            budget, log_context(),
         )
+        if not shut:
+            logger.warning(
+                "Codex Responses post-terminal drain found no socket to shut down; the drain thread will close "
+                "the stream when the provider closes it. %s", log_context(),
+            )
+    except Exception:
+        logger.debug("Codex post-terminal drain hand-off logging failed", exc_info=True)
     return True
+
+
+def _stream_closed(stream: Any) -> bool:
+    """True when the stream's ``httpx.Response`` reports itself closed (a managed wrapper closes its
+    provider resources on exhaustion; a second ``close()`` would only re-enter the failure branch)."""
+    response = getattr(stream, "response", None)
+    return bool(getattr(response, "is_closed", False)) if response is not None else False
 
 
 def _call_guarded(fn: Callable | None, fail_msg: str, *fail_args: Any, args: tuple = (), kwargs: dict | None = None):
