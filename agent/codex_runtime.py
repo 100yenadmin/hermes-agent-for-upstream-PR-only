@@ -137,10 +137,12 @@ def _drain_then_handoff(
         return _handoff_step(lambda: _shutdown_stream_socket(raw_stream, event_stream), False)
 
     thread = threading.Thread(target=_drain, name="codex-post-terminal-drain", daemon=True)
+    launch_attempted = False  # True from the statement before ``start()``: only then may a thread exist
     try:
         # The hold is taken inside the guarded region: an exception between here and ``start()`` reaches the
         # release below (no reader exists yet), and nothing acquired before the region can be leaked.
         release_hold = _handoff_step(hold_fn) if hold_fn is not None else None  # before any reader exists
+        launch_attempted = True
         thread.start()
         if drained.wait(budget):
             _release_client_hold()
@@ -151,13 +153,14 @@ def _drain_then_handoff(
                 return False  # finished as the budget expired; the caller closes, as on the normal path
             shut = _hand_off_locked()
     except BaseException as exc:
-        # ``start()`` raising an ordinary Exception means the thread never launched (CPython raises before
-        # creating it): the caller still owns the close. Anything else — an interrupt on the owner thread
-        # at any point after the thread may exist (KeyboardInterrupt on the CLI) — hands the close off
-        # unless the drain already finished, then re-raises: once the drain thread runs, the owner thread
-        # never closes. (An interrupt inside ``start()`` before the thread exists leaks the stream instead
-        # of racing on it; the process is being interrupted.)
-        never_launched = isinstance(exc, Exception) and thread.ident is None
+        # Before ``launch_attempted`` no thread can exist, whatever was raised (the hold, an interrupt):
+        # the caller still owns the close. From there on, ``start()`` raising an ordinary Exception means
+        # the thread never launched (CPython raises before creating it); anything else — an interrupt on
+        # the owner thread at any point after the thread may exist (KeyboardInterrupt on the CLI) — hands
+        # the close off unless the drain already finished, then re-raises: once the drain thread runs, the
+        # owner thread never closes. (An interrupt inside ``start()`` before the thread exists leaks the
+        # stream instead of racing on it; the process is being interrupted.)
+        never_launched = thread.ident is None and (not launch_attempted or isinstance(exc, Exception))
         handed_off = False
         if not never_launched:
             with lock:

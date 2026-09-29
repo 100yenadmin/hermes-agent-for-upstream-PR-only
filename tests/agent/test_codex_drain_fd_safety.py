@@ -206,10 +206,16 @@ class _FakeAgent(ClientLifecycleMixin):
 
 
 def _run(monkeypatch, *, budget: float, release: threading.Event, sock: _FakeSocket | None,
-         wrapper_cls=_ManagedWrapper, expect_raise=None, implicit_client: bool = False):
+         wrapper_cls=_ManagedWrapper, expect_raise=None, implicit_client: bool = False, hold_raises=None):
     _ManagedWrapper.instances.clear()
     raw = _HeldOpenRawStream(release, sock)
     client, agent = _FakeClient(raw), _FakeAgent()
+    if hold_raises is not None:
+        # An interrupt on the owner thread before the drain thread is started (the hold is the last
+        # statement before ``start()``): no reader can exist, so the owner must still own the close.
+        def _interrupted_hold(_client):
+            raise hold_raises
+        agent._hold_openai_client = _interrupted_hold
     monkeypatch.setattr(relay_llm, "stream", wrapper_cls)
     monkeypatch.setattr(codex_runtime, "_stream_drain_timeout", lambda: budget)
     request = {"model": "gpt-5-codex", "input": [{"role": "user", "content": "Ping"}], "store": False}
@@ -269,6 +275,9 @@ _HANDOFF = {
     "interrupt_in_thread_start": dict(budget=0.05, sock=_FakeSocket, wrapper=_ManagedWrapper, raises=KeyboardInterrupt, handoff=True),
     # Thread.start() fails before any thread exists: no reader, so the owner still closes (as before)
     "thread_start_fails": dict(budget=0.05, sock=_FakeSocket, wrapper=_ManagedWrapper, raises=RuntimeError, handoff=False),
+    # an interrupt before start() is even attempted (raised by the hold): no thread, the owner closes
+    "interrupt_before_start": dict(budget=0.05, sock=_FakeSocket, wrapper=_ManagedWrapper, raises=KeyboardInterrupt,
+                                   handoff=False, hold_raises=KeyboardInterrupt),
     # the drain ends inside the budget: no shutdown, the owner closes once (the wrapper owns the raw stream)
     "within_budget": dict(budget=5.0, sock=_FakeSocket, wrapper=_ManagedWrapper, raises=None, handoff=False),
     # budget 0: no drain thread at all, the owner closes once
@@ -333,7 +342,8 @@ def test_close_ownership_contract(monkeypatch, caplog, scenario):
         with caplog.at_level(logging.DEBUG, logger="agent.codex_runtime"):
             raw, wrapper, client = _run(monkeypatch, budget=spec["budget"], release=release, sock=sock,
                                         wrapper_cls=spec["wrapper"], expect_raise=spec["raises"],
-                                        implicit_client=spec.get("implicit", False))
+                                        implicit_client=spec.get("implicit", False),
+                                        hold_raises=spec.get("hold_raises"))
         if spec["handoff"]:
             # The iteration is still blocked: the owner thread closed nothing and woke the reader FD-safely;
             # the worker's client release is deferred (a pool close would release the reader's FD too).
@@ -360,7 +370,7 @@ def test_close_ownership_contract(monkeypatch, caplog, scenario):
         assert client.closes == [owner]  # no reader outlived the call: the worker's release is immediate
         if scenario == "budget_zero":
             assert _DRAIN_THREAD not in started
-    if scenario == "thread_start_fails":
+    if scenario in ("thread_start_fails", "interrupt_before_start"):
         assert not raw.blocked.is_set()  # no drain thread ever iterated past the terminal event
     if sock is not None:
         assert "close" not in sock.names()
