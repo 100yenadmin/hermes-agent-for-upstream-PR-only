@@ -113,26 +113,31 @@ def _drain_then_handoff(
         state["handed_off"] = True
         # From here the drain thread owns the close: nothing below may raise past this function, or the
         # caller would fall back to its own close() and recreate the owner-thread race.
-        try:
-            # Under the lock so the drain thread cannot close (release the FD) mid-shutdown.
-            shut = _shutdown_stream_socket(raw_stream, event_stream)
-        except Exception:
-            shut = False
-            logger.debug("Codex post-terminal drain socket shutdown failed", exc_info=True)
-    try:
-        logger.warning(
-            "Codex Responses stream remained open %.1fs after a terminal response (agent.stream_drain_timeout); "
-            "closing it and returning the completed response instead of retrying. %s",
-            budget, log_context(),
-        )
-        if not shut:
-            logger.warning(
-                "Codex Responses post-terminal drain found no socket to shut down; the drain thread will close "
-                "the stream when the provider closes it. %s", log_context(),
-            )
-    except Exception:
-        logger.debug("Codex post-terminal drain hand-off logging failed", exc_info=True)
+        # Under the lock so the drain thread cannot close (release the FD) mid-shutdown.
+        shut = _handoff_step(lambda: _shutdown_stream_socket(raw_stream, event_stream), False)
+    _handoff_step(lambda: logger.warning(
+        "Codex Responses stream remained open %.1fs after a terminal response (agent.stream_drain_timeout); "
+        "closing it and returning the completed response instead of retrying. %s",
+        budget, log_context(),
+    ))
+    if not shut:
+        _handoff_step(lambda: logger.warning(
+            "Codex Responses post-terminal drain found no socket to shut down; the drain thread will close "
+            "the stream when the provider closes it. %s", log_context(),
+        ))
     return True
+
+
+def _handoff_step(fn: Callable[[], Any], default: Any = None) -> Any:
+    """Run one step of the post-hand-off path so that it cannot raise (a raising logging filter, a socket
+    whose ``shutdown`` fails): an exception here would return to the caller before ``drain_owns_close``
+    is set and put the owner thread's ``close()`` back under the drain thread."""
+    try:
+        return fn()
+    except Exception:
+        with suppress(Exception):
+            logger.debug("Codex post-terminal drain hand-off step failed", exc_info=True)
+        return default
 
 
 def _stream_closed(stream: Any) -> bool:

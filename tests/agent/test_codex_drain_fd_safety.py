@@ -284,3 +284,41 @@ def test_wrapper_that_closes_its_raw_stream_is_not_closed_twice(monkeypatch):
     # The wrapper closed the raw stream on the drain thread; the drain thread must not close it again.
     assert raw.closes == [_DRAIN_THREAD]
     assert "close" not in sock.names()
+
+
+class _RaisingShutdownSocket(_FakeSocket):
+    def shutdown(self, how):
+        super().shutdown(how)
+        raise RuntimeError("shutdown failed")
+
+
+class _RaisingHandoffLogFilter(logging.Filter):
+    """Raises on every hand-off log record (the WARNING and its DEBUG fallback alike)."""
+
+    def filter(self, record):
+        message = record.getMessage()
+        if "post-terminal drain" in message or "stream remained open" in message:
+            raise RuntimeError("logging filter failed")
+        return True
+
+
+@pytest.mark.parametrize("failure", ["socket_shutdown_raises", "logging_raises"])
+def test_failures_after_the_handoff_never_return_the_close_to_the_owner_thread(monkeypatch, caplog, failure):
+    release = threading.Event()
+    sock = _RaisingShutdownSocket() if failure == "socket_shutdown_raises" else _FakeSocket()
+    log_filter = _RaisingHandoffLogFilter()
+    if failure == "logging_raises":
+        codex_runtime.logger.addFilter(log_filter)
+    try:
+        # DEBUG enabled so the fallback diagnostics emit records too (a raising filter hits them as well).
+        with caplog.at_level(logging.DEBUG, logger="agent.codex_runtime"):
+            raw, wrapper = _run(monkeypatch, budget=0.05, release=release, sock=sock)
+        assert raw.closes == [] and wrapper.closes == []
+        assert "shutdown" in sock.names()
+    finally:
+        codex_runtime.logger.removeFilter(log_filter)
+        release.set()
+    _join_drain_threads()
+    assert wrapper.closes == [_DRAIN_THREAD]
+    assert raw.closes == [_DRAIN_THREAD]
+    assert "close" not in sock.names()
