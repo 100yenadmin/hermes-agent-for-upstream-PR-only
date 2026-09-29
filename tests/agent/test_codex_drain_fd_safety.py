@@ -249,3 +249,38 @@ def test_drain_ending_as_timeout_fires_closes_each_stream_exactly_once(monkeypat
             assert wrapper.closes == [owner]
             assert raw.closes == []
         assert "close" not in sock.names()
+
+
+class _FaithfulWrapper(_ManagedWrapper):
+    """Like Relay's real wrapper: ``close()`` closes the raw stream it owns and marks its response closed."""
+
+    def close(self):
+        super().close()
+        self.raw.close()
+        self.raw.response.is_closed = True
+
+
+def test_wrapper_that_closes_its_raw_stream_is_not_closed_twice(monkeypatch):
+    release, sock = threading.Event(), _FakeSocket()
+    _ManagedWrapper.instances.clear()
+    raw = _HeldOpenRawStream(release, sock)
+    raw.response.is_closed = False
+    client = SimpleNamespace(base_url="https://example.invalid/backend-api/codex",
+                             responses=SimpleNamespace(create=lambda **_kw: raw))
+    monkeypatch.setattr(relay_llm, "stream", _FaithfulWrapper)
+    monkeypatch.setattr(codex_runtime, "_stream_drain_timeout", lambda: 0.05)
+    try:
+        final = codex_runtime.run_codex_stream(
+            _FakeAgent(), {"model": "gpt-5-codex", "input": [{"role": "user", "content": "Ping"}], "store": False},
+            client=client,
+        )
+        assert final.status == "completed"
+        assert raw.closes == []
+    finally:
+        release.set()
+    _join_drain_threads()
+    (wrapper,) = _ManagedWrapper.instances
+    assert wrapper.closes == [_DRAIN_THREAD]
+    # The wrapper closed the raw stream on the drain thread; the drain thread must not close it again.
+    assert raw.closes == [_DRAIN_THREAD]
+    assert "close" not in sock.names()
