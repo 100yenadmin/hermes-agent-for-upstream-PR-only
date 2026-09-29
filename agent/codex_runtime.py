@@ -48,6 +48,82 @@ def _stream_drain_timeout() -> float:
     return _DEFAULT_STREAM_DRAIN_TIMEOUT
 
 
+def _shutdown_stream_socket(*streams: Any) -> bool:
+    """``shutdown(SHUT_RDWR)`` the socket under the first stream exposing an ``httpx.Response``.
+
+    Wakes a reader blocked in ``SSL_read`` on another thread without releasing the FD (see
+    ``agent_runtime_helpers._shutdown_socket``). Returns False when no socket was discovered.
+    """
+    from agent.agent_runtime_helpers import _connection_candidates, _shutdown_socket, _socket_from_candidate
+
+    for stream in streams:
+        response = getattr(stream, "response", None)
+        if response is None:
+            continue
+        exts = getattr(response, "extensions", None) or {}
+        direct = exts.get("network_stream") if isinstance(exts, dict) else None
+        for start in (direct, getattr(response, "stream", None)):
+            if start is None:
+                continue
+            for candidate in _connection_candidates(start):
+                sock = _socket_from_candidate(candidate)
+                if sock is not None:
+                    _shutdown_socket(sock)
+                    return True
+    return False
+
+
+def _drain_then_handoff(
+    drain_fn: Callable[[], None], event_stream: Any, raw_stream: Any, budget: float,
+    close_fn: Callable[[Any], None], log_context: Callable[[], str],
+) -> bool:
+    """Run ``drain_fn`` on a ``codex-post-terminal-drain`` thread for at most ``budget`` seconds.
+
+    Returns True when close ownership passed to the drain thread: the caller must then NOT close
+    ``event_stream``/``raw_stream``. ``close()`` from a thread that is not iterating the stream is the
+    #29507 FD-recycle race (the drain thread's SSL BIO still caches the raw FD), so on timeout this
+    thread only ``shutdown()``s the socket, and the drain thread closes both streams once its
+    iteration has ended. A lock-guarded flag makes exactly one thread close, exactly once.
+    """
+    lock = threading.Lock()
+    state = {"drain_done": False, "handed_off": False}
+    drained = threading.Event()
+
+    def _drain() -> None:
+        try:
+            drain_fn()
+        finally:
+            with lock:
+                state["drain_done"] = True
+                close_here = state["handed_off"]
+            drained.set()
+            if close_here:
+                if raw_stream is not None and raw_stream is not event_stream:
+                    close_fn(raw_stream)
+                close_fn(event_stream)
+
+    threading.Thread(target=_drain, name="codex-post-terminal-drain", daemon=True).start()
+    if drained.wait(budget):
+        return False
+    with lock:
+        if state["drain_done"]:
+            return False  # finished as the budget expired; the caller closes, as on the normal path
+        state["handed_off"] = True
+        # Under the lock so the drain thread cannot close (release the FD) mid-shutdown.
+        shut = _shutdown_stream_socket(raw_stream, event_stream)
+    logger.warning(
+        "Codex Responses stream remained open %.1fs after a terminal response (agent.stream_drain_timeout); "
+        "closing it and returning the completed response instead of retrying. %s",
+        budget, log_context(),
+    )
+    if not shut:
+        logger.warning(
+            "Codex Responses post-terminal drain found no socket to shut down; the drain thread will close "
+            "the stream when the provider closes it. %s", log_context(),
+        )
+    return True
+
+
 def _call_guarded(fn: Callable | None, fail_msg: str, *fail_args: Any, args: tuple = (), kwargs: dict | None = None):
     """Invoke an optional display/debug callback; a buggy hook must never tear down the turn."""
     if fn is None:
@@ -1151,13 +1227,13 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         logger.debug("Codex stream opened (attempt=%s/%s, model=%s)",
             attempt + 1, max_stream_retries + 1, model)
 
-    def _drain_for_finalizer(event_stream: Any) -> None:
+    def _drain_for_finalizer(event_stream: Any) -> bool:
         # ``final`` is already assembled; draining only lets Relay run its finalizer. A transport error
-        # here must NOT discard the completed, already-billed response.
+        # here must NOT discard the completed, already-billed response. Returns True when the drain
+        # thread took over closing the stream (the ``finally`` below must then skip its close).
         budget = _stream_drain_timeout()
         if budget <= 0:
-            return  # the ``finally`` below closes the stream
-        drained = threading.Event()
+            return False  # the ``finally`` below closes the stream
 
         def _drain() -> None:
             try:
@@ -1171,23 +1247,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                                agent._client_log_context(), exc)
             except Exception:
                 logger.debug("Codex Responses stream finalization failed after a terminal response", exc_info=True)
-            finally:
-                drained.set()
 
-        threading.Thread(target=_drain, name="codex-post-terminal-drain", daemon=True).start()
-        if drained.wait(budget):
-            return
-        logger.warning(
-            "Codex Responses stream remained open %.1fs after a terminal response (agent.stream_drain_timeout); "
-            "closing it and returning the completed response instead of retrying. %s",
-            budget, agent._client_log_context(),
-        )
         # Under a live Relay loop the managed wrapper's close() cannot reach the provider response
-        # (the loop is still running the drain); close the raw stream captured at stream creation too.
-        raw_stream = writer_token.get("raw_stream")
-        if raw_stream is not None and raw_stream is not event_stream:
-            _close_event_stream(raw_stream)
-        _close_event_stream(event_stream)
+        # (the loop is still running the drain); on timeout the raw stream captured at stream creation
+        # is closed too — by the drain thread, after its iteration ends.
+        return _drain_then_handoff(_drain, event_stream, writer_token.get("raw_stream"), budget,
+                                   _close_event_stream, agent._client_log_context)
 
     def _close_event_stream(event_stream: Any) -> None:
         close_fn = getattr(event_stream, "close", None)  # None while connect never succeeded
@@ -1222,6 +1287,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         intercepted_events: list = []
         writer_token["value"] = writer_token["raw_stream"] = event_stream = None
         writer_token["superseded_logged"] = False
+        drain_owns_close = False
         try:
             try:
                 event_stream = relay_llm.stream(
@@ -1274,7 +1340,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 _log_failure(exc)
                 raise
             if not agent._interrupt_requested:
-                _drain_for_finalizer(event_stream)
+                drain_owns_close = _drain_for_finalizer(event_stream)
             if final.status in {"incomplete", "failed"}:
                 logger.warning("Codex Responses stream terminal status=%s "
                                "(incomplete_details=%s, error=%s, streamed_chars=%d). %s",
@@ -1282,7 +1348,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                                sum(len(p) for p in agent._codex_streamed_text_parts), agent._client_log_context())
             return final
         finally:
-            _close_event_stream(event_stream)
+            if not drain_owns_close:  # else the drain thread closes it once its iteration ends (#29507)
+                _close_event_stream(event_stream)
 
 
 __all__ = [
