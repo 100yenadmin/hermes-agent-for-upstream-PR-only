@@ -7,7 +7,7 @@ import logging
 import threading
 import time
 from contextlib import suppress
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from agent.lazy_forward import forward as _forward, forward_static as _forward_static, lazy_attr as _lazy_attr
 from hermes_cli.timeouts import get_provider_request_timeout
@@ -464,7 +464,51 @@ class ClientLifecycleMixin:
         self._store_request_slot(_OPENAI_SLOT, client, snapshot)
         return client
 
+    def _hold_request_openai_client(self, client: Any) -> Callable[[], None]:
+        """A worker that hands its stream close to another thread (the Codex post-terminal drain, #400)
+        keeps its request client alive until that thread has closed the stream: while any hold exists,
+        ``_close_request_openai_client`` only records the reason. Returns an idempotent release; the last
+        release performs the deferred release/close on the releasing thread — the holder's own, after it
+        closed what it was reading — so ``client.close()`` never releases an FD under a live reader.
+        The reuse slot stays ``in_use`` meanwhile, so teardown only aborts (shutdown) and a concurrent
+        checkout builds an untracked client instead of evicting this one.
+        """
+        with self._openai_client_lock():
+            holds = self._held_request_clients()
+            entry = holds.get(id(client))
+            if entry is None or entry["client"] is not client:
+                entry = holds[id(client)] = {"client": client, "count": 0, "pending": None}
+            entry["count"] += 1
+        released = [False]
+
+        def _release() -> None:
+            with self._openai_client_lock():
+                if released[0]:
+                    return
+                released[0] = True
+                entry["count"] -= 1
+                if entry["count"] > 0:
+                    return
+                if holds.get(id(client)) is entry:
+                    del holds[id(client)]
+                pending = entry["pending"]
+            if pending is not None:
+                self._close_request_openai_client(client, reason=pending)
+
+        return _release
+
+    def _held_request_clients(self) -> dict:
+        holds = getattr(self, "_request_client_holds", None)  # lazy: agents built via __new__ in tests
+        if holds is None:
+            self._request_client_holds = holds = {}
+        return holds
+
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
+        with self._openai_client_lock():
+            entry = self._held_request_clients().get(id(client))
+            if entry is not None and entry["client"] is client:
+                entry["pending"] = reason  # deferred: the holder releases/closes when its reader has exited
+                return
         if not self._release_request_slot(_OPENAI_SLOT, client, reason):
             self._close_openai_client(client, reason=reason, shared=False)
 

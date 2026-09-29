@@ -76,6 +76,7 @@ def _shutdown_stream_socket(*streams: Any) -> bool:
 def _drain_then_handoff(
     drain_fn: Callable[[], None], event_stream: Any, raw_stream: Any, budget: float,
     close_fn: Callable[[Any], None], log_context: Callable[[], str], handoff_state: dict | None = None,
+    hold_fn: Callable[[], Callable[[], None]] | None = None,
 ) -> bool:
     """Run ``drain_fn`` on a ``codex-post-terminal-drain`` thread for at most ``budget`` seconds.
 
@@ -90,6 +91,11 @@ def _drain_then_handoff(
     the drain thread and the caller's ``finally`` always agree, even when this function exits with an
     exception. Any ``BaseException`` (an interrupt on the owner thread) after the drain thread may exist
     performs the hand-off before re-raising: once the thread runs, the owner thread never closes.
+
+    ``hold_fn`` (returns a release callable) keeps the request client alive for as long as the drain
+    thread may read from it: the worker's client release/close after this function returns would
+    otherwise ``close()`` the connection pool — releasing the drain thread's FD under its SSL BIO, the
+    same race one pool up. The thread that closes the stream also releases the hold, afterwards.
     """
     lock = threading.Lock()
     # ONE dict, shared by the drain thread and the caller (its ``writer_token``): ``drain_owns_close`` is a
@@ -98,6 +104,11 @@ def _drain_then_handoff(
     state["drain_done"] = False
     state["drain_owns_close"] = False
     drained = threading.Event()
+    release_hold = _handoff_step(hold_fn) if hold_fn is not None else None  # before any reader exists
+
+    def _release_client_hold() -> None:
+        if release_hold is not None:
+            _handoff_step(release_hold)
 
     def _drain() -> None:
         try:
@@ -110,9 +121,12 @@ def _drain_then_handoff(
             if close_here:
                 # The iteration is over, so the managed wrapper's close() reaches its provider resources;
                 # close the captured raw stream afterwards only if the wrapper did not already close it.
-                close_fn(event_stream)
-                if raw_stream is not None and raw_stream is not event_stream and not _stream_closed(raw_stream):
-                    close_fn(raw_stream)
+                try:
+                    close_fn(event_stream)
+                    if raw_stream is not None and raw_stream is not event_stream and not _stream_closed(raw_stream):
+                        close_fn(raw_stream)
+                finally:
+                    _release_client_hold()  # the request client outlived its last reader: release/close it
 
     def _hand_off_locked() -> bool:
         """Caller holds ``lock`` and the drain is not done: move the close to the drain thread, then wake it."""
@@ -126,9 +140,11 @@ def _drain_then_handoff(
     try:
         thread.start()
         if drained.wait(budget):
+            _release_client_hold()
             return False
         with lock:
             if state["drain_done"]:
+                _release_client_hold()
                 return False  # finished as the budget expired; the caller closes, as on the normal path
             shut = _hand_off_locked()
     except BaseException as exc:
@@ -139,10 +155,14 @@ def _drain_then_handoff(
         # never closes. (An interrupt inside ``start()`` before the thread exists leaks the stream instead
         # of racing on it; the process is being interrupted.)
         never_launched = isinstance(exc, Exception) and thread.ident is None
+        handed_off = False
         if not never_launched:
             with lock:
                 if not state["drain_done"] and not state["drain_owns_close"]:
                     _hand_off_locked()
+                handed_off = state["drain_owns_close"]
+        if not handed_off:
+            _release_client_hold()  # no reader outlives this call: the worker's own release may proceed
         raise
     _handoff_step(lambda: logger.warning(
         "Codex Responses stream remained open %.1fs after a terminal response (agent.stream_drain_timeout); "
@@ -1303,8 +1323,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         # Under a live Relay loop the managed wrapper's close() cannot reach the provider response
         # (the loop is still running the drain); on timeout the raw stream captured at stream creation
         # is closed too — by the drain thread, after its iteration ends.
+        hold_fn = None
+        if client is not None and callable(getattr(agent, "_hold_request_openai_client", None)):
+            hold_fn = lambda: agent._hold_request_openai_client(active_client)  # noqa: E731 — bound late
         return _drain_then_handoff(_drain, event_stream, writer_token.get("raw_stream"), budget,
-                                   _close_event_stream, agent._client_log_context, handoff_state=writer_token)
+                                   _close_event_stream, agent._client_log_context, handoff_state=writer_token,
+                                   hold_fn=hold_fn)
 
     def _close_event_stream(event_stream: Any) -> None:
         close_fn = getattr(event_stream, "close", None)  # None while connect never succeeded

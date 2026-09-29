@@ -13,12 +13,14 @@ Two invariants, both proven red on the unfixed code:
   no socket found, the wrapper owning its raw stream, a failing socket shutdown, a raising logging
   filter, an interrupt on the owner thread during the wait or inside ``Thread.start``, a thread that
   never launched), every stream is closed exactly once, only by the thread
-  that iterated it, and the socket is only ever ``shutdown()``, never ``close()``d.
+  that iterated it, the socket is only ever ``shutdown()``, never ``close()``d, and the request
+  client's release/close waits for that last reader too (a pool close releases its FD as well).
 * ``test_real_httpx_stream_shutdown_wakes_reader_without_releasing_fd`` — on the real httpx/httpcore
   stream shape, the owner-side wake-up finds the socket and unblocks a reader without releasing its FD.
 """
 from __future__ import annotations
 
+import itertools
 import logging
 import socket as _socket
 import threading
@@ -28,6 +30,7 @@ import pytest
 
 import agent.codex_runtime as codex_runtime
 from agent import relay_llm
+from agent.client_lifecycle import ClientLifecycleMixin
 
 _DRAIN_THREAD = "codex-post-terminal-drain"
 
@@ -66,12 +69,21 @@ class _FakeNetworkStream:
         return self._socket if key == "socket" else None
 
 
+_CLOSE_SEQ = itertools.count()
+_CLOSE_SEQ_LOCK = threading.Lock()
+
+
 class _CloseRecorder:
+    """Records the thread of every ``close()`` and a global sequence number (cross-thread ordering)."""
+
     def __init__(self):
         self.closes: list[str] = []
+        self.order: list[int] = []
 
     def close(self):
-        self.closes.append(threading.current_thread().name)
+        with _CLOSE_SEQ_LOCK:
+            self.order.append(next(_CLOSE_SEQ))
+            self.closes.append(threading.current_thread().name)
 
 
 class _HeldOpenRawStream(_CloseRecorder):
@@ -161,7 +173,19 @@ class _FailingStartThread(threading.Thread):
         raise RuntimeError("can't start new thread")
 
 
-class _FakeAgent:
+class _FakeClient(_CloseRecorder):
+    """The request-local OpenAI client: ``close()`` here is the pool close that would release FDs."""
+
+    base_url = "https://example.invalid/backend-api/codex"
+
+    def __init__(self, raw):
+        super().__init__()
+        self.responses = SimpleNamespace(create=lambda **_kw: raw)
+
+
+class _FakeAgent(ClientLifecycleMixin):
+    """Real client lifecycle (hold / deferred release); everything else stubbed."""
+
     provider = "openai-codex"
     base_url = "https://example.invalid/backend-api/codex"
     model = "gpt-5-codex"
@@ -185,19 +209,20 @@ def _run(monkeypatch, *, budget: float, release: threading.Event, sock: _FakeSoc
          wrapper_cls=_ManagedWrapper, expect_raise=None):
     _ManagedWrapper.instances.clear()
     raw = _HeldOpenRawStream(release, sock)
-    client = SimpleNamespace(base_url="https://example.invalid/backend-api/codex",
-                             responses=SimpleNamespace(create=lambda **_kw: raw))
+    client, agent = _FakeClient(raw), _FakeAgent()
     monkeypatch.setattr(relay_llm, "stream", wrapper_cls)
     monkeypatch.setattr(codex_runtime, "_stream_drain_timeout", lambda: budget)
     request = {"model": "gpt-5-codex", "input": [{"role": "user", "content": "Ping"}], "store": False}
     if expect_raise is not None:
         with pytest.raises(expect_raise):
-            codex_runtime.run_codex_stream(_FakeAgent(), request, client=client)
+            codex_runtime.run_codex_stream(agent, request, client=client)
     else:
-        final = codex_runtime.run_codex_stream(_FakeAgent(), request, client=client)
+        final = codex_runtime.run_codex_stream(agent, request, client=client)
         assert final.status == "completed" and final.id == "resp_drain_fd"
     (wrapper,) = _ManagedWrapper.instances
-    return raw, wrapper
+    # What the request worker does right after run_codex_stream returns: release/close the request client.
+    agent._close_request_openai_client(client, reason="request_complete")
+    return raw, wrapper, client
 
 
 def _drain_threads():
@@ -253,17 +278,20 @@ def test_close_ownership_contract(monkeypatch, caplog, scenario):
             timer = threading.Timer(budget, release.set)
             timer.start()
             try:
-                raw, wrapper = _run(monkeypatch, budget=budget, release=release, sock=sock)
+                raw, wrapper, client = _run(monkeypatch, budget=budget, release=release, sock=sock)
             finally:
                 timer.join(5.0)
                 release.set()
             _join_drain_threads()
-            assert len(wrapper.closes) == 1
+            assert len(wrapper.closes) == 1 and len(client.closes) == 1
             if "shutdown" in sock.names():
                 assert sock.names() == ["settimeout", "shutdown"]
                 assert wrapper.closes == [_DRAIN_THREAD] and raw.closes == [_DRAIN_THREAD]
+                # The client's pool close follows the drain thread's stream closes: on the drain thread when
+                # the worker's release found the hold, on the owner thread when the drain had already let go.
+                assert client.order[0] > max(wrapper.order[0], raw.order[0])
             else:
-                assert wrapper.closes == [owner] and raw.closes == []
+                assert wrapper.closes == [owner] and raw.closes == [] and client.closes == [owner]
             assert "close" not in sock.names()
         return
 
@@ -292,13 +320,15 @@ def test_close_ownership_contract(monkeypatch, caplog, scenario):
     try:
         # DEBUG enabled so the fallback diagnostics emit records too (a raising filter hits them as well).
         with caplog.at_level(logging.DEBUG, logger="agent.codex_runtime"):
-            raw, wrapper = _run(monkeypatch, budget=spec["budget"], release=release, sock=sock,
-                                wrapper_cls=spec["wrapper"], expect_raise=spec["raises"])
+            raw, wrapper, client = _run(monkeypatch, budget=spec["budget"], release=release, sock=sock,
+                                        wrapper_cls=spec["wrapper"], expect_raise=spec["raises"])
         if spec["handoff"]:
-            # The iteration is still blocked: the owner thread closed nothing and woke the reader FD-safely.
+            # The iteration is still blocked: the owner thread closed nothing and woke the reader FD-safely;
+            # the worker's client release is deferred (a pool close would release the reader's FD too).
             assert raw.blocked.wait(2.0)
             assert raw.closes == [] and wrapper.closes == [], (
                 "close() from the owner thread while the drain thread iterates is the #29507 FD-recycle race")
+            assert client.closes == [], "the request client was closed under the drain thread's reader"
             if sock is not None:
                 assert sock.names() == ["settimeout", "shutdown"]
                 assert {thread for _name, thread in sock.calls} == {owner}
@@ -311,9 +341,11 @@ def test_close_ownership_contract(monkeypatch, caplog, scenario):
     if spec["handoff"]:
         assert wrapper.closes == [_DRAIN_THREAD]
         assert raw.closes == [_DRAIN_THREAD]  # closed once: by the drain thread, or by the wrapper on that thread
+        assert client.closes == [_DRAIN_THREAD]  # the deferred worker release ran after the last read
     else:
         assert wrapper.closes == [owner]
         assert raw.closes == []  # unchanged: the managed wrapper owns the raw stream on this path
+        assert client.closes == [owner]  # no reader outlived the call: the worker's release is immediate
         if scenario == "budget_zero":
             assert _DRAIN_THREAD not in started
     if scenario == "thread_start_fails":
