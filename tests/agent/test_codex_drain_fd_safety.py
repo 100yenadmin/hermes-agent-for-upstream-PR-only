@@ -7,11 +7,14 @@ FD-recycle race of #29507: ``close()`` releases the FD, the kernel recycles the 
 ``open()``, and the drain thread's TLS layer flushes a record into that unrelated file (it clobbered
 a SQLite header).
 
-The rules pinned here (object granularity, no network, no real sockets):
+Two invariants, both proven red on the unfixed code:
 
-* on timeout the owner thread only ``shutdown(SHUT_RDWR)``s the socket, never ``close()``s;
-* the drain thread closes raw + managed stream exactly once, after its iteration ends;
-* the owner's ``finally`` never closes a handed-off stream; every other path is unchanged.
+* ``test_close_ownership_contract`` — whichever way the drain ends (within budget, at the budget, never,
+  no socket found, the wrapper owning its raw stream, a failing socket shutdown, a raising logging
+  filter, an interrupt on the owner thread), every stream is closed exactly once, only by the thread
+  that iterated it, and the socket is only ever ``shutdown()``, never ``close()``d.
+* ``test_real_httpx_stream_shutdown_wakes_reader_without_releasing_fd`` — on the real httpx/httpcore
+  stream shape, the owner-side wake-up finds the socket and unblocks a reader without releasing its FD.
 """
 from __future__ import annotations
 
@@ -48,6 +51,12 @@ class _FakeSocket:
         return [name for name, _thread in self.calls]
 
 
+class _RaisingShutdownSocket(_FakeSocket):
+    def shutdown(self, how):
+        super().shutdown(how)
+        raise RuntimeError("shutdown failed")
+
+
 class _FakeNetworkStream:
     def __init__(self, sock):
         self._socket = sock
@@ -59,11 +68,9 @@ class _FakeNetworkStream:
 class _CloseRecorder:
     def __init__(self):
         self.closes: list[str] = []
-        self.closed = threading.Event()
 
     def close(self):
         self.closes.append(threading.current_thread().name)
-        self.closed.set()
 
 
 class _HeldOpenRawStream(_CloseRecorder):
@@ -74,7 +81,7 @@ class _HeldOpenRawStream(_CloseRecorder):
         self._release = release
         self.blocked = threading.Event()
         extensions = {"network_stream": _FakeNetworkStream(sock)} if sock is not None else {}
-        self.response = SimpleNamespace(extensions=extensions)
+        self.response = SimpleNamespace(extensions=extensions, is_closed=False)
         message = SimpleNamespace(type="message", status="completed",
                                   content=[SimpleNamespace(type="output_text", text="All done.")])
         usage = SimpleNamespace(input_tokens=10, output_tokens=6, total_tokens=16)
@@ -110,6 +117,34 @@ class _ManagedWrapper(_CloseRecorder):
         return next(self._iter)
 
 
+class _FaithfulWrapper(_ManagedWrapper):
+    """Like Relay's real wrapper: ``close()`` closes the raw stream it owns and marks its response closed."""
+
+    def close(self):
+        super().close()
+        self.raw.close()
+        self.raw.response.is_closed = True
+
+
+class _RaisingHandoffLogFilter(logging.Filter):
+    """Raises on every hand-off log record (the WARNING and its DEBUG fallback alike)."""
+
+    def filter(self, record):
+        message = record.getMessage()
+        if "post-terminal drain" in message or "stream remained open" in message:
+            raise RuntimeError("logging filter failed")
+        return True
+
+
+class _InterruptingEvent(threading.Event):
+    """``wait(timeout)`` raises like Ctrl-C landing on the owner thread during the drain budget."""
+
+    def wait(self, timeout=None):
+        if timeout is not None:
+            raise KeyboardInterrupt
+        return super().wait(timeout)
+
+
 class _FakeAgent:
     provider = "openai-codex"
     base_url = "https://example.invalid/backend-api/codex"
@@ -130,18 +165,21 @@ class _FakeAgent:
     def _abort_request_openai_client(self, *_a, **_k): pass
 
 
-def _run(monkeypatch, *, budget: float, release: threading.Event, sock: _FakeSocket | None):
+def _run(monkeypatch, *, budget: float, release: threading.Event, sock: _FakeSocket | None,
+         wrapper_cls=_ManagedWrapper, expect_raise=None):
     _ManagedWrapper.instances.clear()
     raw = _HeldOpenRawStream(release, sock)
     client = SimpleNamespace(base_url="https://example.invalid/backend-api/codex",
                              responses=SimpleNamespace(create=lambda **_kw: raw))
-    monkeypatch.setattr(relay_llm, "stream", _ManagedWrapper)
+    monkeypatch.setattr(relay_llm, "stream", wrapper_cls)
     monkeypatch.setattr(codex_runtime, "_stream_drain_timeout", lambda: budget)
-    final = codex_runtime.run_codex_stream(
-        _FakeAgent(), {"model": "gpt-5-codex", "input": [{"role": "user", "content": "Ping"}], "store": False},
-        client=client,
-    )
-    assert final.status == "completed" and final.id == "resp_drain_fd"
+    request = {"model": "gpt-5-codex", "input": [{"role": "user", "content": "Ping"}], "store": False}
+    if expect_raise is not None:
+        with pytest.raises(expect_raise):
+            codex_runtime.run_codex_stream(_FakeAgent(), request, client=client)
+    else:
+        final = codex_runtime.run_codex_stream(_FakeAgent(), request, client=client)
+        assert final.status == "completed" and final.id == "resp_drain_fd"
     (wrapper,) = _ManagedWrapper.instances
     return raw, wrapper
 
@@ -162,163 +200,133 @@ def _no_lingering_drain_threads():
     _join_drain_threads()
 
 
-def test_timeout_shuts_socket_down_and_hands_close_to_drain_thread(monkeypatch):
-    release, sock = threading.Event(), _FakeSocket()
-    raw, wrapper = _run(monkeypatch, budget=0.05, release=release, sock=sock)
-    try:
-        assert raw.blocked.is_set()
-        # The owner thread closed nothing while the iteration is blocked and woke the reader FD-safely.
-        assert raw.closes == [] and wrapper.closes == [], (
-            "close() from the owner thread while the drain thread iterates is the #29507 FD-recycle race")
-        assert sock.names() == ["settimeout", "shutdown"]
-        assert {thread for _name, thread in sock.calls} == {threading.current_thread().name}
-    finally:
-        release.set()
-    _join_drain_threads()
-    assert raw.closes == [_DRAIN_THREAD]
-    assert wrapper.closes == [_DRAIN_THREAD]
-    assert "close" not in sock.names()
+# Scenario → budget, socket factory, wrapper class, expected exception, hand-off expected?
+_HANDOFF = {
+    # the drain outlives the budget: the owner thread shuts the socket down and hands the close over
+    "timeout": dict(budget=0.05, sock=_FakeSocket, wrapper=_ManagedWrapper, raises=None, handoff=True),
+    # no socket under the stream: still hand off (a lingering daemon thread beats corruption) + WARNING
+    "no_socket": dict(budget=0.05, sock=lambda: None, wrapper=_ManagedWrapper, raises=None, handoff=True),
+    # a wrapper that closes its own raw stream (ManagedLlmStream does) must not have it closed again
+    "wrapper_owns_raw": dict(budget=0.05, sock=_FakeSocket, wrapper=_FaithfulWrapper, raises=None, handoff=True),
+    # failures after the hand-off never return the close to the owner thread
+    "shutdown_raises": dict(budget=0.05, sock=_RaisingShutdownSocket, wrapper=_ManagedWrapper, raises=None, handoff=True),
+    "logging_raises": dict(budget=0.05, sock=_FakeSocket, wrapper=_ManagedWrapper, raises=None, handoff=True),
+    # an interrupt on the owner thread during the budget: hand off, then re-raise
+    "interrupt_during_wait": dict(budget=0.05, sock=_FakeSocket, wrapper=_ManagedWrapper, raises=KeyboardInterrupt, handoff=True),
+    # the drain ends inside the budget: no shutdown, the owner closes once (the wrapper owns the raw stream)
+    "within_budget": dict(budget=5.0, sock=_FakeSocket, wrapper=_ManagedWrapper, raises=None, handoff=False),
+    # budget 0: no drain thread at all, the owner closes once
+    "budget_zero": dict(budget=0.0, sock=_FakeSocket, wrapper=_ManagedWrapper, raises=None, handoff=False),
+}
 
 
-def test_drain_finishing_within_budget_closes_once_on_owner_thread(monkeypatch):
-    release, sock = threading.Event(), _FakeSocket()
-    release.set()  # the provider closes right after the terminal event
-    raw, wrapper = _run(monkeypatch, budget=5.0, release=release, sock=sock)
-    _join_drain_threads()
-    assert sock.calls == []
-    assert wrapper.closes == [threading.current_thread().name]
-    assert raw.closes == []  # unchanged: the managed wrapper owns the raw stream on this path
+@pytest.mark.parametrize("scenario", list(_HANDOFF) + ["race"])
+def test_close_ownership_contract(monkeypatch, caplog, scenario):
+    """Exactly one close per stream, only by the thread that iterated it; the socket is never closed."""
+    owner = threading.current_thread().name
+    if scenario == "race":
+        # The drain ends exactly as the budget expires (50 tries): whichever side wins, exactly one close per
+        # stream. A socket shutdown is the witness of a hand-off — then ONLY the drain thread may close.
+        budget = 0.02
+        for _ in range(50):
+            release, sock = threading.Event(), _FakeSocket()
+            timer = threading.Timer(budget, release.set)
+            timer.start()
+            try:
+                raw, wrapper = _run(monkeypatch, budget=budget, release=release, sock=sock)
+            finally:
+                timer.join(5.0)
+                release.set()
+            _join_drain_threads()
+            assert len(wrapper.closes) == 1
+            if "shutdown" in sock.names():
+                assert sock.names() == ["settimeout", "shutdown"]
+                assert wrapper.closes == [_DRAIN_THREAD] and raw.closes == [_DRAIN_THREAD]
+            else:
+                assert wrapper.closes == [owner] and raw.closes == []
+            assert "close" not in sock.names()
+        return
 
+    spec = _HANDOFF[scenario]
+    release, sock = threading.Event(), spec["sock"]()
+    started: list = []
+    if scenario == "budget_zero":
+        real_thread = threading.Thread
 
-def test_zero_budget_skips_the_drain_and_closes_on_owner_thread(monkeypatch):
-    release, sock = threading.Event(), _FakeSocket()
-    started = []
-    real_thread = threading.Thread
+        def _spy_thread(*args, **kwargs):
+            started.append(kwargs.get("name"))
+            return real_thread(*args, **kwargs)
 
-    def _spy_thread(*args, **kwargs):
-        started.append(kwargs.get("name"))
-        return real_thread(*args, **kwargs)
-
-    monkeypatch.setattr(codex_runtime.threading, "Thread", _spy_thread)
-    try:
-        raw, wrapper = _run(monkeypatch, budget=0.0, release=release, sock=sock)
-    finally:
-        release.set()
-    assert _DRAIN_THREAD not in started
-    assert sock.calls == []
-    assert wrapper.closes == [threading.current_thread().name]
-    assert raw.closes == []
-
-
-def test_no_socket_found_still_hands_off_and_warns(monkeypatch, caplog):
-    release = threading.Event()
-    with caplog.at_level(logging.WARNING, logger="agent.codex_runtime"):
-        raw, wrapper = _run(monkeypatch, budget=0.05, release=release, sock=None)
-    try:
-        assert raw.closes == [] and wrapper.closes == []
-        assert "stream remained open" in caplog.text
-        assert "drain thread will close" in caplog.text
-    finally:
-        release.set()
-    _join_drain_threads()
-    assert raw.closes == [_DRAIN_THREAD]
-    assert wrapper.closes == [_DRAIN_THREAD]
-
-
-def test_drain_ending_as_timeout_fires_closes_each_stream_exactly_once(monkeypatch):
-    budget = 0.02
-    for _ in range(50):
-        release, sock = threading.Event(), _FakeSocket()
-        timer = threading.Timer(budget, release.set)
-        timer.start()
-        try:
-            raw, wrapper = _run(monkeypatch, budget=budget, release=release, sock=sock)
-        finally:
-            timer.join(5.0)
-            release.set()
-        _join_drain_threads()
-        assert len(wrapper.closes) == 1
-        owner = threading.current_thread().name
-        # Branch on the socket, not on who closed: a shutdown means the owner handed off, so ONLY the drain
-        # thread may close; no shutdown means the drain finished first and ONLY the owner may close.
-        if "shutdown" in sock.names():
-            assert sock.names() == ["settimeout", "shutdown"]
-            assert wrapper.closes == [_DRAIN_THREAD]
-            assert raw.closes == [_DRAIN_THREAD]
-        else:
-            assert wrapper.closes == [owner]
-            assert raw.closes == []
-        assert "close" not in sock.names()
-
-
-class _FaithfulWrapper(_ManagedWrapper):
-    """Like Relay's real wrapper: ``close()`` closes the raw stream it owns and marks its response closed."""
-
-    def close(self):
-        super().close()
-        self.raw.close()
-        self.raw.response.is_closed = True
-
-
-def test_wrapper_that_closes_its_raw_stream_is_not_closed_twice(monkeypatch):
-    release, sock = threading.Event(), _FakeSocket()
-    _ManagedWrapper.instances.clear()
-    raw = _HeldOpenRawStream(release, sock)
-    raw.response.is_closed = False
-    client = SimpleNamespace(base_url="https://example.invalid/backend-api/codex",
-                             responses=SimpleNamespace(create=lambda **_kw: raw))
-    monkeypatch.setattr(relay_llm, "stream", _FaithfulWrapper)
-    monkeypatch.setattr(codex_runtime, "_stream_drain_timeout", lambda: 0.05)
-    try:
-        final = codex_runtime.run_codex_stream(
-            _FakeAgent(), {"model": "gpt-5-codex", "input": [{"role": "user", "content": "Ping"}], "store": False},
-            client=client,
-        )
-        assert final.status == "completed"
-        assert raw.closes == []
-    finally:
-        release.set()
-    _join_drain_threads()
-    (wrapper,) = _ManagedWrapper.instances
-    assert wrapper.closes == [_DRAIN_THREAD]
-    # The wrapper closed the raw stream on the drain thread; the drain thread must not close it again.
-    assert raw.closes == [_DRAIN_THREAD]
-    assert "close" not in sock.names()
-
-
-class _RaisingShutdownSocket(_FakeSocket):
-    def shutdown(self, how):
-        super().shutdown(how)
-        raise RuntimeError("shutdown failed")
-
-
-class _RaisingHandoffLogFilter(logging.Filter):
-    """Raises on every hand-off log record (the WARNING and its DEBUG fallback alike)."""
-
-    def filter(self, record):
-        message = record.getMessage()
-        if "post-terminal drain" in message or "stream remained open" in message:
-            raise RuntimeError("logging filter failed")
-        return True
-
-
-@pytest.mark.parametrize("failure", ["socket_shutdown_raises", "logging_raises"])
-def test_failures_after_the_handoff_never_return_the_close_to_the_owner_thread(monkeypatch, caplog, failure):
-    release = threading.Event()
-    sock = _RaisingShutdownSocket() if failure == "socket_shutdown_raises" else _FakeSocket()
+        monkeypatch.setattr(codex_runtime.threading, "Thread", _spy_thread)
+    if scenario == "within_budget":
+        release.set()  # the provider closes right after the terminal event
+    if scenario == "interrupt_during_wait":
+        proxy = SimpleNamespace(Thread=threading.Thread, Lock=threading.Lock, Event=_InterruptingEvent)
+        monkeypatch.setattr(codex_runtime, "threading", proxy)
     log_filter = _RaisingHandoffLogFilter()
-    if failure == "logging_raises":
+    if scenario == "logging_raises":
         codex_runtime.logger.addFilter(log_filter)
     try:
         # DEBUG enabled so the fallback diagnostics emit records too (a raising filter hits them as well).
         with caplog.at_level(logging.DEBUG, logger="agent.codex_runtime"):
-            raw, wrapper = _run(monkeypatch, budget=0.05, release=release, sock=sock)
-        assert raw.closes == [] and wrapper.closes == []
-        assert "shutdown" in sock.names()
+            raw, wrapper = _run(monkeypatch, budget=spec["budget"], release=release, sock=sock,
+                                wrapper_cls=spec["wrapper"], expect_raise=spec["raises"])
+        if spec["handoff"]:
+            # The iteration is still blocked: the owner thread closed nothing and woke the reader FD-safely.
+            assert raw.blocked.is_set()
+            assert raw.closes == [] and wrapper.closes == [], (
+                "close() from the owner thread while the drain thread iterates is the #29507 FD-recycle race")
+            if sock is not None:
+                assert sock.names() == ["settimeout", "shutdown"]
+                assert {thread for _name, thread in sock.calls} == {owner}
+            else:
+                assert "stream remained open" in caplog.text and "drain thread will close" in caplog.text
     finally:
         codex_runtime.logger.removeFilter(log_filter)
         release.set()
     _join_drain_threads()
-    assert wrapper.closes == [_DRAIN_THREAD]
-    assert raw.closes == [_DRAIN_THREAD]
-    assert "close" not in sock.names()
+    if spec["handoff"]:
+        assert wrapper.closes == [_DRAIN_THREAD]
+        assert raw.closes == [_DRAIN_THREAD]  # closed once: by the drain thread, or by the wrapper on that thread
+    else:
+        assert wrapper.closes == [owner]
+        assert raw.closes == []  # unchanged: the managed wrapper owns the raw stream on this path
+        if scenario == "budget_zero":
+            assert _DRAIN_THREAD not in started
+    if sock is not None:
+        assert "close" not in sock.names()
+        if not spec["handoff"]:
+            assert sock.calls == []
+
+
+def test_real_httpx_stream_shutdown_wakes_reader_without_releasing_fd():
+    """On the real httpx/httpcore stream shape the owner-side wake-up finds the socket, unblocks a reader
+    stuck in ``recv`` and leaves the FD open for the reader to close (no network, no TLS)."""
+    import httpx
+    from httpcore._backends.sync import SyncStream
+
+    ours, theirs = _socket.socketpair()
+    try:
+        response = httpx.Response(200, extensions={"network_stream": SyncStream(ours)})
+        woke = threading.Event()
+        received = {}
+
+        def _reader():
+            try:
+                received["data"] = ours.recv(1)
+            except OSError as exc:  # pragma: no cover — a shut-down socket returns b"" rather than raising
+                received["error"] = exc
+            woke.set()
+
+        reader = threading.Thread(target=_reader, name="blocked-reader", daemon=True)
+        reader.start()
+        assert not woke.wait(0.2), "reader must be blocked before the shutdown"
+
+        assert codex_runtime._shutdown_stream_socket(SimpleNamespace(response=response)) is True
+        assert woke.wait(2.0), "SHUT_RDWR must wake the reader"
+        assert received.get("data") == b"" and "error" not in received
+        assert ours.fileno() >= 0, "the FD must still be owned by the reader (shutdown, never close)"
+        reader.join(2.0)
+    finally:
+        ours.close()
+        theirs.close()
