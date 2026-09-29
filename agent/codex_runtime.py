@@ -85,17 +85,19 @@ def _drain_then_handoff(
     thread only ``shutdown()``s the socket, and the drain thread closes both streams once its
     iteration has ended. A lock-guarded flag makes exactly one thread close, exactly once.
 
-    ``handoff_state`` (a dict the caller owns) gets ``drain_owns_close=True`` under the lock at the
-    moment of the hand-off — before anything that can raise — so the caller's ``finally`` sees it even
-    when this function exits with an exception. Any ``BaseException`` (an interrupt on the owner
-    thread) after the drain thread started performs the hand-off before re-raising: once the thread
-    runs, the owner thread never closes.
+    ``handoff_state`` (a dict the caller owns) is the shared ownership state: ``drain_owns_close`` is
+    set under the lock at the moment of the hand-off — one store, before anything that can raise — so
+    the drain thread and the caller's ``finally`` always agree, even when this function exits with an
+    exception. Any ``BaseException`` (an interrupt on the owner thread) after the drain thread may exist
+    performs the hand-off before re-raising: once the thread runs, the owner thread never closes.
     """
     lock = threading.Lock()
-    state = {"drain_done": False, "handed_off": False}
+    # ONE dict, shared by the drain thread and the caller (its ``writer_token``): ``drain_owns_close`` is a
+    # single store, so the two parties can never disagree about who closes.
+    state = handoff_state if handoff_state is not None else {}
+    state["drain_done"] = False
+    state["drain_owns_close"] = False
     drained = threading.Event()
-    if handoff_state is None:
-        handoff_state = {}
 
     def _drain() -> None:
         try:
@@ -103,7 +105,7 @@ def _drain_then_handoff(
         finally:
             with lock:
                 state["drain_done"] = True
-                close_here = state["handed_off"]
+                close_here = state["drain_owns_close"]
             drained.set()
             if close_here:
                 # The iteration is over, so the managed wrapper's close() reaches its provider resources;
@@ -114,28 +116,33 @@ def _drain_then_handoff(
 
     def _hand_off_locked() -> bool:
         """Caller holds ``lock`` and the drain is not done: move the close to the drain thread, then wake it."""
-        state["handed_off"] = True
-        handoff_state["drain_owns_close"] = True
+        state["drain_owns_close"] = True
         # From here the drain thread owns the close: nothing below may raise past this function, or the
         # caller would fall back to its own close() and recreate the owner-thread race.
         # Under the lock so the drain thread cannot close (release the FD) mid-shutdown.
         return _handoff_step(lambda: _shutdown_stream_socket(raw_stream, event_stream), False)
 
-    threading.Thread(target=_drain, name="codex-post-terminal-drain", daemon=True).start()
+    thread = threading.Thread(target=_drain, name="codex-post-terminal-drain", daemon=True)
     try:
+        thread.start()
         if drained.wait(budget):
             return False
         with lock:
             if state["drain_done"]:
                 return False  # finished as the budget expired; the caller closes, as on the normal path
             shut = _hand_off_locked()
-    except BaseException:
-        # An interrupt between the thread start and the hand-off (KeyboardInterrupt on the CLI): the drain
-        # thread may still be inside SSL_read, so the caller must not close. Hand off now unless the drain
-        # already finished (then the caller's close is safe, as on the normal path), and re-raise.
-        with lock:
-            if not state["drain_done"] and not state["handed_off"]:
-                _hand_off_locked()
+    except BaseException as exc:
+        # ``start()`` raising an ordinary Exception means the thread never launched (CPython raises before
+        # creating it): the caller still owns the close. Anything else — an interrupt on the owner thread
+        # at any point after the thread may exist (KeyboardInterrupt on the CLI) — hands the close off
+        # unless the drain already finished, then re-raises: once the drain thread runs, the owner thread
+        # never closes. (An interrupt inside ``start()`` before the thread exists leaks the stream instead
+        # of racing on it; the process is being interrupted.)
+        never_launched = isinstance(exc, Exception) and thread.ident is None
+        if not never_launched:
+            with lock:
+                if not state["drain_done"] and not state["drain_owns_close"]:
+                    _hand_off_locked()
         raise
     _handoff_step(lambda: logger.warning(
         "Codex Responses stream remained open %.1fs after a terminal response (agent.stream_drain_timeout); "

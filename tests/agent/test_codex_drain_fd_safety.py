@@ -11,7 +11,8 @@ Two invariants, both proven red on the unfixed code:
 
 * ``test_close_ownership_contract`` — whichever way the drain ends (within budget, at the budget, never,
   no socket found, the wrapper owning its raw stream, a failing socket shutdown, a raising logging
-  filter, an interrupt on the owner thread), every stream is closed exactly once, only by the thread
+  filter, an interrupt on the owner thread during the wait or inside ``Thread.start``, a thread that
+  never launched), every stream is closed exactly once, only by the thread
   that iterated it, and the socket is only ever ``shutdown()``, never ``close()``d.
 * ``test_real_httpx_stream_shutdown_wakes_reader_without_releasing_fd`` — on the real httpx/httpcore
   stream shape, the owner-side wake-up finds the socket and unblocks a reader without releasing its FD.
@@ -145,6 +146,21 @@ class _InterruptingEvent(threading.Event):
         return super().wait(timeout)
 
 
+class _InterruptedStartThread(threading.Thread):
+    """``start()`` launches the thread and then raises, like Ctrl-C landing inside ``Thread.start``."""
+
+    def start(self):
+        super().start()
+        raise KeyboardInterrupt
+
+
+class _FailingStartThread(threading.Thread):
+    """``start()`` fails before any thread exists (CPython's ``RuntimeError: can't start new thread``)."""
+
+    def start(self):
+        raise RuntimeError("can't start new thread")
+
+
 class _FakeAgent:
     provider = "openai-codex"
     base_url = "https://example.invalid/backend-api/codex"
@@ -211,8 +227,12 @@ _HANDOFF = {
     # failures after the hand-off never return the close to the owner thread
     "shutdown_raises": dict(budget=0.05, sock=_RaisingShutdownSocket, wrapper=_ManagedWrapper, raises=None, handoff=True),
     "logging_raises": dict(budget=0.05, sock=_FakeSocket, wrapper=_ManagedWrapper, raises=None, handoff=True),
-    # an interrupt on the owner thread during the budget: hand off, then re-raise
+    # an interrupt on the owner thread during the budget, or inside Thread.start() after the thread launched:
+    # hand off, then re-raise
     "interrupt_during_wait": dict(budget=0.05, sock=_FakeSocket, wrapper=_ManagedWrapper, raises=KeyboardInterrupt, handoff=True),
+    "interrupt_in_thread_start": dict(budget=0.05, sock=_FakeSocket, wrapper=_ManagedWrapper, raises=KeyboardInterrupt, handoff=True),
+    # Thread.start() fails before any thread exists: no reader, so the owner still closes (as before)
+    "thread_start_fails": dict(budget=0.05, sock=_FakeSocket, wrapper=_ManagedWrapper, raises=RuntimeError, handoff=False),
     # the drain ends inside the budget: no shutdown, the owner closes once (the wrapper owns the raw stream)
     "within_budget": dict(budget=5.0, sock=_FakeSocket, wrapper=_ManagedWrapper, raises=None, handoff=False),
     # budget 0: no drain thread at all, the owner closes once
@@ -260,8 +280,11 @@ def test_close_ownership_contract(monkeypatch, caplog, scenario):
         monkeypatch.setattr(codex_runtime.threading, "Thread", _spy_thread)
     if scenario == "within_budget":
         release.set()  # the provider closes right after the terminal event
-    if scenario == "interrupt_during_wait":
-        proxy = SimpleNamespace(Thread=threading.Thread, Lock=threading.Lock, Event=_InterruptingEvent)
+    if scenario in ("interrupt_during_wait", "interrupt_in_thread_start", "thread_start_fails"):
+        thread_cls = {"interrupt_during_wait": threading.Thread, "interrupt_in_thread_start": _InterruptedStartThread,
+                      "thread_start_fails": _FailingStartThread}[scenario]
+        event_cls = _InterruptingEvent if scenario == "interrupt_during_wait" else threading.Event
+        proxy = SimpleNamespace(Thread=thread_cls, Lock=threading.Lock, Event=event_cls)
         monkeypatch.setattr(codex_runtime, "threading", proxy)
     log_filter = _RaisingHandoffLogFilter()
     if scenario == "logging_raises":
@@ -273,7 +296,7 @@ def test_close_ownership_contract(monkeypatch, caplog, scenario):
                                 wrapper_cls=spec["wrapper"], expect_raise=spec["raises"])
         if spec["handoff"]:
             # The iteration is still blocked: the owner thread closed nothing and woke the reader FD-safely.
-            assert raw.blocked.is_set()
+            assert raw.blocked.wait(2.0)
             assert raw.closes == [] and wrapper.closes == [], (
                 "close() from the owner thread while the drain thread iterates is the #29507 FD-recycle race")
             if sock is not None:
@@ -293,6 +316,8 @@ def test_close_ownership_contract(monkeypatch, caplog, scenario):
         assert raw.closes == []  # unchanged: the managed wrapper owns the raw stream on this path
         if scenario == "budget_zero":
             assert _DRAIN_THREAD not in started
+    if scenario == "thread_start_fails":
+        assert not raw.blocked.is_set()  # no drain thread ever iterated past the terminal event
     if sock is not None:
         assert "close" not in sock.names()
         if not spec["handoff"]:
