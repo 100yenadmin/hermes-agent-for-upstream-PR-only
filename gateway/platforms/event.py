@@ -12,6 +12,18 @@ from typing import Any, Dict, List, Optional
 from gateway.session import SessionSource
 
 
+def envelope_sender_id(event: Any) -> Optional[str]:
+    """Envelope author id of *event*: the sender an adapter preserved when it re-scoped ``source``
+    (``MessageEvent.envelope_sender``), else ``source.user_id``."""
+    sender = getattr(event, "envelope_sender", None) or getattr(event, "source", None)
+    return getattr(sender, "user_id", None)
+
+
+def same_envelope_sender(a: Any, b: Any) -> bool:
+    """True when two events come from the same author, so they may merge into one turn."""
+    return envelope_sender_id(a) == envelope_sender_id(b)
+
+
 class MessageType(Enum):
     """Types of incoming messages."""
     TEXT = "text"
@@ -92,6 +104,10 @@ class MessageEvent:
     # knows the message was meant for someone else); None means unknown and keeps the visible
     # fallback, like True.
     reply_expected: Optional[bool] = None
+    # Authenticated author when an adapter re-scopes ``source`` to a sender-less shared source
+    # (Telegram observed-group mode): the gateway-verified sender note and sender-aware batching
+    # read it. None means ``source`` still carries the sender.
+    envelope_sender: Optional[SessionSource] = None
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
