@@ -901,6 +901,30 @@ class TestSkillTextDescription:
         assert overrides["description"].startswith(bu_cli._HEADER_BASE)
         assert overrides["description"].endswith(bu_cli._HELPERS_DIGEST)
 
+    def test_workspace_names_in_description_exist_in_exec_namespace(self):
+        """Every backticked workspace name the description offers to code must be defined by the
+        harness. "(also `workspace` in every result)" read as a pre-imported variable, and code
+        using it died with ``NameError: name 'workspace' is not defined``."""
+        import ast
+        import importlib.util
+        import re
+        from pathlib import Path
+
+        spec = importlib.util.find_spec("browser_harness")
+        if spec is None or not spec.submodule_search_locations:
+            pytest.skip("browser-harness not installed")
+        helpers = Path(next(iter(spec.submodule_search_locations))) / "helpers.py"
+        tree = ast.parse(helpers.read_text(encoding="utf-8"))
+        defined = {n.id for node in tree.body if isinstance(node, (ast.Assign, ast.AnnAssign))
+                   for t in (node.targets if isinstance(node, ast.Assign) else [node.target])
+                   for n in ast.walk(t) if isinstance(n, ast.Name)}
+        defined |= {node.name for node in tree.body
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+        named = [m for m in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", bu_cli._HEADER_BASE)
+                 if "workspace" in m.lower()]
+        assert named, "description should tell code how to reach the workspace"
+        assert [m for m in named if m not in defined] == []
+
 
 
 
