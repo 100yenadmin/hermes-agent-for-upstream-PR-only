@@ -901,29 +901,41 @@ class TestSkillTextDescription:
         assert overrides["description"].startswith(bu_cli._HEADER_BASE)
         assert overrides["description"].endswith(bu_cli._HELPERS_DIGEST)
 
-    def test_workspace_names_in_description_exist_in_exec_namespace(self):
-        """Every backticked workspace name the description offers to code must be defined by the
-        harness. "(also `workspace` in every result)" read as a pre-imported variable, and code
-        using it died with ``NameError: name 'workspace' is not defined``."""
-        import ast
+    def test_workspace_names_in_description_resolve_in_exec_namespace(self, tmp_path):
+        """Every backticked workspace name the description offers to code must resolve where
+        browser-harness runs that code (``exec(code, globals())`` in ``browser_harness.run``).
+        "(also `workspace` in every result)" read as a pre-imported variable, and code using it
+        died with ``NameError: name 'workspace' is not defined``."""
         import importlib.util
         import re
-        from pathlib import Path
 
-        spec = importlib.util.find_spec("browser_harness")
-        if spec is None or not spec.submodule_search_locations:
+        if importlib.util.find_spec("browser_harness") is None:
             pytest.skip("browser-harness not installed")
-        helpers = Path(next(iter(spec.submodule_search_locations))) / "helpers.py"
-        tree = ast.parse(helpers.read_text(encoding="utf-8"))
-        defined = {n.id for node in tree.body if isinstance(node, (ast.Assign, ast.AnnAssign))
-                   for t in (node.targets if isinstance(node, ast.Assign) else [node.target])
-                   for n in ast.walk(t) if isinstance(n, ast.Name)}
-        defined |= {node.name for node in tree.body
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
-        named = [m for m in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", bu_cli._HEADER_BASE)
-                 if "workspace" in m.lower()]
-        assert named, "description should tell code how to reach the workspace"
-        assert [m for m in named if m not in defined] == []
+        advertised = [m for m in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", bu_cli._HEADER_BASE)
+                      if "workspace" in m.lower()]
+        assert advertised, "description should tell code how to reach the workspace"
+
+        probe = (
+            "import json, sys\n"
+            "import browser_harness.run as run\n"
+            "resolved = {}\n"
+            "for name in sys.argv[1:]:\n"
+            "    try:\n"
+            "        exec(name, dict(vars(run)))\n"
+            "        resolved[name] = True\n"
+            "    except NameError:\n"
+            "        resolved[name] = False\n"
+            "print(json.dumps(resolved))\n"
+        )
+        env = {**os.environ, "HOME": str(tmp_path), "BH_HOME": str(tmp_path / "bh"),
+               "BH_AGENT_WORKSPACE": str(tmp_path / "workspace")}
+        proc = subprocess.run([sys.executable, "-c", probe, *advertised, "workspace"],
+                              env=env, capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, proc.stderr
+        resolved = json.loads(proc.stdout.strip().splitlines()[-1])
+
+        assert {name: resolved[name] for name in advertised} == dict.fromkeys(advertised, True)
+        assert resolved["workspace"] is False
 
 
 
