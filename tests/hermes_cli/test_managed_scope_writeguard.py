@@ -185,7 +185,7 @@ def test_disconnect_on_a_package_managed_install_still_clears_the_auth_store(ant
 
 @pytest.mark.parametrize("assertion", ["managed_leaf", "notice"])
 def test_bulk_merge_save_does_not_restore_existing_managed_leaf(homes, capsys, assertion):
-    import yaml
+    import hermes_yaml as yaml
 
     from hermes_cli.config import get_config_path, save_config
 
