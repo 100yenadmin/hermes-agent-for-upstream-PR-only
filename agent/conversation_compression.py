@@ -3093,9 +3093,11 @@ def _run_summary_dispatch(
 def _fold_todo_snapshot(agent: Any, compressed: list) -> None:
     """Strip stale todo snapshots from ``compressed`` and fold the live one in (in place)."""
     todo_snapshot = agent._todo_store.format_for_injection()
-    # An empty store may be un-rehydrated; only a non-empty store retires stale scaffolding.
+    # Non-empty store (even all done) is authoritative: drop the old snapshot. A
+    # truly empty store may be un-rehydrated post-compaction: keep the snapshot.
     _todo_has_items = getattr(agent._todo_store, "has_items", None)
-    # Unknown authority must preserve the pending snapshot.
+    # Store may implement only format_for_injection(); unknown authority must
+    # preserve the pending snapshot rather than risk deleting it.
     _todo_store_is_authoritative = False
     with contextlib.suppress(Exception):
         _todo_store_is_authoritative = bool(_todo_has_items()) if callable(_todo_has_items) else False
@@ -3112,11 +3114,13 @@ def _fold_todo_snapshot(agent: Any, compressed: list) -> None:
                 _todo_content, _todo_stripped
             ):
                 compressed.pop(_todo_idx)
-                # Removing mid-history scaffolding may expose two assistant rows.
+                # A standalone snapshot can drift from the tail; deleting it may expose two
+                # assistant rows, so use the normal replay repair to keep metadata consistent.
                 agent._repair_message_sequence(compressed)
             else:
                 _replace_message_content(_todo_message, _todo_stripped)
-                # Preserve other synthetic flags; content also carries provenance after persistence.
+                # No longer todo-only scaffolding; other synthetic flags stay authoritative and
+                # _is_real_user_message() recomputes provenance from content + flags.
                 _todo_message.pop("_todo_snapshot_synthetic", None)
             break
     if todo_snapshot:
