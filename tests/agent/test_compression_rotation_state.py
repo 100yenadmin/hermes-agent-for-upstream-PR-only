@@ -1267,6 +1267,83 @@ class TestCooldownPersistFailureIsNotAClearedRow:
         assert compressor._ineffective_compression_count == 0
 
 
+class TestPlanPointerFold:
+    path = ".hermes/plans/2026-10-05_120000-x.md"
+    header = "[Active plan from /plan: "
+
+    @staticmethod
+    def _plan_turn(path):
+        import json
+        from agent.plan_prompt import build_plan_prompt
+
+        return [
+            {"role": "user", "content": build_plan_prompt("task A")},
+            {"role": "assistant", "tool_calls": [{
+                "id": "plan-write", "type": "function", "function": {
+                    "name": "write_file", "arguments": json.dumps({"path": path, "content": "plan"}),
+                },
+            }]},
+            {"role": "tool", "tool_call_id": "plan-write", "content": "written"},
+        ]
+
+    @pytest.fixture
+    def fold(self, refresh_state_db):
+        db = refresh_state_db
+        db.create_session("PLAN_POINTER", source="cli")
+        agent = _build_agent_with_db(db, "PLAN_POINTER", platform="cli")
+
+        def compress(history, tail=None):
+            agent.context_compressor.compress.return_value = _conforming_fold(
+                tail or {"role": "user", "content": "continue"},
+            )
+            messages = _msgs() + history + [{"role": "assistant", "content": "persisted answer"}]
+            return agent._compress_context(messages, "sys", approx_tokens=120_000)[0]
+
+        return agent, compress
+
+    def _assert_pointer(self, compressed, path):
+        text = "\n".join(str(row.get("content", "")) for row in compressed)
+        assert text.count(self.header) == 1
+        assert f"{self.header}{path}. Re-read it before continuing the planned work.]" in text
+
+    def test_plan_write_survives_compaction(self, fold):
+        _, compress = fold
+        self._assert_pointer(compress(self._plan_turn(self.path)), self.path)
+
+    @pytest.mark.parametrize("retain_pointer", [False, True])
+    def test_second_compaction_has_one_pointer(self, fold, retain_pointer):
+        _, compress = fold
+        first = compress(self._plan_turn(self.path))
+        second = compress(first, copy.deepcopy(first[-1]) if retain_pointer else None)
+        self._assert_pointer(second, self.path)
+
+    def test_newer_plan_replaces_pointer(self, fold):
+        _, compress = fold
+        first = compress(self._plan_turn(self.path))
+        newer = ".hermes/plans/2026-10-05_130000-y.md"
+        second = compress(first + self._plan_turn(newer), copy.deepcopy(first[-1]))
+        self._assert_pointer(second, newer)
+        assert self.path not in str(second)
+        third = compress(self._plan_turn(self.path) + second)
+        self._assert_pointer(third, newer)
+
+    def test_no_plan_turn_has_no_pointer(self, fold):
+        _, compress = fold
+        assert self.header not in str(compress(self._plan_turn(self.path)[1:]))
+
+    def test_write_outside_plans_has_no_pointer(self, fold):
+        _, compress = fold
+        assert self.header not in str(compress(self._plan_turn("notes/plan.md")))
+
+    def test_pointer_and_todo_survive_two_compactions(self, fold):
+        agent, compress = fold
+        agent._todo_store.write([{"id": "t1", "content": "task A", "status": "pending"}])
+        first = compress(self._plan_turn(self.path))
+        second = compress(first, copy.deepcopy(first[-1]))
+        self._assert_pointer(second, self.path)
+        assert "task A" in str(second)
+
+
 class TestTodoSnapshotMergedNotDuplicated:
     """Todo snapshots preserve tail content without duplicate user turns."""
 

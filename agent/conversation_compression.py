@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_engine import automatic_compaction_status_message, sanitize_memory_context
+from agent.conversation_compression_plan_pointer import PLAN_POINTER_HEADER, _fold_plan_pointer
 from agent.memory_provider import PRE_COMPRESS_CHECKPOINT_API_VERSION
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_request_tokens_rough
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
@@ -2243,7 +2244,7 @@ def conversation_history_after_compression(
 _SYNTHETIC_USER_PREFIXES = (
     "[System: Your previous response was truncated", "[System: The previous response was cut off",
     "[System: Your previous tool call", "[Your active task list was preserved across context compression]",
-    "[IMPORTANT: Background process ",
+    "[IMPORTANT: Background process ", PLAN_POINTER_HEADER,
 )
 
 
@@ -2260,7 +2261,7 @@ def _message_text(message: Any) -> str:
 
 _SYNTHETIC_USER_FLAGS = (
     "_todo_snapshot_synthetic", "_empty_recovery_synthetic", "_verification_stop_synthetic", "_pre_verify_synthetic",
-    "_dropped_toolcall_nudge",
+    "_dropped_toolcall_nudge", "_plan_pointer_synthetic",
 )
 
 
@@ -4254,11 +4255,9 @@ def compress_context(
                 )
                 return messages, _existing_sp
         _warn_summary_or_aux_fallback(agent)
-        # A just-delivered reply the engine folded away must stay live or the
-        # next render drops it from the surface (#118900). It runs FIRST: the
-        # todo fold rewrites the trailing user row (its follower would no longer
-        # match) and both later passes place themselves around the tail, so the
-        # reply has to be back in its chronological slot before they look.
+        # Keep the just-delivered reply live (#118900). It runs FIRST: the
+        # todo fold rewrites the tail. Restore the reply's chronological slot
+        # before the later passes place themselves around it.
         from agent.conversation_compression_reply_anchor import _ensure_compressed_keeps_last_assistant_reply
 
         # `/compress here N` hands only the HEAD in as `messages` and carries the kept tail
@@ -4273,6 +4272,7 @@ def compress_context(
                 "Compression: engine folded away the just-delivered assistant reply; reinserted it into the "
                 "active set (session=%s).", agent.session_id or "none",
             )
+        _fold_plan_pointer(agent, messages_before_compression, compressed)
         _fold_todo_snapshot(agent, compressed)
         compressed_user_turn_outcome = _ensure_compressed_has_user_turn(messages, compressed)
         new_system_prompt = _rebuild_system_prompt_at_boundary(agent, system_message)
