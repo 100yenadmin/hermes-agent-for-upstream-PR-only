@@ -65,7 +65,9 @@ def _fold_plan_pointer(agent, messages: list, compressed: list) -> None:
             continue
         if cleaned == content:
             continue
-        if not cleaned and row.get("_plan_pointer_synthetic"):
+        # A row left holding only the pointer is ours even when another fold (the todo strip) dropped its flag;
+        # blanking it instead would leave an empty user turn behind once it is no longer the tail.
+        if not cleaned:
             compressed.pop(i)
             removed = True
         else:

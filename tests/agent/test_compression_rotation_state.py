@@ -1344,6 +1344,25 @@ class TestPlanPointerFold:
         assert "task A" in str(second)
 
 
+    def test_unflagged_pointer_only_row_mid_history_is_removed_not_blanked(self):
+        from types import SimpleNamespace
+        from agent.conversation_compression_plan_pointer import _fold_plan_pointer
+
+        pointer = f"{self.header}{self.path}. Re-read it before continuing the planned work.]"
+        agent = SimpleNamespace(_repair_message_sequence=lambda rows: None)
+        compressed = [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": pointer},  # flag dropped by an earlier todo strip
+            {"role": "assistant", "content": "later"},
+            {"role": "user", "content": "next"},
+        ]
+        _fold_plan_pointer(agent, [], compressed)
+        assert all(row.get("content") for row in compressed if row["role"] == "user")
+        self._assert_pointer(compressed, self.path)
+        assert compressed[-1]["content"].startswith("next")
+
+
 class TestTodoSnapshotMergedNotDuplicated:
     """Todo snapshots preserve tail content without duplicate user turns."""
 

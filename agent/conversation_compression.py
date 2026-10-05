@@ -4255,9 +4255,11 @@ def compress_context(
                 )
                 return messages, _existing_sp
         _warn_summary_or_aux_fallback(agent)
-        # Keep the just-delivered reply live (#118900). It runs FIRST: the
-        # todo fold rewrites the tail. Restore the reply's chronological slot
-        # before the later passes place themselves around it.
+        # A just-delivered reply the engine folded away must stay live or the
+        # next render drops it from the surface (#118900). It runs FIRST: the
+        # todo fold rewrites the trailing user row (its follower would no longer
+        # match) and both later passes place themselves around the tail, so the
+        # reply has to be back in its chronological slot before they look.
         from agent.conversation_compression_reply_anchor import _ensure_compressed_keeps_last_assistant_reply
 
         # `/compress here N` hands only the HEAD in as `messages` and carries the kept tail
