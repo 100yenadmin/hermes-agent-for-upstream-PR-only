@@ -30,7 +30,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_engine import automatic_compaction_status_message, sanitize_memory_context
-from agent.conversation_compression_plan_pointer import PLAN_POINTER_HEADER, _fold_plan_pointer
+from agent.conversation_compression_plan_pointer import PLAN_POINTER_HEADER, _fold_plan_pointer, _strip_plan_pointer
 from agent.memory_provider import PRE_COMPRESS_CHECKPOINT_API_VERSION
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_request_tokens_rough
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
@@ -3093,11 +3093,9 @@ def _run_summary_dispatch(
 def _fold_todo_snapshot(agent: Any, compressed: list) -> None:
     """Strip stale todo snapshots from ``compressed`` and fold the live one in (in place)."""
     todo_snapshot = agent._todo_store.format_for_injection()
-    # Non-empty store (even all done) is authoritative: drop the old snapshot. A
-    # truly empty store may be un-rehydrated post-compaction: keep the snapshot.
+    # An empty store may be un-rehydrated; only a non-empty store retires stale scaffolding.
     _todo_has_items = getattr(agent._todo_store, "has_items", None)
-    # Store may implement only format_for_injection(); unknown authority must
-    # preserve the pending snapshot rather than risk deleting it.
+    # Unknown authority must preserve the pending snapshot.
     _todo_store_is_authoritative = False
     with contextlib.suppress(Exception):
         _todo_store_is_authoritative = bool(_todo_has_items()) if callable(_todo_has_items) else False
@@ -3107,21 +3105,18 @@ def _fold_todo_snapshot(agent: Any, compressed: list) -> None:
             if not isinstance(_todo_message, dict) or _todo_message.get("role") != "user":
                 continue
             _todo_content = _todo_message.get("content")
-            _todo_stripped = _strip_stale_todo_snapshot(_todo_content)
+            _todo_stripped = _strip_plan_pointer(_strip_stale_todo_snapshot(_todo_content))
             if _todo_stripped == _todo_content:
                 continue
-            if _todo_message.get("_todo_snapshot_synthetic") and _todo_snapshot_is_only_content(
+            if (_todo_idx < len(compressed) - 1 or not todo_snapshot) and _todo_snapshot_is_only_content(
                 _todo_content, _todo_stripped
             ):
                 compressed.pop(_todo_idx)
-                if _todo_idx < len(compressed):
-                    # A standalone snapshot can drift from the tail; deleting it may expose two
-                    # assistant rows, so use the normal replay repair to keep metadata consistent.
-                    agent._repair_message_sequence(compressed)
+                # Removing mid-history scaffolding may expose two assistant rows.
+                agent._repair_message_sequence(compressed)
             else:
                 _replace_message_content(_todo_message, _todo_stripped)
-                # No longer todo-only scaffolding; other synthetic flags stay authoritative and
-                # _is_real_user_message() recomputes provenance from content + flags.
+                # Preserve other synthetic flags; content also carries provenance after persistence.
                 _todo_message.pop("_todo_snapshot_synthetic", None)
             break
     if todo_snapshot:
@@ -3145,16 +3140,14 @@ def _fold_todo_snapshot(agent: Any, compressed: list) -> None:
         merged = False
         _tail = compressed[-1] if compressed and isinstance(compressed[-1], dict) else None
         if _tail is not None and _tail.get("role") == "user":
-            _stripped = _strip_stale_todo_snapshot(_tail.get("content"))
+            _stripped = _strip_plan_pointer(_strip_stale_todo_snapshot(_tail.get("content")))
             _probe = {key: value for key, value in _tail.items() if key != "content"}
             _probe["content"] = _stripped
             if _is_real_user_message(_probe):
                 _snapshot_text = f"\n\n{todo_snapshot}" if isinstance(_stripped, str) and _stripped else todo_snapshot
                 _replace_message_content(_tail, _append_text_to_content(_stripped, _snapshot_text))
                 merged = True
-            elif (
-                _stripped != _tail.get("content") and not _message_text({"role": "user", "content": _stripped}).strip()
-            ):
+            elif _todo_snapshot_is_only_content(_tail.get("content"), _stripped):
                 # The tail was nothing but an earlier snapshot row —
                 # refresh it in place instead of stacking a duplicate.
                 _replace_message_content(_tail, todo_snapshot)
@@ -4274,8 +4267,8 @@ def compress_context(
                 "Compression: engine folded away the just-delivered assistant reply; reinserted it into the "
                 "active set (session=%s).", agent.session_id or "none",
             )
-        _fold_plan_pointer(agent, messages_before_compression, compressed)
         _fold_todo_snapshot(agent, compressed)
+        _fold_plan_pointer(agent, messages_before_compression, compressed)
         compressed_user_turn_outcome = _ensure_compressed_has_user_turn(messages, compressed)
         new_system_prompt = _rebuild_system_prompt_at_boundary(agent, system_message)
         commit = _commit_compaction(

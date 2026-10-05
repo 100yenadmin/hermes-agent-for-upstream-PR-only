@@ -43,6 +43,7 @@ from agent.model_metadata import (
 from agent.redact import redact_sensitive_text
 from agent.turn_context import drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
+from agent.conversation_compression_plan_pointer import PLAN_POINTER_HEADER
 
 logger = logging.getLogger(__name__)
 
@@ -968,7 +969,7 @@ def _lean_recovery_stub(tool_name: str, content_len: int, session_id: str) -> st
 
 _SYNTHETIC_USER_ROW_PREFIXES = (
     "[System:", "[CONTEXT", "[PRIOR CONTEXT", "[IMPORTANT: Background", "[Your active task list",
-    "[Planning state preserved", "[ASYNC DELEGATION", "[OUT-OF-BAND", "Cronjob Response:",
+    "[Planning state preserved", "[ASYNC DELEGATION", "[OUT-OF-BAND", "Cronjob Response:", PLAN_POINTER_HEADER,
 )
 
 
@@ -4434,7 +4435,6 @@ Write only the summary body. Do not include any preamble or prefix."""
         if cls._is_context_summary_message(message):
             return True
         text = _content_text_for_contains(message.get("content")).strip()
-        # Recovery nudges are scaffolding, not human turns; lazy import avoids an import cycle.
         from agent.conversation_loop import (
             _CODEX_ACK_CONTINUATION_NUDGE, _CODEX_INCOMPLETE_NUDGE, _DEGENERATE_FINAL_NUDGE,
             _DROPPED_TOOLCALL_NUDGE_CONTENT, _EMPTY_TOOL_RESPONSE_NUDGE, _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX,
@@ -4448,7 +4448,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             _LENGTH_CONTINUATION_NETWORK_STUB, _LEGACY_LENGTH_CONTINUATION_NETWORK_STUB,
             _LENGTH_CONTINUATION_OUTPUT_LIMIT,
         } or text.startswith((
-            _BACKGROUND_PROCESS_NOTIFICATION_PREFIX, TODO_INJECTION_HEADER + "\n", _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX,
+            _BACKGROUND_PROCESS_NOTIFICATION_PREFIX, TODO_INJECTION_HEADER + "\n", _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX, PLAN_POINTER_HEADER,
         ))
 
     @staticmethod
