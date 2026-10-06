@@ -31,7 +31,7 @@ from tools.delegate_tool_child_run import (  # noqa: F401
 from tools.delegate_tool_config import (  # noqa: F401
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
     _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
-    _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
+    _inherit_parent_capabilities, _load_config, _merge_request_overrides, _normalize_child_reasoning_effort, _resolve_child_credential_pool,
     _resolve_child_runtime, _resolve_delegation_credentials,
     _subagent_auto_approve, _subagent_auto_deny,
 )
@@ -206,7 +206,8 @@ def _build_child_agent(
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
-
+    # Exact per-child effort; None preserves existing inheritance.
+    override_reasoning_effort: Optional[str] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -260,6 +261,7 @@ def _build_child_agent(
         override_acp_command=override_acp_command,
         override_acp_args=override_acp_args,
         routing_cfg=routing_cfg,
+        override_reasoning_effort=override_reasoning_effort,
     )
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
@@ -404,6 +406,7 @@ def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
+    top_reasoning_effort: Optional[str] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
@@ -429,6 +432,7 @@ def _build_children(
                 toolsets=None,  # always inherit the parent's toolsets
                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                override_reasoning_effort=_normalize_child_reasoning_effort(t.get("reasoning_effort")) or top_reasoning_effort,
             )
         except ValueError as exc:
             return [], str(exc)
@@ -481,11 +485,17 @@ def delegate_task(
     output_schema: Optional[Dict[str, Any]] = None, images: Optional[List[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
     (per-task beats top-level; capability is depth-derived). Returns JSON with one results entry per task, or a
-    dispatch handle when running in the background."""
+    dispatch handle when running in the background.
+
+    The optional 'reasoning_effort' pins the child's thinking level
+    ("none" disables it); omitted, children inherit the parent's level or
+    the delegation.reasoning_effort config. Per-task beats top-level.
+    """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
@@ -503,6 +513,7 @@ def delegate_task(
         )
 
     top_role = _normalize_role(role)
+    top_reasoning_effort = _normalize_child_reasoning_effort(reasoning_effort)
     # background applies to single tasks AND batches: a batch is ONE async unit
     # that joins on every child and re-enters as a single consolidated message.
     background = is_truthy_value(background, default=False) if background is not None else False
@@ -573,6 +584,7 @@ def delegate_task(
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        top_reasoning_effort=top_reasoning_effort,
     )
     if err:
         return tool_error(err)
@@ -722,6 +734,18 @@ DELEGATE_TASK_SCHEMA = {
                             "schema_valid, plus schema_errors on failure — the child's raw text is still returned "
                             "as summary, never discarded). Keep it forgiving — require only fields you will read.",
                         ),
+                        "reasoning_effort": {
+                            "type": "string",
+                            "enum": [
+                                "none", "minimal", "low", "medium",
+                                "high", "xhigh", "max", "ultra",
+                            ],
+                            "description": (
+                                "Per-task reasoning override. See top-level "
+                                "'reasoning_effort' for semantics; beats the "
+                                "top-level value for this task."
+                            ),
+                        },
                         "images": _p(
                             "array",
                             "Optional images this child must SEE (max 8): local file paths or http(s) URLs — e.g. a "
@@ -754,6 +778,24 @@ DELEGATE_TASK_SCHEMA = {
                 "Control actions return immediately; goal/tasks are ignored unless spawning.",
                 enum=["spawn", "list", "steer", "stop"],
             ),
+            "reasoning_effort": {
+                "type": "string",
+                "enum": [
+                    "none", "minimal", "low", "medium",
+                    "high", "xhigh", "max", "ultra",
+                ],
+                "description": (
+                    "Optional reasoning level for the child(ren). Omit to "
+                    "inherit the parent's level (or the "
+                    "delegation.reasoning_effort config, when set). Use a "
+                    "lower level ('low', 'minimal') for mechanical subtasks "
+                    "and a higher one ('high', 'xhigh') for analysis-heavy "
+                    "work; 'none' disables thinking for the child. Levels "
+                    "the child's model cannot honor degrade the same way "
+                    "the main agent's do. Per-task reasoning_effort beats "
+                    "this top-level value."
+                ),
+            },
             "subagent_id": _p("string", "Target for action='steer'/'stop' (ids from the spawn response or action='list')."),
             "message": _p(
                 "string",
@@ -796,6 +838,7 @@ registry.register(
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
         parent_agent=kw.get("parent_agent"),
+        reasoning_effort=args.get("reasoning_effort"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",

@@ -551,6 +551,25 @@ delegate_task(
 
 **One-shot runs are capped separately.** `hermes chat -q` / `--oneshot` sessions may spawn at most `delegation.oneshot_max_children` subagents in total (default `2`, `0` = unlimited). A one-shot run has no later turn to receive results, and in benchmark trajectories most of its spawns were "independently review my own work" rather than parallel work — each such child re-pays a cold system prompt and re-reads the repo. Interactive and gateway sessions are unaffected.
 
+## Per-Spawn Reasoning Level
+
+Children inherit the parent's thinking level by default (or the `delegation.reasoning_effort` config when set). The spawning agent can pin a different level per spawn — cheap, shallow thinking for mechanical subtasks, deep thinking for analysis — without touching config:
+
+```python
+delegate_task(
+    tasks=[
+        {"goal": "Deep-review the locking design in store.py", "reasoning_effort": "xhigh"},
+        {"goal": "Rename the deprecated helpers across tests"},  # falls back to top-level
+    ],
+    reasoning_effort="low",  # top-level default for tasks that don't set their own
+)
+```
+
+- Valid levels: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` — the same ladder as `agent.reasoning_effort`. `none` disables thinking for the child.
+- Per-task `reasoning_effort` beats the top-level parameter; both beat `delegation.reasoning_effort` config; omitted entirely, the child inherits the parent's level.
+- Unknown values degrade to inherit (with a warning log) instead of failing the spawn.
+- Plugins using the public subagent lifecycle API (`SubagentLaunchRequest`) can pass the same `reasoning_effort` field; invalid values there fail the launch loudly, and the resulting `SubagentHandle` reports the child's effective level.
+
 ## Lifetime and Durability
 
 :::warning Background completion durability is not durable execution
