@@ -286,11 +286,21 @@ class SubagentLifecycleService:
             if request.correlation_id and correlation_key in _REGISTRY.correlations:
                 raise SubagentLifecycleError("Duplicate correlation_id for this parent session.")
         # Lazy: delegate construction stays internal, plugins never import private delegation helpers.
-        from tools.delegate_tool import _build_child_preserving_parent_tools, DEFAULT_MAX_ITERATIONS
+        from tools.delegate_tool import (
+            _build_child_preserving_parent_tools, _credential_overrides, _load_config, _resolve_delegation_credentials,
+            DEFAULT_MAX_ITERATIONS,
+        )
+        # Children follow the delegation config exactly as delegate_task children do.
+        routing_cfg = _load_config()
+        try:
+            creds = _resolve_delegation_credentials(routing_cfg, parent)
+        except ValueError as exc:
+            raise SubagentLifecycleError(str(exc)) from exc
         child = _build_child_preserving_parent_tools(
             task_index=0, goal=request.goal, context=request.context,
             toolsets=list(request.allowed_toolsets) if request.allowed_toolsets else None,
-            model=request.model, max_iterations=DEFAULT_MAX_ITERATIONS, task_count=1, parent_agent=parent, role=request.role,
+            model=request.model or creds["model"], max_iterations=DEFAULT_MAX_ITERATIONS,
+            task_count=1, parent_agent=parent, role=request.role, **_credential_overrides(creds, routing_cfg),
         )
         subagent_id = str(getattr(child, "_subagent_id", "") or "")
         if not subagent_id:

@@ -268,3 +268,92 @@ def test_malformed_handles_keep_unknown_results(lifecycle, handle):
 def test_mapping_request_errors_are_explicit(lifecycle, launch_request, message):
     with pytest.raises(SubagentLifecycleError, match=message):
         lifecycle.launch(launch_request)
+
+
+@pytest.fixture
+def routing_lifecycle(lifecycle, monkeypatch):
+    from tools.delegate_tool import _build_child_agent
+
+    build = Mock(wraps=_build_child_agent)
+    config = Mock(return_value={})
+    resolve = Mock(return_value={
+        "provider": "openrouter", "model": "runtime-model",
+        "base_url": "https://route.example/v1", "api_key": "fixture-key",
+        "api_mode": "chat_completions", "request_overrides": {"temperature": 0.2},
+    })
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", build)
+    monkeypatch.setattr("tools.delegate_tool._load_config", config)
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
+    return lifecycle, build, config, resolve
+
+
+def test_routing_delegation_direct_endpoint(routing_lifecycle):
+    service, build, config, resolve = routing_lifecycle
+    config.return_value = {
+        "base_url": "https://direct.example/v1", "model": "delegated-model",
+        "api_key": "direct-fixture-key", "request_overrides": {"temperature": 0.4},
+    }
+    handle = service.launch(SubagentLaunchRequest(goal="route"))
+    assert service.wait(handle, timeout_seconds=2).state is SubagentState.SUCCEEDED
+    kwargs = build.call_args.kwargs
+    assert kwargs["model"] == "delegated-model"
+    assert kwargs["override_base_url"] == "https://direct.example/v1"
+    assert kwargs["override_provider"] == "custom"
+    assert kwargs["override_api_key"] == "direct-fixture-key"
+    assert kwargs["override_api_mode"] == "chat_completions"
+    assert kwargs["override_request_overrides"] == {"temperature": 0.4}
+    assert kwargs["routing_cfg"] == config.return_value
+    resolve.assert_not_called()
+
+
+def test_routing_delegation_provider_bundle(routing_lifecycle):
+    service, build, config, resolve = routing_lifecycle
+    config.return_value = {"provider": "openrouter", "model": "delegated-model"}
+    handle = service.launch(SubagentLaunchRequest(goal="route"))
+    assert service.wait(handle, timeout_seconds=2).state is SubagentState.SUCCEEDED
+    kwargs = build.call_args.kwargs
+    assert kwargs["model"] == "delegated-model"
+    assert kwargs["override_provider"] == "openrouter"
+    assert kwargs["override_base_url"] == "https://route.example/v1"
+    assert kwargs["override_api_key"] == "fixture-key"
+    assert kwargs["override_api_mode"] == "chat_completions"
+    assert kwargs["override_request_overrides"] == {"temperature": 0.2}
+    assert kwargs["override_acp_command"] is None
+    assert kwargs["override_acp_args"] == []
+    resolve.assert_called_once_with(requested="openrouter", target_model="delegated-model")
+
+
+def test_routing_unknown_provider_refuses_before_registration(routing_lifecycle):
+    from agent.subagent_lifecycle import _REGISTRY
+
+    service, build, config, resolve = routing_lifecycle
+    resolve.side_effect = ValueError("Unknown provider fixture-missing")
+    config.return_value = {"provider": "fixture-missing"}
+    records, correlations = dict(_REGISTRY.records), dict(_REGISTRY.correlations)
+    with pytest.raises(SubagentLifecycleError, match="Unknown provider fixture-missing"):
+        service.launch({"goal": "route", "correlation_id": "refused-route"})
+    assert _REGISTRY.records == records
+    assert _REGISTRY.correlations == correlations
+    build.assert_not_called()
+    resolve.assert_called_once_with(requested="fixture-missing", target_model=None)
+
+
+def test_routing_no_config_inherits_parent(routing_lifecycle):
+    service, build, _config, resolve = routing_lifecycle
+    handle = service.launch(SubagentLaunchRequest(goal="route"))
+    assert service.wait(handle, timeout_seconds=2).state is SubagentState.SUCCEEDED
+    kwargs = build.call_args.kwargs
+    assert kwargs["model"] is None
+    for name in ("provider", "base_url", "api_key", "api_mode", "request_overrides", "acp_command", "acp_args"):
+        assert kwargs[f"override_{name}"] is None
+    assert kwargs["routing_cfg"] == {}
+    resolve.assert_not_called()
+
+
+def test_routing_request_model_beats_delegation_model(routing_lifecycle):
+    service, build, config, _resolve = routing_lifecycle
+    config.return_value = {"model": "delegated-model", "base_url": "https://direct.example/v1"}
+    handle = service.launch(SubagentLaunchRequest(goal="route", model="request-model"))
+    assert service.wait(handle, timeout_seconds=2).state is SubagentState.SUCCEEDED
+    assert build.call_args.kwargs["model"] == "request-model"
+    assert build.call_args.kwargs["override_base_url"] == "https://direct.example/v1"

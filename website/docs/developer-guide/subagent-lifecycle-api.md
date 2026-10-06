@@ -12,6 +12,17 @@ CLI, gateway, non-interactive, and kanban-worker sessions. Launching outside an
 active agent turn fails closed with `No active Hermes parent session`.
 The facade also works when a plugin runs under `plugins.isolation: host`.
 
+Requests accept `goal`, `context`, `role`, `model`, `allowed_toolsets`,
+`blocked_tools`, `working_directory`, `parent_session_id`, `correlation_id`,
+`metadata`, and `timeout_seconds`, subject to the restrictions below.
+
+## Routing
+
+Children follow the `delegation` config (provider, model, base_url,
+request_overrides, and ACP command) exactly as `delegate_task` children do.
+The request's `model` overrides the configured model. A configured provider
+that cannot be resolved raises `SubagentLifecycleError` before launch.
+
 ```python
 from agent.subagent_lifecycle import SubagentLaunchRequest
 
