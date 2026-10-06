@@ -1,5 +1,6 @@
 """Contract tests for the public plugin subagent lifecycle API."""
 
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -27,6 +28,11 @@ class FakeChild:
         self.interrupt_kind = None
         self.interrupt_message = None
         self.tool_reason = None
+        self.steering = []
+
+    def steer(self, text):
+        self.steering.append(text)
+        return True
 
     def interrupt(self, _reason):
         self.interrupted = True
@@ -178,3 +184,87 @@ def test_agent_turn_binds_and_clears_lifecycle_parent(monkeypatch):
     assert agent.run_conversation("hello") == {"final_response": "ok"}
     assert observed == [agent]
     assert get_active_subagent_parent() is None
+
+
+@pytest.fixture
+def steer_lifecycle(monkeypatch):
+    from agent.subagent_lifecycle import _REGISTRY
+    from tools.delegate_tool_registry import _register_subagent, _unregister_subagent
+
+    child = FakeChild("sa-steer-contract")
+    started, finish = threading.Event(), threading.Event()
+    service = SubagentLifecycleService(lambda: SimpleNamespace(session_id="parent-steer", enabled_toolsets=["file"]))
+
+    def run(_index, _goal, child, _parent):
+        _register_subagent({"subagent_id": child._subagent_id, "agent": child})
+        try:
+            started.set()
+            assert finish.wait(5)
+            return {"status": "interrupted" if child.interrupted else "completed", "summary": "done"}
+        finally:
+            _unregister_subagent(child._subagent_id, agent=child)
+
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", lambda **_kwargs: child)
+    monkeypatch.setattr("tools.delegate_tool._run_single_child", run)
+    yield service, child, started, finish
+    finish.set()
+    record = _REGISTRY.records.get(child._subagent_id)
+    if record is not None:
+        record.future.result(timeout=5)
+
+
+@pytest.mark.parametrize("wire", [False, True])
+def test_steer_queues_to_running_child_and_rejects_invalid_calls(steer_lifecycle, wire):
+    from hermes_cli.plugin_host_wire import decode, encode
+
+    service, child, started, finish = steer_lifecycle
+    request = SubagentLaunchRequest(goal="review", allowed_toolsets=("file",))
+    handle = service.launch(decode(encode(request)) if wire else request)
+    assert started.wait(2)
+    handle = decode(encode(handle)) if wire else handle
+    assert service.status(handle).state is SubagentState.RUNNING
+    assert service.reconnect(handle).connected
+    assert service.steer(handle, "focus on correctness") is True
+    assert child.steering == ["focus on correctness"]
+    assert service.steer(handle, "") is False
+    assert service.steer(handle, "   ") is False
+    other = SubagentLifecycleService(lambda: SimpleNamespace(session_id="foreign"))
+    assert other.steer(handle, "foreign") is False
+    forged = {**(dict(handle) if wire else handle.to_dict()), "capability": "forged"}
+    assert service.steer(forged, "forged") is False
+    finish.set()
+    assert service.wait(handle, timeout_seconds=2).state is SubagentState.SUCCEEDED
+    assert service.result(handle).summary == "done"
+    assert service.steer(handle, "too late") is False
+    assert child.steering == ["focus on correctness"]
+
+
+def test_wire_handle_can_cancel_a_running_child(steer_lifecycle):
+    from hermes_cli.plugin_host_wire import decode, encode
+
+    service, child, started, finish = steer_lifecycle
+    handle = decode(encode(service.launch(SubagentLaunchRequest(goal="cancel"))))
+    assert started.wait(2)
+    assert service.cancel(handle, reason="cancel wire child").accepted
+    assert child.interrupted
+    finish.set()
+    assert service.wait(handle, timeout_seconds=2).state is SubagentState.CANCELLED
+
+
+@pytest.mark.parametrize("handle", [{}, {"subagent_id": "unknown"}, 42])
+def test_malformed_handles_keep_unknown_results(lifecycle, handle):
+    assert lifecycle.status(handle).diagnostic == "UNKNOWN_HANDLE"
+    assert lifecycle.wait(handle).diagnostic == "UNKNOWN_HANDLE"
+    assert lifecycle.cancel(handle, reason="test").unknown_handle
+    assert lifecycle.result(handle).error_classification == "UNKNOWN_HANDLE"
+    assert lifecycle.reconnect(handle).diagnostic == "RECONNECT_UNAVAILABLE"
+    assert lifecycle.steer(handle, "test") is False
+
+
+@pytest.mark.parametrize("launch_request, message", [
+    ({"goal": "review", "future_field": True}, "future_field"),
+    (42, "request must be a SubagentLaunchRequest"),
+])
+def test_mapping_request_errors_are_explicit(lifecycle, launch_request, message):
+    with pytest.raises(SubagentLifecycleError, match=message):
+        lifecycle.launch(launch_request)

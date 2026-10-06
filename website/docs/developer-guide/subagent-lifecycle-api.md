@@ -10,6 +10,7 @@ Plugins can launch and supervise fresh Hermes child sessions without importing
 The service resolves its parent from the current agent turn, so it works in
 CLI, gateway, non-interactive, and kanban-worker sessions. Launching outside an
 active agent turn fails closed with `No active Hermes parent session`.
+The facade also works when a plugin runs under `plugins.isolation: host`.
 
 ```python
 from agent.subagent_lifecycle import SubagentLaunchRequest
@@ -31,8 +32,14 @@ def launch_review(ctx):
 ```
 
 `SubagentHandle` is serializable and carries a versioned, opaque capability.
-Pass it back to `status`, `wait`, `cancel`, `result`, or `reconnect`; malformed
+Requests and handles may also arrive as mappings, including plugin-host wire records.
+Pass a handle back to `status`, `wait`, `cancel`, `steer`, `result`, or `reconnect`; malformed
 or forged handles return `UNKNOWN`/`UNKNOWN_HANDLE` and cannot access a child.
+
+`steer(handle, text)` queues text for the child's next iteration boundary and
+returns `True` while the child accepts steering. It returns `False` for empty
+text, unknown or forged handles, handles owned by another parent session, or a
+child that has finished or stopped accepting steering.
 
 The stable states are `PENDING`, `STARTING`, `RUNNING`, `SUCCEEDED`, `FAILED`,
 `INTERRUPTED`, `CANCEL_REQUESTED`, `CANCELLED`, and `UNKNOWN`.
