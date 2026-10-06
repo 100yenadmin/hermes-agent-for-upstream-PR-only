@@ -51,6 +51,7 @@ class SubagentLaunchRequest:
     context: Optional[str] = None
     role: str = "leaf"
     model: Optional[str] = None
+    provider: Optional[str] = None
     allowed_toolsets: Optional[tuple[str, ...]] = None
     blocked_tools: tuple[str, ...] = ()
     working_directory: Optional[str] = None
@@ -222,6 +223,8 @@ _REQUEST_REJECTIONS: tuple[tuple[Callable[[Any], bool], str], ...] = (
     (lambda r: r.context is not None and (not isinstance(r.context, str) or len(r.context) > _MAX_CONTEXT_CHARS),
      "context must be a string of at most 32000 characters."),
     (lambda r: r.role not in {"leaf", "orchestrator"}, "role must be 'leaf' or 'orchestrator'."),
+    (lambda r: r.provider is not None and (not isinstance(r.provider, str) or not r.provider.strip() or len(r.provider) > 64),
+     "provider must be a non-empty string of at most 64 characters."),
     (lambda r: r.timeout_seconds is not None, "Per-launch timeout is not supported; configure delegation timeout explicitly."),
     (lambda r: r.working_directory is not None,
      "working_directory is not supported because Hermes delegates use isolated task environments."),
@@ -290,8 +293,8 @@ class SubagentLifecycleService:
             _build_child_preserving_parent_tools, _credential_overrides, _load_config, _resolve_delegation_credentials,
             DEFAULT_MAX_ITERATIONS,
         )
-        # Children follow the delegation config exactly as delegate_task children do.
-        routing_cfg = _load_config()
+        # Routing precedence: request.provider > delegation config > parent.
+        routing_cfg = {"provider": request.provider, "model": request.model or ""} if request.provider is not None else _load_config()
         try:
             creds = _resolve_delegation_credentials(routing_cfg, parent)
         except ValueError as exc:

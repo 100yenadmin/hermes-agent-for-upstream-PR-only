@@ -323,15 +323,49 @@ def test_routing_delegation_provider_bundle(routing_lifecycle):
     resolve.assert_called_once_with(requested="openrouter", target_model="delegated-model")
 
 
-def test_routing_unknown_provider_refuses_before_registration(routing_lifecycle):
+@pytest.mark.parametrize("wire", [False, True])
+def test_routing_request_provider_wins_without_mixing_bundles(routing_lifecycle, wire):
+    from hermes_cli.plugin_host_wire import decode, encode
+
+    service, build, config, resolve = routing_lifecycle
+    config.return_value = {
+        "provider": "nous", "model": "delegated-model",
+        "base_url": "https://delegation.example/v1", "api_key": "delegation-fixture-key",
+        "api_mode": "anthropic_messages", "command": "delegation-command",
+        "request_overrides": {"temperature": 0.9},
+    }
+    request = SubagentLaunchRequest(goal="route", provider="openrouter", model="m")
+    request = decode(encode(request)) if wire else request
+    if wire:
+        assert request["provider"] == "openrouter"
+    handle = service.launch(request)
+    assert service.wait(handle, timeout_seconds=2).state is SubagentState.SUCCEEDED
+    kwargs = build.call_args.kwargs
+    assert kwargs["model"] == "m"
+    assert kwargs["override_provider"] == "openrouter"
+    assert kwargs["override_base_url"] == "https://route.example/v1"
+    assert kwargs["override_api_key"] == "fixture-key"
+    assert kwargs["override_api_mode"] == "chat_completions"
+    assert kwargs["override_request_overrides"] == {"temperature": 0.2}
+    assert kwargs["override_acp_command"] is None
+    assert kwargs["override_acp_args"] == []
+    assert kwargs["routing_cfg"] == {"provider": "openrouter", "model": "m"}
+    resolve.assert_called_once_with(requested="openrouter", target_model="m")
+
+
+@pytest.mark.parametrize("per_launch", [False, True])
+def test_routing_unknown_provider_refuses_before_registration(routing_lifecycle, per_launch):
     from agent.subagent_lifecycle import _REGISTRY
 
     service, build, config, resolve = routing_lifecycle
     resolve.side_effect = ValueError("Unknown provider fixture-missing")
-    config.return_value = {"provider": "fixture-missing"}
+    config.return_value = {} if per_launch else {"provider": "fixture-missing"}
+    request = {"goal": "route", "correlation_id": "refused-route"}
+    if per_launch:
+        request["provider"] = "fixture-missing"
     records, correlations = dict(_REGISTRY.records), dict(_REGISTRY.correlations)
     with pytest.raises(SubagentLifecycleError, match="Unknown provider fixture-missing"):
-        service.launch({"goal": "route", "correlation_id": "refused-route"})
+        service.launch(request)
     assert _REGISTRY.records == records
     assert _REGISTRY.correlations == correlations
     build.assert_not_called()
@@ -357,3 +391,13 @@ def test_routing_request_model_beats_delegation_model(routing_lifecycle):
     assert service.wait(handle, timeout_seconds=2).state is SubagentState.SUCCEEDED
     assert build.call_args.kwargs["model"] == "request-model"
     assert build.call_args.kwargs["override_base_url"] == "https://direct.example/v1"
+
+
+@pytest.mark.parametrize("provider", ["", " ", 123, "p" * 65])
+def test_routing_provider_validation(routing_lifecycle, provider):
+    service, build, _config, resolve = routing_lifecycle
+    with pytest.raises(SubagentLifecycleError) as exc:
+        service.launch({"goal": "route", "provider": provider})
+    assert str(exc.value) == "provider must be a non-empty string of at most 64 characters."
+    build.assert_not_called()
+    resolve.assert_not_called()
