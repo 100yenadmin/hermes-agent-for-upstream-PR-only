@@ -58,6 +58,7 @@ def _real_agent_factory(built: list, tail=None):
             agent = real_cls(skip_context_files=True, **kwargs)
         compressor = MagicMock()
         compressor.compression_count = 1
+        compressor.context_length = 272_000  # a MagicMock window would read as 1 token
         compressor.last_prompt_tokens = 0
         compressor.last_completion_tokens = 0
         compressor._last_summary_error = None
