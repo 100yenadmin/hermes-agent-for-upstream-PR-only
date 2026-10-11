@@ -33,6 +33,7 @@ from agent.auxiliary_client import (
 from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.context_compressor_prellm import PreLlmSkipMixin
 from agent.context_compressor_summary import SummaryDispatchMixin
+from agent.context_compressor_background import _LEAN_BACKGROUND_HEADING, _build_background_section
 from agent.context_compressor_tail import demote_stale_tail_tools, is_demoted_stub
 from agent.context_compressor_telemetry import CompressionTelemetryMixin
 from agent.compaction_user_quotes import _build_verbatim_user_section
@@ -957,8 +958,6 @@ def _build_recovery_footer(session_id: str, region_len: int) -> str:
     )
 
 
-# Detailed session log comes from the SAME single summary request (one aux LLM
-# call per attempt); coverage via input sampling, exact needles via anchor index.
 # One flat 2-3K-token summary cannot carry a 400K+ region's specifics — the eval showed recall collapsing to
 # ~33% when the big tail (which accidentally archived restated facts) shrank. The detailed,
 # identifier-preserving session log is produced by the SAME single summary request as the narrative summary
@@ -3621,6 +3620,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         for heading, build in (
             (_LEAN_ANCHOR_HEADING, lambda: _redact_compaction_text(_build_anchor_index(turns_to_summarize))),
             (_LEAN_USER_MESSAGES_HEADING, lambda: _redact_compaction_text(_build_verbatim_user_section(turns_to_summarize))),
+            (_LEAN_BACKGROUND_HEADING, lambda: _redact_compaction_text(_build_background_section(self))),
             (_LEAN_RECOVERY_HEADING, lambda: _build_recovery_footer(getattr(self, "_session_id", "") or "", len(turns_to_summarize))),
         ):
             if heading not in summary:
