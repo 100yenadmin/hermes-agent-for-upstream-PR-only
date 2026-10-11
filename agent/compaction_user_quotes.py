@@ -1,8 +1,16 @@
 """Bounded user quotes for lean compaction, excluding model-facing scaffolding."""
 
+from itertools import chain
 from typing import Any
 
+from agent.compaction_lean_carry import previous_user_quotes
 from agent.compression_marker import ELISION_MARKER_MAX_LEN, elide, elide_middle
+
+USER_QUOTES_NOTE = (
+    "(Every real user message from the compacted region, quoted "
+    "verbatim. These are the user's actual words and override any "
+    "paraphrase of them above.)"
+)
 
 
 def _user_quote_text(msg: dict[str, Any], content: str) -> str:
@@ -50,8 +58,9 @@ def _bounded_user_quote(text: str, cap: int, message_cap: int) -> str:
     return elide(text, cap)
 
 
-def _build_verbatim_user_section(turns: list[dict[str, Any]]) -> str:
-    """Quote distinct real user messages newest-first under the lean char budget."""
+def _build_verbatim_user_section(turns: list[dict[str, Any]], previous_summary: str | None = "") -> str:
+    """Quote distinct real user messages newest-first under the lean char budget, then the quotes
+    the previous summary's section already carried, in their existing order."""
     # The compressor owns these shared budgets and content adapters. Late imports
     # preserve its existing import seam without a module-level cycle.
     from agent.context_compressor import (
@@ -64,10 +73,11 @@ def _build_verbatim_user_section(turns: list[dict[str, Any]]) -> str:
     collected: list[str] = []
     seen: set[str] = set()
     used = 0
-    for msg in reversed(turns):
-        if msg.get("role") != "user":
-            continue
-        text = _user_quote_text(msg, _content_text_for_contains(msg.get("content")))
+    current = (
+        _user_quote_text(msg, _content_text_for_contains(msg.get("content")))
+        for msg in reversed(turns) if msg.get("role") == "user"
+    )
+    for text in chain(current, previous_user_quotes(previous_summary or "", _LEAN_USER_MESSAGES_HEADING)):
         if not text or text in seen:
             continue
         remaining = _LEAN_USER_MESSAGES_BUDGET_CHARS - used
@@ -75,16 +85,12 @@ def _build_verbatim_user_section(turns: list[dict[str, Any]]) -> str:
             break
         if len(text) > remaining and remaining <= ELISION_MARKER_MAX_LEN:
             break  # no room for a marker plus content
-        seen.add(text)
-        text = _bounded_user_quote(text, min(_LEAN_USER_MESSAGE_MAX_CHARS, remaining), _LEAN_USER_MESSAGE_MAX_CHARS)
-        collected.append("> " + text.replace("\n", "\n> "))
-        used += len(text)
+        quote = _bounded_user_quote(text, min(_LEAN_USER_MESSAGE_MAX_CHARS, remaining), _LEAN_USER_MESSAGE_MAX_CHARS)
+        if quote in seen:
+            continue  # already quoted in its bounded form (a long message carried from the last pass)
+        seen.update((text, quote))
+        collected.append("> " + quote.replace("\n", "\n> "))
+        used += len(quote)
     if not collected:
         return ""
-    return (
-        "\n\n" + _LEAN_USER_MESSAGES_HEADING + "\n"
-        + "\n\n".join(collected)
-        + "\n(Every real user message from the compacted region, quoted "
-        "verbatim. These are the user's actual words and override any "
-        "paraphrase of them above.)"
-    )
+    return "\n\n" + _LEAN_USER_MESSAGES_HEADING + "\n" + "\n\n".join(collected) + "\n" + USER_QUOTES_NOTE

@@ -35,6 +35,7 @@ from agent.context_compressor_prellm import PreLlmSkipMixin
 from agent.context_compressor_summary import SummaryDispatchMixin
 from agent.context_compressor_tail import demote_stale_tail_tools, is_demoted_stub
 from agent.context_compressor_telemetry import CompressionTelemetryMixin
+from agent.compaction_lean_carry import lean_anchor_index, strip_lean_section
 from agent.compaction_user_quotes import _build_verbatim_user_section
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.micro_compaction import MicroCompactionMixin
@@ -3615,16 +3616,15 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         return result
 
     def _augment_summary_lean(self, summary: str, turns_to_summarize: list[dict[str, Any]]) -> str:
-        """Append deterministic lean-mode sections to a summary; no-op in legacy mode."""
+        """Rebuild the deterministic lean-mode sections (a model-written copy is replaced); no-op in legacy mode."""
         if getattr(self, "tail_mode", "lean") != "lean":
             return summary
-        for heading, build in (
-            (_LEAN_ANCHOR_HEADING, lambda: _redact_compaction_text(_build_anchor_index(turns_to_summarize))),
-            (_LEAN_USER_MESSAGES_HEADING, lambda: _redact_compaction_text(_build_verbatim_user_section(turns_to_summarize))),
+        for heading, build in (  # quotes and anchors in Hermes' own previous summary carry forward
+            (_LEAN_ANCHOR_HEADING, lambda: _redact_compaction_text(lean_anchor_index(turns_to_summarize, getattr(self, "_anchor_source_messages", None), self._previous_summary))),
+            (_LEAN_USER_MESSAGES_HEADING, lambda: _redact_compaction_text(_build_verbatim_user_section(turns_to_summarize, self._previous_summary))),
             (_LEAN_RECOVERY_HEADING, lambda: _build_recovery_footer(getattr(self, "_session_id", "") or "", len(turns_to_summarize))),
         ):
-            if heading not in summary:
-                summary += build()
+            summary = strip_lean_section(summary, heading) + build()
         return summary
 
     @classmethod
@@ -5505,7 +5505,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         spare_pending_images = bool(self._spared_pending_tool_round(messages))
         # Unpruned copy for no-op/abort returns (history stays lossless) and finalize; head/tail are
         # assembled and measured from the pruned copy (#61932).
-        canonical_messages = self._drop_blank_echoes(messages)
+        canonical_messages = self._anchor_source_messages = self._drop_blank_echoes(messages)
         # Phase 1: Prune old tool results (cheap, no LLM call)
         messages, pruned_count = self._prune_old_tool_results(
             messages, protect_tail_count=self.protect_last_n, protect_tail_tokens=self.tail_token_budget,
