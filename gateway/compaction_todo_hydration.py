@@ -3,11 +3,18 @@
 import re
 from typing import Any
 
-from tools.todo_tool import TODO_INJECTION_HEADER
+from tools.todo_tool import _STATUS_MARKERS, TODO_INJECTION_HEADER, TodoStore
 
-# One rendered line of TodoStore.format_for_injection: "<indent>- [x] <id>. <content> (<status>)".
-_SNAPSHOT_ITEM = re.compile(r"^( *)- \[.\] (.+?)\. (.*)$")
-_SNAPSHOT_STATUS = re.compile(r"^(.*) \((pending|in_progress|completed|cancelled)\)$", re.DOTALL)
+# The first line of one rendered TodoStore.format_for_injection item: "<indent>- <marker> <id>. <content>".
+# Content may span lines; the item ends at the first line that closes with " (<status>)" for its marker
+# and is followed by another item's first line or by the end of the block.
+_SNAPSHOT_ITEM = re.compile(r"^( *)- (\[.\]) (.+?)\. (.*)$")
+_MARKER_STATUS = {marker: status for status, marker in _STATUS_MARKERS.items()}
+
+
+def _item_start(line: str) -> Any:
+    match = _SNAPSHOT_ITEM.match(line)
+    return match if match is not None and match.group(2) in _MARKER_STATUS else None
 
 
 def _row_text(msg: Any) -> str:
@@ -25,30 +32,43 @@ def _is_todo_snapshot_row(msg: Any) -> bool:
 def _parse_todo_snapshot(text: str) -> list:
     """Read the items back out of a folded snapshot (the block after the header, up to any reload notice).
 
-    Item content may itself hold blank lines, so only the notice the fold appends ends the block."""
+    Content may hold blank lines and checkbox-shaped lines, so a line opens an item only after the previous
+    item's rendered " (<status>)" closed it. A block that does not re-render to itself returns no items:
+    the snapshot is then left as it is rather than restored from a guess."""
     from agent.conversation_compression import _PRUNED_SKILL_RELOAD_NOTICE_HEADER
 
     block = text[text.find(TODO_INJECTION_HEADER) + len(TODO_INJECTION_HEADER):]
     block = block.split("\n\n" + _PRUNED_SKILL_RELOAD_NOTICE_HEADER, 1)[0].strip("\n")
     items: list = []
     parents: list = []  # parents[depth] = id of the latest item rendered at that depth
-    for line in block.split("\n"):
-        match = _SNAPSHOT_ITEM.match(line)
-        if match is None:
-            if items:  # multi-line content continues the previous item
-                items[-1]["content"] += "\n" + line
-            continue
-        depth = len(match.group(1)) // 2
-        del parents[depth:]
-        item = {"id": match.group(2), "content": match.group(3)}
-        if depth and len(parents) == depth:
-            item["parent"] = parents[-1]
-        parents.append(item["id"])
-        items.append(item)
-    for item in items:
-        status = _SNAPSHOT_STATUS.match(item["content"])
-        if status is not None:
-            item["content"], item["status"] = status.group(1), status.group(2)
+    lines: list = []  # content lines of the item still open
+    rows = block.split("\n")
+    for n, line in enumerate(rows):
+        if not lines:
+            match = _item_start(line)
+            if match is None:
+                return []
+            depth = len(match.group(1)) // 2
+            del parents[depth:]
+            item = {"id": match.group(3), "status": _MARKER_STATUS[match.group(2)]}
+            if depth and len(parents) == depth:
+                item["parent"] = parents[-1]
+            parents.append(item["id"])
+            line = match.group(4)
+        lines.append(line)
+        suffix = f" ({item['status']})"
+        if line.endswith(suffix) and (n + 1 == len(rows) or _item_start(rows[n + 1]) is not None):
+            lines[-1] = line[:-len(suffix)]
+            item["content"] = "\n".join(lines)
+            items.append(item)
+            lines = []
+    check = TodoStore()
+    try:
+        check.restore(items)
+    except ValueError:  # an empty content item: not something the renderer emits
+        return []
+    if lines or check.format_for_injection() != TODO_INJECTION_HEADER + "\n" + block:
+        return []
     return items
 
 

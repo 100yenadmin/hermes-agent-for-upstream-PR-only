@@ -69,6 +69,7 @@ def _build_verbatim_user_section(turns: list[dict[str, Any]], previous_summary: 
         _LEAN_USER_MESSAGES_HEADING,
         _content_text_for_contains,
     )
+    from agent.conversation_compression import _strip_stale_todo_snapshot
 
     collected: list[str] = []
     seen: set[str] = set()
@@ -77,7 +78,10 @@ def _build_verbatim_user_section(turns: list[dict[str, Any]], previous_summary: 
         _user_quote_text(msg, _content_text_for_contains(msg.get("content")))
         for msg in reversed(turns) if msg.get("role") == "user"
     )
-    for text in chain(current, previous_user_quotes(previous_summary or "", _LEAN_USER_MESSAGES_HEADING)):
+    carried = previous_user_quotes(previous_summary or "", _LEAN_USER_MESSAGES_HEADING)
+    # A todo snapshot folded into a user row is scaffolding: quoted, its header would make the next fold
+    # take the summary for the live snapshot and cut the appendix after it. Keep only the user's words.
+    for text in map(_strip_stale_todo_snapshot, chain(current, carried)):
         if not text or text in seen:
             continue
         remaining = _LEAN_USER_MESSAGES_BUDGET_CHARS - used

@@ -257,3 +257,46 @@ async def test_hygiene_compaction_carries_todo_list_from_history():
 
     assert built and results, "the hygiene attempt did not compact through the built agent"
     _assert_todo_carried(results[0])
+
+
+def _bare_agent():
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+        return run_agent.AIAgent(api_key="test-key", base_url="https://openrouter.ai/api/v1", model="test/model",
+                                 quiet_mode=True, skip_context_files=True, skip_memory=True)
+
+
+@pytest.mark.parametrize("todos", [
+    [{"id": "t1", "content": "Release\n\n- [ ] 1. Verify signatures", "status": "in_progress"}],
+    [{"id": "p1", "content": "Cut the release\n- [x] 2. Tag it (completed)\n\n- [>] 3. Sign it", "status": "in_progress"},
+     {"id": "k1", "content": "Build\n  - [ ] k2. Notarize (pending)", "parent": "p1", "status": "pending"},
+     {"id": "g1", "content": "Upload\n\n\nthe artifacts", "parent": "k1", "status": "pending"},
+     {"id": "k3", "content": "Check (in_progress)\n- [~] 9. Skip", "parent": "p1", "status": "cancelled"},
+     {"id": "g2", "content": "Mirror", "parent": "k3", "status": "pending"},
+     {"id": "t2", "content": "Publish (pending)\nnotes", "status": "pending"}],
+], ids=["checkbox-line", "nested-multiline"])
+def test_hydration_round_trips_the_rendered_snapshot(todos):
+    from gateway.compaction_todo_hydration import hydrate_todos_for_compaction
+    from tools.todo_tool import TodoStore
+
+    source = TodoStore()
+    source.write(todos)
+    assert source.read() == todos
+    snapshot = {"role": "user", "content": "go\n\n" + source.format_for_injection()}
+    store = hydrate_todos_for_compaction(_bare_agent(), [*_todo_pair("c1", _REV1, 1), snapshot])._todo_store
+    assert store.read() == todos
+
+
+@pytest.mark.asyncio
+async def test_manual_compress_leaves_an_unparseable_snapshot_as_it_is():
+    # The status does not match the marker, so this is not the renderer's output: restoring items from it
+    # would be a guess. Hydration restores nothing and the boundary keeps the snapshot row unchanged.
+    from gateway.compaction_todo_hydration import hydrate_todos_for_compaction
+
+    snapshot = {"role": "user", "content": "keep going\n\n" + TODO_INJECTION_HEADER + "\n- [>] t3. Step three (pending)"}
+    history = [{"role": "user", "content": "plan it"}, *_todo_pair("c1", _REV1, 1),
+               {"role": "user", "content": "[CONTEXT COMPACTION] t1 done; t3 added"},
+               {"role": "assistant", "content": "ok"}, snapshot, {"role": "assistant", "content": "working"},
+               {"role": "user", "content": "more"}]
+    assert not hydrate_todos_for_compaction(_bare_agent(), history)._todo_store.has_items()
+    compressed = await _manual_compress(history, tail=history[3:])
+    assert snapshot["content"] in [m.get("content") for m in compressed]
