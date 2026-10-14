@@ -1,7 +1,7 @@
 name: plan-mode
 title: Plan mode
 repo: https://github.com/100yenadmin/hermes-plan-mode
-sha: 13d61c8fe9ca7af1eb029573fce0e903380ce0c4
+sha: 90be7dd41cc5064ff3ebf46818e564a1f0075de0
 description: 'Claude Code-style plan mode on every interactive Hermes surface: /plan or /planmode on blocks mutating Hermes tools dispatched
   through pre_tool_call (writes outside .hermes/plans, terminal, code execution, delegation, MCP) while the agent
   explores, asks clarifying questions and writes a plan. The agent shows the complete plan, submits it with
@@ -24,7 +24,9 @@ description: 'Claude Code-style plan mode on every interactive Hermes surface: /
   .hermes/plans under the session working directory, reads plan files there, saves the approved text of an edited
   plan as a new file under .hermes/plans/approved, and keeps per-session state in plugin state. It adds a turn note
   while planning or executing, a ≤200-char system-prompt hint, and a one-line footer to short replies on chat
-  platforms. When you pick "Always" on a plan approval or a per-edit review, Hermes core writes a
+  platforms. When a turn ends while a submitted plan still awaits approval and no approval card was answered, it adds
+  one line to that reply on any surface, whatever its length, saying how to approve (unless footer is off). When you
+  pick "Always" on a plan approval or a per-edit review, Hermes core writes a
   plugin_rule:plan-mode entry to command_allowlist in config.yaml; each entry is keyed to one plan revision, so it
   cannot approve another plan. With allow_gateway_injection: true it queues one message to start work after a typed
   /planmode approve. On TUI, Desktop and hermes serve sessions (lean profile, plan_once) it reads the visible reply
@@ -35,13 +37,13 @@ tier: community
 category: tools
 requires_hermes: '>=0.21.3'
 docs_url: https://github.com/100yenadmin/hermes-plan-mode#readme
-version: "0.6.3"
-image: https://raw.githubusercontent.com/100yenadmin/hermes-plan-mode/13d61c8fe9ca7af1eb029573fce0e903380ce0c4/docs/media/banner.png
+version: "0.6.4"
+image: https://raw.githubusercontent.com/100yenadmin/hermes-plan-mode/90be7dd41cc5064ff3ebf46818e564a1f0075de0/docs/media/banner.png
 screenshots:
-  - https://raw.githubusercontent.com/100yenadmin/hermes-plan-mode/13d61c8fe9ca7af1eb029573fce0e903380ce0c4/docs/media/cli-card.png
-  - https://raw.githubusercontent.com/100yenadmin/hermes-plan-mode/13d61c8fe9ca7af1eb029573fce0e903380ce0c4/docs/media/cli-edit-review.png
-  - https://raw.githubusercontent.com/100yenadmin/hermes-plan-mode/13d61c8fe9ca7af1eb029573fce0e903380ce0c4/docs/media/cli-card-implement.png
-  - https://raw.githubusercontent.com/100yenadmin/hermes-plan-mode/13d61c8fe9ca7af1eb029573fce0e903380ce0c4/docs/media/cli-edit-approve.png
+  - https://raw.githubusercontent.com/100yenadmin/hermes-plan-mode/90be7dd41cc5064ff3ebf46818e564a1f0075de0/docs/media/cli-card.png
+  - https://raw.githubusercontent.com/100yenadmin/hermes-plan-mode/90be7dd41cc5064ff3ebf46818e564a1f0075de0/docs/media/cli-edit-review.png
+  - https://raw.githubusercontent.com/100yenadmin/hermes-plan-mode/90be7dd41cc5064ff3ebf46818e564a1f0075de0/docs/media/cli-card-implement.png
+  - https://raw.githubusercontent.com/100yenadmin/hermes-plan-mode/90be7dd41cc5064ff3ebf46818e564a1f0075de0/docs/media/cli-edit-approve.png
 platforms: []
 capabilities:
   provides_tools:
