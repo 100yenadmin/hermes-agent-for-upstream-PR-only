@@ -21,6 +21,13 @@ transport:
 auth:
   type: oauth
 
+# get_audio_data is the server's player-UI helper (declared app-only via
+# _meta.ui.visibility); it returns base64 audio bytes, so keep it out of the
+# model's tool list. The other 47 tools stay on.
+tools:
+  default_excluded:
+    - get_audio_data
+
 # Composer-suggestion triggers (desktop brand pills).
 suggest:
   keywords:
