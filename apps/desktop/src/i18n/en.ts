@@ -2257,6 +2257,7 @@ export const en: Translations = {
         saveFailed: (name: string) => `Could not save ${name} settings`,
         required: 'Required',
         secretSet: '•••••••• (set)',
+        secretEmpty: 'Not set. Paste here',
         secretStoredAs: (env: string) =>
           `Stored in the profile's .env as ${env}, never in config.yaml; leave blank to keep the current value.`
       }
