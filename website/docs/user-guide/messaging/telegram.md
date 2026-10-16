@@ -1028,6 +1028,28 @@ platforms:
 3. Topics without a `skill` key get session isolation only (existing behavior, unchanged)
 4. Unmapped `thread_id` values or `chat_id` values fall through silently — no error, no skill
 
+### Learned forum topic names
+
+Hermes learns group/supergroup forum names online from `forum_topic_created` and
+nonempty `forum_topic_edited` service messages. These updates only refresh the cache;
+they do not invoke the agent or generate a reply. Icon-only edits keep the previous name.
+Names persist in the receiving adapter's profile `state.db`, isolated by transport
+profile, bot identity, chat ID and thread ID, and are available immediately after restart.
+
+Configured `group_topics` names and skills remain authoritative, including after a
+Telegram rename. Both the list form above and the mapping form
+`group_topics: {"-1001234567890": [{thread_id: 5, name: Engineering}]}` are supported.
+Learned names are fallback labels only; routing/session IDs do not change.
+The connected adapter merges configured topics, learned names and session history
+into the channel directory (also consumed by `hermes send --list`). A directory refresh
+can update an old topic label without starting a new agent session.
+
+Telegram's Bot API cannot enumerate existing forum topics or look up their old names.
+If a message happens to include a reply to the original creation service message,
+Hermes can seed an unknown name from it, but ordinary messages do not always include
+that metadata. Old creation replies never overwrite a learned rename. Topics not yet
+observed or configured continue to display as `topic <id>`; there is no bulk backfill.
+
 ### Differences from DM Topics
 
 | | DM Topics | Group Topics |

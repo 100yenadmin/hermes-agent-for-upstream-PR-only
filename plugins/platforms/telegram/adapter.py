@@ -180,6 +180,7 @@ _MEDIA_KIND_KEYS = {
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from plugins.platforms.telegram.telegram_entities import expand_link_entities
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
+from plugins.platforms.telegram.telegram_group_topics import TelegramGroupTopicsMixin
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
 from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
@@ -511,7 +512,7 @@ class _PollingStallError(RuntimeError):
     """
 
 
-class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
+class TelegramAdapter(TelegramHeldInboundMixin, TelegramGroupTopicsMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
     # Bound for the per-(chat_id, status_key) status-message cache; FIFO half-trim on overflow.
@@ -589,6 +590,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         # Resolved now: secondary profiles construct adapters inside their own home scope.
         from hermes_constants import get_hermes_home
         self._update_receipt_dir = get_hermes_home()
+        self._init_group_topic_cache()
         self._update_receipts_loaded: set = set()
         self._update_receipts_dirty: set = set()
         self._update_receipt_flush: Optional[asyncio.Task] = None
@@ -2885,6 +2887,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""
         table = getattr(app, "handlers", None)
         core_before = {g: len(hs) for g, hs in table.items()} if isinstance(table, dict) else {}
+        app.add_handler(TelegramMessageHandler(
+            filters.StatusUpdate.FORUM_TOPIC_CREATED | filters.StatusUpdate.FORUM_TOPIC_EDITED,
+            self._handle_forum_topic_status_update))
         app.add_handler(TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message))
         app.add_handler(TelegramMessageHandler(filters.COMMAND, self._handle_command))
         app.add_handler(TelegramMessageHandler(
@@ -3423,6 +3428,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 logger.warning("[%s] Error during Telegram disconnect: %s", self.name, _redact_telegram_error_text(e))
         self._app = None
         self._bot = None
+        self._release_telegram_group_topic_cache_db()
         # Land the last completed receipts before a replacement adapter reads them.
         flush = getattr(self, "_update_receipt_flush", None)
         if flush is not None and not flush.done():
@@ -7013,28 +7019,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                     if not chat_topic:
                         chat_topic = created_name
         elif chat_type == "group" and thread_id_str:
-            # Forum topic skill binding via config.extra['group_topics']; accepts both
-            # [{"chat_id": ..., "topics": [...]}] and legacy {"-100...": [{"thread_id": 12}]}.
-            group_topics_config = self.config.extra.get("group_topics", [])
-            if isinstance(group_topics_config, dict):
-                group_topics_iter = [{"chat_id": cfg_chat_id, "topics": topics} for cfg_chat_id, topics in group_topics_config.items()]
-            elif isinstance(group_topics_config, list):
-                group_topics_iter = [entry for entry in group_topics_config if isinstance(entry, dict)]
-            else:
-                group_topics_iter = []
-            for chat_entry in group_topics_iter:
-                if str(chat_entry.get("chat_id", "")) != str(chat.id):
-                    continue
-                topics = chat_entry.get("topics", [])
-                for topic in (topics if isinstance(topics, list) else []):
-                    if not isinstance(topic, dict):
-                        continue
-                    tid = topic.get("thread_id")
-                    if tid is not None and str(tid) == thread_id_str:
-                        chat_topic = topic.get("name")
-                        topic_skill = topic.get("skill")
-                        break
-                break
+            chat_topic, topic_skill = self._resolve_group_topic_binding(message, thread_id_str)
         return chat_topic, topic_skill
 
     def _reply_context(self, message: Message) -> tuple:
