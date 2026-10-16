@@ -131,9 +131,15 @@ async def test_optional_reply_seed_never_rolls_back_rename():
     owner = adapter()
     app = registered_app(owner)
     old_reply = message(created="Original")
+    owner._is_user_authorized_from_message = lambda msg: True
+    owner._gate_or_observe = lambda *args: True
+    owner._ensure_forum_commands = AsyncMock()
+    owner._enqueue_text_event = lambda event: None
     try:
+        await dispatch(app, message(reply=old_reply))
         assert label(owner, message(reply=old_reply)) == "Original"
         await dispatch(app, message(edited="Renamed"))
+        await dispatch(app, message(reply=old_reply))
         assert label(owner, message(reply=old_reply)) == "Renamed"
         assert label(owner) == "Renamed"  # absent reply metadata is normal
         assert label(owner, message(thread=99)) is None
@@ -205,7 +211,7 @@ async def test_shared_db_transport_bot_chat_thread_isolation(tmp_path):
 async def test_reused_origin_and_directory_refresh_without_new_session():
     owner = adapter()
     store = SessionStore(sessions_dir=get_hermes_home() / "sessions", config=GatewayConfig())
-    initial = owner._build_message_event(message(), MessageType.TEXT).source
+    initial = owner._build_observed_message_event(message(), MessageType.TEXT).source
     entry = store.get_or_create_session(initial)
     sid, key = entry.session_id, entry.session_key
     db = store._db_for_key(key)

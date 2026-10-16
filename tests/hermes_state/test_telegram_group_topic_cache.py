@@ -34,3 +34,23 @@ def test_group_cache_requires_explicit_namespace(tmp_path):
             db.set_telegram_group_topic_name(chat_id="-100123", thread_id="42", name="No namespace")
         with pytest.raises(ValueError, match="namespace"):
             db.set_telegram_group_topic_name(profile_name="", bot_id="123456", chat_id="-100123", thread_id="42", name="Invalid")
+
+
+def test_unknown_observation_is_stable_and_reply_seed_cannot_replace_rename(tmp_path):
+    scope = dict(profile_name="receiver", bot_id="123456", chat_id="-100123", thread_id="42")
+    with SessionDB(tmp_path / "state.db") as db:
+        db.record_telegram_group_topic_observation(**scope)
+        assert db.get_telegram_group_topic_name(**scope) is None
+        assert db.list_telegram_group_topic_names(profile_name="receiver", bot_id="123456") == [
+            {"chat_id": "-100123", "thread_id": "42", "name": ""}]
+        changes = db._conn.total_changes
+        db.record_telegram_group_topic_observation(**scope)
+        assert db._conn.total_changes == changes
+        db.set_telegram_group_topic_name(**scope, name="Creation", source="creation_reply", only_if_unknown=True)
+        assert db.get_telegram_group_topic_name(**scope) == "Creation"
+        db.set_telegram_group_topic_name(**scope, name="Renamed", source="forum_topic_edited")
+        changes = db._conn.total_changes
+        db.record_telegram_group_topic_observation(**scope)
+        db.set_telegram_group_topic_name(**scope, name="Creation", source="creation_reply", only_if_unknown=True)
+        assert db._conn.total_changes == changes
+        assert db.get_telegram_group_topic_name(**scope) == "Renamed"

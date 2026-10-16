@@ -1044,11 +1044,32 @@ The connected adapter merges configured topics, learned names and session histor
 into the channel directory (also consumed by `hermes send --list`). A directory refresh
 can update an old topic label without starting a new agent session.
 
+Forum targets discovered from history must also have been observed by this receiving
+profile **and bot**, or match an explicit `group_topics` entry. Ordinary forum traffic
+records ownership even without a name: the cache stores an empty-string name marker,
+displayed as `topic <id>`. Repeated messages do not update that observation's timestamp.
+Optional creation replies fill an unknown marker atomically, never a learned rename.
+Merely looking up a label does not establish ownership.
+
+**Legacy policy:** old forum session rows without this scoped observation are omitted
+from discovery until this bot receives traffic there or the operator configures that
+target. A historical profile field or routed session key is not proof of receiving-bot
+ownership. DM and non-forum discovery keep their existing profile/transport filtering;
+old DM rows do not gain universal bot provenance, and missing historical transport
+metadata remains ambiguous.
+
+Directory workers hold a managed database reference for their entire operation,
+including after disconnect or cancellation of the awaiting task. Disconnect fences
+new cache acquisition; only an explicit reconnect reopens it. Optional storage failures
+leave configured bindings and ordinary message enqueue intact, with category-only
+diagnostics. Cache-only service updates never become agent turns on failure.
+
 Telegram's Bot API cannot enumerate existing forum topics or look up their old names.
 If a message happens to include a reply to the original creation service message,
 Hermes can seed an unknown name from it, but ordinary messages do not always include
-that metadata. Old creation replies never overwrite a learned rename. Topics not yet
-observed or configured continue to display as `topic <id>`; there is no bulk backfill.
+that metadata. Old creation replies never overwrite a learned rename. Observed topics
+with unknown names display as `topic <id>`; unobserved historical forum targets are
+omitted under the legacy policy above. There is no bulk backfill.
 
 ### Differences from DM Topics
 

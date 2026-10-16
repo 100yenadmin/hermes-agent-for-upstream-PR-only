@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import threading
+from plugins.platforms.telegram.telegram_group_topic_cache import TelegramGroupTopicCacheMixin, optional_cache_action
 
 
 def configured_group_topics(value):
@@ -45,25 +45,18 @@ def _session_origins(db, home, profile_name):
                 for entry in data.values() if isinstance(entry, dict) and isinstance(entry.get("origin"), dict)
                 and entry["origin"].get("platform") == "telegram"] if isinstance(data, dict) else []
     for row in rows:
-        if (row.get("transport_profile") or row.get("profile_name") or "default") != profile_name:
-            continue
         try:
             origin = json.loads(row["origin_json"]) if row.get("origin_json") else {
                 "chat_id": row.get("chat_id"), "thread_id": row.get("thread_id"), "chat_name": row.get("display_name"),
             }
         except (TypeError, ValueError):
             continue
-        if isinstance(origin, dict):
+        if isinstance(origin, dict) and (row.get("transport_profile") or row.get("profile_name") or "default") == profile_name:
             yield origin, row.get("chat_type") or origin.get("chat_type") or "dm"
 
 
-class TelegramGroupTopicsMixin:
+class TelegramGroupTopicsMixin(TelegramGroupTopicCacheMixin):
     """Persistent cache owned by the receiving adapter, never the routed runtime profile."""
-
-    def _init_group_topic_cache(self) -> None:
-        # Directory discovery runs in a worker while service updates arrive on the event loop.
-        self._group_topic_db_lock = threading.Lock()
-        self._telegram_group_topic_cache_db = None
 
     def _group_topic_namespace(self) -> dict[str, str]:
         token = self.config.token or ""
@@ -73,26 +66,6 @@ class TelegramGroupTopicsMixin:
         bot_id = public_id if separator and public_id.isdecimal() else hashlib.sha256(token.encode()).hexdigest()
         profile = getattr(self, "_owner_profile", None) or getattr(self, "_hermes_profile_name", None) or "default"
         return {"profile_name": profile, "bot_id": bot_id}
-
-    def _get_telegram_group_topic_cache_db(self):
-        from hermes_state_registry import acquire
-        with self._group_topic_db_lock:
-            db = self._telegram_group_topic_cache_db
-            if db is None:
-                # Captured during construction in the transport's home scope, not the current turn's.
-                db = acquire(self._update_receipt_dir / "state.db")
-                self._telegram_group_topic_cache_db = db
-            return db
-
-    def _release_telegram_group_topic_cache_db(self) -> None:
-        from hermes_state_registry import release
-        # A few teardown-only test adapters bypass __init__ and have never acquired a handle.
-        if getattr(self, "_telegram_group_topic_cache_db", None) is None:
-            return
-        with self._group_topic_db_lock:
-            db, self._telegram_group_topic_cache_db = self._telegram_group_topic_cache_db, None
-        if db is not None:
-            release(db)  # releases only our reference; never closes the runner's handle
 
     @staticmethod
     def _is_group_forum(message) -> bool:
@@ -107,14 +80,31 @@ class TelegramGroupTopicsMixin:
         thread_id = getattr(message, "message_thread_id", None)
         if thread_id is None:
             return
-        for source in ("forum_topic_created", "forum_topic_edited"):
-            name = getattr(getattr(message, source, None), "name", None)
-            if isinstance(name, str) and name.strip():
-                self._get_telegram_group_topic_cache_db().set_telegram_group_topic_name(
-                    **self._group_topic_namespace(), chat_id=str(message.chat.id), thread_id=str(thread_id),
-                    name=name, source=source,
-                )
+        def learn(db):
+            key = dict(**self._group_topic_namespace(), chat_id=str(message.chat.id), thread_id=str(thread_id))
+            db.record_telegram_group_topic_observation(**key)
+            for source in ("forum_topic_created", "forum_topic_edited"):
+                name = getattr(getattr(message, source, None), "name", None)
+                if isinstance(name, str) and name.strip():
+                    db.set_telegram_group_topic_name(**key, name=name, source=source)
+        self._optional_group_topic_cache(learn)
         self._accept_update()
+
+    def _build_observed_message_event(self, message, msg_type, update_id=None):
+        """Ingress-only builder: a display lookup is not proof this bot received traffic."""
+        if self._is_group_forum(message):
+            thread_id = self._effective_message_thread_id(message)
+            if thread_id:
+                self._optional_group_topic_cache(lambda db: self._observe_group_topic_message(db, message, thread_id))
+        return self._build_message_event(message, msg_type, update_id=update_id)
+
+    def _observe_group_topic_message(self, db, message, thread_id):
+        key = dict(**self._group_topic_namespace(), chat_id=str(message.chat.id), thread_id=thread_id)
+        db.record_telegram_group_topic_observation(**key)
+        reply = getattr(message, "reply_to_message", None)
+        created_name = getattr(getattr(reply, "forum_topic_created", None), "name", None)
+        if isinstance(created_name, str) and created_name.strip():
+            db.set_telegram_group_topic_name(**key, name=created_name, source="creation_reply", only_if_unknown=True)
 
     def _resolve_group_topic_binding(self, message, thread_id: str) -> tuple:
         name = skill = None
@@ -124,18 +114,10 @@ class TelegramGroupTopicsMixin:
                 break
         if not self._is_group_forum(message):
             return name, skill
-        db = self._get_telegram_group_topic_cache_db()
-        namespace = self._group_topic_namespace()
-        reply = getattr(message, "reply_to_message", None)
-        created_name = getattr(getattr(reply, "forum_topic_created", None), "name", None)
-        if isinstance(created_name, str) and created_name.strip():
-            db.set_telegram_group_topic_name(
-                **namespace, chat_id=str(message.chat.id), thread_id=thread_id,
-                name=created_name, source="creation_reply", only_if_unknown=True,
-            )
-        return name or db.get_telegram_group_topic_name(
-            **namespace, chat_id=str(message.chat.id), thread_id=thread_id,
-        ), skill
+        def resolve(db):
+            return name or db.get_telegram_group_topic_name(
+                **self._group_topic_namespace(), chat_id=str(message.chat.id), thread_id=thread_id)
+        return self._optional_group_topic_cache(resolve, fallback=name), skill
 
     async def list_channels(self) -> list[dict]:
         """Merge this transport's persisted sessions, learned labels and configured topics."""
@@ -143,25 +125,37 @@ class TelegramGroupTopicsMixin:
         return await asyncio.to_thread(self._list_group_topic_channels)
 
     def _list_group_topic_channels(self) -> list[dict]:
+        fallback = self._merge_group_topic_channels([], [])
+        def discover(db):
+            return self._merge_group_topic_channels(
+                _session_origins(db, self._update_receipt_dir, self._group_topic_namespace()["profile_name"]),
+                optional_cache_action(lambda: db.list_telegram_group_topic_names(**self._group_topic_namespace()), []))
+        return self._optional_group_topic_cache(discover, fallback=fallback)
+
+    def _merge_group_topic_channels(self, sessions, topics) -> list[dict]:
         from gateway.channel_directory import _session_entry_id, _session_entry_name
-        db = self._get_telegram_group_topic_cache_db()
-        namespace = self._group_topic_namespace()
+        configured = list(configured_group_topics(self.config.extra.get("group_topics")))
+        owned = {(topic["chat_id"], topic["thread_id"]) for topic in topics}
+        explicit = {(chat_id, str(topic["thread_id"])) for chat_id, _, topic in configured}
         origins = {}
-        for origin, kind in _session_origins(db, self._update_receipt_dir, namespace["profile_name"]):
+        for origin, kind in sessions:
             if not _session_entry_id(origin):
                 continue
             # Persisted group labels may belong to a prior bot. Only this bot's scoped cache or
             # explicit config can name them; DM topic behavior stays untouched.
             if kind == "group" and origin.get("thread_id"):
+                key = (str(origin.get("chat_id")), str(origin["thread_id"]))
+                if key not in owned and key not in explicit:
+                    continue
                 origin["chat_topic"] = None
             origins.setdefault(_session_entry_id(origin), (origin, kind))
         chat_names = {str(origin["chat_id"]): origin.get("chat_name") for origin, _ in origins.values()}
-        for topic in db.list_telegram_group_topic_names(**namespace):
+        for topic in topics:
             entry_id = f"{topic['chat_id']}:{topic['thread_id']}"
             origin, kind = origins.get(entry_id, ({"chat_id": topic["chat_id"], "thread_id": topic["thread_id"]}, "group"))
             origin.update(chat_topic=topic["name"], chat_name=chat_names.get(topic["chat_id"]) or origin.get("chat_name"))
             origins[entry_id] = (origin, kind)
-        for chat_id, chat_name, topic in configured_group_topics(self.config.extra.get("group_topics")):
+        for chat_id, chat_name, topic in configured:
             entry_id = f"{chat_id}:{topic['thread_id']}"
             origin, kind = origins.get(entry_id, ({"chat_id": chat_id, "thread_id": str(topic["thread_id"])}, "group"))
             origin["chat_name"] = chat_names.get(chat_id) if chat_name == chat_id and chat_names.get(chat_id) else chat_name

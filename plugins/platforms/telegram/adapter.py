@@ -3165,6 +3165,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramGroupTopicsMixin, BasePl
         TELEGRAM_WEBHOOK_URL, TELEGRAM_WEBHOOK_PORT (8443), TELEGRAM_WEBHOOK_HOST,
         TELEGRAM_WEBHOOK_SECRET."""
         # Explicit connect() is the only operation allowed to reopen polling after a completed teardown.
+        self._resume_group_topic_cache()
         self._polling_teardown_started = False
         self._webhook_mode = False  # re-evaluated on every explicit connection
         if not TELEGRAM_AVAILABLE:
@@ -6345,7 +6346,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramGroupTopicsMixin, BasePl
             return
         adapter_name = getattr(self, "name", "telegram")
         try:
-            event = event or self._build_message_event(message, msg_type, update_id=update_id)
+            event = event or self._build_observed_message_event(message, msg_type, update_id=update_id)
             session_entry = store.get_or_create_session(self._telegram_group_observe_shared_source(event.source))
             entry = {
                 "role": "user", "content": self._telegram_group_observe_attributed_text(event),
@@ -6464,7 +6465,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramGroupTopicsMixin, BasePl
         """Event for an addressed text/command: trigger text cleaned (sole addressee only), replied-to
         media cached, attribution applied."""
         from plugins.platforms.telegram.telegram_context import group_trigger_text
-        event = self._build_message_event(msg, msg_type, update_id=update.update_id)
+        event = self._build_observed_message_event(msg, msg_type, update_id=update.update_id)
         event.text = group_trigger_text(self, msg, event.text)
         await self._cache_replied_media(msg, event)
         return self._apply_telegram_group_observe_attribution(event)
@@ -6531,7 +6532,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramGroupTopicsMixin, BasePl
         parts += [
             f"latitude: {lat}", f"longitude: {lon}", f"Map: https://www.google.com/maps/search/?api=1&query={lat},{lon}",
             "Ask what they'd like to find nearby (restaurants, cafes, etc.) and any preferences."]
-        event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
+        event = self._build_observed_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
         event.text = "\n".join(parts)
         await self.handle_message(self._apply_telegram_group_observe_attribution(event))
 
@@ -6792,13 +6793,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramGroupTopicsMixin, BasePl
             return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
-                _event = self._build_message_event(msg, self._media_message_type(msg), update_id=update.update_id)
+                _event = self._build_observed_message_event(msg, self._media_message_type(msg), update_id=update.update_id)
                 if msg.caption:
                     _event.text = self._clean_bot_trigger_text(expand_link_entities(msg))
                 await self._cache_observed_media(msg, _event)
                 self._observe_unmentioned_group_message(msg, _event.message_type, update_id=update.update_id, event=_event)
             return
-        event = self._build_message_event(msg, self._media_message_type(msg), update_id=update.update_id)
+        event = self._build_observed_message_event(msg, self._media_message_type(msg), update_id=update.update_id)
         if msg.caption:
             from plugins.platforms.telegram.telegram_context import group_trigger_text
             event.text = group_trigger_text(self, msg, expand_link_entities(msg))
