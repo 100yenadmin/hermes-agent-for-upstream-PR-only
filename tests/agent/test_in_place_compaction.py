@@ -9,6 +9,7 @@ gaps, #42228 null cwd). When the flag is False (default), rotation behaves
 exactly as before.
 """
 
+from copy import deepcopy
 import os
 import tempfile
 from pathlib import Path
@@ -95,18 +96,19 @@ class TestContextEngineLifecycleAcrossCompaction:
             agent = _make_agent(db, sid, in_place=in_place)
             memory_manager, engine = _record_lifecycle_calls(agent)
             messages = [{"role": "user", "content": f"m{i}" * 100} for i in range(8)]
+            original_messages = deepcopy(messages)
 
             compressed, _ = compress_context(agent, messages, approx_tokens=100_000, system_message="sys")
 
             assert len(compressed) == 2
             assert (agent.session_id == sid) is in_place
-            memory_manager.on_session_end.assert_called_once_with(messages)
+            memory_manager.on_session_end.assert_called_once_with(original_messages)
             memory_manager.on_session_switch.assert_called_once_with(
                 agent.session_id, parent_session_id=sid, reset=False, reason="compression",
             )
             expected = [("start", sid, {})]
             if not in_place:
-                expected.append(("end", sid, messages))
+                expected.append(("end", sid, original_messages))
             expected.append(("start", agent.session_id, {
                 "boundary_reason": "compression", "old_session_id": sid,
                 "platform": "cli", "conversation_id": None,
