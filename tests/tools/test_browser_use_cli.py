@@ -1012,7 +1012,7 @@ class TestSkillTextDescription:
         env = {**os.environ, "HOME": str(tmp_path), "BH_HOME": str(tmp_path / "bh"),
                "BH_AGENT_WORKSPACE": str(tmp_path / "workspace")}
         proc = subprocess.run([sys.executable, "-c", probe, *advertised, "workspace"],
-                              env=env, capture_output=True, text=True, timeout=60)
+                              env=env, capture_output=True, text=True, timeout=60, check=False)
         assert proc.returncode == 0, proc.stderr
         resolved = json.loads(proc.stdout.strip().splitlines()[-1])
 
