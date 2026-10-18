@@ -10,6 +10,7 @@ import { deLocalModels } from './de_local_models'
 import { deModelMenu } from './de_model_menu'
 import { deNotices } from './de_notices'
 import { deOnboarding } from './de_onboarding'
+import { dePluginSettingsForm } from './de_plugin_settings_form'
 import { deProjects } from './de_projects'
 import { deSharedMetrics } from './de_shared_metrics'
 import { deThemePicker } from './de_theme_picker'
@@ -2611,16 +2612,7 @@ export const deOverrides = {
       deepLinkCatalogUnavailable:
         'Der Hermes-Plugin-Katalog konnte nicht geladen werden. Prüfen Sie Ihre Verbindung und öffnen Sie den Link erneut.',
       settingsToggle: (name: string) => `Einstellungen: ${name}`,
-      settingsForm: {
-        save: 'Einstellungen speichern',
-        saved: (name: string) => `Einstellungen von ${name} gespeichert.`,
-        saveFailed: (name: string) => `Einstellungen von ${name} konnten nicht gespeichert werden`,
-        required: 'Erforderlich',
-        secretSet: '•••••••• (gesetzt)',
-        secretEmpty: 'Leer. Hier einfügen',
-        secretStoredAs: (env: string) =>
-          `Wird in der .env des Profils als ${env} gespeichert, nie in config.yaml; leer lassen, um den aktuellen Wert zu behalten.`
-      }
+      settingsForm: dePluginSettingsForm
     },
     officialCatalog: 'Verfügbar zum Installieren',
     officialPill: 'Offiziell',

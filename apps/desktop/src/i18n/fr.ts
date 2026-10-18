@@ -11,6 +11,7 @@ import { frLocalModels } from './fr_local_models'
 import { frModelMenu } from './fr_model_menu'
 import { frNotices } from './fr_notices'
 import { frOnboarding } from './fr_onboarding'
+import { frPluginSettingsForm } from './fr_plugin_settings_form'
 import { frProjects } from './fr_projects'
 import { frSharedMetrics } from './fr_shared_metrics'
 import { frThemePicker } from './fr_theme_picker'
@@ -2620,16 +2621,7 @@ export const frOverrides = {
       deepLinkCatalogUnavailable:
         'Impossible de charger le catalogue de plugins Hermes. Vérifiez votre connexion et rouvrez le lien.',
       settingsToggle: (name: string) => `Paramètres : ${name}`,
-      settingsForm: {
-        save: 'Enregistrer les paramètres',
-        saved: (name: string) => `Paramètres de ${name} enregistrés.`,
-        saveFailed: (name: string) => `Impossible d’enregistrer les paramètres de ${name}`,
-        required: 'Obligatoire',
-        secretSet: '•••••••• (défini)',
-        secretEmpty: 'Vide. Collez ici',
-        secretStoredAs: (env: string) =>
-          `Stocké dans le .env du profil sous ${env}, jamais dans config.yaml ; laissez vide pour conserver la valeur actuelle.`
-      }
+      settingsForm: frPluginSettingsForm
     },
     officialCatalog: "Disponibles à l'installation",
     officialPill: 'Officiel',
