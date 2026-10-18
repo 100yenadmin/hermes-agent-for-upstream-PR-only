@@ -47,19 +47,9 @@ def _start_session_work(target, *, name: str, session: dict | None = None):
         raise
 
 
-def _session_live_status(sid: str, session: dict) -> str:
-    if _session_pending_kind(sid):
-        return "waiting"
-    ready = session.get("agent_ready")
-    # Unset + build never started = a lazy watch session idling, not one stuck mid-construction.
-    if ready is not None and not ready.is_set() and session.get("agent_build_started"):
-        return "starting"
-    return "working" if session.get("running") else "idle"
-
-
 def _reconcile_finished_run_thread(session: dict) -> bool:
     """Under history_lock, clear busy state only when the current admitted worker exited."""
-    if not session.get("running"):
+    if not session.get("running") or session.get("_manual_compress_active"):
         return False
     run_thread, turn = session.get("_run_thread"), session.get("_run_turn")
     if run_thread is None or turn is None or getattr(run_thread, "_hermes_run_turn", None) != turn:
@@ -81,14 +71,14 @@ def _reconcile_finished_run_thread(session: dict) -> bool:
     return True
 
 
-def _notify_session_boundary(event_type: str, session_id: str | None, platform: str | None = None) -> None:
-    """Fire session lifecycle hooks with CLI parity."""
+def _notify_session_boundary(event_type: str, session_id: str | None, platform: str | None = None) -> list[str]:
+    """Fire session lifecycle hooks with CLI parity; returns plugin ``on_session_finalize`` user messages."""
     with contextlib.suppress(Exception):
-        from hermes_cli.lifecycle import finalize_session, invoke_hook
+        from hermes_cli.lifecycle import finalize_session, invoke_hook, session_end_messages
         if event_type == "on_session_finalize":
-            finalize_session(session_id=session_id, platform=_resolve_agent_platform(platform))
-        else:
-            invoke_hook(event_type, session_id=session_id, platform=_resolve_agent_platform(platform))
+            return session_end_messages(finalize_session(session_id=session_id, platform=_resolve_agent_platform(platform)))
+        invoke_hook(event_type, session_id=session_id, platform=_resolve_agent_platform(platform))
+    return []
 
 
 _SESSION_OWNERSHIP_UNAVAILABLE = "Hermes could not safely reserve this session. Try again."
@@ -96,9 +86,9 @@ _AUTOMATIC_SESSION_END_REASONS = frozenset({"ws_orphan_reap", "ws_disconnect", "
 
 
 def _lease_metadata(live_session_id: str) -> dict:
-    """Writer identity for a lease: ``live_session_id`` is half of ``_is_same_writer``; the delivery flag is
-    what Bot Chat gates live delivery on (session_notifications)."""
-    return {"live_session_id": live_session_id, "bot_live_delivery_consumer": True}
+    """Writer identity for a lease: ``live_session_id`` is half of ``_is_same_writer``. Bot Chat delivery is
+    admitted by the session authority (gateway/session_bot), never gated on a lease flag."""
+    return {"live_session_id": live_session_id}
 
 
 def _claim_active_session_slot(
@@ -158,6 +148,8 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     do NOT claim: tile paints, reconnect-resumes and abandoned drafts would hold invisible slots (no DB row)
     that starve the messaging gateway sharing the cap. Anything holding a slot must be user-visible. An
     inert borrowed token (see _install_borrowed_lease) also lands here: present = slot held upstream."""
+    if (canonical := _canonical_ledger_refusal(session)) is not None:
+        return canonical
     if session.get("active_session_lease") is not None:
         return None
     key = str(session.get("session_key") or "")
@@ -170,6 +162,43 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     if getattr(limit_message, "reason", None) == SESSION_NOT_OWNED and _take_over_detached_runtime_lease(sid, session, key):
         return None
     return limit_message
+
+
+_CANONICAL_PENDING_SQL = """SELECT status FROM session_admissions WHERE target_session_id=? AND status!='terminal'
+    UNION ALL SELECT status FROM worker_executions WHERE session_id=? AND status!='terminal' LIMIT 1"""
+
+
+def _canonical_ledger_refusal(session: dict):
+    """Refusal when the gateway's durable ledger still holds work for this stored session, else None.
+
+    The registry lease only fences other legacy backends. A session a gateway once owned can carry
+    an ``unknown`` admission (outcome lost across an owner restart: never replayed, only Discard
+    resolves it), queued input or a running worker; a legacy turn would run past that barrier
+    and write the transcript beside the canonical FIFO. Checked on every turn, not only at the
+    first claim, because a gateway may admit work while this backend still holds its lease."""
+    import sqlite3
+    from hermes_cli.active_sessions import (
+        ActiveSessionRefusal, SESSION_COORDINATION_UNAVAILABLE, SESSION_NOT_OWNED)
+    key = str(session.get("session_key") or "")
+    if not key:
+        return None
+    try:
+        with _session_db(session) as db:
+            read_ctx = getattr(db, "_read_ctx", None)
+            if read_ctx is None:
+                return None
+            with read_ctx() as conn:
+                row = next(iter(conn.execute(_CANONICAL_PENDING_SQL, (key, key))), None)
+    except sqlite3.Error:
+        logger.warning("canonical ledger read failed for %s", key, exc_info=True)
+        return ActiveSessionRefusal(_SESSION_OWNERSHIP_UNAVAILABLE, SESSION_COORDINATION_UNAVAILABLE)
+    if row is None:
+        return None
+    logger.info("Refusing legacy turn for %s: canonical ledger holds %s work", key, row[0])
+    return ActiveSessionRefusal(
+        f"Session {key} has {'outcome-unknown' if row[0] == 'unknown' else 'pending'} work in the gateway's "
+        "durable queue. Resume it through the gateway (hermes chat --resume, Desktop or the TUI) to "
+        "resolve it; nothing was run here.", SESSION_NOT_OWNED)
 
 
 def _attach_lease(session: dict, lease) -> None:
@@ -430,7 +459,8 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
 
     session_key = session.get("session_key")
     session_id = getattr(agent, "session_id", None) or session_key
-    _notify_session_boundary("on_session_finalize", session_id, _session_source(session))
+    # Returned to the client by ``session.close`` (the TUI shows them after its /new reset); reaper paths have no client.
+    session["_end_msgs"] = _notify_session_boundary("on_session_finalize", session_id, _session_source(session)) or []
     # End the state.db row so it doesn't linger as a ghost in /resume. Use session_id (agent.session_id), not
     # session_key: after compression the key may be the stale ended parent while session_id is the live continuation.
     # Fix for #20001.
@@ -728,7 +758,10 @@ def _interrupt_session_turn(
     caller, never from request_id prefix sniffing — a future orphan caller may use another id (#106678).
     """
     use_compute_host = _session_uses_compute_host(session)
-    should_interrupt = bool(session.get("running"))
+    # A manual compaction holds `running` with no run thread and its own finally releases it: Stop must not
+    # abort it nor clear `running` under it, or the next submit is admitted idle and loses its reply (#133504).
+    compressing = bool(session.get("_manual_compress_active"))
+    should_interrupt = bool(session.get("running")) and not compressing
     run_thread_alive = False
     if use_compute_host:
         # The host owns the live turn (parent `running` can lag a blocked tool), so let it decide. Gate on
@@ -770,7 +803,7 @@ def _interrupt_session_turn(
             interrupt_for_session(
                 origin_ui_session_id=_lifecycle_own_sid(session, sid), reason="user_stop",
                 parent_session_id=str(getattr(session.get("agent"), "session_id", "") or ""))
-        if not run_thread_alive:
+        if not run_thread_alive and not compressing:
             with session["history_lock"]:
                 if session.get("running"):
                     session["running"] = False
@@ -965,7 +998,12 @@ def _schedule_ws_orphan_reap(
                 current.pop("_client_gone_interrupt_polls", None)
                 _pending_ws_reaps.pop(sid, None)
                 return
-            if _session_has_active_delegations(sid, current):
+            if _session_has_active_delegations(sid, current) or (
+                    not current.get("running")
+                    and not current.get("_client_gone_interrupt_requested")
+                    and _session_owns_live_wakeup_schedule(current)):
+                # Live background work, or an active /loop or /heartbeat only this process's poller can fire. A
+                # settled client-gone interrupt wins over the schedule: its latches block every tick and reattach.
                 reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
             elif not current.get("running"):
                 session = _pop_session_by_id(sid)

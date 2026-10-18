@@ -27,10 +27,12 @@ def test_payload_reconciles_only_the_current_started_dead_worker(monkeypatch):
     unstarted = threading.Thread(target=lambda: None)
     unstarted._hermes_run_turn = 1
     try:
-        for worker, turn, host, busy in [(alive, 1, False, True), (dead, 2, False, True),
-                                       (unstarted, 1, False, True), (dead, 1, True, True),
-                                       (dead, 1, False, False)]:
+        for worker, turn, host, compacting, busy in [
+                (alive, 1, False, False, True), (dead, 2, False, False, True),
+                (unstarted, 1, False, False, True), (dead, 1, True, False, True),
+                (dead, 1, False, True, True), (dead, 1, False, False, False)]:
             session = _session(_run_thread=worker, _compute_host_active=host,
+                               _manual_compress_active=compacting,
                                inflight_turn={"user": "turn", "assistant": "partial", "status": "streaming"})
             session["_run_turn"] = turn
             payload = server._live_session_payload("truthful", session, omit_messages=True)
@@ -113,10 +115,7 @@ def test_start_frames_follow_admission_once_and_keep_diagnostic_visibility(monke
                 assert session["running"] is False
 
 
-@pytest.mark.parametrize("source", ["queued_drain", "bot_live"])
-def test_new_claim_stays_busy_before_successor_publication(monkeypatch, tmp_path, source):
-    from tools import bot_live_delivery
-
+def test_new_claim_stays_busy_before_successor_publication(monkeypatch):
     previous = threading.Thread(target=lambda: None)
     previous.start()
     previous.join(timeout=2)
@@ -133,19 +132,9 @@ def test_new_claim_stays_busy_before_successor_publication(monkeypatch, tmp_path
         return True
 
     monkeypatch.setattr(server, "_run_prompt_submit", submit)
-    if source == "queued_drain":
-        session["queued_prompt"] = {"text": "queued turn", "transport": None}
-        assert server._drain_queued_prompt("rid", "truthful", session)
-        assert session["queued_prompt"] is None
-    else:
-        session["active_session_lease"] = types.SimpleNamespace(lease_id="test-lease", released=False)
-        owner = {"lease_id": "test-lease", "live_session_id": "truthful", "session_id": "truthful-key"}
-        monkeypatch.setattr(server, "_session_home", lambda _: tmp_path)
-        monkeypatch.setattr(bot_live_delivery, "has_mailbox", lambda _: True)
-        monkeypatch.setattr(bot_live_delivery, "find_canonical_live_owner", lambda _: owner)
-        monkeypatch.setattr(bot_live_delivery, "claim_pending_delivery",
-                            lambda *_: {"id": "test-delivery", "message": "bot turn"})
-        assert server._poll_bot_live_delivery_once("truthful", session)
+    session["queued_prompt"] = {"text": "queued turn", "transport": None}
+    assert server._drain_queued_prompt("rid", "truthful", session)
+    assert session["queued_prompt"] is None
     assert observed == [(2, False, True)]
     assert session["running"] is True
     assert session["_run_thread"] is previous
