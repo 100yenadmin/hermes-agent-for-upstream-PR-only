@@ -49,7 +49,8 @@ async def test_polling_error_record_has_no_raw_exception(monkeypatch, caplog):
 
 
 @pytest.mark.asyncio
-async def test_voice_forbidden_info_preserves_fallback_and_other_errors(monkeypatch, tmp_path, caplog):
+@pytest.mark.parametrize("chat_id", ["100", "200"])
+async def test_voice_forbidden_info_preserves_fallback_and_other_errors(monkeypatch, tmp_path, caplog, chat_id):
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token=_FAKE_TOKEN, extra={}))
     adapter._bot = MagicMock()
     monkeypatch.setattr(telegram_mod, "_probe_voice_duration_seconds", lambda _p: None)
@@ -69,12 +70,12 @@ async def test_voice_forbidden_info_preserves_fallback_and_other_errors(monkeypa
         adapter._send_voice_bubble = AsyncMock(side_effect=error)
         with caplog.at_level(logging.DEBUG, logger=telegram_mod.logger.name):
             result = await adapter.send_voice(
-                "123", str(clip), caption="Caption", reply_to="7", metadata=metadata)
+                chat_id, str(clip), caption="Caption", reply_to="7", metadata=metadata)
 
         assert result is receipt
         adapter.send.assert_awaited_once()
         args = adapter.send.await_args
-        assert args.args[0] == "123"
+        assert args.args[0] == chat_id
         assert args.args[1].startswith("Caption\n")
         assert "audio" in args.args[1].lower()
         assert str(clip) not in args.args[1]
@@ -85,6 +86,8 @@ async def test_voice_forbidden_info_preserves_fallback_and_other_errors(monkeypa
         assert record.levelno == level
         assert bool(record.exc_info) is traceback
         rendered = logging.Formatter("%(message)s").format(record)
+        assert f"[{adapter.name}]" in rendered
+        assert f"to chat {chat_id}," in rendered
         assert _FAKE_TOKEN not in rendered
         assert _FAKE_TOKEN not in str(record.args)
         assert _FAKE_TOKEN not in (record.exc_text or "")

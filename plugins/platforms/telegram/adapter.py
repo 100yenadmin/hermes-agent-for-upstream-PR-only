@@ -5207,8 +5207,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             forbidden = "voice_messages_forbidden" in str(e).lower()  # recipient privacy setting, not a fault
-            logger.log(logging.INFO if forbidden else logging.ERROR, "[%s] Failed to send Telegram voice/audio, falling back to base adapter: %s",
-                       self.name, _redact_telegram_error_text(e), exc_info=not forbidden)
+            logger.log(logging.INFO if forbidden else logging.ERROR, "[%s] Failed to send Telegram voice/audio to chat %s, falling back to base adapter: %s",
+                       self.name, chat_id, _redact_telegram_error_text(e), exc_info=not forbidden)
             return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata=metadata)
         finally:
             if _transcoded_voice_path:
