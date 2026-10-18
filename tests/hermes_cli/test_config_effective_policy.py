@@ -71,3 +71,36 @@ def test_strict_read_skips_fail_open_managed_snapshot_read(policy_homes, caplog)
     caplog.clear()
     assert load_user_config_effective()["kanban"] == {"dispatch_profiles": ["default"]}
     assert ignoring()  # the ordinary read still fails open, loudly
+
+
+@pytest.mark.parametrize("strict_policy", [False, True])
+def test_worker_snapshot_preserves_policy_read_mode(policy_homes, monkeypatch, strict_policy):
+    from agent import safe_worker_policy
+    from hermes_cli.config_effective import load_user_config_effective
+
+    home, managed = policy_homes
+    (home / "config.yaml").write_text("authorization: {grants: [disk]}\n")
+    monkeypatch.setattr(
+        safe_worker_policy, "worker_config_snapshot",
+        lambda: {"authorization": {"grants": ["snapshot"]}},
+    )
+    (managed / "config.yaml").write_text("authorization: null\n")
+    result = load_user_config_effective(strict_policy=strict_policy)
+    assert result["authorization"] == (None if strict_policy else {"grants": ["snapshot"]})
+
+
+@pytest.mark.parametrize("strict_policy", [False, True])
+def test_worker_snapshot_rejects_broken_policy_only_for_strict_reads(
+    policy_homes, monkeypatch, strict_policy
+):
+    from agent import safe_worker_policy
+    from hermes_cli.config_effective import load_user_config_effective
+
+    _, managed = policy_homes
+    monkeypatch.setattr(safe_worker_policy, "worker_config_snapshot", lambda: {"model": "snapshot"})
+    (managed / "config.yaml").write_text("kanban: [unterminated")
+    if strict_policy:
+        with pytest.raises(yaml.YAMLError):
+            load_user_config_effective(strict_policy=True)
+    else:
+        assert load_user_config_effective() == {"model": "snapshot"}

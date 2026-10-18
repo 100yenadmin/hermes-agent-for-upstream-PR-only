@@ -33,8 +33,8 @@ _DEFAULT_MANAGED_DIR = Path("/etc/hermes")
 _CACHE_LOCK = threading.Lock()
 _MISSING = object()  # Distinct from an explicit YAML null; absent files are not cached.
 # path_key -> (*file_signature, parsed)
-_CONFIG_CACHE: Dict[str, tuple] = {}
-_ENV_CACHE: Dict[str, tuple] = {}
+_CONFIG_CACHE: dict[str, tuple] = {}
+_ENV_CACHE: dict[str, tuple] = {}
 
 
 def _under_pytest() -> bool:
@@ -67,7 +67,7 @@ def invalidate_managed_cache() -> None:
         _ENV_CACHE.clear()
 
 
-def _cached_read(path: Path, cache: Dict[str, tuple], parse, *, strict_policy: bool = False):
+def _cached_read(path: Path, cache: dict[str, tuple], parse, *, strict_policy: bool = False):
     """Shared stat-signature-keyed read; returns a deepcopy of the parsed value.
 
     ``_MISSING`` when absent; ordinary parse failures return ``None`` and log loudly. Strict
@@ -89,7 +89,7 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse, *, strict_policy: b
             return copy.deepcopy(hit[len(key)])
     try:
         parsed = parse(path)
-    except Exception as exc:  # noqa: BLE001 — fail-open, but LOUD
+    except Exception as exc:
         if strict_policy:
             raise
         logger.warning(
@@ -103,7 +103,7 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse, *, strict_policy: b
 
 
 def _load_managed_file(
-    name: str, cache: Dict[str, tuple], parse, *, strict_policy: bool = False
+    name: str, cache: dict[str, tuple], parse, *, strict_policy: bool = False
 ) -> dict:
     managed_dir = get_managed_dir()
     if managed_dir is None:
@@ -128,12 +128,12 @@ def load_managed_config(*, strict_policy: bool = False) -> dict:
     )
 
 
-def load_managed_env() -> Dict[str, str]:
+def load_managed_env() -> dict[str, str]:
     """Parsed managed .env (KEY=VALUE), or {} when absent (fail-open)."""
     return _load_managed_file(".env", _ENV_CACHE, _parse_managed_env)
 
 
-def _parse_managed_env(path: Path) -> Dict[str, str]:
+def _parse_managed_env(path: Path) -> dict[str, str]:
     from agent.secret_scope import load_env_file
 
     path.read_text(encoding="utf-8-sig")  # load_env_file swallows decode errors; an admin file must fail LOUD
@@ -163,7 +163,7 @@ def apply_managed_overlay(config: dict, *, strict_policy: bool = False) -> dict:
             managed_expanded = dict(managed_expanded)
             managed_expanded["model"] = {"default": managed_expanded["model"]}
         return _deep_merge(config, managed_expanded, preserve_null=strict_policy)
-    except Exception:  # noqa: BLE001 — overlay must never break a caller
+    except Exception:
         if strict_policy:
             raise
         logger.warning("managed scope: failed to apply config overlay", exc_info=True)

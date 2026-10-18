@@ -25,12 +25,12 @@ from utils import fast_safe_load
 
 # path -> raw user mapping from the last successful parse in this process; served (through the
 # normal pipeline) when the file is later found mid-edit as broken YAML.
-_LAST_GOOD_USER_RAW: Dict[str, Dict[str, Any]] = {}
+_LAST_GOOD_USER_RAW: dict[str, dict[str, Any]] = {}
 # (path, fail_closed, strict_policy) -> (*user_signature, *managed_signature, effective, env_snapshot).
-_EFFECTIVE_CACHE: Dict[Tuple[str, bool, bool], Tuple[Any, ...]] = {}
+_EFFECTIVE_CACHE: dict[tuple[str, bool, bool], tuple[Any, ...]] = {}
 
 
-def _effective(raw: Dict[str, Any], *, strict_policy: bool = False) -> Dict[str, Any]:
+def _effective(raw: dict[str, Any], *, strict_policy: bool = False) -> dict[str, Any]:
     expanded = _config._expand_env_vars(raw)
     merged = managed_scope.apply_managed_overlay(
         expanded if isinstance(expanded, dict) else {}, strict_policy=strict_policy
@@ -38,7 +38,7 @@ def _effective(raw: Dict[str, Any], *, strict_policy: bool = False) -> Dict[str,
     return _config._normalize_root_model_keys(merged if isinstance(merged, dict) else {})
 
 
-def _recover_user_raw(config_path: Path, path_key: str, exc: Exception) -> Dict[str, Any]:
+def _recover_user_raw(config_path: Path, path_key: str, exc: Exception) -> dict[str, Any]:
     """Last-known-good raw user mapping after a parse failure: this process's last good parse,
     else the newest ``good`` copy in backups/config/, else ``{}`` (warned as defaults)."""
     raw = _LAST_GOOD_USER_RAW.get(path_key)
@@ -57,7 +57,7 @@ def load_user_config_effective(
     fail_closed: bool = False,
     strict_policy: bool = False,
     side_effect_free: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """User ``config.yaml`` → ``${VAR}`` expansion → managed overlay → model-key canonicalization.
     NO ``DEFAULT_CONFIG`` merge: a key absent from the file (and from the managed layer) is absent
     here, so ``{}`` sentinels and presence-sensitive bridges keep working. An absent file is an
@@ -70,6 +70,13 @@ def load_user_config_effective(
     ``strict_policy=True`` separately rejects invalid managed roots and preserves explicit nulls.
     ``side_effect_free`` suppresses backup writes; ordinary backups occur only on a fresh parse.
     Cached on the user + managed file signatures and the values of every referenced env var."""
+    from agent.safe_worker_policy import worker_config_snapshot
+
+    # A frozen-policy worker is detached from the profile's files: the owner-supplied
+    # snapshot IS the user layer (same seam load_config / read_raw_config honour).
+    snapshot = worker_config_snapshot()
+    if snapshot is not None:
+        return _effective(snapshot, strict_policy=strict_policy)
     if config_path is None:
         config_path = _config.get_config_path()
     path_key = str(config_path)
@@ -81,7 +88,7 @@ def load_user_config_effective(
             if all(_config._env_ref_lookup(k) == v for k, v in cached[9].items()):
                 return copy.deepcopy(cached[8])
 
-        raw: Dict[str, Any] = {}
+        raw: dict[str, Any] = {}
         recovered = False
         raw_hit = _config._RAW_CONFIG_CACHE.get(path_key)
         if user_sig is not None and raw_hit is not None and raw_hit[:4] == user_sig:
