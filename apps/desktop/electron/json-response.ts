@@ -3,12 +3,17 @@ import type http from 'node:http'
 import { gunzipSync } from 'node:zlib'
 
 // Over loopback the transfer costs nothing, so compressing would only spend server CPU.
-const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]'])
+const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]', '0.0.0.0', '[::]'])
 
-export function asksForGzip(url: URL): boolean {
+// A remote backend is asked for gzip whatever its URL: an SSH backend is dialled through a
+// 127.0.0.1 port forward. Without a descriptor, the URL decides.
+export function asksForGzip(url: URL, remoteBackend = false): boolean {
   const host = url.hostname.toLowerCase()
 
-  return !(LOOPBACK_HOSTNAMES.has(host) || host.startsWith('127.') || host.endsWith('.localhost'))
+  const local =
+    LOCAL_HOSTNAMES.has(host) || host.startsWith('127.') || host.startsWith('[::ffff:7f') || host.endsWith('.localhost')
+
+  return remoteBackend || !local
 }
 
 export function decodeJsonResponseBody(chunks: Buffer[], encoding: string | string[] | undefined): string {
@@ -37,9 +42,10 @@ export function requestJsonResponse(
   client: Pick<typeof http, 'request'>,
   url: URL,
   options: RequestOptions,
-  onResponse: (response: IncomingMessage) => void
+  onResponse: (response: IncomingMessage) => void,
+  remoteBackend = false
 ) {
-  const headers = asksForGzip(url) ? { ...options.headers, 'Accept-Encoding': 'gzip' } : options.headers
+  const headers = asksForGzip(url, remoteBackend) ? { ...options.headers, 'Accept-Encoding': 'gzip' } : options.headers
 
   return client.request(url, { ...options, headers }, onResponse)
 }
