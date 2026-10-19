@@ -570,6 +570,10 @@ class _LocalOriginCORSMiddleware(CORSMiddleware):
         return _is_trusted_local_origin(origin)
 
 
+from hermes_cli.web_server_gzip import DashboardGZipMiddleware
+
+app.add_middleware(DashboardGZipMiddleware, minimum_size=4096, compresslevel=5)
+
 # CORS: the trusted loopback origins only (web_server_boundary.is_trusted_local_origin, the same
 # rule the WebSocket Origin gate applies). allow_origins=["*"] on 0.0.0.0 would let any website
 # read/modify config and secrets; any local port would let a page on another port read
