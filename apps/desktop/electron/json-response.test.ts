@@ -30,9 +30,14 @@ describe('Node JSON response compression', () => {
       'http://localhost:9119/',
       'http://LOCALHOST/',
       'http://[::1]:9119/',
-      'http://desktop.localhost/'
+      'http://desktop.localhost/',
+      'http://0.0.0.0:9119/',
+      'http://[::]:9119/',
+      'http://[::ffff:127.0.0.1]:9119/'
     ]) {
       expect(asksForGzip(new URL(href))).toBe(false)
+      // An SSH backend's REST rides a 127.0.0.1 port forward; its descriptor marks it remote.
+      expect(asksForGzip(new URL(href), true)).toBe(true)
     }
 
     for (const href of [
@@ -83,27 +88,33 @@ describe('Node JSON response compression', () => {
     // A remote backend's URL, connected to this loopback server through the options' hostname.
     const remote = `http://backend.example:${port}`
 
-    const read = (path: string, base = remote) =>
+    const read = (path: string, base = remote, remoteBackend = false) =>
       new Promise((resolve, reject) => {
         const url = new URL(path, base)
 
-        const request = requestJsonResponse(http, url, { agent: false, hostname: '127.0.0.1' }, res => {
-          const chunks: Buffer[] = []
+        const request = requestJsonResponse(
+          http,
+          url,
+          { agent: false, hostname: '127.0.0.1' },
+          res => {
+            const chunks: Buffer[] = []
 
-          res.on('error', reject)
-          res.on('data', chunk => chunks.push(chunk))
-          res.on('end', () =>
-            decodeJsonResponse(chunks, res.headers['content-encoding'], reject, text => {
-              if (res.statusCode! >= 400) {
-                reject(httpStatusError(res.statusCode, text, res.statusMessage))
-              } else if (res.headers['content-type']?.includes('text/html')) {
-                reject(htmlResponseError(url.href, res.statusCode))
-              } else {
-                resolve(JSON.parse(text))
-              }
-            })
-          )
-        })
+            res.on('error', reject)
+            res.on('data', chunk => chunks.push(chunk))
+            res.on('end', () =>
+              decodeJsonResponse(chunks, res.headers['content-encoding'], reject, text => {
+                if (res.statusCode! >= 400) {
+                  reject(httpStatusError(res.statusCode, text, res.statusMessage))
+                } else if (res.headers['content-type']?.includes('text/html')) {
+                  reject(htmlResponseError(url.href, res.statusCode))
+                } else {
+                  resolve(JSON.parse(text))
+                }
+              })
+            )
+          },
+          remoteBackend
+        )
 
         request.on('error', reject)
         request.end()
@@ -115,8 +126,12 @@ describe('Node JSON response compression', () => {
       await expect(read('/invalid')).rejects.toThrow()
       await expect(read('/error')).rejects.toMatchObject({ statusCode: 503, message: '503: backend unavailable' })
       // A loopback backend is not asked for gzip, but a gzip body still decodes.
-      await expect(read('/json', `http://127.0.0.1:${port}`)).resolves.toEqual({ messages: ['transcript ✓'] })
-      expect(requests).toEqual(['gzip', 'gzip', 'gzip', 'gzip', 'undefined'])
+      const loopback = `http://127.0.0.1:${port}`
+
+      await expect(read('/json', loopback)).resolves.toEqual({ messages: ['transcript ✓'] })
+      // An SSH tunnel is a loopback URL to a remote backend: asked for gzip.
+      await expect(read('/json', loopback, true)).resolves.toEqual({ messages: ['transcript ✓'] })
+      expect(requests).toEqual(['gzip', 'gzip', 'gzip', 'gzip', 'undefined', 'gzip'])
     } finally {
       await new Promise<void>((resolve, reject) => server.close(error => (error ? reject(error) : resolve())))
     }
