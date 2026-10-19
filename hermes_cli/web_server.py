@@ -559,6 +559,10 @@ async def _dashboard_health_middleware(request: Request, call_next):
     return response
 
 
+from hermes_cli.web_server_gzip import DashboardGZipMiddleware
+
+app.add_middleware(DashboardGZipMiddleware, minimum_size=4096, compresslevel=5)
+
 # CORS: restrict to localhost origins only.  The web UI is intended to run
 # locally; binding to 0.0.0.0 with allow_origins=["*"] would let any website
 # read/modify config and secrets.
