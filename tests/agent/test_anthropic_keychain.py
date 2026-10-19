@@ -507,15 +507,36 @@ class TestKeychainLookupPrefersClaudeCodesAccount:
         assert _find_claude_code_keychain_item() is None
         assert _read_claude_code_credentials_from_keychain() is None
 
-    def test_account_falls_back_to_the_login_name_without_user(self, monkeypatch):
+    @pytest.mark.platforms("macos")
+    def test_a_real_failure_on_the_users_item_does_not_fall_through(self, monkeypatch):
+        """Locked keychain / access denied (not exit 44) must not land on another account's stale item."""
+        calls = []
+
+        def run(argv, **_kwargs):
+            calls.append(argv)
+            if "-a" in argv:
+                return MagicMock(returncode=51, stdout="", stderr="User interaction is not allowed.")
+            stale = json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-stale", "refreshToken": "R"}})
+            return MagicMock(returncode=0, stdout=stale + "\n", stderr="")
+
+        monkeypatch.setenv("USER", "alice")
+        monkeypatch.setattr(subprocess, "run", run)
+
+        assert _read_claude_code_credentials_from_keychain() is None
+        assert len(calls) == 1
+
+    def test_account_falls_back_to_the_os_user_name_without_user(self, monkeypatch):
+        import pwd
+
         from agent import anthropic_credentials
 
         monkeypatch.delenv("USER", raising=False)
-        monkeypatch.setattr(anthropic_credentials.getpass, "getuser", lambda: "bob")
+        monkeypatch.setenv("LOGNAME", "old-account")  # getpass would pick this; Claude Code does not
+        monkeypatch.setattr(pwd, "getpwuid", lambda _uid: MagicMock(pw_name="bob"))
         assert anthropic_credentials._claude_code_keychain_account() == "bob"
 
-        def no_user():
-            raise OSError("no username")
+        def no_user(_uid):
+            raise KeyError("no passwd entry")
 
-        monkeypatch.setattr(anthropic_credentials.getpass, "getuser", no_user)
+        monkeypatch.setattr(pwd, "getpwuid", no_user)
         assert anthropic_credentials._claude_code_keychain_account() == ""

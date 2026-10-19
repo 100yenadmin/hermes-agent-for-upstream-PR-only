@@ -12,7 +12,6 @@ re-reads them on every ``load_pool()``, so a failed write here is a failed refre
 import base64
 import contextlib
 import functools
-import getpass
 import hashlib
 import json
 import logging
@@ -260,11 +259,20 @@ def _decode_keychain_attr(match: Optional[re.Match[str]]) -> str:
 
 
 def _claude_code_keychain_account() -> str:
-    """The account Claude Code files its Keychain item under: ``$USER``, else the login name."""
+    """The account Claude Code files its Keychain item under: ``$USER``, else the OS user name
+    (Claude Code's ``process.env.USER || os.userInfo().username``; ``getpass`` would try $LOGNAME first)."""
+    if user := os.environ.get("USER"):
+        return user
     try:
-        return os.environ.get("USER") or getpass.getuser()
-    except (OSError, KeyError):  # no resolvable user name
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name  # windows-footgun: ok (callers are Darwin-only)
+    except (ImportError, AttributeError, KeyError, OSError):  # no resolvable user name
         return ""
+
+
+# ``security`` exits 44 (errSecItemNotFound) when no item matches; anything else is a real failure
+# (locked keychain, access denied) that must not fall through to some other account's item.
+_SECURITY_ITEM_NOT_FOUND = 44
 
 
 def _run_claude_code_keychain_lookup(flag: str) -> Optional[subprocess.CompletedProcess]:
@@ -273,7 +281,7 @@ def _run_claude_code_keychain_lookup(flag: str) -> Optional[subprocess.Completed
     Several items can share the service name (other accounts, a migrated Mac), and an unscoped
     lookup returns whichever comes first, often a stale login. Claude Code itself reads the item
     filed under its account (``-a $USER``), so that one goes first; the unscoped lookup is only the
-    fallback for a lone item filed under another name.
+    fallback when no item exists under that account (a lone item filed under another name).
     """
     account = _claude_code_keychain_account()
     scopes = ([["-a", account]] if account else []) + [[]]
@@ -289,6 +297,9 @@ def _run_claude_code_keychain_lookup(flag: str) -> Optional[subprocess.Completed
             return None
         if result.returncode == 0:
             return result
+        if result.returncode != _SECURITY_ITEM_NOT_FOUND:
+            logger.debug("Keychain: lookup failed (rc=%s)", result.returncode)
+            return None
     logger.debug("Keychain: no entry found for %r", _CLAUDE_CODE_KEYCHAIN_SERVICE)
     return None
 
