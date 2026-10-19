@@ -42,6 +42,7 @@ def _eligible(request: httpx.Request) -> bool:
         _latched_off is None
         and request.method == "POST"
         and request.url.host == NATIVE_HOST
+        and request.url.port is None  # Claude Code's host check keeps a non-default port, so :8443 stays raw
         and request.url.path.startswith("/v1/messages")
         and "content-encoding" not in request.headers
     )

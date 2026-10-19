@@ -2,6 +2,7 @@
 
 import gzip
 import json
+import re
 from unittest.mock import MagicMock
 
 import anthropic
@@ -13,6 +14,7 @@ from agent import anthropic_request_compression as compression
 from agent.azure_identity_adapter import build_bearer_http_client
 
 NATIVE = "https://api.anthropic.com/v1/messages"
+_REAL_PADDING = compression._padding
 PAYLOAD = {"text": "x" * 5000}
 RAW = json.dumps(PAYLOAD).encode()
 MESSAGE = {
@@ -57,12 +59,32 @@ def test_native_messages_are_gzip_and_lossless(size):
         client.post(NATIVE + "?beta=true", content=raw, extensions={"test": "preserved"})
 
 
+def test_wire_body_is_one_member_with_zero_mtime_and_whitespace_pad(monkeypatch):
+    monkeypatch.setattr(compression, "_padding", _REAL_PADDING)
+    bodies = []
+
+    def handler(request):
+        bodies.append(request.content)
+        return httpx.Response(200)
+
+    with _client(handler) as client:
+        for _ in range(8):
+            client.post(NATIVE, content=RAW)
+    for body in bodies:
+        assert body[:4] == b"\x1f\x8b\x08\x00" and body[4:8] == b"\x00\x00\x00\x00"  # gzip, no flags, mtime=0
+        plain = gzip.decompress(body)
+        assert plain.startswith(RAW) and re.fullmatch(rb"\n[ \t]{0,256}", plain[len(RAW):])
+        assert json.loads(plain) == PAYLOAD
+    assert len({len(gzip.decompress(body)) for body in bodies}) > 1  # the pad length varies per request
+
+
 @pytest.mark.parametrize("method,url,headers,raw", [
     ("POST", NATIVE, {}, b"x" * 4095),
     ("GET", NATIVE, {}, RAW),
     ("POST", "https://api.anthropic.com/v1/models", {}, RAW),
     ("POST", NATIVE, {"Content-Encoding": "identity"}, RAW),
     ("POST", "https://proxy.example/v1/messages", {}, RAW),
+    ("POST", "https://api.anthropic.com:8443/v1/messages", {}, RAW),
 ])
 def test_ineligible_requests_stay_raw(method, url, headers, raw):
     def handler(request):
@@ -265,6 +287,19 @@ def test_rejection_resends_original_once_and_latches_for_other_clients(caplog):
     assert compression._latched_off == "non_anthropic_rejection"
     compression._latch("unsupported_encoding", 415)
     assert caplog.messages == ["Anthropic request gzip disabled: non_anthropic_rejection (HTTP 415)"]
+
+
+def test_rejected_raw_resend_is_returned_without_another_attempt():
+    captured = []
+
+    def handler(request):
+        captured.append(request)
+        return httpx.Response(415)
+
+    with _client(handler) as client:
+        assert client.post(NATIVE, content=RAW).status_code == 415
+    assert [r.headers.get("content-encoding") for r in captured] == ["gzip", None]
+    assert compression._latched_off == "non_anthropic_rejection"
 
 
 @pytest.mark.parametrize("status,headers", [
