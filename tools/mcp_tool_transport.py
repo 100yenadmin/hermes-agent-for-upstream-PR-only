@@ -181,8 +181,8 @@ class MCPServerTransportMixin:
         if _core._client_session_accepts("client_info"):
             # Servers key logs/behaviour on clientInfo; the SDK default is "mcp"/"0.1.0".
             from mcp.types import Implementation
-            from hermes_cli.version_info import get_version_info
-            kwargs["client_info"] = Implementation(name="hermes-agent", version=get_version_info().base_version)
+            from hermes_cli.version_info import get_base_version
+            kwargs["client_info"] = Implementation(name="hermes-agent", version=get_base_version())
         return kwargs
 
     async def _negotiate_session(self, session, connect_timeout: float):

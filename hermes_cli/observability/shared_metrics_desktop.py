@@ -90,13 +90,13 @@ def friction_pair(kind: Any, detail: Any) -> tuple[str, str] | None:
 def _store_and_resource() -> tuple[Any, dict[str, str]]:
     """The active profile's store and client resource (the subscriber's), for rows that latch
     durably or belong to a past period and so cannot ride the relay's current-day marks."""
-    from hermes_cli.version_info import get_version_info
+    from hermes_cli.version_info import get_base_version
 
     from .shared_metrics import SharedMetricsStore
     from .shared_metrics_install import detect_client_install_method
 
     return SharedMetricsStore(), contract.client_resource(
-        get_version_info().base_version, os_name=platform.system(), architecture=platform.machine(),
+        get_base_version(), os_name=platform.system(), architecture=platform.machine(),
         install_method=detect_client_install_method(),
     )
 

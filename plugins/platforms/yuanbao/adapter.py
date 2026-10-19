@@ -70,7 +70,7 @@ from gateway.session_transcript import TranscriptReadError
 logger = logging.getLogger(__name__)
 
 # AUTH_BIND / sign-token header values
-from hermes_cli.version_info import get_version_info
+from hermes_cli.version_info import get_base_version
 
 _YUANBAO_INSTANCE_ID = str(HERMES_INSTANCE_ID)
 _OPERATION_SYSTEM = sys.platform
@@ -216,7 +216,7 @@ class SignManager:
                 timestamp = cls.build_timestamp()
                 payload = {"app_key": app_key, "nonce": nonce,
                            "signature": cls.compute_signature(nonce, timestamp, app_key, app_secret), "timestamp": timestamp}
-                version = get_version_info().base_version
+                version = get_base_version()
                 headers = {"Content-Type": "application/json", "X-AppVersion": version, "X-OperationSystem": _OPERATION_SYSTEM,
                            "X-Instance-Id": _YUANBAO_INSTANCE_ID, "X-Bot-Version": version}
                 if route_env:
@@ -1885,7 +1885,7 @@ class ConnectionManager:
         if self._ws is None:
             return False
         uid = adapter._bot_id or token_data.get("bot_id", "")
-        msg_id, version = str(uuid.uuid4()), get_version_info().base_version
+        msg_id, version = str(uuid.uuid4()), get_base_version()
         await self._ws.send(encode_auth_bind(
             biz_id="ybBot", uid=uid, source=token_data.get("source") or "bot", token=token_data.get("token", ""),
             msg_id=msg_id, app_version=version, operation_system=_OPERATION_SYSTEM, bot_version=version,
