@@ -2,6 +2,7 @@
 
 Lossless transport encoding: tokens and prompt caching are unchanged. A rejected
 encoding disables gzip process-wide and resends the original body once.
+Like Claude Code, custom-CA and proxied routes stay uncompressed.
 """
 
 import gzip
@@ -18,16 +19,15 @@ NATIVE_HOST = "api.anthropic.com"
 MIN_BODY_BYTES = 4096
 GZIP_LEVEL = 3
 _REJECTION_STATUSES = frozenset({400, 403, 415})
+_BAD_JSON = re.compile(r"^bad json: (?:invalid character |unexpected EOF$|unexpected end of JSON input$|EOF$)")
 _latched_off: str | None = None
 logger = logging.getLogger(__name__)
 
 
 def native_gzip_allowed() -> bool:
-    from agent.process_bootstrap import _get_proxy_for_base_url
-
-    # Claude Code skips proxy/custom-CA routes too: middleboxes may reject gzip
-    # with resets or 5xx errors that the 400/403/415 classifier cannot see.
-    return not _get_proxy_for_base_url(f"https://{NATIVE_HOST}") and not any(
+    # Custom-CA middleboxes may reject gzip with resets or 5xx errors that the
+    # classifier cannot see. Proxy routing is checked on the client at send time.
+    return not any(
         os.environ.get(name)
         for name in ("SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
     )
@@ -59,7 +59,7 @@ def _says_invalid_json(text: str) -> bool:
     try:
         data = json.loads(text)
     except ValueError:
-        return re.match(r"^bad json: ", text.strip()) is not None
+        return _BAD_JSON.match(text.strip()) is not None
     if not isinstance(data, dict):
         return False
     error = data.get("error")
@@ -69,7 +69,21 @@ def _says_invalid_json(text: str) -> bool:
             "The request body is not valid JSON",
             "Failed to parse request: could not parse request body as JSON",
         ))
-    return data.get("reason") == "bad_json" and isinstance(error, str) and error.startswith("bad json: ")
+    return data.get("reason") == "bad_json" and isinstance(error, str) and _BAD_JSON.match(error.strip()) is not None
+
+
+def _error_fields(text: str) -> tuple[str, str | None]:
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return "", None
+    error = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(error, dict):
+        return "", None
+    message = error.get("message")
+    details = error.get("details")
+    error_code = details.get("error_code") if isinstance(details, dict) else None
+    return message if isinstance(message, str) else "", error_code if isinstance(error_code, str) else None
 
 
 def _rejection_kind(response: httpx.Response) -> str | None:
@@ -80,8 +94,13 @@ def _rejection_kind(response: httpx.Response) -> str | None:
         return "non_anthropic_rejection"
     if response.status_code == 415:
         return "unsupported_encoding"
-    if response.status_code == 400 and _says_invalid_json(response.content[:8192].decode("utf-8", "replace")):
-        return "invalid_json_at_origin"
+    if response.status_code == 400:
+        text = response.content[:8192].decode("utf-8", "replace")
+        message, error_code = _error_fields(text)
+        if error_code == "request_body_encoding_unsupported" or message.startswith("Unsupported Content-Encoding"):
+            return "unsupported_encoding"
+        if _says_invalid_json(text):
+            return "invalid_json_at_origin"
     return None
 
 
@@ -94,7 +113,9 @@ def _latch(kind: str, status: int) -> None:
 
 class _GzipRequestSend:
     def send(self, request: httpx.Request, **kwargs) -> httpx.Response:
-        if not _eligible(request):
+        # Use the client's actual route, including system proxies and NO_PROXY
+        # mount semantics, rather than guessing from environment variables.
+        if not _eligible(request) or self._transport_for_url(request.url) is not self._transport:
             return super().send(request, **kwargs)
         raw = request.read()
         if len(raw) < MIN_BODY_BYTES:

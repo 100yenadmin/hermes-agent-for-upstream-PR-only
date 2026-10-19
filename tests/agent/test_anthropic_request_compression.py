@@ -74,6 +74,32 @@ def test_ineligible_requests_stay_raw(method, url, headers, raw):
         client.request(method, url, headers=headers, content=raw)
 
 
+@pytest.mark.parametrize("sdk_client", [False, True])
+@pytest.mark.parametrize("mounted", [False, True])
+def test_compression_follows_selected_transport(sdk_client, mounted):
+    captured = []
+
+    def handler(request):
+        captured.append(request)
+        if mounted:
+            assert "content-encoding" not in request.headers
+            assert request.content == RAW
+        else:
+            assert request.headers["content-encoding"] == "gzip"
+            assert gzip.decompress(request.content) == RAW + b"\n \t"
+        return httpx.Response(200)
+
+    def default_handler(request):
+        assert not mounted, "mounted route must bypass the default transport"
+        return handler(request)
+
+    cls = compression.anthropic_gzip_client_cls(anthropic) if sdk_client else compression.gzip_httpx_client_cls()
+    mounts = {"https://api.anthropic.com": httpx.MockTransport(handler)} if mounted else {}
+    with cls(transport=httpx.MockTransport(default_handler), mounts=mounts) as client:
+        assert client.send(httpx.Request("POST", NATIVE, content=RAW)).status_code == 200
+    assert len(captured) == 1
+
+
 @pytest.mark.parametrize("base_url", [None, "", "https://api.anthropic.com"])
 def test_native_builder_uses_sdk_gzip_client(base_url):
     with adapter.build_anthropic_client("sk-ant-api03-x", base_url) as client:
@@ -95,11 +121,57 @@ def test_other_builders_stay_raw(base_url, callable_key):
 
 
 @pytest.mark.parametrize("callable_key", [False, True])
-def test_proxy_disables_gzip(monkeypatch, callable_key):
-    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:8888")
+@pytest.mark.parametrize("no_proxy", [None, "*.anthropic.com", "api.anthropic.com"])
+def test_builder_env_proxy_routing_controls_gzip(monkeypatch, callable_key, no_proxy):
+    monkeypatch.setenv("HTTPS_PROXY", "http://p:1")
+    if no_proxy is not None:
+        monkeypatch.setenv("NO_PROXY", no_proxy)
+    captured = []
+
+    def handle_request(transport, request):
+        captured.append(request)
+        if no_proxy == "api.anthropic.com":
+            assert request.headers["content-encoding"] == "gzip"
+            assert gzip.decompress(request.content) == RAW + b"\n \t"
+        else:
+            assert "content-encoding" not in request.headers
+            assert request.content == RAW
+        return httpx.Response(200)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", handle_request)
     key = (lambda: "sk-ant-api03-x") if callable_key else "sk-ant-api03-x"
     with adapter.build_anthropic_client(key) as client:
-        assert not isinstance(client._client, compression._GzipRequestSend)
+        assert client._client.send(httpx.Request("POST", NATIVE, content=RAW)).status_code == 200
+    assert len(captured) == 1
+
+
+@pytest.mark.parametrize("callable_key", [False, True])
+def test_builder_system_proxy_sends_raw(monkeypatch, callable_key):
+    import urllib.request
+
+    import anthropic._utils._httpx as sdk_httpx
+    import httpx._utils as httpx_utils
+
+    def system_proxies():
+        return {"https": "http://sys:8080"}
+
+    monkeypatch.setattr(urllib.request, "getproxies", system_proxies)
+    # Both clients bind getproxies at import time; patch those bindings too.
+    monkeypatch.setattr(sdk_httpx, "getproxies", system_proxies)
+    monkeypatch.setattr(httpx_utils, "getproxies", system_proxies)
+    captured = []
+
+    def handle_request(transport, request):
+        captured.append(request)
+        assert "content-encoding" not in request.headers
+        assert request.content == RAW
+        return httpx.Response(200)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", handle_request)
+    key = (lambda: "sk-ant-api03-x") if callable_key else "sk-ant-api03-x"
+    with adapter.build_anthropic_client(key) as client:
+        assert client._client.send(httpx.Request("POST", NATIVE, content=RAW)).status_code == 200
+    assert len(captured) == 1
 
 
 def test_custom_ca_disables_builder_gzip(monkeypatch):
@@ -217,8 +289,6 @@ def test_genuine_errors_are_returned_unchanged(status, headers):
      "invalid_json_at_origin"),
     (400, {"cf-ray": "ray-x"}, b'{"error":{"message":"Failed to parse request: could not parse request body as JSON"}}',
      "invalid_json_at_origin"),
-    (400, {"request-id": "req_x"}, b'{"reason":"bad_json","error":"bad json: gzip"}', "invalid_json_at_origin"),
-    (400, {"request-id": "req_x"}, b'  bad json: gzip\n', "invalid_json_at_origin"),
     (415, {"request-id": "req_x"}, b'unsupported', "unsupported_encoding"),
 ])
 def test_encoding_rejections_resend_raw(status, headers, body, kind):
@@ -236,6 +306,73 @@ def test_encoding_rejections_resend_raw(status, headers, body, kind):
         assert client.post(NATIVE, content=RAW).status_code == 200
     assert len(captured) == 2
     assert compression._latched_off == kind
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("error", [
+    "bad json: invalid character 'x' looking for beginning of value",
+    "bad json: unexpected EOF",
+    "bad json: unexpected end of JSON input",
+    "bad json: EOF",
+    "bad json: json: cannot unmarshal string into Go value",
+    "bad json: unexpected EOF trailing text",
+    "bad json: gzip",
+])
+def test_bad_json_rejection_is_anchored(wrapped, error):
+    text = f"  {error}\n"
+    body = json.dumps({"reason": "bad_json", "error": text}).encode() if wrapped else text.encode()
+    rejected = httpx.Response(400, headers={"request-id": "req_x"}, content=body)
+    captured = []
+    should_resend = error in {
+        "bad json: invalid character 'x' looking for beginning of value",
+        "bad json: unexpected EOF", "bad json: unexpected end of JSON input", "bad json: EOF",
+    }
+
+    def handler(request):
+        captured.append(request)
+        return rejected if len(captured) == 1 else httpx.Response(200)
+
+    with _client(handler) as client:
+        response = client.post(NATIVE, content=RAW)
+    assert len(captured) == (2 if should_resend else 1)
+    if should_resend:
+        assert response.status_code == 200
+        assert captured[1].content == RAW
+        assert "content-encoding" not in captured[1].headers
+        assert compression._latched_off == "invalid_json_at_origin"
+    else:
+        assert response is rejected
+        assert compression._latched_off is None
+
+
+@pytest.mark.parametrize("error", [
+    {
+        "type": "invalid_request_error",
+        "message": 'Unsupported Content-Encoding "zstd": send the request body gzip-compressed or uncompressed.',
+        "details": {"error_code": "request_body_encoding_unsupported"},
+    },
+    {"message": "encoding refused", "details": {"error_code": "request_body_encoding_unsupported"}},
+    {"message": 'Unsupported Content-Encoding "gzip"'},
+])
+def test_origin_400_unsupported_encoding_resends_and_latches(error):
+    body = json.dumps({"type": "error", "error": error}).encode()
+    captured = []
+
+    def handler(request):
+        captured.append(request)
+        if len(captured) == 1:
+            assert request.headers["content-encoding"] == "gzip"
+            return httpx.Response(400, headers={"request-id": "req_x"}, content=body)
+        assert request.content == RAW
+        assert "content-encoding" not in request.headers
+        return httpx.Response(200)
+
+    with _client(handler) as client:
+        assert client.post(NATIVE, content=RAW).status_code == 200
+        assert len(captured) == 2
+        assert compression._latched_off == "unsupported_encoding"
+        assert client.post(NATIVE, content=RAW).status_code == 200
+    assert len(captured) == 3
 
 
 def test_rejected_stream_is_read_and_closed_before_resend():
