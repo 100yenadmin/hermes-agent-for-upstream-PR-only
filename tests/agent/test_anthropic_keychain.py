@@ -452,3 +452,70 @@ class TestMirrorClaudeCodeCredentialsToKeychain:
         assert argv == ["security", "-i"]
         assert json.loads(bytes.fromhex(kwargs["input"].split(" -X ", 1)[1].strip()))["claudeAiOauth"] == {
             "accessToken": "A1", "refreshToken": "R1", "expiresAt": 1}
+
+
+class TestKeychainLookupPrefersClaudeCodesAccount:
+    """Several items can share the ``Claude Code-credentials`` service (other accounts, a migrated Mac).
+    Claude Code reads the one under ``-a $USER``; an unscoped lookup returns whichever comes first."""
+
+    @staticmethod
+    def _security(items: dict[str, dict], first_unscoped: str):
+        """Fake ``security``: ``items`` maps account -> payload; an unscoped lookup returns ``first_unscoped``."""
+        calls = []
+
+        def run(argv, **_kwargs):
+            calls.append(argv)
+            account = argv[argv.index("-a") + 1] if "-a" in argv else first_unscoped
+            if account not in items:
+                return MagicMock(returncode=44, stdout="", stderr="security: SecKeychainSearchCopyNext: not found")
+            blob = json.dumps(items[account])
+            if "-w" in argv:
+                return MagicMock(returncode=0, stdout=blob + "\n", stderr="")
+            return MagicMock(returncode=0, stdout=f'    "acct"<blob>="{account}"\n',
+                             stderr=f"password: 0x{blob.encode().hex()}  \"...\"\n")
+
+        return run, calls
+
+    @pytest.mark.platforms("macos")
+    def test_the_users_item_wins_over_a_stale_item_listed_first(self, monkeypatch):
+        live = {"claudeAiOauth": {"accessToken": "sk-ant-oat01-live", "refreshToken": "R-live", "expiresAt": 2}}
+        stale = {"claudeAiOauth": {"accessToken": "sk-ant-oat01-stale", "refreshToken": "R-stale", "expiresAt": 1}}
+        run, calls = self._security({"alice": live, "old-mac": stale}, first_unscoped="old-mac")
+        monkeypatch.setenv("USER", "alice")
+        monkeypatch.setattr(subprocess, "run", run)
+
+        assert _find_claude_code_keychain_item() == ("alice", live)
+        assert _read_claude_code_credentials_from_keychain()["accessToken"] == "sk-ant-oat01-live"
+        assert all(argv[2:4] == ["-a", "alice"] for argv in calls)
+
+    @pytest.mark.platforms("macos")
+    def test_a_lone_item_under_another_account_still_resolves(self, monkeypatch):
+        only = {"claudeAiOauth": {"accessToken": "sk-ant-oat01-only", "refreshToken": "R", "expiresAt": 1}}
+        run, calls = self._security({"someone-else": only}, first_unscoped="someone-else")
+        monkeypatch.setenv("USER", "alice")
+        monkeypatch.setattr(subprocess, "run", run)
+
+        assert _find_claude_code_keychain_item() == ("someone-else", only)
+        assert ["-a", "alice"] == calls[0][2:4] and "-a" not in calls[1]
+
+    @pytest.mark.platforms("macos")
+    def test_no_item_at_all_is_none(self, monkeypatch):
+        run, _calls = self._security({}, first_unscoped="nobody")
+        monkeypatch.setenv("USER", "alice")
+        monkeypatch.setattr(subprocess, "run", run)
+
+        assert _find_claude_code_keychain_item() is None
+        assert _read_claude_code_credentials_from_keychain() is None
+
+    def test_account_falls_back_to_the_login_name_without_user(self, monkeypatch):
+        from agent import anthropic_credentials
+
+        monkeypatch.delenv("USER", raising=False)
+        monkeypatch.setattr(anthropic_credentials.getpass, "getuser", lambda: "bob")
+        assert anthropic_credentials._claude_code_keychain_account() == "bob"
+
+        def no_user():
+            raise OSError("no username")
+
+        monkeypatch.setattr(anthropic_credentials.getpass, "getuser", no_user)
+        assert anthropic_credentials._claude_code_keychain_account() == ""
