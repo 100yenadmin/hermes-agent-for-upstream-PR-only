@@ -320,9 +320,12 @@ def test_genuine_errors_are_returned_unchanged(status, headers):
 
 
 @pytest.mark.parametrize("status,headers,body,kind", [
-    (400, {"request-id": "req_x"}, b'{"error":{"message":"The request body is not valid JSON: gzip"}}',
+    (400, {"request-id": "req_x"},
+     b'{"type":"error","error":{"type":"invalid_request_error","message":"The request body is not valid JSON: gzip"}}',
      "invalid_json_at_origin"),
-    (400, {"cf-ray": "ray-x"}, b'{"error":{"message":"Failed to parse request: could not parse request body as JSON"}}',
+    (400, {"cf-ray": "ray-x"},
+     b'{"type":"error","error":{"type":"invalid_request_error",'
+     b'"message":"Failed to parse request: could not parse request body as JSON"}}',
      "invalid_json_at_origin"),
     (415, {"request-id": "req_x"}, b'unsupported', "unsupported_encoding"),
 ])
@@ -354,8 +357,8 @@ def test_encoding_rejections_resend_raw(status, headers, body, kind):
     "bad json: gzip",
 ])
 def test_bad_json_rejection_is_anchored(wrapped, error):
-    text = f"  {error}\n"
-    body = json.dumps({"reason": "bad_json", "error": text}).encode() if wrapped else text.encode()
+    # A raw body is trimmed at the end only, as Claude Code's trimEnd() does; a wrapped error is not.
+    body = json.dumps({"reason": "bad_json", "error": error}).encode() if wrapped else f"{error} \t\n".encode()
     rejected = httpx.Response(400, headers={"request-id": "req_x"}, content=body)
     captured = []
     should_resend = error in {
@@ -378,6 +381,22 @@ def test_bad_json_rejection_is_anchored(wrapped, error):
     else:
         assert response is rejected
         assert compression._latched_off is None
+
+
+# Claude Code 2.1.302 runs its regex on a raw body's trimEnd() and on a bad_json error untrimmed, and
+# reads a message only from a full Anthropic error envelope.
+@pytest.mark.parametrize("body,rejected", [
+    ("bad json: EOF\ufeff\u00a0\n", True),  # trimEnd() strips U+FEFF and NBSP
+    (" bad json: EOF", False),  # no leading trim
+    ("bad json: EOF\x1c", False),  # Python's rstrip() would strip U+001C; trimEnd() does not
+    (json.dumps({"reason": "bad_json", "error": "bad json: EOF\n"}), False),
+    (json.dumps({"reason": "bad_json", "error": " bad json: EOF"}), False),
+    ('{"error":{"message":"The request body is not valid JSON: gzip"}}', False),  # no envelope type
+    ('{"type":"error","error":{"message":"The request body is not valid JSON: gzip"}}', False),
+    ('{"type":"error","error":{"type":"invalid_request_error","message":"The request body is not valid JSON"}}', True),
+])
+def test_invalid_json_classifier_matches_claude_code(body, rejected):
+    assert compression._says_invalid_json(body) is rejected
 
 
 @pytest.mark.parametrize("error", [

@@ -19,7 +19,11 @@ NATIVE_HOST = "api.anthropic.com"
 MIN_BODY_BYTES = 4096
 GZIP_LEVEL = 3
 _REJECTION_STATUSES = frozenset({400, 403, 415})
-_BAD_JSON = re.compile(r"^bad json: (?:invalid character |unexpected EOF$|unexpected end of JSON input$|EOF$)")
+# Claude Code's classifier verbatim: its JS ``$`` never matches before a trailing newline, so ``\Z``.
+_BAD_JSON = re.compile(r"^bad json: (?:invalid character |unexpected EOF\Z|unexpected end of JSON input\Z|EOF\Z)")
+# What JavaScript's String.prototype.trimEnd removes (Python's rstrip() differs: it keeps U+FEFF
+# and strips U+001C..U+001F and U+0085).
+_JS_TRIM = " \t\n\v\f\r\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 _latched_off: str | None = None
 logger = logging.getLogger(__name__)
 
@@ -57,20 +61,25 @@ def _compressed(request: httpx.Request, raw: bytes) -> httpx.Request:
 
 
 def _says_invalid_json(text: str) -> bool:
+    """Claude Code 2.1.302's origin-400 test: a raw body is trimmed at the end only, an Anthropic
+    error envelope needs ``type: "error"`` and string ``error.type``/``error.message``, and a
+    ``bad_json`` error string is matched untrimmed."""
     try:
         data = json.loads(text)
     except ValueError:
-        return _BAD_JSON.match(text.strip()) is not None
+        return _BAD_JSON.match(text.rstrip(_JS_TRIM)) is not None
     if not isinstance(data, dict):
         return False
     error = data.get("error")
-    if isinstance(error, dict):
+    if data.get("type") == "error" and isinstance(error, dict) and isinstance(error.get("type"), str):
         message = error.get("message")
-        return isinstance(message, str) and message.startswith((
-            "The request body is not valid JSON",
-            "Failed to parse request: could not parse request body as JSON",
-        ))
-    return data.get("reason") == "bad_json" and isinstance(error, str) and _BAD_JSON.match(error.strip()) is not None
+        if isinstance(message, str):
+            return message.startswith((
+                "The request body is not valid JSON",
+                "Failed to parse request: could not parse request body as JSON",
+            ))
+    return (data.get("reason") == "bad_json" and isinstance(error, str)
+            and _BAD_JSON.match(error) is not None)
 
 
 def _error_fields(text: str) -> tuple[str, str | None]:
