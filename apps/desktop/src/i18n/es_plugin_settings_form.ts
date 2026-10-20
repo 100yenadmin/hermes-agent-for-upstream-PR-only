@@ -1,6 +1,6 @@
 import type { PluginSettingsFormCopy } from './types_plugin_settings_form'
 
-export const esPluginSettingsForm: PluginSettingsFormCopy = {
+export const esPluginSettingsForm: Partial<PluginSettingsFormCopy> = {
   save: 'Guardar configuración',
   saved: (name: string) => `Configuración de ${name} guardada.`,
   saveFailed: (name: string) => `No se pudo guardar la configuración de ${name}`,

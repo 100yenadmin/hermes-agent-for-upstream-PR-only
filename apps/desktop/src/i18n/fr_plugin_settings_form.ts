@@ -1,6 +1,6 @@
 import type { PluginSettingsFormCopy } from './types_plugin_settings_form'
 
-export const frPluginSettingsForm: PluginSettingsFormCopy = {
+export const frPluginSettingsForm: Partial<PluginSettingsFormCopy> = {
   save: 'Enregistrer les paramètres',
   saved: (name: string) => `Paramètres de ${name} enregistrés.`,
   saveFailed: (name: string) => `Impossible d’enregistrer les paramètres de ${name}`,
