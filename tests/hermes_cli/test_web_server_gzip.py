@@ -71,6 +71,8 @@ def test_large_json_negotiates_gzip_and_identity(dashboard):
     assert identity.status_code == 200
     assert "content-encoding" not in identity.headers
     assert bytes(raw) == PLAIN == identity.content
+    # Both variants say they vary, so a cache never hands one to a client asking for the other.
+    assert "Accept-Encoding" in identity.headers["vary"]
 
     compressed = client.get("/api/_gzip/large", headers={"Accept-Encoding": "gzip"})
     assert compressed.headers["content-encoding"] == "gzip"
@@ -87,6 +89,7 @@ def test_excluded_responses_stay_unencoded(dashboard, kind):
     response = client.get(f"/api/_gzip/{kind}", headers={"Accept-Encoding": "gzip"})
     assert response.status_code == identity.status_code
     assert "content-encoding" not in response.headers
+    assert "vary" not in identity.headers and "vary" not in response.headers
     assert bytes(raw) == expected
 
 
@@ -143,4 +146,5 @@ def test_gzip_follows_accept_encoding_q_values(dashboard, accept_encoding, compr
     client, raw = dashboard
     response = client.get("/api/_gzip/large", headers={"Accept-Encoding": accept_encoding})
     assert ("content-encoding" in response.headers) is compressed
+    assert "Accept-Encoding" in response.headers["vary"]
     assert (gzip.decompress(bytes(raw)) if compressed else bytes(raw)) == PLAIN
