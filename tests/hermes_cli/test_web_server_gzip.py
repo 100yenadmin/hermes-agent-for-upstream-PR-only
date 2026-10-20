@@ -127,3 +127,20 @@ def test_cors_preflight_preserves_existing_status_and_headers(dashboard):
     assert "GET" in response.headers["access-control-allow-methods"]
     assert response.headers["access-control-allow-headers"] == "x-hermes-session-token"
     assert "content-encoding" not in response.headers
+
+
+@pytest.mark.parametrize(("accept_encoding", "compressed"), [
+    ("gzip", True),
+    ("GZip", True),
+    ("br, gzip;q=0.5", True),
+    ("gzip;q=0", False),
+    ("deflate, gzip; q=0.000", False),
+    ("gzip;q=junk", False),
+    ("x-gzip", False),
+    ("br, deflate", False),
+])
+def test_gzip_follows_accept_encoding_q_values(dashboard, accept_encoding, compressed):
+    client, raw = dashboard
+    response = client.get("/api/_gzip/large", headers={"Accept-Encoding": accept_encoding})
+    assert ("content-encoding" in response.headers) is compressed
+    assert (gzip.decompress(bytes(raw)) if compressed else bytes(raw)) == PLAIN

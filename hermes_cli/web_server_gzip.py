@@ -25,11 +25,28 @@ class _DashboardGZipResponder(GZipResponder):
             )
 
 
+def _accepts_gzip(accept_encoding: str) -> bool:
+    """True when the request lists gzip with a non-zero q-value (RFC 9110 12.5.3)."""
+    for item in accept_encoding.lower().split(","):
+        coding, *params = (part.strip() for part in item.split(";"))
+        if coding != "gzip":
+            continue
+        for param in params:
+            name, _, value = param.partition("=")
+            if name.strip() == "q":
+                try:
+                    return float(value) > 0
+                except ValueError:
+                    return False
+        return True
+    return False
+
+
 class DashboardGZipMiddleware(GZipMiddleware):
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if (
             scope["type"] != "http"
-            or "gzip" not in Headers(scope=scope).get("accept-encoding", "")
+            or not _accepts_gzip(Headers(scope=scope).get("accept-encoding", ""))
             or "range" in Headers(scope=scope)
         ):
             await self.app(scope, receive, send)
