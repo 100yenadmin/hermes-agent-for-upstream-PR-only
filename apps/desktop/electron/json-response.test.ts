@@ -5,7 +5,13 @@ import { gzipSync } from 'node:zlib'
 import { describe, expect, it, vi } from 'vitest'
 
 import { htmlResponseError, httpStatusError } from './api-transport'
-import { asksForGzip, decodeJsonResponse, decodeJsonResponseBody, requestJsonResponse } from './json-response'
+import {
+  asksForGzip,
+  decodeJsonResponse,
+  decodeJsonResponseBody,
+  JSON_RESPONSE_MAX_DECODED_BYTES,
+  requestJsonResponse
+} from './json-response'
 
 describe('Node JSON response compression', () => {
   it('decodes gzip after concatenation and preserves other encodings', () => {
@@ -49,6 +55,20 @@ describe('Node JSON response compression', () => {
     ]) {
       expect(asksForGzip(new URL(href))).toBe(true)
     }
+  })
+
+  it('caps what a gzip body may inflate to', () => {
+    const bomb = gzipSync(Buffer.alloc(1024, 65))
+
+    expect(decodeJsonResponseBody([bomb], 'gzip', 1024)).toBe('A'.repeat(1024))
+    expect(() => decodeJsonResponseBody([bomb], 'gzip', 128)).toThrow('JSON response exceeds the 128-byte decoded limit')
+
+    // The default cap holds a real bomb: 64 MiB + 1 of zeros compresses to ~64 KB.
+    const reject = vi.fn()
+    const onText = vi.fn()
+    decodeJsonResponse([gzipSync(Buffer.alloc(JSON_RESPONSE_MAX_DECODED_BYTES + 1))], 'gzip', reject, onText)
+    expect(reject).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('decoded limit') }))
+    expect(onText).not.toHaveBeenCalled()
   })
 
   it('rejects corrupt gzip without throwing out of the response callback', () => {
