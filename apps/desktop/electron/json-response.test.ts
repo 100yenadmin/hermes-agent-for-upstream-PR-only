@@ -4,13 +4,14 @@ import { gzipSync } from 'node:zlib'
 
 import { describe, expect, it, vi } from 'vitest'
 
-import { htmlResponseError, httpStatusError } from './api-transport'
+import { htmlResponseError } from './api-transport'
 import {
   asksForGzip,
   decodeJsonResponse,
   decodeJsonResponseBody,
   JSON_RESPONSE_MAX_DECODED_BYTES,
-  requestJsonResponse
+  requestJsonResponse,
+  settleJsonResponse
 } from './json-response'
 
 describe('Node JSON response compression', () => {
@@ -87,14 +88,22 @@ describe('Node JSON response compression', () => {
       requests.push(String(req.headers['accept-encoding']))
       const path = req.url
 
-      const body =
-        path === '/html'
-          ? '<!doctype html><html>login</html>'
-          : path === '/invalid'
-            ? 'not json'
-            : path === '/error'
-              ? 'backend unavailable'
-              : JSON.stringify({ messages: ['transcript ✓'] })
+      const bodies: Record<string, string> = {
+        '/empty': '',
+        '/error': 'backend unavailable',
+        '/html': '<!doctype html><html>login</html>',
+        '/invalid': 'not json',
+        '/spa': '<!doctype html><html>index</html>'
+      }
+
+      const body = bodies[path!] ?? JSON.stringify({ messages: ['transcript ✓'] })
+
+      if (path === '/moved') {
+        res.writeHead(302, { Location: '/login' })
+        res.end()
+
+        return
+      }
 
       res.writeHead(path === '/error' ? 503 : 200, {
         'Content-Encoding': 'gzip',
@@ -122,15 +131,9 @@ describe('Node JSON response compression', () => {
             res.on('error', reject)
             res.on('data', chunk => chunks.push(chunk))
             res.on('end', () =>
-              decodeJsonResponse(chunks, res.headers['content-encoding'], reject, text => {
-                if (res.statusCode! >= 400) {
-                  reject(httpStatusError(res.statusCode, text, res.statusMessage))
-                } else if (res.headers['content-type']?.includes('text/html')) {
-                  reject(htmlResponseError(url.href, res.statusCode))
-                } else {
-                  resolve(JSON.parse(text))
-                }
-              })
+              decodeJsonResponse(chunks, res.headers['content-encoding'], reject, text =>
+                settleJsonResponse(url.href, res, text, resolve, reject)
+              )
             )
           },
           remoteBackend
@@ -143,7 +146,11 @@ describe('Node JSON response compression', () => {
     try {
       await expect(read('/json')).resolves.toEqual({ messages: ['transcript ✓'] })
       await expect(read('/html')).rejects.toThrow(/HTML/)
-      await expect(read('/invalid')).rejects.toThrow()
+      await expect(read('/invalid')).rejects.toThrow(/Invalid JSON from .*\/invalid \(status 200\): not json/)
+      await expect(read('/empty')).resolves.toBeNull()
+      // An unregistered /api path falls through to the SPA index under a JSON content type.
+      await expect(read('/spa')).rejects.toThrow(/HTML/)
+      await expect(read('/moved')).rejects.toThrow(htmlResponseError(`${remote}/moved`, 302, '/login').message)
       await expect(read('/error')).rejects.toMatchObject({ statusCode: 503, message: '503: backend unavailable' })
       // A loopback backend is not asked for gzip, but a gzip body still decodes.
       const loopback = `http://127.0.0.1:${port}`
@@ -151,7 +158,7 @@ describe('Node JSON response compression', () => {
       await expect(read('/json', loopback)).resolves.toEqual({ messages: ['transcript ✓'] })
       // An SSH tunnel is a loopback URL to a remote backend: asked for gzip.
       await expect(read('/json', loopback, true)).resolves.toEqual({ messages: ['transcript ✓'] })
-      expect(requests).toEqual(['gzip', 'gzip', 'gzip', 'gzip', 'undefined', 'gzip'])
+      expect(requests).toEqual(['gzip', 'gzip', 'gzip', 'gzip', 'gzip', 'gzip', 'gzip', 'undefined', 'gzip'])
     } finally {
       await new Promise<void>((resolve, reject) => server.close(error => (error ? reject(error) : resolve())))
     }

@@ -2,6 +2,8 @@ import type { IncomingMessage, RequestOptions } from 'node:http'
 import type http from 'node:http'
 import { gunzipSync } from 'node:zlib'
 
+import { htmlResponseError, httpStatusError } from './api-transport'
+
 // Over loopback the transfer costs nothing, so compressing would only spend server CPU.
 const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]', '0.0.0.0', '[::]'])
 
@@ -54,6 +56,57 @@ export function decodeJsonResponse(
     onText(decodeJsonResponseBody(chunks, encoding))
   } catch (error) {
     reject(error as Error)
+  }
+}
+
+// fetchJson and fetchPublicJson settle a decoded body the same way.
+export function settleJsonResponse(
+  url: string,
+  res: IncomingMessage,
+  text: string,
+  resolve: (value: unknown) => void,
+  reject: (error: Error) => void
+): void {
+  const statusCode = res.statusCode || 500
+
+  if (statusCode >= 400) {
+    reject(httpStatusError(res.statusCode, text, res.statusMessage))
+
+    return
+  }
+
+  // http.request never follows redirects, so any 3xx -- with an HTML
+  // login page, an empty body, whatever -- is the request bouncing
+  // off a proxy or a scheme/slash mismatch, never JSON.
+  if (statusCode >= 300) {
+    reject(htmlResponseError(url, res.statusCode, res.headers.location))
+
+    return
+  }
+
+  if (!text) {
+    resolve(null)
+
+    return
+  }
+
+  // A 2xx response whose body is HTML means the request fell through
+  // to the SPA index.html (e.g. an unregistered /api path). JSON.parse
+  // would throw an opaque `Unexpected token '<'` here, so surface a
+  // clear diagnostic with the offending URL instead.
+  const looksHtml = /^\s*<(?:!doctype|html)/i.test(text)
+  const contentType = String(res.headers['content-type'] || '')
+
+  if (looksHtml || contentType.includes('text/html')) {
+    reject(htmlResponseError(url, res.statusCode))
+
+    return
+  }
+
+  try {
+    resolve(JSON.parse(text))
+  } catch {
+    reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
   }
 }
 

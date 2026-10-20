@@ -46,8 +46,6 @@ import { type ActiveRuntimeState, classifyActiveRuntime } from './active-runtime
 import { HERMES_API_EXPECTED_404 } from './api-expected-404'
 import {
   destroyKeepaliveAgents,
-  htmlResponseError,
-  httpStatusError,
   jsonAgentFor,
   readJsonErrorBody,
   readStatusCode,
@@ -326,7 +324,7 @@ import { buildHudWindowUrl } from './hud-url'
 import { linuxOzoneBackend, resolveHudWindowing } from './hud-windowing'
 import { INSTALL_STAMP, installShape } from './install-stamp'
 import type { InstallStamp } from './install-stamp'
-import { decodeJsonResponse, requestJsonResponse } from './json-response'
+import { decodeJsonResponse, requestJsonResponse, settleJsonResponse } from './json-response'
 import { createKeepAwakeController } from './keep-awake-controller'
 import { launchBuildIdentity } from './launch-build-identity'
 import { applyLaunchProfileOverride, parseLaunchProfile } from './launch-profile'
@@ -5236,47 +5234,9 @@ function fetchJson(url, token, options: any = {}) {
             const chunks = []
             res.on('error', reject)
             res.on('data', chunk => chunks.push(chunk))
-            res.on('end', () => decodeJsonResponse(chunks, res.headers['content-encoding'], reject, text => {
-              if ((res.statusCode || 500) >= 400) {
-                reject(httpStatusError(res.statusCode, text, res.statusMessage))
-
-                return
-              }
-
-              // http.request never follows redirects, so any 3xx -- with an HTML
-              // login page, an empty body, whatever -- is the request bouncing
-              // off a proxy or a scheme/slash mismatch, never JSON.
-              if (res.statusCode >= 300) {
-                reject(htmlResponseError(url, res.statusCode, res.headers.location))
-
-                return
-              }
-
-              if (!text) {
-                resolve(null)
-
-                return
-              }
-
-              // A 2xx response whose body is HTML means the request fell through
-              // to the SPA index.html (e.g. an unregistered /api path). JSON.parse
-              // would throw an opaque `Unexpected token '<'` here, so surface a
-              // clear diagnostic with the offending URL instead.
-              const looksHtml = /^\s*<(?:!doctype|html)/i.test(text)
-              const contentType = String(res.headers['content-type'] || '')
-
-              if (looksHtml || contentType.includes('text/html')) {
-                reject(htmlResponseError(url, res.statusCode))
-
-                return
-              }
-
-              try {
-                resolve(JSON.parse(text))
-              } catch {
-                reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
-              }
-            }))
+            res.on('end', () =>
+              decodeJsonResponse(chunks, res.headers['content-encoding'], reject, text => settleJsonResponse(url, res, text, resolve, reject))
+            )
           },
           Boolean(options.remoteBackend)
         )
@@ -5348,40 +5308,9 @@ function fetchPublicJson(url, options: any = {}) {
           res => {
             const chunks = []
             res.on('data', chunk => chunks.push(chunk))
-            res.on('end', () => decodeJsonResponse(chunks, res.headers['content-encoding'], reject, text => {
-              if ((res.statusCode || 500) >= 400) {
-                reject(httpStatusError(res.statusCode, text, res.statusMessage))
-
-                return
-              }
-
-              if (res.statusCode >= 300) {
-                reject(htmlResponseError(url, res.statusCode, res.headers.location))
-
-                return
-              }
-
-              if (!text) {
-                resolve(null)
-
-                return
-              }
-
-              const looksHtml = /^\s*<(?:!doctype|html)/i.test(text)
-              const contentType = String(res.headers['content-type'] || '')
-
-              if (looksHtml || contentType.includes('text/html')) {
-                reject(htmlResponseError(url, res.statusCode))
-
-                return
-              }
-
-              try {
-                resolve(JSON.parse(text))
-              } catch {
-                reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
-              }
-            }))
+            res.on('end', () =>
+              decodeJsonResponse(chunks, res.headers['content-encoding'], reject, text => settleJsonResponse(url, res, text, resolve, reject))
+            )
           }
         )
 
