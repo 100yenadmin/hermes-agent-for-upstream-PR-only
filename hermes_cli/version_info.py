@@ -331,8 +331,9 @@ def get_version_info() -> VersionInfo:
     if _cached_version_info is not None:
         return _cached_version_info
 
-    # 1. Install stamp (packaged builds: Docker, Nix)
-    info = _stamp_or_none()
+    # 1. Install stamp (packaged builds: Docker, Nix). A cached git release means this
+    # process already ruled the stamp out; a stale source=git stamp costs a rev-parse.
+    info = None if _cached_git_release is not None else _stamp_or_none()
 
     # 2. Live git (source/dev installs)
     if info is None:

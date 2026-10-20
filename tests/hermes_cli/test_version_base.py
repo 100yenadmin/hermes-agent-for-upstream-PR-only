@@ -100,6 +100,23 @@ def test_stale_git_stamp_costs_git_once_not_per_call(release_repo, monkeypatch):
     assert v.get_version_info().base_version == "0.21.4"
 
 
+def test_stale_git_stamp_is_checked_once_before_the_full_walk(release_repo, monkeypatch):
+    """The CLI banner reads the release first and the full identity second; the second read
+    must not repeat the stale stamp's HEAD check (main runs 8 git commands here, not 9)."""
+    repo, git = release_repo
+    git("tag", "v0.21.4")
+    stamp = repo / "install-stamp.json"
+    stamp.write_text(json.dumps({
+        "commit": "b" * 40, "baseVersion": "0.20.0", "source": "git", "updateMechanism": "external",
+    }), encoding="utf-8")
+    monkeypatch.setattr(v, "_resolve_stamp_file", lambda: stamp)
+    with patch.object(subprocess, "run", wraps=subprocess.run) as run:
+        assert v.get_base_version() == "0.21.4"
+        info = v.get_version_info()
+        assert run.call_count == 8
+    assert (info.base_version, info.source, info.commit) == ("0.21.4", "git", git("rev-parse", "HEAD"))
+
+
 def test_identity_refresh_rereads_release_tags(release_repo):
     _, git = release_repo
     git("tag", "v0.21.4")
