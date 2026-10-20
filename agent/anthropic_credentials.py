@@ -270,38 +270,29 @@ def _claude_code_keychain_account() -> str:
         return ""
 
 
-# ``security`` exits 44 (errSecItemNotFound) when no item matches; anything else is a real failure
-# (locked keychain, access denied) that must not fall through to some other account's item.
-_SECURITY_ITEM_NOT_FOUND = 44
-
-
 def _run_claude_code_keychain_lookup(flag: str) -> Optional[subprocess.CompletedProcess]:
     """``security find-generic-password <flag>`` for the Claude Code item, or None when there is none.
 
-    Several items can share the service name (other accounts, a migrated Mac), and an unscoped
-    lookup returns whichever comes first, often a stale login. Claude Code itself reads the item
-    filed under its account (``-a $USER``), so that one goes first; the unscoped lookup is only the
-    fallback when no item exists under that account (a lone item filed under another name).
+    Several items can share the service name (other accounts, a migrated Mac, Claude Code's own MCP
+    OAuth state under account ``unknown``), and an unscoped lookup returns whichever comes first,
+    often a stale login. Claude Code reads only the item filed under its account (``-a $USER``; exit
+    44 means logged out), so Hermes does the same: one ``security`` process per read, as before.
     """
     account = _claude_code_keychain_account()
-    scopes = ([["-a", account]] if account else []) + [[]]
-    for scope in scopes:
-        try:
-            result = subprocess.run(
-                ["security", "find-generic-password", *scope, "-s", _CLAUDE_CODE_KEYCHAIN_SERVICE, flag],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
-                stdin=subprocess.DEVNULL, check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            logger.debug("Keychain: security command not available or timed out")
-            return None
-        if result.returncode == 0:
-            return result
-        if result.returncode != _SECURITY_ITEM_NOT_FOUND:
-            logger.debug("Keychain: lookup failed (rc=%s)", result.returncode)
-            return None
-    logger.debug("Keychain: no entry found for %r", _CLAUDE_CODE_KEYCHAIN_SERVICE)
-    return None
+    scope = ["-a", account] if account else []
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", *scope, "-s", _CLAUDE_CODE_KEYCHAIN_SERVICE, flag],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+            stdin=subprocess.DEVNULL, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        logger.debug("Keychain: security command not available or timed out")
+        return None
+    if result.returncode != 0:
+        logger.debug("Keychain: no entry found for %r (rc=%s)", _CLAUDE_CODE_KEYCHAIN_SERVICE, result.returncode)
+        return None
+    return result
 
 
 def _find_claude_code_keychain_item() -> Optional[tuple[str, dict[str, Any]]]:

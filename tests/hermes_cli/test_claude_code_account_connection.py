@@ -40,6 +40,20 @@ def test_windows_claude_code_removal_command_is_unambiguous_powershell():
     assert " -f " not in command and not command.strip().endswith(" -f")
 
 
+def test_macos_claude_code_removal_deletes_only_the_users_keychain_item():
+    """Scoped like Claude Code's logout: unscoped, ``security`` deletes whichever item matches first,
+    which can be Claude Code's MCP OAuth state (account ``unknown``) instead of the login."""
+    from hermes_cli.web_routers.oauth import _oauth_provider_disconnect_command
+
+    command = _oauth_provider_disconnect_command(
+        {"id": "claude-code", "flow": "external"}, platform="darwin"
+    )
+
+    assert command is not None
+    assert 'security delete-generic-password -a "${USER:-$(id -un)}" -s "Claude Code-credentials"' in command
+    assert "rm -f ~/.claude/.credentials.json" in command
+
+
 def test_disconnect_is_not_success_when_nothing_was_cleared(monkeypatch):
     """A no-op clear must not be a 200 the client can toast as removed."""
     from hermes_cli import auth as auth_mod

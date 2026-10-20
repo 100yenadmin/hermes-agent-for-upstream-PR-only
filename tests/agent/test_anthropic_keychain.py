@@ -456,7 +456,8 @@ class TestMirrorClaudeCodeCredentialsToKeychain:
 
 class TestKeychainLookupPrefersClaudeCodesAccount:
     """Several items can share the ``Claude Code-credentials`` service (other accounts, a migrated Mac).
-    Claude Code reads the one under ``-a $USER``; an unscoped lookup returns whichever comes first."""
+    Claude Code reads only the one under ``-a $USER``; an unscoped lookup returns whichever comes first.
+    Each read stays one ``security`` process: the resolver reads the Keychain on every turn."""
 
     @staticmethod
     def _security(items: dict[str, dict], first_unscoped: str):
@@ -486,26 +487,29 @@ class TestKeychainLookupPrefersClaudeCodesAccount:
 
         assert _find_claude_code_keychain_item() == ("alice", live)
         assert _read_claude_code_credentials_from_keychain()["accessToken"] == "sk-ant-oat01-live"
-        assert all(argv[2:4] == ["-a", "alice"] for argv in calls)
+        assert len(calls) == 2 and all(argv[2:4] == ["-a", "alice"] for argv in calls)
 
     @pytest.mark.platforms("macos")
-    def test_a_lone_item_under_another_account_still_resolves(self, monkeypatch):
-        only = {"claudeAiOauth": {"accessToken": "sk-ant-oat01-only", "refreshToken": "R", "expiresAt": 1}}
-        run, calls = self._security({"someone-else": only}, first_unscoped="someone-else")
-        monkeypatch.setenv("USER", "alice")
-        monkeypatch.setattr(subprocess, "run", run)
-
-        assert _find_claude_code_keychain_item() == ("someone-else", only)
-        assert ["-a", "alice"] == calls[0][2:4] and "-a" not in calls[1]
-
-    @pytest.mark.platforms("macos")
-    def test_no_item_at_all_is_none(self, monkeypatch):
-        run, _calls = self._security({}, first_unscoped="nobody")
+    def test_an_item_under_another_account_is_not_adopted(self, monkeypatch):
+        """Claude Code does not read it either: with no item under its account it is logged out."""
+        other = {"claudeAiOauth": {"accessToken": "sk-ant-oat01-other", "refreshToken": "R", "expiresAt": 1}}
+        run, calls = self._security({"someone-else": other}, first_unscoped="someone-else")
         monkeypatch.setenv("USER", "alice")
         monkeypatch.setattr(subprocess, "run", run)
 
         assert _find_claude_code_keychain_item() is None
         assert _read_claude_code_credentials_from_keychain() is None
+        assert len(calls) == 2 and all(argv[2:4] == ["-a", "alice"] for argv in calls)
+
+    @pytest.mark.platforms("macos")
+    def test_no_item_at_all_is_none(self, monkeypatch):
+        run, calls = self._security({}, first_unscoped="nobody")
+        monkeypatch.setenv("USER", "alice")
+        monkeypatch.setattr(subprocess, "run", run)
+
+        assert _find_claude_code_keychain_item() is None
+        assert _read_claude_code_credentials_from_keychain() is None
+        assert len(calls) == 2  # one process per read, as before the account scoping
 
     @pytest.mark.platforms("macos")
     def test_a_real_failure_on_the_users_item_does_not_fall_through(self, monkeypatch):

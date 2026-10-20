@@ -623,7 +623,9 @@ def _claude_code_disconnect_command(platform: str) -> str:
         )
     rm_file = "rm -f ~/.claude/.credentials.json"
     if platform == "darwin":
-        return f'security delete-generic-password -s "Claude Code-credentials" 2>/dev/null; {rm_file}'
+        # Scoped like Claude Code's own logout: an unscoped delete removes whichever item matches
+        # first, which can be Claude Code's MCP OAuth state (account "unknown") instead of the login.
+        return f'security delete-generic-password -a "${{USER:-$(id -un)}}" -s "Claude Code-credentials" 2>/dev/null; {rm_file}'
     return rm_file
 
 
