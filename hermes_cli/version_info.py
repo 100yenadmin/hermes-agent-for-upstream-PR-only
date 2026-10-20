@@ -281,20 +281,26 @@ def _git_version_info(
 # --- Cache + public API -----------------------------------------------------
 
 _cached_version_info: VersionInfo | None = None
+# get_base_version()'s answer when no valid stamp exists. Without it, a stale
+# source=git stamp re-runs its `git rev-parse HEAD` check on every call.
+_cached_base_version: str | None = None
 
 
 def _reset_version_info_cache() -> None:
     """Test-only cache reset."""
-    global _cached_version_info
+    global _cached_version_info, _cached_base_version
     _cached_version_info = None
+    _cached_base_version = None
     _process_git_release.cache_clear()
 
 
 def get_base_version() -> str:
     """Return the same base_version as get_version_info(), without the git provenance walk."""
-    global _cached_version_info
+    global _cached_version_info, _cached_base_version
     if _cached_version_info is not None:
         return _cached_version_info.base_version
+    if _cached_base_version is not None:
+        return _cached_base_version
     try:
         info = _stamp_version_info()
     except RuntimeError:
@@ -303,7 +309,8 @@ def get_base_version() -> str:
         _cached_version_info = info
         return info.base_version
     repo_dir = _resolve_repo_dir()
-    return _process_git_release(repo_dir)[0] if repo_dir is not None else "unknown"
+    _cached_base_version = _process_git_release(repo_dir)[0] if repo_dir is not None else "unknown"
+    return _cached_base_version
 
 
 def _stamp_or_none() -> VersionInfo | None:

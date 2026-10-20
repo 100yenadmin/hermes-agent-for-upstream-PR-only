@@ -82,6 +82,24 @@ def test_base_then_provenance_runs_seven_git_commands(release_repo):
         assert sum(call.args[0][1] == "tag" for call in run.call_args_list) == 1
 
 
+def test_stale_git_stamp_costs_git_once_not_per_call(release_repo, monkeypatch):
+    """A source=git stamp whose commit is no longer HEAD falls through to git. Per-request
+    readers (provider headers, status routes) call get_base_version() many times, so the
+    stale-stamp HEAD check and the release read must run once per process."""
+    repo, git = release_repo
+    git("tag", "v0.21.4")
+    stamp = repo / "install-stamp.json"
+    stamp.write_text(json.dumps({
+        "commit": "b" * 40, "baseVersion": "0.20.0", "source": "git", "updateMechanism": "external",
+    }), encoding="utf-8")
+    monkeypatch.setattr(v, "_resolve_stamp_file", lambda: stamp)
+    with patch.object(subprocess, "run", wraps=subprocess.run) as run:
+        assert [v.get_base_version() for _ in range(50)] == ["0.21.4"] * 50
+        assert [call.args[0][1] for call in run.call_args_list] == ["rev-parse", "tag"]
+    v._reset_version_info_cache()
+    assert v.get_version_info().base_version == "0.21.4"
+
+
 def test_identity_refresh_rereads_release_tags(release_repo):
     _, git = release_repo
     git("tag", "v0.21.4")
