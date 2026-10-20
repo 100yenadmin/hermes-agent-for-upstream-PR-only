@@ -15,7 +15,6 @@ import json
 import subprocess
 import tomllib
 from dataclasses import dataclass
-from functools import cache
 from pathlib import Path
 from typing import Literal, cast
 
@@ -220,12 +219,6 @@ def _git_release(repo_dir: Path) -> tuple[str, int | None]:
     return _calver_release_version(repo_dir) or ("unknown", None)
 
 
-@cache
-def _process_git_release(repo_dir: Path) -> tuple[str, int | None]:
-    """The release this process runs, shared by get_base_version() and get_version_info()."""
-    return _git_release(repo_dir)
-
-
 def _git_version_info(
     repo_dir: Path, *, include_untracked: bool = False, release: tuple[str, int | None] | None = None,
 ) -> VersionInfo:
@@ -281,36 +274,18 @@ def _git_version_info(
 # --- Cache + public API -----------------------------------------------------
 
 _cached_version_info: VersionInfo | None = None
-# get_base_version()'s answer when no valid stamp exists. Without it, a stale
-# source=git stamp re-runs its `git rev-parse HEAD` check on every call.
-_cached_base_version: str | None = None
+# The release this process runs when no valid stamp exists, shared by get_base_version() and
+# get_version_info(). get_base_version() reads it before the stamp, so a stale source=git
+# stamp's `git rev-parse HEAD` check runs once per process, not on every call.
+_cached_git_release: tuple[str, int | None] | None = None
 
 
 def _reset_version_info_cache() -> None:
-    """Test-only cache reset."""
-    global _cached_version_info, _cached_base_version
+    """Drop the per-process version caches: get_code_identity(refresh=True), the source-stamp
+    writer and tests re-read identity after the checkout moves."""
+    global _cached_version_info, _cached_git_release
     _cached_version_info = None
-    _cached_base_version = None
-    _process_git_release.cache_clear()
-
-
-def get_base_version() -> str:
-    """Return the same base_version as get_version_info(), without the git provenance walk."""
-    global _cached_version_info, _cached_base_version
-    if _cached_version_info is not None:
-        return _cached_version_info.base_version
-    if _cached_base_version is not None:
-        return _cached_base_version
-    try:
-        info = _stamp_version_info()
-    except RuntimeError:
-        info = None
-    if info is not None:
-        _cached_version_info = info
-        return info.base_version
-    repo_dir = _resolve_repo_dir()
-    _cached_base_version = _process_git_release(repo_dir)[0] if repo_dir is not None else "unknown"
-    return _cached_base_version
+    _cached_git_release = None
 
 
 def _stamp_or_none() -> VersionInfo | None:
@@ -319,13 +294,35 @@ def _stamp_or_none() -> VersionInfo | None:
     A malformed stamp (missing/illegal updateMechanism, mispackaged "light"
     payload) raises RuntimeError — the build lane that wrote it must be
     fixed, but a crashing CLI is the wrong failure mode for every uncached
-    caller. Degrade to live git / "unknown" and let the authoring lane's own
-    tests surface the malformed stamp.
+    caller. Treat it as no stamp (live git, then "unknown") and let the
+    authoring lane's own tests surface the malformed stamp.
     """
     try:
         return _stamp_version_info()
     except RuntimeError:
         return None
+
+
+def _process_git_release(repo_dir: Path | None) -> tuple[str, int | None]:
+    """The release this process runs, resolved once."""
+    global _cached_git_release
+    if _cached_git_release is None:
+        _cached_git_release = _git_release(repo_dir) if repo_dir is not None else ("unknown", None)
+    return _cached_git_release
+
+
+def get_base_version() -> str:
+    """Return the same base_version as get_version_info(), without the git provenance walk."""
+    global _cached_version_info
+    if _cached_version_info is not None:
+        return _cached_version_info.base_version
+    if _cached_git_release is not None:
+        return _cached_git_release[0]
+    info = _stamp_or_none()
+    if info is not None:
+        _cached_version_info = info
+        return info.base_version
+    return _process_git_release(_resolve_repo_dir())[0]
 
 
 def get_version_info() -> VersionInfo:
