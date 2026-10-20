@@ -3,6 +3,8 @@
 Harness: a named profile with ``multiplex_profiles`` makes ``start_gateway`` exit EX_CONFIG right
 after the probe call (see test_multiplex_requires_default_profile.py), so nothing binds or forks.
 """
+import sys
+
 import pytest
 
 from gateway.restart import GATEWAY_FATAL_CONFIG_EXIT_CODE
@@ -38,3 +40,10 @@ async def test_start_gateway_warms_the_probe_at_boot(tmp_path, monkeypatch):
     await _start_until_config_verdict(tmp_path, monkeypatch)
 
     assert calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_boots_past_an_unimportable_probe(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, 'tools.env_probe', None)  # the lazy import raises ImportError
+
+    await _start_until_config_verdict(tmp_path, monkeypatch)

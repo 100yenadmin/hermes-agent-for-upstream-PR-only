@@ -727,8 +727,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     resolved_config = config if config is not None else load_gateway_config_for_runner()
     # The first turn's prompt needs the host toolchain probe (five subprocess calls); start it now
     # so it runs beside the boot imports instead of serially inside the pre-READY warm-up.
-    from tools.env_probe import warm_environment_probe_at_boot
-    warm_environment_probe_at_boot()
+    try:
+        from tools.env_probe import warm_environment_probe_at_boot
+        warm_environment_probe_at_boot()
+    except Exception:
+        logger.debug("early environment probe did not start", exc_info=True)
     profile_homes = (_multiplex_profile_homes(resolved_config)
                      if getattr(resolved_config, 'multiplex_profiles', False) else [])
     if profile_homes and not _launch_home_may_multiplex(resolved_config):

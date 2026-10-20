@@ -162,9 +162,12 @@ async def standalone_lifespan(app: "FastAPI"):
     start_background_bootstrap()
     # Desktop creates a chat's session when its first message is sent, so that turn's prompt build
     # would otherwise wait on the host toolchain probe (~0.5 s of subprocesses). Off-thread.
-    from tools.env_probe import warm_environment_probe_at_boot
+    try:
+        from tools.env_probe import warm_environment_probe_at_boot
 
-    warm_environment_probe_at_boot()
+        warm_environment_probe_at_boot()
+    except Exception:
+        logger.debug("early environment probe did not start", exc_info=True)
 
     try:
         yield
