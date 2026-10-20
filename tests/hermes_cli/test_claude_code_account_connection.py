@@ -50,8 +50,10 @@ def test_macos_claude_code_removal_deletes_only_the_users_keychain_item():
     )
 
     assert command is not None
-    assert 'security delete-generic-password -a "${USER:-$(id -un)}" -s "Claude Code-credentials"' in command
+    assert 'security delete-generic-password -a "$USER" -s "Claude Code-credentials"' in command
     assert "rm -f ~/.claude/.credentials.json" in command
+    # Desktop runs it in the user's shell, which may be fish: no POSIX-only ``${VAR:-default}``.
+    assert "${" not in command
 
 
 def test_disconnect_is_not_success_when_nothing_was_cleared(monkeypatch):

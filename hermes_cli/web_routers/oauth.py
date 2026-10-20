@@ -625,7 +625,9 @@ def _claude_code_disconnect_command(platform: str) -> str:
     if platform == "darwin":
         # Scoped like Claude Code's own logout: an unscoped delete removes whichever item matches
         # first, which can be Claude Code's MCP OAuth state (account "unknown") instead of the login.
-        return f'security delete-generic-password -a "${{USER:-$(id -un)}}" -s "Claude Code-credentials" 2>/dev/null; {rm_file}'
+        # Desktop types this into the user's own shell, fish included: plain "$USER" parses in
+        # sh/bash/zsh/fish alike, where "${USER:-…}" defaults are POSIX-only.
+        return f'security delete-generic-password -a "$USER" -s "Claude Code-credentials" 2>/dev/null; {rm_file}'
     return rm_file
 
 
