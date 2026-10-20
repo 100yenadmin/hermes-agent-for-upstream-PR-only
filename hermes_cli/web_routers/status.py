@@ -120,8 +120,8 @@ async def get_ssh_ownership(request: Request):
 async def get_health():
     """Lightweight process liveness for desktop/backend readiness probes.
 
-    ``commit`` is the code this process BOOTED from (``get_version_info`` is cached at
-    ``web_server`` import): Desktop refuses to attach to a backend whose commit differs from
+    ``commit`` is the code this process BOOTED from (``get_version_info`` is cached when
+    ``app_lifespan`` starts the app): Desktop refuses to attach to a backend whose commit differs from
     its checkout, so a serve that outlived ``hermes update`` is never re-adopted.
     """
     info = get_version_info()
