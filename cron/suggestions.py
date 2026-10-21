@@ -130,7 +130,10 @@ def add_suggestion(
 
 
 def get_suggestion(ref: str) -> Optional[dict[str, Any]]:
-    """Resolve a suggestion by id, 1-based pending index, or exact (case-insensitive) title."""
+    """Resolve a suggestion by id, 1-based pending index, or exact (case-insensitive) title.
+
+    A title prefers a pending record: an integration can re-offer a job under a new
+    ``dedup_key`` with the same title, and older accepted/dismissed records keep that title."""
     suggestions = load_suggestions()
     for s in suggestions:
         if s.get("id") == ref:
@@ -140,10 +143,8 @@ def get_suggestion(ref: str) -> Optional[dict[str, Any]]:
         idx = int(ref) - 1
         if 0 <= idx < len(pending):
             return pending[idx]
-    for s in suggestions:
-        if s.get("title", "").lower() == ref.lower():
-            return s
-    return None
+    matches = [s for s in suggestions if s.get("title", "").lower() == ref.lower()]
+    return next((s for s in matches if s.get("status") == _STATUS_PENDING), matches[0] if matches else None)
 
 
 def _set_status(suggestion_id: str, status: str) -> bool:

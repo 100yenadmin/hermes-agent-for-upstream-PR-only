@@ -168,6 +168,17 @@ class TestStore:
         assert store.get_suggestion("findable")["id"] == rec["id"]
         assert store.get_suggestion("nope") is None
 
+    def test_title_prefers_pending_over_resolved_record_with_same_title(self, store):
+        """A job re-offered under a new dedup_key keeps its title; the title must reach the pending record."""
+        old = _add(store, key="routine:1", title="Daily Brief")
+        assert store.dismiss_suggestion(old["id"])
+        new = _add(store, key="routine:2", title="Daily Brief")
+        assert store.get_suggestion("daily brief")["id"] == new["id"]
+        with patch("cron.jobs.create_job", lambda **k: {"id": "job1", **k}):
+            assert store.accept_suggestion("Daily Brief") is not None
+        assert store.list_pending() == []
+        assert store.get_suggestion(old["id"])["status"] == "dismissed"
+
     def test_clear_resolved_drops_accepted_only(self, store):
         _add(store, key="a")
         _add(store, key="b")
