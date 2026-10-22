@@ -696,7 +696,7 @@ def my_callback(session_id: str, user_message: str, conversation_history: list,
 | `platform` | `str` | Where the session is running: `"cli"`, `"telegram"`, `"discord"`, etc. |
 | `turn_author` | `dict \| None` | Who wrote this turn: `{"id", "name", "is_bot"}`, or `None` when the transport names no author (for example a CLI turn) |
 
-`turn_author` is the author memory providers receive in `sync_turn()`. `id` is whatever the transport knows the sender by: the platform user id on a messaging platform, `bot:<profile>` when another agent wrote the turn. `name` is the display name and `is_bot` marks agent-written turns. `sender_id` is the gateway user id only. The author is attribution, not authentication: an API-server client supplies its own.
+`turn_author` is the author memory providers receive in `sync_turn()`. `id` is whatever the transport knows the sender by: the platform user id on a messaging platform, `bot:<profile>` when another agent on the same install wrote the turn (`bot:<connection>/<profile>` or `bot:<hostname>/<profile>` when it came from another machine). `name` is the display name and `is_bot` marks agent-written turns. `sender_id` is the gateway user id only. The author is attribution, not authentication: an API-server client supplies its own.
 
 **Fires:** In `agent/turn_context.py` (turn preparation for `run_conversation()` in `agent/conversation_loop.py`), after context compression but before the main `while` loop. Fires once per `run_conversation()` call (i.e. once per user turn), not once per API call within the tool loop.
 
