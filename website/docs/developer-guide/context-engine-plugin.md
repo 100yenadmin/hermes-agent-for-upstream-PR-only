@@ -91,6 +91,7 @@ These have sensible defaults in the ABC. Override as needed:
 |--------|---------|--------------|
 | `on_session_start(session_id, **kwargs)` | No-op | You need to load persisted state (DAG, DB) |
 | `on_session_end(session_id, messages)` | No-op | You need to flush state, close connections |
+| `on_session_rewound(session_id, messages, **kwargs)` | No-op | You keep state derived from turns (summaries, indexes, recall) that `/undo` should drop — `messages` is the history that remains, `turns_undone` how many user turns were removed |
 | `on_session_reset()` | Resets token counters | You have per-session state to clear |
 | `update_model(model, context_length, ...)` | Updates context_length + threshold | You need to recalculate budgets on model switch |
 | `get_tool_schemas()` | Returns `[]` | Your engine provides agent-callable tools (e.g., `lcm_grep`) |
@@ -314,6 +315,8 @@ def clone_for_agent(self):
 ```
 
 `on_session_reset()` is called on `/new` or `/reset` to clear per-session state without a full shutdown.
+
+`on_session_rewound()` is called when `/undo` (CLI or TUI) removes the newest user turns; the session id does not change.
 
 ## Configuration
 

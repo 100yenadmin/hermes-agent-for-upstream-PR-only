@@ -859,7 +859,8 @@ def _cmd_undo(rid, params, session, name, arg):
             return err
         active, live_view, rewound_count = rewound
         target_text = _tools_mod("agent.message_content").flatten_message_text(live_view.get("content"))
-    # Notify memory providers (same hook /branch fires) with rewound=True so cached per-turn state invalidates.
+    # Notify memory providers (same hook /branch fires) with rewound=True, and the context engine via
+    # on_session_rewound(), so state derived from the removed turns invalidates.
     agent = session.get("agent")
     if agent is not None:
         # See #6672 + #21910.
@@ -867,6 +868,8 @@ def _cmd_undo(rid, params, session, name, arg):
         for step in (
             lambda: mm is not None and mm.on_session_switch(
                 session_key, parent_session_id="", reset=False, rewound=True),
+            lambda: _tools_mod("agent.conversation_loop").notify_context_engine_session_rewound(
+                agent, active, turns_undone=turns_undone),
             lambda: hasattr(agent, "_invalidate_system_prompt") and agent._invalidate_system_prompt(),
             lambda: hasattr(agent, "_last_flushed_db_idx") and setattr(agent, "_last_flushed_db_idx", len(active)),
         ):

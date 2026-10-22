@@ -375,3 +375,40 @@ def test_undo_last_prefills_live_text_and_retains_durable_scaffold(tmp_path):
     assert cli.agent._session_messages is cli.conversation_history
     assert cli.agent._last_flushed_db_idx == 3
     db.close()
+
+
+class _RewindRecordingEngine:
+    def __init__(self, fail=False):
+        self.calls, self.fail = [], fail
+
+    def on_session_rewound(self, session_id, messages, **kwargs):
+        self.calls.append((session_id, [m["content"] for m in messages], kwargs))
+        if self.fail:
+            raise RuntimeError("engine bug")
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["engine-ok", "engine-raises"])
+def test_undo_last_tells_the_context_engine_which_turns_remain(fail):
+    cli = _make_cli()
+    cli._session_db = None
+    cli.session_id = "cli-undo-engine"
+    cli.conversation_history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "one"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "third"},
+        {"role": "assistant", "content": "three"},
+    ]
+    cli._prefill_input_buffer = MagicMock()
+    engine = _RewindRecordingEngine(fail=fail)
+    cli.agent = SimpleNamespace(
+        session_id="cli-undo-engine", context_compressor=engine, _memory_manager=None,
+        _invalidate_system_prompt=MagicMock(),
+    )
+
+    assert cli.undo_last(2) == 2
+
+    assert engine.calls == [("cli-undo-engine", ["first", "one"], {"turns_undone": 2})]
+    assert [m["content"] for m in cli.conversation_history] == ["first", "one"]
+    cli._prefill_input_buffer.assert_called_once_with("second")

@@ -184,6 +184,11 @@ class ContextEngine(ABC):
     def on_session_end(self, session_id: str, messages: list[dict[str, Any]]) -> None:
         """Real session boundary (CLI exit, /reset, gateway expiry) — never per-turn."""
 
+    def on_session_rewound(self, session_id: str, messages: list[dict[str, Any]], **kwargs) -> None:
+        """/undo dropped the newest user turns; the session id stays the same. ``messages`` is a
+        copy of the history that remains; kwargs include ``turns_undone``. Forget state derived
+        from the removed turns (summaries, indexes, recall entries)."""
+
     def on_session_reset(self) -> None:
         """/new or /reset: reset per-session state (default: counters and token tracking)."""
         # Reset cross-call calibration state captured under the PREVIOUS model. These fields encode "the

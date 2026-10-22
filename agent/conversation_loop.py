@@ -1351,6 +1351,20 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def notify_context_engine_session_rewound(agent: Any, messages: list[dict[str, Any]], *, turns_undone: int) -> None:
+    """Tell the active context engine that /undo dropped the newest ``turns_undone`` user turns
+    of its session (fail-open; the engine gets a copy of the remaining history)."""
+    engine = getattr(agent, "context_compressor", None)
+    if not _engine_overrides_hook(engine, "on_session_rewound"):
+        return
+    try:
+        engine.on_session_rewound(
+            agent.session_id, [_clone_message_for_send(m) for m in messages], turns_undone=turns_undone,
+        )
+    except Exception:
+        logger.warning("Context engine on_session_rewound hook failed (session=%s)", agent.session_id, exc_info=True)
+
+
 def _decode_inline_moa_turn(user_message, persist_user_message):
     """Decode a MoA preset encoded into ``user_message``; returns ``(user_message,
     moa_config, persist_user_message)``, unchanged with ``moa_config=None`` otherwise."""

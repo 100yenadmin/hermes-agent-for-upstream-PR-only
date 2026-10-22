@@ -122,3 +122,19 @@ def test_undo_notifies_memory_providers_from_the_session_profile(server, session
     finally:
         reset_multiplex_context(token)
     assert len(callers) == 1 and callers[0] is not None, callers
+
+
+def test_undo_tells_the_context_engine_which_turns_remain(server, session_with_history):
+    sid, session_key, _s, agent = session_with_history
+    calls = []
+
+    class Engine:
+        def on_session_rewound(self, session_id, messages, **kwargs):
+            calls.append((session_id, [m["content"] for m in messages], kwargs))
+
+    agent.session_id = session_key
+    agent.context_compressor = Engine()
+
+    assert _call(server, "command.dispatch", session_id=sid, name="undo", arg="2")["result"]["type"] == "prefill"
+
+    assert calls == [(session_key, ["question 1", "answer 1"], {"turns_undone": 2})]

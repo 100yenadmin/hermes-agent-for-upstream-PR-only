@@ -825,7 +825,8 @@ class CLISessionMixin:
 
         Discards everything from the Nth-from-last user message onward (clamped to the oldest
         turn). Rows are soft-deleted in SessionDB (``active=0``, kept for audit), memory
-        providers get ``on_session_switch(rewound=True)``, and the agent is patched like
+        providers get ``on_session_switch(rewound=True)``, the context engine
+        ``on_session_rewound()``, and the agent is patched like
         /branch does. ``prefill=False`` is for programmatic callers (checkpoint rollback)
         that must not touch the input buffer. Returns the number of user turns undone (None when
         nothing changed).
@@ -873,6 +874,8 @@ class CLISessionMixin:
         if _mm is not None and self.session_id:
             with contextlib.suppress(Exception):
                 _mm.on_session_switch(self.session_id, parent_session_id="", reset=False, rewound=True)
+        from agent.conversation_loop import notify_context_engine_session_rewound
+        notify_context_engine_session_rewound(self.agent, self.conversation_history, turns_undone=turns_undone)
 
         key = "cli.session.undo_ok_one" if turns_undone == 1 else "cli.session.undo_ok_other"
         print(t(key, count=turns_undone, messages=rewound_rows or removed_count,
