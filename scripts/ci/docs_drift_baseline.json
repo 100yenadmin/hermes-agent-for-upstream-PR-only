@@ -11,6 +11,7 @@
   "agent.gateway_startup_warmup_timeout",
   "agent.gateway_timeout_warning",
   "agent.intent_ack_continuation",
+  "agent.interim_preamble_guidance",
   "agent.parallel_tool_call_guidance",
   "agent.reasoning_echo",
   "agent.sanitizer_heal_escalation_threshold",

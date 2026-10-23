@@ -59,6 +59,7 @@ SURFACES = (
     ("cli-code.claude", "cli", "claude", True),
     ("desktop.claude", "desktop", "claude", False),
     ("telegram.claude", "telegram", "claude", False),
+    ("telegram-interim.claude", "telegram", "claude", False),
     ("discord.claude", "discord", "claude", False),
     ("cron.claude", "cron", "claude", False),
 )
@@ -125,7 +126,7 @@ def _enabled_toolsets(platform: str) -> list[str]:
     return sorted(_get_platform_tools(load_config(), platform))
 
 
-def _render_surface(home: Path, platform: str, model: str, code: bool) -> tuple[dict[str, str], dict]:
+def _render_surface(home: Path, platform: str, model: str, code: bool, *, interim: bool = False) -> tuple[dict[str, str], dict]:
     from hermes_cli.config import load_config, save_config
     from agent.system_prompt import build_system_prompt_parts
     from run_agent import AIAgent
@@ -139,6 +140,7 @@ def _render_surface(home: Path, platform: str, model: str, code: bool) -> tuple[
         model=model, api_key="inspect-only", base_url="https://openrouter.ai/api/v1",
         quiet_mode=True, save_trajectories=False, platform=platform, skip_context_files=True,
         session_id=SESSION_ID, enabled_toolsets=_enabled_toolsets(platform),
+        interim_assistant_callback=(lambda *_a, **_k: None) if interim else None,
     )
     tiers = {tier: _scrub(text, home) for tier, text in build_system_prompt_parts(agent).items()}
     tools = json.loads(_scrub(json.dumps(agent.tools), home))
@@ -159,7 +161,9 @@ def _render_child(out: Path) -> int:
 
     prompts, tools_by_surface = {}, {}
     for surface, platform, family, code in SURFACES:
-        prompts[surface], tools_by_surface[surface] = _render_surface(home, platform, MODELS[family], code)
+        prompts[surface], tools_by_surface[surface] = _render_surface(
+            home, platform, MODELS[family], code, interim=surface == "telegram-interim.claude",
+        )
     if failures.failures:
         print("\n".join(failures.failures), file=sys.stderr)
         return 1

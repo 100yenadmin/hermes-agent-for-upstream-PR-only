@@ -40,6 +40,25 @@ def _make_agent(**overrides):
     return SimpleNamespace(**base)
 
 
+@pytest.mark.parametrize("tools, callback, enabled, platform, expected", [
+    (["read_file"], lambda *a: None, True, "telegram", True),
+    (["read_file"], None, True, "telegram", False),
+    ([], lambda *a: None, True, "telegram", False),
+    (["read_file"], lambda *a: None, False, "telegram", False),
+    (["read_file"], None, True, "subagent", False),
+], ids=["interim", "no-callback", "no-tools", "disabled", "delegate"])
+def test_interim_preamble_guidance(tools, callback, enabled, platform, expected):
+    from agent.prompt_builder import INTERIM_PREAMBLE_GUIDANCE
+
+    agent = _make_agent(
+        valid_tool_names=tools, interim_assistant_callback=callback,
+        _interim_preamble_guidance=enabled, platform=platform,
+    )
+    parts = build_system_prompt_parts(agent)
+    assert (INTERIM_PREAMBLE_GUIDANCE in parts["stable"]) is expected
+    assert INTERIM_PREAMBLE_GUIDANCE not in parts["context"] + parts["volatile"]
+
+
 def _captured_context_cwd(agent):
     """The cwd build_system_prompt_parts hands to build_context_files_prompt."""
     captured = {}
@@ -494,7 +513,7 @@ def test_coding_prompt_orders_shared_context_before_workspace(monkeypatch):
 
     agent = _make_agent(
         valid_tool_names=["read_file"],
-        _parallel_tool_call_guidance=False,
+        _parallel_tool_call_guidance=False, _interim_preamble_guidance=False,
     )
     monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "IDENTITY")
     monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "HELP")
@@ -884,7 +903,7 @@ def test_conversation_start_uses_session_start_not_build_time(monkeypatch):
 
     agent = _make_agent(
         valid_tool_names=["read_file"],
-        _parallel_tool_call_guidance=False,
+        _parallel_tool_call_guidance=False, _interim_preamble_guidance=False,
         session_id="20260101_120000_abc123",
     )
     monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "IDENTITY")
