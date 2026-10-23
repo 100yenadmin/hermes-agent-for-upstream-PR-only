@@ -422,7 +422,7 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
 )
 
 # Interim text before tool calls is delivered at once; otherwise models can stay silent for whole slow turns.
-# Gated on the interim callback. About 60 cached tokens — keep tight.
+# Gated on the interim callback. About 90 cached tokens — keep tight.
 INTERIM_PREAMBLE_GUIDANCE = (
     "Text you write before a tool call is shown to the user right away, while the tools run. Before tool work, "
     "write one short plain sentence saying what you are about to do, then make the tool calls in the same response; "

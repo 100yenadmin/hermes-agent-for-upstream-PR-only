@@ -582,7 +582,10 @@ def _guidance_parts(agent: Any) -> list[str]:
     if _model_gate(getattr(agent, "_execution_guidance", "auto"), agent.model, EXECUTION_GUIDANCE_MODELS):
         from agent.prompt_builder import execution_guidance_text
         parts.append(execution_guidance_text(agent.valid_tool_names))
-    if getattr(agent, "_interim_preamble_guidance", True) and getattr(agent, "interim_assistant_callback", None) is not None:
+    # Interim text reaches the user: a live callback, or a between-turns TUI rebuild that sets the prompt-only flag.
+    interim = (getattr(agent, "interim_assistant_callback", None) is not None
+               or getattr(agent, "_interim_preamble_surface", False))
+    if interim and getattr(agent, "_interim_preamble_guidance", True):
         parts.append(INTERIM_PREAMBLE_GUIDANCE)
     return parts
 

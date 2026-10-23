@@ -513,7 +513,7 @@ def test_coding_prompt_orders_shared_context_before_workspace(monkeypatch):
 
     agent = _make_agent(
         valid_tool_names=["read_file"],
-        _parallel_tool_call_guidance=False, _interim_preamble_guidance=False,
+        _parallel_tool_call_guidance=False,
     )
     monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "IDENTITY")
     monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "HELP")
@@ -903,7 +903,7 @@ def test_conversation_start_uses_session_start_not_build_time(monkeypatch):
 
     agent = _make_agent(
         valid_tool_names=["read_file"],
-        _parallel_tool_call_guidance=False, _interim_preamble_guidance=False,
+        _parallel_tool_call_guidance=False,
         session_id="20260101_120000_abc123",
     )
     monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "IDENTITY")

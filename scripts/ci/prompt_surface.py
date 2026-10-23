@@ -50,7 +50,8 @@ MODELS = {
 }
 # (surface, platform, model family, cwd is a code workspace). Model names gate guidance blocks
 # and the patch dialect, so the matrix runs on cli; one row per other surface catches its hint
-# and toolset; ``cli-code`` adds the coding posture every repo session gets.
+# and toolset; ``cli-code`` adds the coding posture every repo session gets; ``telegram-interim``
+# renders telegram with an interim-message callback, which adds the interim preamble line.
 SURFACES = (
     ("cli.claude", "cli", "claude", False),
     ("cli.gpt", "cli", "gpt", False),

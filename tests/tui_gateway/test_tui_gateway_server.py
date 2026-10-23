@@ -22090,7 +22090,7 @@ def test_persist_live_session_system_prompt_interim_guidance(monkeypatch, enable
 
     prompt = agent._session_db.update_system_prompt.call_args.args[1]
     assert (INTERIM_PREAMBLE_GUIDANCE in prompt) is enabled
-    assert agent.interim_assistant_callback is None
+    assert agent.interim_assistant_callback is None and agent._interim_preamble_surface is False
 
 
 def test_persist_live_session_system_prompt_no_profile_is_unchanged(monkeypatch):

@@ -1258,16 +1258,15 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
     # persist). The full scope, not HERMES_HOME alone: the external memory provider's system_prompt_block()
     # reads its credential through get_secret, which fails closed once this process multiplexes (#112927).
     session_tokens = _set_session_context(session_key, cwd=_session_cwd(session))
-    previous_interim_callback = getattr(agent, "interim_assistant_callback", None)
     try:
         with _session_profile_runtime_scope(session):
+            # The interim callback is cleared between turns, so tell the build through a prompt-only flag whether
+            # this surface shows interim text; the live callback belongs to any turn that starts meanwhile.
+            agent._interim_preamble_surface = _load_interim_assistant_messages()
             try:
-                # Between turns the callback is cleared; preserve the surface's interim prompt guidance.
-                if _load_interim_assistant_messages() and previous_interim_callback is None:
-                    agent.interim_assistant_callback = lambda *a, **k: None
                 prompt = agent._cached_system_prompt = agent._build_system_prompt(None)
             finally:
-                agent.interim_assistant_callback = previous_interim_callback
+                agent._interim_preamble_surface = False
         db.update_system_prompt(getattr(agent, "session_id", None) or session_key, prompt)
     except Exception:
         logger.warning("failed to persist live session system prompt for session %s", session_key, exc_info=True)
