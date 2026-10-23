@@ -41,7 +41,7 @@ async def engine_session(tmp_path, monkeypatch, *, frozen='compressor', live='co
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
     from hermes_constants import get_hermes_home
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
     import plugins.context_engine as engines
 
     config = {'context': {'engine': frozen}}
