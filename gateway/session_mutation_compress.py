@@ -59,6 +59,15 @@ async def prepare_compress(authority, live, payload, prepared):
                                             estimate_request_tokens_rough(messages))
         return {'status': 'preview', 'lines': report['lines'], 'head_count': report['head_count'],
                 'tail_count': report['tail_count'], 'message_count': report['total']}
+    context = config.get('context')
+    engine = (context.get('engine') if isinstance(context, dict) else None) or 'compressor'
+    if engine != 'compressor':
+        # Plugin compress() may write its own durable state before returning. Neither a
+        # deferred notification nor the resident agent's separate commit can roll that back
+        # when the gateway's final revision/generation fence refuses publication.
+        return {'status': 'noop', 'summary': {
+            'headline': 'Manual /compress is unavailable for the configured context engine.',
+            'note': 'Gateway compression cannot yet commit plugin state transactionally. History is unchanged.'}}
     # The session's resident agent owns its memory providers; give them the same pre-compress
     # turn (and the same best-effort contract) the in-process compressor does. No resident agent
     # (cold session, or a managed worker that runs out of process) means no provider to call.
