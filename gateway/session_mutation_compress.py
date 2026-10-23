@@ -95,11 +95,14 @@ async def prepare_compress(authority, live, payload, prepared):
     resident = cached_agent(live.route) if callable(cached_agent) else None
     if _plugin_engine(policy, config, resident):
         # Plugin writes cannot be rolled back by the gateway's publication fence.
-        return {'status': 'noop', 'summary': {
-            'noop': True, 'aborted': False, 'refused_would_grow': False, 'fallback_used': False,
-            'headline': 'Manual /compress is unavailable for the configured context engine.',
-            'token_line': None,
-            'note': 'Gateway compression cannot yet commit plugin state transactionally. History is unchanged.'}}
+        from agent.manual_compression_feedback import summarize_manual_compression
+        row = None if resident is not None else authority.db.get_session(snapshot['target'])
+        tokens = _request_tokens(resident, messages, row)
+        summary = summarize_manual_compression(messages, messages, tokens, tokens)
+        summary.update(
+            headline='Manual /compress is unavailable for the configured context engine.',
+            note='Gateway compression cannot yet commit plugin state transactionally. History is unchanged.')
+        return {'status': 'noop', 'summary': summary}
     if request.preview:
         # Read-only: the report is the whole result; the caller commits nothing.
         report = summarize_compress_preview(messages, request.partial, request.keep_last, request.focus_topic,
