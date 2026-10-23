@@ -116,6 +116,8 @@ def test_cli_compress_prints_exact_engine_refusal(make_agent, capsys, tmp_path, 
     cli._manual_compress('/compress')
     out = capsys.readouterr().out
     assert refusal['summary']['headline'] in out
+    assert all(line.strip() != 'None' for line in out.splitlines())
+    assert refusal['summary']['token_line'] in out
     assert 'Compression failed' not in out
     assert '✅' not in out
     assert cli.conversation_history == history

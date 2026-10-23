@@ -125,10 +125,14 @@ async def engine_session(tmp_path, monkeypatch, *, frozen='compressor', live='co
 def assert_refusal(reply):
     result = reply.get('result', {})
     assert result.get('status') == 'noop', reply
+    token_line = result['summary']['token_line']
+    assert isinstance(token_line, str) and token_line
+    assert token_line.startswith('Approx request size: ~')
+    assert token_line.endswith(' tokens (unchanged)')
     assert result['summary'] == {
         'noop': True, 'aborted': False, 'refused_would_grow': False, 'fallback_used': False,
         'headline': 'Manual /compress is unavailable for the configured context engine.',
-        'token_line': None,
+        'token_line': token_line,
         'note': 'Gateway compression cannot yet commit plugin state transactionally. History is unchanged.'}
 
 
