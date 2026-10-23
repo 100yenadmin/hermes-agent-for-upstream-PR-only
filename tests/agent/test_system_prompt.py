@@ -40,21 +40,20 @@ def _make_agent(**overrides):
     return SimpleNamespace(**base)
 
 
-@pytest.mark.parametrize("tools, callback, enabled, platform, expected", [
-    (["read_file"], lambda *a: None, True, "telegram", True),
-    (["read_file"], None, True, "telegram", False),
-    ([], lambda *a: None, True, "telegram", False),
-    (["read_file"], lambda *a: None, False, "telegram", False),
-    (["read_file"], None, True, "subagent", False),
-], ids=["interim", "no-callback", "no-tools", "disabled", "delegate"])
-def test_interim_preamble_guidance(tools, callback, enabled, platform, expected):
+@pytest.mark.parametrize("tools, callback, surface_flag, platform, expected", [
+    (["read_file"], lambda *a: None, False, "telegram", True),
+    (["read_file"], None, False, "telegram", False),
+    ([], lambda *a: None, False, "telegram", False),
+    (["read_file"], None, True, "tui", True),
+    (["read_file"], None, False, "subagent", False),
+], ids=["interim", "no-callback", "no-tools", "tui-rebuild-flag", "delegate"])
+def test_interim_preamble_guidance(tools, callback, surface_flag, platform, expected):
     from agent.prompt_builder import INTERIM_PREAMBLE_GUIDANCE
+    from agent.system_prompt import interim_preamble_surface
 
-    agent = _make_agent(
-        valid_tool_names=tools, interim_assistant_callback=callback,
-        _interim_preamble_guidance=enabled, platform=platform,
-    )
-    parts = build_system_prompt_parts(agent)
+    agent = _make_agent(valid_tool_names=tools, interim_assistant_callback=callback, platform=platform)
+    with interim_preamble_surface(surface_flag):
+        parts = build_system_prompt_parts(agent)
     assert (INTERIM_PREAMBLE_GUIDANCE in parts["stable"]) is expected
     assert INTERIM_PREAMBLE_GUIDANCE not in parts["context"] + parts["volatile"]
 

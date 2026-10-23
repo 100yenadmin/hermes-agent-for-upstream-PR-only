@@ -1142,30 +1142,6 @@ class TestTaskCompletionGuidance:
             assert TASK_COMPLETION_GUIDANCE not in a._build_system_prompt()
 
 
-@pytest.mark.parametrize("enabled", [True, False], ids=["enabled", "disabled"])
-def test_interim_preamble_config_reaches_prompt(tmp_path, monkeypatch, enabled):
-    from agent.prompt_builder import INTERIM_PREAMBLE_GUIDANCE
-
-    (tmp_path / "config.yaml").write_text(
-        f"agent:\n  interim_preamble_guidance: {str(enabled).lower()}\n  environment_probe: false\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with (
-        patch("model_tools.get_tool_definitions", return_value=_make_tool_defs("read_file")),
-        patch("model_tools.check_toolset_requirements", return_value={}),
-        patch("agent.process_bootstrap.OpenAI"),
-    ):
-        agent = AIAgent(
-            model="anthropic/claude-sonnet-4.5", api_key="inspect-only",
-            base_url="https://openrouter.ai/api/v1", quiet_mode=True,
-            skip_context_files=True, skip_memory=True, save_trajectories=False,
-            interim_assistant_callback=lambda *a: None,
-        )
-        assert agent._interim_preamble_guidance is enabled
-        assert (INTERIM_PREAMBLE_GUIDANCE in agent._build_system_prompt()) is enabled
-
-
 class TestEnvironmentProbeIntegration:
     """Tests for the local Python toolchain probe wiring (config.yaml
     ``agent.environment_probe``).  The probe itself is unit-tested in

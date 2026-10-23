@@ -10,6 +10,8 @@ provider, timestamp line).  See ``references/system-prompt-invariant.md``.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -556,6 +558,21 @@ def _identity_parts(agent: Any, ctx_len: Optional[int]) -> tuple[list[str], bool
     return ([_soul_content], True) if _soul_content else ([DEFAULT_AGENT_IDENTITY], False)
 
 
+# A between-turns TUI rebuild runs while the interim callback is cleared; it says through this context-local flag
+# whether the surface shows interim text (a turn on another thread keeps its own callback and context).
+_interim_surface: contextvars.ContextVar[bool] = contextvars.ContextVar("interim_preamble_surface", default=False)
+
+
+@contextlib.contextmanager
+def interim_preamble_surface(enabled: bool):
+    """Build prompts in this context as if interim assistant text reaches the user (``enabled``)."""
+    token = _interim_surface.set(bool(enabled))
+    try:
+        yield
+    finally:
+        _interim_surface.reset(token)
+
+
 def _guidance_parts(agent: Any) -> list[str]:
     """Universal + tool-aware + model-gated guidance blocks, each gated by its config.yaml key."""
     parts: list[str] = []
@@ -582,10 +599,9 @@ def _guidance_parts(agent: Any) -> list[str]:
     if _model_gate(getattr(agent, "_execution_guidance", "auto"), agent.model, EXECUTION_GUIDANCE_MODELS):
         from agent.prompt_builder import execution_guidance_text
         parts.append(execution_guidance_text(agent.valid_tool_names))
-    # Interim text reaches the user: a live callback, or a between-turns TUI rebuild that sets the prompt-only flag.
-    interim = (getattr(agent, "interim_assistant_callback", None) is not None
-               or getattr(agent, "_interim_preamble_surface", False))
-    if interim and getattr(agent, "_interim_preamble_guidance", True):
+    # Only where interim text reaches the user (display.interim_assistant_messages): a live callback, or a
+    # between-turns TUI rebuild inside interim_preamble_surface().
+    if getattr(agent, "interim_assistant_callback", None) is not None or _interim_surface.get():
         parts.append(INTERIM_PREAMBLE_GUIDANCE)
     return parts
 
