@@ -1028,7 +1028,7 @@ _LEAN_ANCHOR_BUDGET_CHARS = 7_000
 _ANCHOR_PATTERNS: list[tuple[str, re.Pattern[str], int]] = [
     ("PRs/issues", re.compile(r"#\d{3,6}\b"), 120),
     # Not our own ``m:<hex>`` message refs (stubs and quotes from earlier compactions): they are not commits.
-    ("commits", re.compile(r"(?<!m:)\b[0-9a-f]{9,40}\b"), 40),
+    ("commits", re.compile(r"(?<!\bm:)\b[0-9a-f]{9,40}\b"), 40),
     ("branches", re.compile(r"\b(?:fix|feat|docs|refactor|chore|salvage|ent)/[A-Za-z0-9._/-]{3,60}"), 40),
     ("files", re.compile(r"\b[\w./-]+/[\w.-]+\.(?:py|ts|tsx|js|rs|md|yaml|yml|json|toml|sh)\b"), 80),
     ("errors", re.compile(r"\b(?:[A-Z][a-zA-Z]*Error|Exception|ENOSPC|EACCES|SIGKILL|Traceback)\b[^\n]{0,90}"), 40),

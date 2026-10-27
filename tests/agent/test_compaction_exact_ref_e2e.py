@@ -306,3 +306,13 @@ def test_helpers_fall_back_when_the_uid_is_absent_or_not_hex():
     footer = _build_recovery_footer("sid", turns)
     assert "m:3f2a9c1e0b7d" not in footer  # the last message carries no uid: no range sentence
     assert _build_recovery_footer("sid", turns[:1] * 2).count("session_search(ref='m:3f2a9c1e0b7d', window=10)") == 1
+
+
+def test_anchor_commits_skip_only_our_own_message_refs():
+    from agent.context_compressor import _build_anchor_index
+
+    index = _build_anchor_index([{"role": "assistant", "content": (
+        "checksum:3f2a9c1e0b7d55 item:abcdef1234 and our ref m:0123456789abcdef")}])
+    commits = next(line for line in index.splitlines() if line.startswith("commits:"))
+    assert "3f2a9c1e0b7d55" in commits and "abcdef1234" in commits
+    assert "0123456789abcdef" not in commits
