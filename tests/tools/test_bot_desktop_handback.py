@@ -153,7 +153,7 @@ def test_consumed_newer_driver_still_supersedes_pending_wake(rig):
 @pytest.mark.parametrize("platform,chat_type,eligible", [
     ("telegram", "group", False), ("discord", "channel", False),
     ("slack", "thread", False), ("telegram", "", False),
-    ("telegram", "dm", True), ("local", "", True),
+    ("telegram", "dm", True), ("discord", "dm", True), ("local", "", True),
 ])
 def test_only_single_person_routes_record_and_wake(rig, platform, chat_type, eligible):
     rig.bind(platform=platform, chat_type=chat_type)
@@ -197,15 +197,78 @@ def test_listener_reads_record_profile_config_and_restores_ambient_home(rig, tmp
     rig.drain()
 
 
-def test_background_side_scope_does_not_replace_conversation_driver(rig):
+def test_background_side_scope_supersedes_conversation_driver(rig):
     _act()
     # session_tui_side._side_scope binds only task identity and workspace/profile data.
     session_context.set_session_vars(session_key="bg_fixture", session_id="bg_fixture")
     _act()
-    assert [record.route["session_key"] for record in rig.handback._drivers.values()] == ["route-A"]
+    assert not rig.handback._drivers
     _hand_back()
     rig.drain()
-    assert [(call.route["session_key"], call.pending) for call in rig.calls] == [("route-A", True)]
+    assert not rig.calls
+
+
+@pytest.mark.parametrize("driver", ["group", "cron"])
+@pytest.mark.parametrize("pending", [False, True])
+def test_ineligible_driver_supersedes_record_and_pending_wake(rig, driver, pending):
+    _act()
+    if pending:
+        _hand_back()
+    rig.bind("G", platform="telegram", chat_type="group" if driver == "group" else "dm",
+             cron_session="1" if driver == "cron" else "")
+    _act()
+    _hand_back()
+    rig.drain()
+    assert [(call.route["session_key"], call.pending) for call in rig.calls] == (
+        [("route-A", False)] if pending else [])
+
+
+@pytest.mark.parametrize("chat_id,eligible", [("G123", False), ("C123", False), ("D123", True)])
+def test_slack_dm_requires_a_one_to_one_channel(rig, chat_id, eligible):
+    rig.bind(platform="slack", chat_type="dm", chat_id=chat_id)
+    _act()
+    _hand_back()
+    rig.drain()
+    assert len(rig.calls) == int(eligible)
+    if eligible:
+        assert rig.calls[0].pending
+
+
+@pytest.mark.parametrize("state", ["forced-human", "refused-human", "pending"])
+def test_display_stop_disarms_handback(rig, monkeypatch, state):
+    from tui_gateway import server
+
+    monkeypatch.setattr(runtime, "stop", lambda: True)
+    _act()
+    if state == "pending":
+        _hand_back()
+    else:
+        lease.acquire("v")
+    response = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "display.stop",
+                                      "params": {"force": state == "forced-human"}})
+    assert ("error" in response) is (state == "refused-human")
+    lease.release("v")
+    rig.drain()
+    assert [(call.route["session_key"], call.pending) for call in rig.calls] == (
+        [("route-A", False)] if state == "pending" else [])
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("state", ["forced-human", "refused-human", "pending"])
+def test_screen_cli_stop_disarms_handback(rig, monkeypatch, state):
+    from hermes_cli.subcommands.computer_use_screen import _screen_stop
+
+    monkeypatch.setattr(runtime, "stop", lambda: True)
+    _act()
+    if state == "pending":
+        _hand_back()
+    else:
+        lease.acquire("v")
+    assert _screen_stop(SimpleNamespace(force=state == "forced-human")) == int(state == "refused-human")
+    lease.release("v")
+    rig.drain()
+    assert [(call.route["session_key"], call.pending) for call in rig.calls] == (
+        [("route-A", False)] if state == "pending" else [])
 
 
 @pytest.mark.parametrize("superseded", ["action", "human"])

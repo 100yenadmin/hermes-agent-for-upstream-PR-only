@@ -169,14 +169,18 @@ When the bot hits a step it should not do itself (a login, 2FA, a CAPTCHA, a
 payment) it says so in its reply and ends its turn; the ask reaches you in
 whatever chat you are on. Take over when you are ready, do the step, and hand back.
 With `bot_desktop.resume_on_handback: true` (off by default), **Hand back** continues
-the Desktop/TUI conversation or direct-message chat that last used the screen, once,
-with a notice to re-capture before acting. In group, channel or thread chats, type
-"continue"; background side agents cannot arm continuation. Otherwise, tell the bot
-to continue. Automatic continuation needs the release
+the eligible Desktop/TUI conversation or direct-message chat that last used the screen,
+once, with a notice to re-capture before acting. Every screen action supersedes the
+previous driver, including group, cron and background side-agent actions, which cannot
+arm continuation. Slack group DMs are excluded; Matrix may classify an unnamed
+multi-member room marked direct as a DM. Otherwise, tell the bot to continue.
+**Stop** disarms continuation, including when a human holds the screen.
+Automatic continuation needs the release
 to happen in the same gateway process: a release from another process (for example,
 the `hermes computer-use screen` CLI), a gateway restart, or more than an hour since
 the bot's last screen action means you must tell it to continue yourself.
-A notice already queued for the conversation is not cancelled by a later screen action.
+A notice that has already passed its pending check or entered the conversation's queue
+is not cancelled by a later screen action or Stop.
 Nothing blocks on the bot's side while it waits:
 taking over is always yours to start, and a bot never holds a tool call open
 waiting for you.

@@ -36,8 +36,19 @@ _generations: dict[str, int] = {}
 _subscribed = False
 
 
+def forget(profile_key: str | None = None) -> int:
+    """Disarm this profile's driver and any notice that has not passed its pending check."""
+    key = profile_key or hermes_home_key()
+    with _lock:
+        _generations[key] = _generations.get(key, 0) + 1
+        _drivers.pop(key, None)
+        return _generations[key]
+
+
 def note_driver() -> None:
-    """Remember only admitted screen actions made by a live gateway conversation."""
+    """Every admitted action supersedes; only eligible live conversations arm continuation."""
+    key = hermes_home_key()
+    generation = forget(key)
     from hermes_cli.config import load_config_readonly
 
     if not (load_config_readonly().get("bot_desktop") or {}).get("resume_on_handback", False):
@@ -55,14 +66,16 @@ def note_driver() -> None:
                  parent_session_id=get_session_env("HERMES_SESSION_ID"))
     if route["platform"] != "local" and (not route["platform"] or route["chat_type"] != "dm"):
         return
-    key = hermes_home_key()
+    if route["platform"] == "slack" and not (route["chat_id"] or "").startswith("D"):
+        return
     global _subscribed
     with _lock:
+        if _generations[key] != generation:
+            return
         if not _subscribed:
             lease.on_change(_on_lease_change)
             _subscribed = True
-        _generations[key] = _generations.get(key, 0) + 1
-        _drivers[key] = _Driver(runner, route, lease.get(key).epoch, monotonic(), _generations[key])
+        _drivers[key] = _Driver(runner, route, lease.get(key).epoch, monotonic(), generation)
 
 
 def _on_lease_change(profile_key: str, current: lease.Lease) -> None:
