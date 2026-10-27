@@ -21,7 +21,7 @@ def test_provider_argument_never_starts_the_wrong_sign_in(monkeypatch, surface, 
     cli._side_worker = MagicMock()
     output = []
     monkeypatch.setattr("cli._cprint", output.append)
-    monkeypatch.setattr("cli.get_skill_commands", lambda: {})
+    monkeypatch.setattr("cli.get_skill_commands", dict)
     monkeypatch.setattr("hermes_cli.plugins.fire_pre_command_hook", lambda **kwargs: None)
     flow = MagicMock(return_value=iter([anon_auth.AlreadySignedIn()]))
     monkeypatch.setattr(anon_auth, "run_sign_in", flow)
