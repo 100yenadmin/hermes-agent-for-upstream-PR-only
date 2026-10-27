@@ -126,29 +126,33 @@ def _runner_draining(adapter: Any) -> bool:
 
 async def deliver_wake(adapter: Any, *, text: str, session_id: str = "", source: Any = None,
                        notification_category: str = "result", profile: Optional[str] = None,
-                       producer: str = "kanban-wake") -> None:
+                       producer: str = "kanban-wake", session_pin: Optional[str] = None) -> None:
     """Deliver a wake turn to the session behind ``adapter``. ``session_id`` is the RAW session id
     (``X-Hermes-Session-Id`` / state.db key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` for the synthetic event — required for push-capable adapters. ``profile``
     names the served profile that canonically owns a non-push destination; a non-default value is
     delivered in-process under the caller's profile scope (see ``_self_post_chat_completion``).
+    ``session_pin`` keeps a push wake in its originating conversation across compression,
+    refusing a replacement conversation after /new.
     Raises on failure so the caller can rewind/retry."""
     if adapter_supports_push(adapter):
         if source is None:
             raise ValueError("deliver_wake: push-capable adapter requires a SessionSource")
         from gateway.platforms.event import MessageEvent, MessageType
+        metadata = {"notification_category": notification_category} if notification_category != "result" else {}
+        if session_pin is not None:
+            metadata["gateway_session_id"] = session_pin
         runner = getattr(adapter, "gateway_runner", None)
         if runner is not None:
             from gateway.session_automation import admit_route_wake
             from hermes_state_runtime import RuntimeStoreError
-            category = {"notification_category": notification_category} if notification_category != "result" else {}
             try:
-                if await admit_route_wake(runner, adapter, source, text, producer, category):
+                if await admit_route_wake(runner, adapter, source, text, producer, metadata):
                     return  # committed to the session FIFO: never interrupts the admitted turn
             except RuntimeStoreError as exc:
                 raise WakeNotAccepted(str(exc), reason=exc.reason) from exc
         synth_event = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=True,
-                                   metadata={"notification_category": notification_category})
+                                   metadata={"notification_category": notification_category, **metadata})
         await admit_internal_event(adapter, synth_event)
         return
     if not session_id:
@@ -178,7 +182,8 @@ async def wake_route(runner, route: dict, text: str, still_pending: Callable[[],
                 return False
             if not still_pending():
                 return False
-            await deliver_wake(adapter, text=text, source=source, producer=producer)
+            await deliver_wake(adapter, text=text, source=source, producer=producer,
+                               session_pin=route.get("parent_session_id") or None)
             return True
     except Exception:
         logger.warning("Captured-route wake was not accepted", exc_info=True)

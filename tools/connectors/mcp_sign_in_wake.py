@@ -6,17 +6,15 @@ import sys
 from threading import Thread
 from typing import Any, Callable
 
-from agent.async_utils import safe_schedule_threadsafe
 from gateway.session_context import async_delivery_supported, get_session_env, session_is_messaging_surface
-from gateway.wake import wake_route
 
 logger = logging.getLogger(__name__)
 _WAIT_SECONDS = 900
 SIGN_IN_WAKE_TEXT = (
     "[Hermes gateway notice, not typed by the user: the MCP server '{name}' finished signing in "
     "and its tools are connected now. If the user's earlier request in this conversation needed "
-    "it, continue that request without asking them to confirm; otherwise tell them briefly that "
-    "{name} is connected.]"
+    "it and is not finished yet, continue it without asking them to confirm, and do not repeat "
+    "anything already done. Otherwise tell them briefly that {name} is connected.]"
 )
 
 
@@ -34,6 +32,9 @@ def _wait_and_wake(runner, route, name, attempt, still_pending) -> None:
             return
         if not _runner_live(runner) or not still_pending(name, attempt):
             return
+        from agent.async_utils import safe_schedule_threadsafe
+        from gateway.wake import wake_route
+
         contextvars.Context().run(
             safe_schedule_threadsafe,
             wake_route(runner, route, SIGN_IN_WAKE_TEXT.format(name=name),

@@ -73,6 +73,7 @@ async def test_wake_route_restores_source_and_enters_profile_scope(route_rig):
     event, = rig.adapter.events
     assert event.internal and event.source is rig.source
     assert event.text == "reports connected"
+    assert event.metadata["gateway_session_id"] == rig.route["parent_session_id"]
     assert rig.scoped == [True]
 
 
@@ -100,6 +101,58 @@ async def test_wake_route_without_parent_skips_classification(route_rig):
     assert await wake.wake_route(rig.runner, rig.route, "reports connected", lambda: True,
                                 producer="mcp-sign-in-wake")
     rig.runner._classify_completion_target.assert_not_awaited()
+    assert "gateway_session_id" not in rig.adapter.events[0].metadata
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transition", ["unchanged", "new", "compression"])
+async def test_wake_route_authority_preserves_captured_session(tmp_path, monkeypatch, caplog, transition):
+    from gateway.platforms.event import MessageEvent
+    from hermes_state_runtime import list_session_admissions
+    from tests.gateway.test_automation_compression_media import _admit_human, _discord_owner
+
+    runner, adapter, authority, source = await _discord_owner(tmp_path, monkeypatch)
+    adapter.gateway_runner = runner
+    try:
+        receipt = await _admit_human(runner, authority, MessageEvent(
+            text="human", source=source, message_id="human"))
+        parent = receipt.ref.session_id
+        key = runner.session_store._generate_session_key(source)
+        route = {"session_key": key, "parent_session_id": parent}
+        classify = runner._classify_completion_target
+
+        async def classify_then_transition(captured_parent, captured_key):
+            result = await classify(captured_parent, captured_key)
+            assert result == "deliver"
+            if transition == "new":
+                runner.session_store.reset_session(key)
+                # The replacement has provenance too: an unpinned wake can enter it.
+                await _admit_human(runner, authority, MessageEvent(
+                    text="new conversation", source=source, message_id="new-human"))
+            elif transition == "compression":
+                authority.db.append_message(parent, "user", "human")
+                child = parent + "-tip"
+                authority.db.publish_compression_child(
+                    parent_session_id=parent, child_session_id=child, source="discord",
+                    messages=[{"role": "user", "content": "summary"}], require_compression_lease=False)
+                assert runner.session_store.advance_compression_session(key, parent, child) is not None
+            return result
+
+        monkeypatch.setattr(runner, "_classify_completion_target", classify_then_transition)
+        accepted = await wake.wake_route(runner, route, "reports connected", lambda: True,
+                                        producer="mcp-sign-in-wake")
+        assert accepted is (transition != "new")
+        owner = authority.logical_owner(runner.session_store.peek_session_id(key))
+        rows = list_session_admissions(authority.db, session_id=owner, pending_only=False)
+        if transition == "new":
+            assert [row["payload"]["text"] for row in rows] == ["new conversation"]
+            assert len(list_session_admissions(authority.db, session_id=parent, pending_only=False)) == 1
+            assert "admission_conflict" in caplog.text
+        else:
+            assert owner == parent
+            assert [row["payload"]["text"] for row in rows] == ["human", "reports connected"]
+    finally:
+        authority.db.close()
 
 
 @pytest.mark.asyncio
@@ -115,14 +168,18 @@ async def test_wake_route_swallows_admission_errors(route_rig, monkeypatch, capl
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("producer", [None, "mcp-sign-in-wake"])
-async def test_deliver_wake_preserves_default_and_accepts_producer(route_rig, monkeypatch, producer):
+@pytest.mark.parametrize("session_pin", [None, "fixture-parent"])
+async def test_deliver_wake_preserves_default_and_accepts_producer(route_rig, monkeypatch, producer, session_pin):
     admit = AsyncMock(return_value=True)
     monkeypatch.setattr("gateway.session_automation.admit_route_wake", admit)
     rig = route_rig
     rig.adapter.gateway_runner = rig.runner
     kwargs = {} if producer is None else {"producer": producer}
+    if session_pin is not None:
+        kwargs["session_pin"] = session_pin
     await wake.deliver_wake(rig.adapter, source=rig.source, text="reports connected", **kwargs)
     assert admit.await_args.args[4] == (producer or "kanban-wake")
+    assert admit.await_args.args[5] == ({"gateway_session_id": session_pin} if session_pin else {})
     assert not rig.adapter.events
 
 
@@ -210,7 +267,7 @@ def test_sign_in_worker_wakes_once_with_captured_route_and_empty_context(live_wa
         finally:
             delivered.set()
 
-    monkeypatch.setattr(rig.sign_in, "wake_route", observe)
+    monkeypatch.setattr(wake, "wake_route", observe)
     captured = {"session_key": rig.env["HERMES_SESSION_KEY"], "parent_session_id": "fixture-parent",
                 **{field: rig.env["HERMES_SESSION_" + field.upper()]
                    for field in ("platform", "chat_id", "chat_type", "thread_id", "user_id",
@@ -227,7 +284,12 @@ def test_sign_in_worker_wakes_once_with_captured_route_and_empty_context(live_wa
     assert called == [(captured, "mcp-sign-in-wake", "empty")]
     event, = rig.adapter.events
     assert event.internal and event.source is rig.source and "reports" in event.text
-    assert "continue that request without asking them to confirm" in event.text
+    assert event.text == (
+        "[Hermes gateway notice, not typed by the user: the MCP server 'reports' finished signing in "
+        "and its tools are connected now. If the user's earlier request in this conversation needed "
+        "it and is not finished yet, continue it without asking them to confirm, and do not repeat "
+        "anything already done. Otherwise tell them briefly that reports is connected.]"
+    )
 
 
 @pytest.mark.parametrize("outcome", ["error", "cancelled", "adopted", "discovery", "timeout", "shutdown"])

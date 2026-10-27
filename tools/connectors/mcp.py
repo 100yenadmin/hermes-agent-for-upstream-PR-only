@@ -13,7 +13,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from hermes_constants import hermes_home_key
 from tools.connectors.contract import Actor, SettleReason, TargetState
 from tools.connectors.gateway.config import operation_session_key
-from tools.connectors.mcp_sign_in_wake import arm_sign_in_wakes
 from tools.connectors.operation import ConnectionOperation, DetachedOperation, IllegalTransition, Target
 from tools.connectors.run import Kind, run_operation
 from tools.connectors.targets import hosted_names, misrouted_to_mcp_error
@@ -839,6 +838,8 @@ def _chat_oauth_note(runner: _Runner, *, resumes: bool = False) -> str:
 
 
 def _no_card_result(runner: _Runner, names: list[str], action: str, session_key: str) -> str:
+    from tools.connectors.mcp_sign_in_wake import arm_sign_in_wakes
+
     if isinstance(runner.backend, _CatalogBackend):
         runner.backend.public_base = _chat_public_base()
     operation = DetachedOperation([Target(n, "mcp", action) for n in names], session_key=session_key)

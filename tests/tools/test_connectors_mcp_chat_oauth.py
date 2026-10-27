@@ -243,7 +243,7 @@ def test_chat_promises_continuation_only_when_wake_armed(chat_oauth, monkeypatch
         assert still_pending("reports", attempts["reports"])
         return armed
 
-    monkeypatch.setattr(mcp, "arm_sign_in_wakes", arm, raising=False)
+    monkeypatch.setattr("tools.connectors.mcp_sign_in_wake.arm_sign_in_wakes", arm)
     out = _connect()
     assert ("continues this conversation on its own" in out["note"]) is armed
     assert ("next message" in out["note"]) is not armed
