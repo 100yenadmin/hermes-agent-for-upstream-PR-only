@@ -849,7 +849,7 @@ function PlatformDetail({
         <section>
           <SectionTitle>{m.discordCheck.checkBot}</SectionTitle>
           <div className="mt-3">
-            <DiscordBotCheck key={scopeProfile} platform={platform} scopeProfile={scopeProfile} />
+            <DiscordBotCheck key={discordCheckKey(platform, scopeProfile)} platform={platform} scopeProfile={scopeProfile} />
           </div>
         </section>
       )}
@@ -1032,6 +1032,13 @@ const PLATFORM_INTRO: Record<string, string> = {
     'Expose Hermes as an OpenAI-compatible API. Set an auth key, then point Open WebUI / LobeChat / etc. at the host:port.',
   webhook:
     'Run an HTTP server that other tools (GitHub, GitLab, custom apps) can POST to. Use the secret to verify signatures.'
+}
+
+// A new or cleared token remounts the check, so a result never outlives the bot it describes.
+function discordCheckKey(platform: MessagingPlatformInfo, scopeProfile: string | undefined): string {
+  const token = platform.env_vars.find(field => field.key === 'DISCORD_BOT_TOKEN')
+
+  return `${scopeProfile ?? ''}:${token?.is_set ? token.redacted_value ?? 'set' : ''}`
 }
 
 const introCopy = (platform: MessagingPlatformInfo, m: Translations['messaging']) =>

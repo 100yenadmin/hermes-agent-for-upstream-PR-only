@@ -6,6 +6,7 @@ Extracted from ``hermes_cli.web_server``; helpers/state that tests monkeypatch o
 
 import asyncio
 import contextlib
+import http.client
 import json
 import logging
 import os
@@ -1237,9 +1238,10 @@ async def check_discord_bot(profile: Optional[str] = None):
 
     try:
         return await asyncio.to_thread(_run)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Copy the bot token again from the Bot page; it isn't header-safe.") from None
-    except (DiscordAPIError, OSError) as exc:
+    # A non-JSON or malformed 2xx body (a captive portal, a proxy) is an unreachable Discord, not a bad
+    # token; these subclasses of ValueError must be caught before the header-safety branch below.
+    except (DiscordAPIError, OSError, json.JSONDecodeError, UnicodeDecodeError, KeyError,
+            http.client.HTTPException) as exc:
         if isinstance(exc, DiscordAPIError) and exc.status == 401:
             raise HTTPException(status_code=400, detail=(
                 "Discord rejected the saved token. Reset it on the Bot page and paste the new one.")) from None
@@ -1247,3 +1249,5 @@ async def check_discord_bot(profile: Optional[str] = None):
         _log.warning("Couldn't reach Discord", exc_info=(
             RuntimeError, RuntimeError(type(exc).__name__), exc.__traceback__))
         raise HTTPException(status_code=502, detail=f"Couldn't reach Discord ({type(exc).__name__}).") from None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Copy the bot token again from the Bot page; it isn't header-safe.") from None

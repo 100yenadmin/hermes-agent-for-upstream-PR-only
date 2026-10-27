@@ -122,3 +122,36 @@ def test_exception_text_never_reaches_response(discord_check, monkeypatch, error
     response = _check(client)
     assert response.status_code == (400 if error_kind == "header" else 502)
     assert TOKEN not in response.text
+
+
+def test_non_json_discord_body_is_unreachable_not_a_bad_token(discord_check, monkeypatch):
+    """A captive portal answering 200 with HTML must not be reported as a header-unsafe token."""
+    import http.server
+    import threading
+    from tools import discord_tool
+
+    class Portal(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"<html>sign in to the network</html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    client, home, _standin = discord_check
+    (home / ".env").write_text(f"DISCORD_BOT_TOKEN={TOKEN}\n", encoding="utf-8")
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Portal)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setattr(discord_tool, "DISCORD_API_BASE", f"http://127.0.0.1:{server.server_address[1]}")
+        response = _check(client)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert response.status_code == 502
+    assert "Couldn't reach Discord" in response.json()["detail"]
+    assert TOKEN not in response.text
