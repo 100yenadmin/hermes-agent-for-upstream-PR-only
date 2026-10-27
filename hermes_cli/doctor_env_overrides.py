@@ -10,7 +10,11 @@ configured provider are reported; the precedence mirrors the resolver, not a gue
   ``model.base_url`` still wins for Anthropic and Actual (``_pool_entry_mode_and_url``); for every other
   API-key provider the env URL wins over it.
 * ``provider: openai`` expands to a custom route at ``OPENAI_BASE_URL`` ahead of api.openai.com unless a
-  ``providers.openai`` entry exists (``expand_direct_api_alias``).
+  ``providers.openai`` entry exists (``expand_direct_api_alias``) or ``model.openai_runtime: codex_app_server``
+  hands the turn to the app-server.
+* ``provider: openrouter`` / ``custom``: ``CUSTOM_BASE_URL`` outranks ``model.base_url``, and
+  ``OPENROUTER_BASE_URL`` outranks the default when no trusted ``model.base_url`` is set
+  (``_resolve_openrouter_runtime``).
 * ``ANTHROPIC_TOKEN`` / ``CLAUDE_CODE_OAUTH_TOKEN`` / ``ANTHROPIC_API_KEY`` come before a stored Hermes
   login (``resolve_anthropic_token``); an API key with no OAuth variable also drops OAuth logins from
   rotation (``_seed_anthropic_singletons``).
@@ -110,6 +114,14 @@ def _route_override(var: str, provider: str, env_url: str, configured: str, via:
     return EnvOverride(var, _source(var), what, fix, warn=not same)
 
 
+def _seeding_key_var(provider: str, names) -> str:
+    """First env API-key variable ``_seed_from_env`` turns into a pool row: numbered ``_2`` siblings count
+    (``_env_key_var_candidates``), a source the user suppressed with ``hermes auth remove`` does not."""
+    from hermes_cli.auth import suppressed_credential_sources
+    suppressed = suppressed_credential_sources(provider)
+    return next((v for name in names for v in (name, f"{name}_2") if _env(v) and f"env:{v}" not in suppressed), "")
+
+
 def _registry_base_url_override(provider: str, model_cfg: dict) -> EnvOverride | None:
     """The configured API-key provider's ``base_url_env_var``, when an env-seeded pool row carries it."""
     from hermes_cli.auth import PROVIDER_REGISTRY
@@ -118,7 +130,7 @@ def _registry_base_url_override(provider: str, model_cfg: dict) -> EnvOverride |
     if not var or pconfig.auth_type != "api_key" or provider in _NO_ENV_ROW_URL:
         return None
     env_url = _env(var).rstrip("/")
-    key_var = next((v for v in pconfig.api_key_env_vars if _env(v)), "")
+    key_var = _seeding_key_var(provider, pconfig.api_key_env_vars)
     if not env_url or not key_var:
         return None  # only rows seeded from an env API key carry the env URL
     from agent.credential_pool import _profile_seeds_pool
@@ -139,15 +151,33 @@ def _is_openai_alias(raw_provider: str) -> bool:
     return raw_provider in _DIRECT_API_BASE_URLS and _get_named_custom_provider(raw_provider) is None
 
 
-def _openai_alias_override(raw_provider: str) -> EnvOverride | None:
-    """The expanded ``provider: openai`` route goes to ``OPENAI_BASE_URL`` ahead of the public endpoint."""
+def _openai_alias_override(raw_provider: str, model_cfg: dict) -> EnvOverride | None:
+    """The expanded ``provider: openai`` route goes to ``OPENAI_BASE_URL`` ahead of the public endpoint —
+    unless ``model.openai_runtime: codex_app_server`` hands the turn to the app-server, which ignores it."""
     from agent.secret_scope import get_secret_str
     from hermes_cli.runtime_provider_custom import _DIRECT_API_BASE_URLS
     env_url = (get_secret_str("OPENAI_BASE_URL", "") or "").strip().rstrip("/")
-    if not env_url:
+    if not env_url or str(model_cfg.get("openai_runtime") or "").strip().lower() == "codex_app_server":
         return None
     return _route_override("OPENAI_BASE_URL", raw_provider, env_url, _DIRECT_API_BASE_URLS[raw_provider],
                            "(provider: openai follows it)")
+
+
+def _openrouter_override(raw_provider: str, model_cfg: dict) -> EnvOverride | None:
+    """OpenRouter / bare ``custom`` endpoint (``_resolve_openrouter_runtime``): CUSTOM_BASE_URL > trusted
+    ``model.base_url`` > OPENROUTER_BASE_URL > the OpenRouter default."""
+    from agent.secret_scope import get_secret_str
+    from hermes_cli.runtime_provider import _config_base_url_trustworthy_for_bare_custom
+    from hermes_constants import OPENROUTER_BASE_URL
+    cfg_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+    trusted = bool(cfg_url) and (raw_provider == "openrouter"
+                                 or _config_base_url_trustworthy_for_bare_custom(cfg_url, raw_provider))
+    configured = cfg_url if trusted else OPENROUTER_BASE_URL.rstrip("/")
+    for var in ("CUSTOM_BASE_URL", "OPENROUTER_BASE_URL"):
+        env_url = (get_secret_str(var, "") or "").strip().rstrip("/")
+        if env_url and (var == "CUSTOM_BASE_URL" or not trusted):
+            return _route_override(var, raw_provider, env_url, configured, "(the env endpoint outranks the default)")
+    return None
 
 
 def _anthropic_auth_override() -> EnvOverride | None:
@@ -178,7 +208,9 @@ def find_route_env_overrides(model_cfg: dict) -> list:
     if not raw or raw == "auto":
         return []  # auto-detection has no configured route to compare against
     if _is_openai_alias(raw):
-        return [o for o in (_openai_alias_override(raw),) if o is not None]
+        return [o for o in (_openai_alias_override(raw, model_cfg),) if o is not None]
+    if raw in ("openrouter", "custom"):
+        return [o for o in (_openrouter_override(raw, model_cfg),) if o is not None]
     from hermes_cli.providers import normalize_provider
     provider = normalize_provider(raw)
     found = [_registry_base_url_override(provider, model_cfg)]

@@ -20,7 +20,8 @@ from hermes_cli.doctor_connectivity import _model_cfg
 
 _ROUTE_VARS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
                "ANTHROPIC_AUTH_TOKEN", "OPENAI_BASE_URL", "OPENAI_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY",
-               "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL", "CUSTOM_BASE_URL", "HERMES_INFERENCE_PROVIDER")
+               "DEEPSEEK_API_KEY_2", "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL", "CUSTOM_BASE_URL",
+               "HERMES_INFERENCE_PROVIDER")
 _API_KEY = "sk-ant-api03-SECRETKEYVALUE0000"
 
 
@@ -145,6 +146,55 @@ def test_openai_base_url_does_not_steer_openrouter(home, monkeypatch, capsys):
     assert finding.manual_issues == []
 
 
+def test_openai_app_server_runtime_ignores_openai_base_url(home, monkeypatch):
+    # model.openai_runtime: codex_app_server hands the turn to the app-server, which never uses the endpoint.
+    _configure(home, {"provider": "openai", "openai_runtime": "codex_app_server"})
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://env.example.test/v1")
+    assert deo.find_route_env_overrides(_model_cfg()) == []
+
+
+def test_openrouter_base_url_redirects_openrouter_without_a_configured_mirror(home, monkeypatch, capsys):
+    _configure(home, {"provider": "openrouter"})
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-SECRETVALUE")
+    monkeypatch.setenv("OPENROUTER_BASE_URL", "https://mirror.example.test/api/v1")
+    out, finding = _run_check(capsys)
+    assert "openrouter route https://openrouter.ai → https://mirror.example.test" in out
+    assert len(finding.manual_issues) == 1
+
+
+def test_configured_openrouter_mirror_outranks_openrouter_base_url(home, monkeypatch):
+    _configure(home, {"provider": "openrouter", "base_url": "https://cfgmirror.example.test/api/v1"})
+    monkeypatch.setenv("OPENROUTER_BASE_URL", "https://mirror.example.test/api/v1")
+    assert deo.find_route_env_overrides(_model_cfg()) == []
+
+
+def test_custom_base_url_outranks_the_configured_custom_endpoint(home, monkeypatch, capsys):
+    _configure(home, {"provider": "custom", "base_url": "http://127.0.0.1:11434/v1"})
+    monkeypatch.setenv("CUSTOM_BASE_URL", "https://custom.example.test/v1")
+    out, finding = _run_check(capsys)
+    assert "custom route http://127.0.0.1 → https://custom.example.test" in out
+    assert len(finding.manual_issues) == 1
+
+
+def test_numbered_env_key_still_carries_the_base_url(home, monkeypatch):
+    # _seed_from_env also seeds DEEPSEEK_API_KEY_2, and that row carries DEEPSEEK_BASE_URL too.
+    _configure(home, {"provider": "deepseek"})
+    monkeypatch.setenv("DEEPSEEK_API_KEY_2", "sk-deepseek-SECRETVALUE00")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://env.example.test/v1")
+    (override,) = deo.find_route_env_overrides(_model_cfg())
+    assert override.warn and "DEEPSEEK_API_KEY_2" in override.overrides
+
+
+def test_suppressed_env_credential_does_not_carry_the_base_url(home, monkeypatch):
+    # `hermes auth remove` suppresses the env source: no pool row is seeded from it, so the URL is unused.
+    _configure(home, {"provider": "deepseek"})
+    (home / "auth.json").write_text(json.dumps({"providers": {}, "suppressed_sources": {"deepseek": ["env:DEEPSEEK_API_KEY"]}}),
+                                    encoding="utf-8")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-deepseek-SECRETVALUE00")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://env.example.test/v1")
+    assert deo.find_route_env_overrides(_model_cfg()) == []
+
+
 def test_secrets_in_urls_and_credentials_never_reach_output(home, monkeypatch, capsys):
     _configure(home, {"provider": "anthropic"})
     monkeypatch.setenv("ANTHROPIC_API_KEY", _API_KEY)
@@ -198,6 +248,11 @@ def test_env_credential_without_a_stored_login_is_info_only(home, monkeypatch, c
     ({"provider": "deepseek", "base_url": "https://cfg.example.test/v1"},
      {"DEEPSEEK_API_KEY": "sk-deepseek-SECRETVALUE00", "DEEPSEEK_BASE_URL": "https://env.example.test/v1"}, True),
     ({"provider": "deepseek"}, {"DEEPSEEK_API_KEY": "sk-deepseek-SECRETVALUE00", "ANTHROPIC_BASE_URL": "https://proxy.example.test"}, False),
+    ({"provider": "openrouter"},
+     {"OPENROUTER_API_KEY": "sk-or-v1-SECRETVALUE", "OPENROUTER_BASE_URL": "https://env.example.test/api/v1"}, True),
+    ({"provider": "openrouter", "base_url": "https://cfg.example.test/api/v1"},
+     {"OPENROUTER_API_KEY": "sk-or-v1-SECRETVALUE", "OPENROUTER_BASE_URL": "https://env.example.test/api/v1"}, False),
+    ({"provider": "custom", "base_url": "http://127.0.0.1:11434/v1"}, {"CUSTOM_BASE_URL": "https://env.example.test/v1"}, True),
 ])
 def test_doctor_agrees_with_the_runtime_resolver(home, monkeypatch, model, env, warns):
     """Ground truth: the doctor warns exactly when the real resolver lands somewhere config does not say."""
