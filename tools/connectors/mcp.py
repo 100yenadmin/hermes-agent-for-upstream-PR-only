@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from hermes_constants import hermes_home_key
 from tools.connectors.contract import Actor, SettleReason, TargetState
 from tools.connectors.gateway.config import operation_session_key
+from tools.connectors.mcp_sign_in_wake import arm_sign_in_wakes
 from tools.connectors.operation import ConnectionOperation, DetachedOperation, IllegalTransition, Target
 from tools.connectors.run import Kind, run_operation
 from tools.connectors.targets import hosted_names, misrouted_to_mcp_error
@@ -818,7 +819,7 @@ def _chat_public_base() -> Optional[str]:
     return getattr(getattr(getattr(runner, "session_api", None), "app", None), "public_url", None) or None
 
 
-def _chat_oauth_note(runner: _Runner) -> str:
+def _chat_oauth_note(runner: _Runner, *, resumes: bool = False) -> str:
     public_base = getattr(runner.backend, "public_base", None)
     redirects = [getattr(getattr(work.attempt, "flow", None), "redirect_uri", "")
                  for work in runner.work.values() if work.attempt is not None and work.attempt.auth_url]
@@ -826,7 +827,9 @@ def _chat_oauth_note(runner: _Runner) -> str:
               for uri in redirects]
     note = NO_CARD_NOTE
     if any(public):
-        note += (" After they finish signing in through the Webapp, the tools become available on "
+        note += (" After they finish signing in, Hermes continues this conversation on its own; "
+                 "do not ask them to confirm." if resumes else
+                 " After they finish signing in through the Webapp, the tools become available on "
                  "their next message; do not ask them to confirm.")
     if public and not all(public):
         note += (" A loopback sign-in link only completes in a browser on the gateway machine. "
@@ -841,12 +844,16 @@ def _no_card_result(runner: _Runner, names: list[str], action: str, session_key:
     operation = DetachedOperation([Target(n, "mcp", action) for n in names], session_key=session_key)
     for target in operation.targets:
         runner.run(_NO_CARD, operation, target)
+    key = _late_key(operation)
     for name, work in runner.work.items():
         if work.attempt is not None:
-            _LATE_ATTEMPTS.setdefault(_late_key(operation), {})[name] = work.attempt
+            _LATE_ATTEMPTS.setdefault(key, {})[name] = work.attempt
+    resumes = arm_sign_in_wakes(
+        {name: work.attempt for name, work in runner.work.items() if work.attempt is not None},
+        lambda name, attempt: _LATE_ATTEMPTS.get(key, {}).get(name) is attempt)
     payload = operation.result(with_urls=True)
     payload["status"] = "initiated" if any(t.state == TargetState.initiated for t in operation.targets) else "settled"
-    payload["note"] = _chat_oauth_note(runner)
+    payload["note"] = _chat_oauth_note(runner, resumes=resumes)
     return json.dumps(payload, ensure_ascii=False)
 
 

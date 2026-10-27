@@ -89,8 +89,10 @@ card works the same way in the desktop app (a dialog), the terminal UI
 
 In messaging apps (Telegram, Slack, Discord) there is no card; Hermes shows a
 sign-in link. With the gateway's Webapp enabled and `webapp.public_url` set,
-OAuth sign-in finishes through that public address and the tools become available
-on your next message, without confirming again. Without it, the link only
+OAuth sign-in finishes through that public address. On push-capable chat apps
+(Telegram, Slack, Discord, and others), the conversation continues by itself once
+sign-in finishes, without confirming again. Elsewhere, or if the gateway restarts,
+the tools appear on your next message. Without the public address, the link only
 completes in a browser on the gateway machine. Providers with a pinned loopback
 redirect still require that local browser.
 

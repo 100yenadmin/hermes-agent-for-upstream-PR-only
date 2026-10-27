@@ -229,3 +229,24 @@ def test_attempt_without_auth_url_has_no_callback_guidance():
     runner = SimpleNamespace(backend=SimpleNamespace(public_base=None),
                              work={"reports": SimpleNamespace(attempt=attempt)})
     assert mcp._chat_oauth_note(runner) == mcp.NO_CARD_NOTE
+
+
+@pytest.mark.parametrize("armed", [False, True])
+def test_chat_promises_continuation_only_when_wake_armed(chat_oauth, monkeypatch, armed):
+    (chat_oauth[0] / "config.yaml").write_text(
+        "webapp:\n  enabled: true\n  public_url: https://agent.example/hermes\n")
+    _listener(monkeypatch)
+    captured = []
+
+    def arm(attempts, still_pending):
+        captured.append((attempts, still_pending))
+        assert still_pending("reports", attempts["reports"])
+        return armed
+
+    monkeypatch.setattr(mcp, "arm_sign_in_wakes", arm, raising=False)
+    out = _connect()
+    assert ("continues this conversation on its own" in out["note"]) is armed
+    assert ("next message" in out["note"]) is not armed
+    attempts, still_pending = captured[0]
+    mcp._LATE_ATTEMPTS[(hermes_home_key(), "chat")].pop("reports")
+    assert not still_pending("reports", attempts["reports"])
