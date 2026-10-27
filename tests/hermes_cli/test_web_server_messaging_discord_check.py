@@ -124,18 +124,24 @@ def test_exception_text_never_reaches_response(discord_check, monkeypatch, error
     assert TOKEN not in response.text
 
 
-def test_non_json_discord_body_is_unreachable_not_a_bad_token(discord_check, monkeypatch):
-    """A captive portal answering 200 with HTML must not be reported as a header-unsafe token."""
+@pytest.mark.parametrize(("status", "body"), [
+    (200, b"<html>sign in to the network</html>"),
+    (200, b"[]"),
+    (200, b'{"id": "1", "flags": "abc"}'),
+    (204, b""),
+])
+def test_non_json_discord_body_is_unreachable_not_a_bad_token(discord_check, monkeypatch, status, body):
+    """A captive portal or proxy answering 2xx with something other than an application is not a bad token."""
     import http.server
     import threading
     from tools import discord_tool
 
     class Portal(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
-            body = b"<html>sign in to the network</html>"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_response(status)
+            if body:
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 

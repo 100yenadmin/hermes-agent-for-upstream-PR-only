@@ -79,9 +79,13 @@ def _owners(app: dict) -> tuple[tuple[str, str], ...]:
 def check_bot_token(token: str) -> DiscordBotCheck:
     """Read the application behind ``token``. Raises :class:`DiscordAPIError` (401 = bad token)
     or ``OSError`` when Discord is unreachable."""
-    from tools.discord_tool import _FLAGS_GUILD_MEMBERS, _FLAGS_MESSAGE_CONTENT, _discord_request
+    from tools.discord_tool import (
+        _FLAGS_GUILD_MEMBERS, _FLAGS_MESSAGE_CONTENT, DiscordAPIError, _discord_request)
     app = _discord_request("GET", "/applications/@me", token.strip(), timeout=10)
-    flags = int(app.get("flags") or 0)
+    flags = (app.get("flags") or 0) if isinstance(app, dict) else None
+    if not isinstance(flags, int):
+        # Something other than Discord answered (a proxy or captive portal).
+        raise DiscordAPIError(502, "unexpected application payload")
     bot = app.get("bot") or {}
     count = app.get("approximate_guild_count")
     return DiscordBotCheck(
