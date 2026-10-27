@@ -3,7 +3,9 @@
 import hashlib
 import json
 import logging
+import threading
 from collections import OrderedDict
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -166,7 +168,7 @@ def test_a_second_terminal_emission_for_the_same_call_is_dropped(hooks):
     _terminal_emit(status="timeout", error_type="tool_timeout")
     _terminal_emit()
     [event] = hooks.decisions
-    assert event["verdict"] == "allowed"
+    assert event["verdict"] == "abandoned"
 
 
 def test_abandoned_call_is_not_re_reported_when_its_worker_settles_late(hooks, monkeypatch):
@@ -179,7 +181,8 @@ def test_abandoned_call_is_not_re_reported_when_its_worker_settles_late(hooks, m
                                      effective_task_id="task-1", tool_call_id=f"other-{n}")
     agent._current_turn_id = "turn-2"
     emit_terminal_post_tool_call(agent, function_name="write_file", function_args={"path": "a"}, result="r",
-                                 effective_task_id=IDS["task_id"], tool_call_id=IDS["tool_call_id"])
+                                 effective_task_id=IDS["task_id"], tool_call_id=IDS["tool_call_id"],
+                                 dispatch_turn_id=IDS["turn_id"])
     assert [e["tool_call_id"] for e in hooks.decisions].count(IDS["tool_call_id"]) == 1
     assert len(hooks.decisions) == 6
 
@@ -260,3 +263,108 @@ def test_a_refusal_outranks_an_earlier_approval_for_the_same_call():
     assert merged == ("denied_by_user", "approval_prompt")
     assert tool_decision._merge(merged, ("user_approved", "approval_prompt")) == merged
     assert tool_decision._merge(("auto_approved", "allowlist"), ("user_approved", "approval_prompt"))[0] == "user_approved"
+
+
+def test_reused_call_id_in_a_new_dispatch_turn_is_not_an_old_abandoned_call(hooks):
+    ids = dict(IDS, tool_call_id="call_0")  # sequential ids recur after compaction
+    model_tools._emit_post_tool_call_hook(function_name="read_file", function_args={}, result="timeout",
+                                         status="timeout", error_type="tool_timeout", **ids)
+    with patch.object(model_tools.registry, "dispatch", return_value="ok"):
+        model_tools.handle_function_call("read_file", {}, **dict(ids, turn_id="turn-2"))
+    assert [e["turn_id"] for e in hooks.decisions] == ["turn-1", "turn-2"]
+    assert ("sess-1", "call_0", "turn-1") in tool_decision._abandoned
+    model_tools._emit_post_tool_call_hook(function_name="read_file", function_args={}, result="late", **ids)
+    assert len(hooks.decisions) == 2
+
+
+@pytest.mark.parametrize("name", ["read_file", "todo_list"])
+def test_timeout_and_late_concurrent_worker_keep_the_dispatch_turn(hooks, monkeypatch, name):
+    """A queued worker starts after T2; both its event attempt and timeout still carry T1."""
+    from agent import tool_executor as te
+    from agent.inline_tool_executors import INLINE_TOOL_EXECUTORS
+    from agent.agent_runtime_helpers import invoke_tool
+
+    agent = _agent()
+    agent._interrupt_requested = False
+    agent._tool_worker_threads_lock = threading.Lock()
+    agent._tool_worker_threads = set()
+    agent._memory_manager = None
+    agent.valid_tool_names = {name}
+    agent._touch_activity = lambda *args: None
+    agent._invoke_tool = partial(invoke_tool, agent)
+    pc = te._ParsedCall(SimpleNamespace(id="call_0"), name, {}, [], None, None)
+    batch = te._ConcurrentBatch(agent, [], "task-1", [pc], 1.0)
+    queued = []
+    executor = SimpleNamespace(submit=lambda fn, *args: queued.append(partial(fn, *args)))
+
+    def execute_middleware(_agent, *, execute, function_args, **kwargs):
+        return te._ManagedToolResult(result=execute(function_args), args=function_args, middleware_trace=[],
+                                     blocked=False, dispatched=True)
+
+    monkeypatch.setattr(te, "_run_agent_tool_execution_middleware", execute_middleware)
+    monkeypatch.setattr(te, "_commit_tool_result", lambda *args, **kwargs: None)
+    monkeypatch.setitem(INLINE_TOOL_EXECUTORS, "todo_list", lambda *args: "ok")
+    with patch.object(model_tools.registry, "dispatch", return_value="ok"), \
+            patch.object(tool_decision, "emit_for_call", wraps=tool_decision.emit_for_call) as attempts, \
+            patch.object(model_tools, "_emit_post_tool_call_hook", wraps=model_tools._emit_post_tool_call_hook) as posts:
+        batch.submit_all(executor, [0])
+        batch.timed_out_indices = {0}
+        te._append_batch_results(agent, [], "task-1", batch, None)
+        agent._current_turn_id = "turn-2"
+        queued[0]()
+    assert [c.kwargs["turn_id"] for c in attempts.call_args_list] == ["turn-1", "turn-1"]
+    assert [c.kwargs["turn_id"] for c in posts.call_args_list] == ["turn-1", "turn-1"]
+    [event] = hooks.decisions
+    assert (event["turn_id"], event["verdict"], event["source"]) == ("turn-1", "abandoned", "tool_timeout")
+
+
+@pytest.mark.parametrize("error_type", ["tool_timeout", "tool_interrupted", "keyboard_interrupt", "thread_missing_result"])
+def test_abandoned_calls_report_the_reason_unless_a_gate_refused(hooks, error_type):
+    _terminal_emit(status="error", error_type=error_type)
+    [event] = hooks.decisions
+    assert (event["verdict"], event["source"]) == ("abandoned", error_type)
+    hooks.decisions.clear()
+    tool_decision._emitted.clear()
+    tool_decision._abandoned.clear()
+    tokens = approval_context.set_current_observability_context(**{k: IDS[k] for k in ("session_id", "tool_call_id", "turn_id")})
+    try:
+        tool_decision.note("denied_by_user", "approval_prompt")
+    finally:
+        approval_context.reset_current_observability_context(tokens)
+    _terminal_emit(status="error", error_type=error_type)
+    assert hooks.decisions[0]["verdict"] == "denied_by_user"
+
+
+@pytest.mark.parametrize("context", ["cron", "single_query"])
+@pytest.mark.parametrize("dangerous", [True, False])
+def test_unattended_approve_reports_only_flagged_commands_as_auto_approved(hooks, monkeypatch, context, dangerous):
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"approvals": {f"{context}_mode": "approve"}})
+    monkeypatch.setattr(approval, "_yolo_active", lambda: False)
+    monkeypatch.setattr(approval, "_command_matches_permanent_allowlist", lambda command: False)
+    monkeypatch.setattr(approval, "_presence", lambda cb: (None, False, False, False))
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1" if context == "single_query" else "")
+    tokens = set_session_vars(cron_session="1" if context == "cron" else "")
+
+    def handler(name, args, **kwargs):
+        assert approval.check_all_command_guards(args["command"], "local")["approved"]
+        return "ok"
+
+    try:
+        _call("terminal", {"command": "rm -rf ./fixture" if dangerous else "echo ok"}, handler)
+    finally:
+        clear_session_vars(tokens)
+    [event] = hooks.decisions
+    expected = ("auto_approved", "unattended_approve") if dangerous else ("allowed", "")
+    assert (event["verdict"], event["source"]) == expected
+
+
+@pytest.mark.parametrize("circular", [True, False])
+def test_unserializable_arguments_still_emit_a_digest(hooks, circular):
+    args = {"value": SECRET} if circular else {1: SECRET, "value": 2}
+    if circular:
+        args["self"] = args
+    model_tools._emit_post_tool_call_hook(function_name="read_file", function_args=args, result="ok", **IDS)
+    [event] = hooks.decisions
+    assert event["args_sha256"] == hashlib.sha256(repr(args).encode("utf-8")).hexdigest()

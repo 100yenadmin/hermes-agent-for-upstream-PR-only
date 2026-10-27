@@ -1197,11 +1197,12 @@ def check_all_command_guards(command: str, env_type: str,
     # Outside CLI/gateway/ask flows we never block on approvals: each
     # unattended context applies its configured deny/approve mode, else allow.
     if not is_cli and not is_gateway and not is_ask:
-        for ctx in _unattended_contexts():
+        contexts = _unattended_contexts()
+        for ctx in contexts:
             result = _unattended_deny(command, ctx)
             if result is not None:
                 return result
-        return _approved()
+        return _approved("unattended_approve" if contexts and detect_dangerous_command(command)[0] else None)
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
     session_key = get_current_session_key()

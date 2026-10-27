@@ -78,7 +78,7 @@ class _TerminalSlot:
         from agent import tool_executor as te
         token = _slot.set(self)
         pc, batch = self.parsed, self.batch
-        ref = pc.ref(batch.task_id)
+        ref = pc.ref(batch.task_id, batch.dispatch_turn_id)
         try:
             with te._registered_tool_worker(batch.agent) as tid:
                 self.tids.append(tid)
@@ -99,6 +99,7 @@ class _TerminalBatch:
         from agent.tool_executor import _ConcurrentToolAuthorizationGate
         from tools.daemon_pool import DaemonThreadPoolExecutor
         self.agent, self.messages, self.task_id = agent, messages, task_id
+        self.dispatch_turn_id = getattr(agent, "_current_turn_id", "") or ""
         self.cancelled = threading.Event()
         self.pending_approvals = []  # guarded by tools.approval._lock
         self.authorization_gate = _ConcurrentToolAuthorizationGate()

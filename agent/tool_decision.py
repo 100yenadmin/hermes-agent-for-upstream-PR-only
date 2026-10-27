@@ -43,12 +43,12 @@ _OUTCOME_VERDICTS = {"denied": "denied_by_user", "timeout": "timeout"}
 _MAX_PENDING = 1024  # notes whose call never reached the funnel are dropped oldest-first
 
 _pending: OrderedDict[tuple[str, str], tuple[str, str]] = OrderedDict()
-# (session_id, tool_call_id) already reported (ids are uniquified per session before dispatch), so a call
+# (session_id, tool_call_id, dispatch turn) already reported (ids can recur after compaction), so a call
 # whose terminal post_tool_call is published twice still yields one decision. A call published as
 # abandoned (deadline / interrupt) is also held in ``_abandoned`` until its late worker reports, so a
 # worker that settles long after its deadline is never re-reported by eviction from ``_emitted``.
-_emitted: OrderedDict[tuple[str, str], None] = OrderedDict()
-_abandoned: OrderedDict[tuple[str, str], None] = OrderedDict()
+_emitted: OrderedDict[tuple[str, str, str], None] = OrderedDict()
+_abandoned: OrderedDict[tuple[str, str, str], None] = OrderedDict()
 _ABANDON_ERROR_TYPES = frozenset({"tool_timeout", "tool_interrupted", "keyboard_interrupt", "thread_missing_result"})
 _MAX_EMITTED = 8192
 _lock = threading.Lock()
@@ -62,8 +62,11 @@ def _has_subscriber() -> bool:
 
 def args_digest(args: Any) -> str:
     """sha256 hex of the canonical JSON of *args* (sorted keys, compact separators)."""
-    canonical = json.dumps(args if args is not None else {}, sort_keys=True, separators=(",", ":"),
-                           ensure_ascii=False, default=str)
+    try:
+        canonical = json.dumps(args if args is not None else {}, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False, default=str)
+    except (TypeError, ValueError, RecursionError):
+        canonical = repr(args)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -149,8 +152,8 @@ def _pop(session_id: str, tool_call_id: str) -> Optional[tuple[str, str]]:
         return _pending.pop((session_id or "", tool_call_id), None)
 
 
-def _already_emitted(session_id: str, tool_call_id: str, error_type: Optional[str]) -> bool:
-    key = (session_id or "", tool_call_id)
+def _already_emitted(session_id: str, tool_call_id: str, turn_id: str, error_type: Optional[str]) -> bool:
+    key = (session_id or "", tool_call_id, turn_id or "")
     with _lock:
         if key in _abandoned:
             del _abandoned[key]  # the abandoned call's worker settled; its late report is dropped
@@ -182,6 +185,8 @@ def _resolve(status: Optional[str], error_type: Optional[str], noted: Optional[t
         return noted  # a gate's refusal is more specific than the dispatcher's block status
     if error_type in _BY_ERROR_TYPE:
         return _BY_ERROR_TYPE[error_type]
+    if error_type in _ABANDON_ERROR_TYPES:
+        return "abandoned", error_type
     if status == "blocked":
         return "blocked_by_policy", error_type or "blocked"
     return noted or ("allowed", "")
@@ -195,7 +200,7 @@ def emit_for_call(*, tool_name: str, args: Any, status: Optional[str], error_typ
     try:
         noted = _pop(session_id, tool_call_id)
         if (not tool_call_id or error_type in _SKIPPED_ERROR_TYPES or not _has_subscriber()
-                or _already_emitted(session_id, tool_call_id, error_type)):
+                or _already_emitted(session_id, tool_call_id, turn_id, error_type)):
             return
         verdict, source = _resolve(status, error_type, noted)
         from hermes_cli.lifecycle import invoke_hook

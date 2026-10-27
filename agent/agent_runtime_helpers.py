@@ -2508,7 +2508,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                  pre_tool_block_checked: bool = False,
                  skip_tool_request_middleware: bool = False,
                  tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None,
-                 skip_tool_execution_middleware: bool = False) -> str:
+                 skip_tool_execution_middleware: bool = False, dispatch_turn_id: Optional[str] = None) -> str:
     """Invoke a single tool (agent-level or registry-dispatched) and return the result string;
     no display logic. Used by the concurrent path; the sequential path keeps its own inline
     invocation for display."""
@@ -2518,7 +2518,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     )
     if not isinstance(function_args, dict):
         function_args = {}
-    hook_ids = tool_hook_ids(agent, effective_task_id, tool_call_id)
+    hook_ids = tool_hook_ids(agent, effective_task_id, tool_call_id, dispatch_turn_id)
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
         from hermes_cli.middleware import apply_tool_request_middleware
@@ -2539,7 +2539,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             agent, function_name=function_name, function_args=function_args, result=result,
             effective_task_id=effective_task_id, tool_call_id=tool_call_id, status="blocked",
             error_type="plugin_block", error_message=block_message,
-            middleware_trace=_tool_middleware_trace,
+            middleware_trace=_tool_middleware_trace, dispatch_turn_id=hook_ids["turn_id"],
         )
         return result
     tool_start_time = time.monotonic()
@@ -2556,7 +2556,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             emit_terminal_post_tool_call(
                 agent, function_name=function_name, function_args=call_args,
                 result=result, effective_task_id=effective_task_id, tool_call_id=tool_call_id,
-                duration_ms=duration_ms, middleware_trace=_tool_middleware_trace,
+                duration_ms=duration_ms, middleware_trace=_tool_middleware_trace, dispatch_turn_id=hook_ids["turn_id"],
             )
             return apply_transform_tool_result(
                 agent, function_name=function_name, function_args=call_args, result=result,
@@ -2566,7 +2566,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         def _execute(next_args: dict) -> Any:
             dispatch_kwargs = dict(
                 tool_call_id=tool_call_id, session_id=agent.session_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                turn_id=hook_ids["turn_id"],
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                 skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
