@@ -101,6 +101,22 @@ def test_persisted_env_api_key_does_not_hide_anthropic_overrides(home, monkeypat
     assert _API_KEY not in out + "".join(finding.manual_issues)
 
 
+@pytest.mark.parametrize("source", ["hermes_pkce", "claude_code"])
+def test_pruned_oauth_row_does_not_hide_an_api_key_redirect(home, monkeypatch, capsys, source):
+    # With ANTHROPIC_API_KEY and no OAuth variable the pool drops autodiscovered OAuth rows, so the
+    # env-seeded key and its inherited base URL carry every turn.
+    _configure(home, {"provider": "anthropic"})
+    (home / "auth.json").write_text(json.dumps({"credential_pool": {"anthropic": [{
+        "id": "stored-login", "provider": "anthropic", "source": source,
+        "auth_type": "oauth", "access_token": "sk-ant-oat01-STOREDLOGIN"}]}}), encoding="utf-8")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _API_KEY)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://proxy.example.test/v1")
+    out, finding = _run_check(capsys)
+    assert "⚠ ANTHROPIC_BASE_URL from the process environment" in out
+    assert "may override if the stored credential is unavailable" not in out
+    assert finding.manual_issues and _API_KEY not in out
+
+
 def test_no_finding_when_nothing_overrides(home, monkeypatch, capsys):
     _configure(home, {"provider": "anthropic"})
     out, finding = _run_check(capsys)
@@ -299,7 +315,8 @@ def test_env_oauth_token_with_a_stored_login_is_uncertain(home, monkeypatch, cap
 @pytest.mark.parametrize("var, source, warns", [
     ("ANTHROPIC_TOKEN", "hermes_pkce", True),
     ("CLAUDE_CODE_OAUTH_TOKEN", "hermes_pkce", True),
-    ("ANTHROPIC_API_KEY", "hermes_pkce", False),
+    ("ANTHROPIC_API_KEY", "hermes_pkce", True),  # an API-key-only environment prunes PKCE rows
+    ("ANTHROPIC_API_KEY", "claude_code", True),
     ("ANTHROPIC_TOKEN", "manual", False),
 ])
 def test_anthropic_stored_pool_source_rank(home, monkeypatch, capsys, var, source, warns):

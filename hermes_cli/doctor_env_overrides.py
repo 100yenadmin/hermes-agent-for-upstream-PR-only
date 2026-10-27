@@ -154,6 +154,9 @@ def _suppressed_sources(provider: str):
 def _stored_could_win(provider: str, env_var: str = "") -> bool:
     # Env rows are persisted references to the same variables, not competing credentials.
     rows = [row for row in _stored_rows(provider) if not row.get("source", "").startswith("env:")]
+    if provider == "anthropic" and env_var == "ANTHROPIC_API_KEY" and not any(_env(v) for v in _ANTHROPIC_OAUTH_VARS):
+        # An API-key-only environment makes the pool drop autodiscovered OAuth rows (_seed_anthropic_singletons).
+        rows = [row for row in rows if row.get("source") not in ("hermes_pkce", "claude_code")]
     if rows:
         if provider != "anthropic":
             return True  # includes the root fallback; never refresh or validate credentials
