@@ -40,7 +40,7 @@ def shutdown_memory_and_context(agent: Any, messages: list | None = None) -> Non
         if agent._memory_manager and agent._memory_manager.claim_teardown(session_end=True):
             try:
                 agent._memory_manager.on_session_end(messages or [])
-            except Exception as e:
+            except Exception as e:  # health: allow BLE001 -- moved from AIAgent.shutdown_memory_provider; logged with its traceback
                 logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
             _quietly(lambda: agent._memory_manager.shutdown_all())
         _notify_context_engine_session_end(agent, messages)
@@ -234,7 +234,6 @@ class ContextEngine(ABC):
         never close a backend shared with the registered instance or other agents' clones.
         Default: no-op.
         """
-        return None
 
     def on_session_reset(self) -> None:
         """/new or /reset: reset per-session state (default: counters and token tracking)."""
