@@ -19,6 +19,8 @@ def validate_action(operation, payload):
         return
     # Session-scope ``/reasoning <level>`` and Desktop's Move to project: revision-fenced edits of
     # the frozen policy (gateway/session_mutation_policy.py).
+    if operation == 'reasoning' and set(payload) == {'effort'} and payload['effort'] is None:
+        return  # ``/reasoning reset``: the session's level goes back to the profile
     if operation == 'reasoning' and set(payload) == {'effort'} and isinstance(payload['effort'], str):
         from hermes_constants import parse_reasoning_effort
         if parse_reasoning_effort(payload['effort']) is not None:
@@ -28,6 +30,10 @@ def validate_action(operation, payload):
     # The editor's MCP servers (gateway/session_local_mcp.py): the owner keeps the list in memory and
     # hands the store only its fingerprint, so no transport credential reaches a receipt.
     if operation == 'editor_mcp' and set(payload) == {'mcp_servers'} and _valid_editor_fingerprint(payload):
+        return
+    # An ACP session's edit approval policy (gateway/session_mutation_policy.py prepare_edit_policy).
+    if (operation == 'edit_policy' and set(payload) == {'policy'} and isinstance(payload['policy'], str)
+            and payload['policy'] in {'ask', 'workspace_session', 'session'}):
         return
     if operation == 'compress' and _valid_compress_payload(payload):
         return
@@ -84,7 +90,7 @@ def apply_action(db, conn, session_id, operation, payload, *, prepared=None):
     if operation == 'compress':
         from hermes_state_mutation_compress import compress_in_transaction
         return compress_in_transaction(db, conn, session_id, payload, prepared)
-    if operation in {'model', 'reasoning', 'workspace', 'editor_mcp'}:
+    if operation in {'model', 'reasoning', 'workspace', 'editor_mcp', 'edit_policy'}:
         from hermes_state_mutation_prepared import POLICY_HANDLERS
         return POLICY_HANDLERS[operation](db, conn, session_id, payload, prepared)
     if operation == 'branch':

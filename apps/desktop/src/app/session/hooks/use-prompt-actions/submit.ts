@@ -1,4 +1,4 @@
-import type { PromptSubmitResult } from '@hermes/shared'
+import { type PromptSubmitResult, randomUuid } from '@hermes/shared'
 import { type MutableRefObject, useCallback } from 'react'
 
 import { getSession, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
@@ -67,6 +67,7 @@ import {
   isProviderSetupError,
   isSessionBusyError,
   isTargetSessionBusy,
+  isVoiceStoppedReceipt,
   ownershipErrorSurface,
   refusalDroppedImages,
   releaseSubmitInFlight,
@@ -196,6 +197,8 @@ type SubmitReceipt = Pick<PromptSubmitResult, 'forwarded' | 'user_row_id'> & {
   submission_id?: string
   session_id?: string
   status?: string
+  /** TUI-26: the owner ended the session's voice chat on a typed stop phrase and admitted nothing. */
+  voice_stopped?: boolean
 }
 
 /** A refusal the backend issued before admitting anything, so an identityless retry cannot duplicate a turn. */
@@ -510,7 +513,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         : captured
 
       let requestGateway = destination.requestGateway
-      const submissionId = retained?.id ?? options?.submission_id ?? crypto.randomUUID()
+      const submissionId = retained?.id ?? options?.submission_id ?? randomUuid()
 
       let startingStoredSessionId = routedSessionNeedsResume
         ? routedStoredSessionId
@@ -1210,6 +1213,15 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           // Validate the admission receipt and bind it to the optimistic bubble.
           // Returns false when the receipt is not this send's admission.
           const applySubmitReceipt = (result: SubmitReceipt, receiptSessionId: string): boolean => {
+            if (isVoiceStoppedReceipt(result)) {
+              // Settled with no turn: the stop phrase ended the voice chat another viewer runs. No
+              // turn holds the bubble, so it goes, and nothing is tracked as pending.
+              dropOptimistic(receiptSessionId)
+              releaseBusy()
+
+              return true
+            }
+
             if (
               !legacyAccepted &&
               ((result?.submission_id ?? result?.admission_id) !== submissionId ||
