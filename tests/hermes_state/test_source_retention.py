@@ -28,7 +28,7 @@ def db(tmp_path, monkeypatch):
 
 def _seed(store, sid: str, source: str, age_days: float) -> None:
     store.create_session(session_id=sid, source=source)
-    store.end_session(sid, end_reason="done")
+    store.end_session(sid, end_reason="cron_complete" if source == "cron" else "done")
     store._conn.execute(
         "UPDATE sessions SET started_at = ?, last_activity_at = ? WHERE id = ?",
         (time.time() - age_days * 86400, time.time() - age_days * 86400, sid),

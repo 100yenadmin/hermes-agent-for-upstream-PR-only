@@ -4411,8 +4411,7 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
     from hermes_cli.session_retention_config import auto_prune_kwargs
     from hermes_state_registry import acquire, release_or_close
     _sess_cfg = (_load_full_config().get("sessions") or {})
-    kwargs = auto_prune_kwargs(_sess_cfg)
-    if not (_sess_cfg.get("auto_archive", False) or kwargs):
+    if not (_sess_cfg.get("auto_archive", False) or auto_prune_kwargs(_sess_cfg)):
         return
     _adb = acquire()
     try:
@@ -4420,7 +4419,7 @@ def _housekeeping_state_db_maintenance(launch: Optional[tuple[Path, Path]] = Non
             _adb.maybe_auto_archive(
                 idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
                 min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)))
-        if kwargs:
+        if kwargs := auto_prune_kwargs(_sess_cfg):
             _adb.maybe_auto_prune_and_vacuum(**kwargs, sessions_dir=_profile_sessions_dir(launch))
     finally:
         release_or_close(_adb)

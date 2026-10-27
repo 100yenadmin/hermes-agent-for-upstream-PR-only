@@ -113,9 +113,10 @@ _AUTOMATION_ONLY_SQL = (
     f"WHERE {_CONTINUATION_EDGE_SQL} UNION "
     "SELECT p.id FROM lineage l JOIN sessions c ON c.id=l.id JOIN sessions p ON p.id=c.parent_session_id "
     f"WHERE {_CONTINUATION_EDGE_SQL}) SELECT 1 FROM lineage l JOIN sessions a ON a.id=l.id WHERE "
-    f"a.source NOT IN {_SOURCE_RETENTION_SOURCES!s} OR "
+    f"a.source NOT IN {_SOURCE_RETENTION_SOURCES!s} OR json_extract(a.model_config, '$._human_continued') IS NOT NULL OR "
+    "(a.source='cron' AND COALESCE(a.end_reason,'') NOT IN ('cron_complete','cron_incomplete_no_output','startup_orphan_reap')) OR "
     "(SELECT COUNT(*) FROM messages m WHERE m.session_id=a.id AND m.role='user') > 1 OR "
-    "EXISTS (SELECT 1 FROM messages m WHERE m.session_id=a.id AND m.role='user' AND m.timestamp > a.started_at+600))"
+    "EXISTS (SELECT 1 FROM messages m WHERE m.session_id=a.id AND m.role='user' AND m.timestamp > a.started_at+60))"
 )
 
 

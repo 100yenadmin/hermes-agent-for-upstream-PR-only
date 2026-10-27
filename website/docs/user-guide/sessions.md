@@ -1156,13 +1156,10 @@ sessions:
   source_retention_days: {cron: 30, subagent: 14}
 ```
 
-This key only deletes ended `cron`, `kanban`, and `subagent` sessions past their inactivity window.
-It keeps pinned and open sessions, everything outside those sources, and automation sessions a person
-continued: more than one user message, or a user message more than 10 minutes after the run started.
-Every compression segment must qualify; ambiguous history is kept. Stale open automation rows close first,
-then age a full window before deletion. A subagent's own transcript goes; its parent chat keeps its summary.
-Disk space returns through the gated VACUUM below or `hermes sessions optimize`. With global pruning on,
-source windows only tighten the global window; the content protection applies to this key's passes only.
+This key only deletes ended `cron`, `kanban`, and `subagent` sessions past their inactivity window. It keeps pinned and open sessions, everything outside those sources, and sessions a person continued (marked durably from this version onward). For older history, it keeps rows with more than one user-role message, a user message more than a minute after the run started, or a cron row not ended by the scheduler (`cron_complete`, `cron_incomplete_no_output`) or stale-open sweep (`startup_orphan_reap`).
+Runs the agent itself extended also stay: nudges, max-iterations summary requests, late LSP notes, and Kanban goal/recovery turns can add user-role messages. These kept runs age out only under global `auto_prune`. The remaining legacy gap is a pre-marker subagent or Kanban row with no messages that a person resumed within its first minute and wrote exactly one message into. Every compression segment must qualify.
+
+Stale open automation rows close first, then age a full window before deletion. A subagent's own transcript goes; its parent chat keeps its summary. Disk space returns through the gated VACUUM below or `hermes sessions optimize`. With global pruning on, source windows only tighten the global window; these protections apply to this key's passes only.
 
 - Gateway conversations persist across inactivity; use `/new` or `/reset` for an explicit boundary
 - Before reset, the agent saves memories and skills from the expiring session

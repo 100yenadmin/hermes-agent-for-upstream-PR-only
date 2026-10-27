@@ -64,3 +64,31 @@ def test_source_map_does_not_enable_global_prune_or_change_defaults():
     kwargs = auto_prune_kwargs({"auto_prune": True, "source_retention_days": {"cron": 30}})
     assert kwargs["global_prune"] is True
     assert kwargs["source_retention_days"] == {"cron": 30}
+
+
+@pytest.mark.parametrize("global_prune", [False, True])
+def test_bad_global_retention_cannot_stop_gateway_archive(monkeypatch, global_prune):
+    from gateway.run import _housekeeping_state_db_maintenance
+
+    cfg = {"auto_prune": global_prune, "retention_days": "90d", "auto_archive": True,
+           "source_retention_days": {"cron": 30}}
+    db = MagicMock()
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"sessions": cfg})
+    monkeypatch.setattr("hermes_state_registry.acquire", lambda: db)
+    monkeypatch.setattr("hermes_state_registry.release_or_close", lambda _: None)
+    if global_prune:
+        with pytest.raises(ValueError):
+            _housekeeping_state_db_maintenance()
+    else:
+        _housekeeping_state_db_maintenance()
+        db.maybe_auto_prune_and_vacuum.assert_called_once()
+        assert db.maybe_auto_prune_and_vacuum.call_args.kwargs["retention_days"] == 90
+        assert db.maybe_auto_prune_and_vacuum.call_args.kwargs["global_prune"] is False
+    db.maybe_auto_archive.assert_called_once()
+
+
+def test_builder_never_warns_about_rejected_sources(caplog):
+    from hermes_cli.session_retention_config import auto_prune_kwargs
+
+    assert auto_prune_kwargs({"source_retention_days": {"telegram": 30}}) is None
+    assert not caplog.records
