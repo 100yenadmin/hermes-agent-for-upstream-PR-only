@@ -51,7 +51,10 @@ _MIRROR_SOURCES = frozenset({"tui", "gui", "acp"})
 
 
 def _mirror_session() -> bool:
-    from gateway.session_policy import active_policy
+    try:
+        from gateway.session_policy import active_policy
+    except ImportError:  # install without the gateway package: no local session can be running
+        return False
     policy = active_policy()
     return policy is not None and policy.source in _MIRROR_SOURCES
 
