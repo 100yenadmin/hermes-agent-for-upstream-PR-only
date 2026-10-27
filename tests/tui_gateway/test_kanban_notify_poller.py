@@ -262,7 +262,7 @@ class TestNotificationPollerLoopKanbanWiring:
 
     def _start_poller(self, session: dict, monkeypatch):
         import threading
-        import tui_gateway.server as server
+        from tui_gateway import server
 
         emits: list = []
         submits: list = []
@@ -270,11 +270,12 @@ class TestNotificationPollerLoopKanbanWiring:
         monkeypatch.setattr(
             server, "_emit", lambda event, sid, payload=None: emits.append((event, payload))
         )
-        monkeypatch.setattr(
-            server,
-            "_run_prompt_submit",
-            lambda rid, sid, sess, text: submits.append(text),
-        )
+        def accept(rid, sid, sess, text):
+            # Model execution is replaced, including its concrete admission receipt.
+            server._emit("message.start", sid)
+            submits.append(text)
+            return True
+        monkeypatch.setattr(server, "_run_prompt_submit", accept)
         stop = threading.Event()
         thread = threading.Thread(
             target=server._notification_poller_loop,
@@ -354,7 +355,7 @@ class TestNotificationPollerLoopKanbanWiring:
     @pytest.mark.parametrize("raises", [False, True])
     def test_rejected_dispatch_keeps_batch_for_retry(self, monkeypatch, raises):
         """Restore the selected batch ahead of the diagnostic remainder and newer entries."""
-        import tui_gateway.server as server
+        from tui_gateway import server
         from gateway import warning_notifications as warnings
 
         tid = _create_subscribed_task()
@@ -395,8 +396,6 @@ class TestNotificationPollerLoopKanbanWiring:
         accepted = []
         monkeypatch.setattr(server, "_run_prompt_submit",
                             lambda *_args, **_kwargs: accepted.append(_args[3]) or True)
-        # Advance past the refusal backoff without a sleep.
-        monkeypatch.setattr(server.time, "monotonic", lambda: float("inf"))
         server._notif_poll_kanban("sid-kanban-reject", session)
         assert accepted == [submitted[0] + "\n" + newer]
         assert session["_kanban_pending"] == [diagnostic]

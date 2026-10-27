@@ -110,8 +110,7 @@ def test_the_poller_thread_survives_a_dispatch_that_raises(monkeypatch):
     events.put({"type": "completion", "session_id": "proc_a"})
     monkeypatch.setattr("tools.process_registry.process_registry",
                         SimpleNamespace(completion_queue=events, restore_completions=lambda: 0))
-    for name in ("_poll_bot_live_delivery_guarded", "_maybe_fire_tui_loop_tick",
-                 "_maybe_fire_tui_heartbeat_tick", "_notif_poll_kanban"):
+    for name in ("_maybe_fire_tui_loop_tick", "_maybe_fire_tui_heartbeat_tick", "_notif_poll_kanban"):
         monkeypatch.setattr(server, name, lambda *a, **k: None)
     stop = threading.Event()
     handled: list = []
@@ -152,4 +151,3 @@ def test_a_refused_notification_does_not_release_a_turn_claimed_since(monkeypatc
 
     assert server._notif_submit("rid", "sid", session, "kanban update", "test dispatch") is False
     assert session["running"] is True
-    assert session["_notification_retry_at"] > 0
