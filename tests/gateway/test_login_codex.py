@@ -178,3 +178,24 @@ async def test_private_delivery_failure_aborts_poll_without_leaking_exception(se
     assert not runner._login_attempts
     assert "test-sensitive-error" not in caplog.text
     assert "did not complete" in runner._deliver_platform_notice.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_busy_nous_login_fires_the_accepted_hook_and_codex_rejection_does_not(setup):
+    from gateway.run_busy import BUSY_ACCEPTED
+
+    runner, _, _, _ = setup
+    hook = AsyncMock()
+    runner._handle_login_command = AsyncMock(return_value="started")
+    token = BUSY_ACCEPTED.set(hook)
+    try:
+        nous = _event(args="")
+        assert await runner._dispatch_busy_slash_command(nous, resolve_command("login"), "k", nous.source) == "started"
+        hook.assert_awaited_once()
+        hook.reset_mock()
+        codex = _event()
+        assert "can't run mid-turn" in await runner._dispatch_busy_slash_command(
+            codex, resolve_command("login"), "k", codex.source)
+        hook.assert_not_awaited()
+    finally:
+        BUSY_ACCEPTED.reset(token)

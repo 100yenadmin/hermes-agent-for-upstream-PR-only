@@ -141,6 +141,9 @@ class GatewayLoginCommandsMixin:
         provider = event.get_command_args().strip().lower()
         if provider in {"codex", "openai-codex", "openai_codex"}:
             return t("gateway.busy.slash_rejected", command="login")
+        from gateway.run_busy import _busy_accepted
+
+        await _busy_accepted()  # as main's plain busy route: a local session's pre_command fires once accepted
         async with self._async_profile_scope_for_source(source):
             return await self._handle_login_command(event)
 
