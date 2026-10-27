@@ -13,6 +13,7 @@ import pytest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import SessionSource
 from gateway.platforms.event import MessageEvent, MessageType
+from tests.waiting import async_wait_until
 
 
 def _make_adapter():
@@ -119,11 +120,11 @@ class TestTextBatching:
         second = "b" * 3955
 
         adapter._enqueue_text_event(_make_event(first))
-        await asyncio.sleep(1.177)
+        await asyncio.sleep(1.177)  # health: allow HX013 -- the observed client-split delivery gap is the behaviour under test
         adapter.handle_message.assert_not_called()
 
         adapter._enqueue_text_event(_make_event(second))
-        await asyncio.sleep(1.6)
+        await async_wait_until(lambda: adapter.handle_message.called, what="the batch flush")
 
         adapter.handle_message.assert_called_once()
         dispatched = adapter.handle_message.call_args.args[0]
