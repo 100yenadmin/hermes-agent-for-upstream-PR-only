@@ -271,7 +271,7 @@ def choose_callback_receiver(
     if client_redirect_uri is not None:
         flow.redirect_uri = _validate_client_redirect_uri(client_redirect_uri)
         return None
-    if public_base is not None:
+    if public_base is not None and not (cfg.get("oauth") or {}).get("redirect_uri"):
         flow.redirect_uri = f"{public_base}/api/mcp/oauth/callback/{quote(flow.server_name, safe='')}"
         return None
     httpd = _start_loopback_receiver(flow)

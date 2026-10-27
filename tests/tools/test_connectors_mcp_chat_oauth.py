@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import sys
+import time
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -17,6 +19,7 @@ from tui_gateway import mcp_oauth_sessions
 def chat_oauth(monkeypatch):
     from hermes_cli import mcp_catalog, mcp_config
 
+    monkeypatch.setitem(sys.modules, "gateway.run", SimpleNamespace(_gateway_runner_ref=lambda: None))
     home = get_hermes_home()
     cfg = {"url": "https://mcp.example/mcp", "auth": "oauth"}
     entry = SimpleNamespace(auth=SimpleNamespace(type="oauth", provider=None, env=[]),
@@ -54,11 +57,20 @@ def _connect(action="authorize"):
         connection_callback=None, session_id="chat"))
 
 
+def _listener(monkeypatch, state="serving", public_url="https://agent.example/hermes"):
+    runner = SimpleNamespace(
+        webapp_status={"state": state, "url": "http://127.0.0.1:8080"},
+        session_api=SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+            listener_public_url=public_url))))
+    monkeypatch.setitem(sys.modules, "gateway.run", SimpleNamespace(_gateway_runner_ref=lambda: runner))
+
+
 @pytest.mark.parametrize("action", ["authorize", "install"])
 def test_chat_public_redirect_and_next_turn_adoption(chat_oauth, monkeypatch, action):
     home, listeners = chat_oauth
     (home / "config.yaml").write_text(
         "webapp:\n  enabled: true\n  public_url: https://agent.example/hermes/\n")
+    _listener(monkeypatch)
     out = _connect(action)
     target = out["targets"][0]
     redirect = parse_qs(urlparse(target["connect_url"]).query)["redirect_uri"][0]
@@ -137,3 +149,101 @@ def test_callback_receiver_precedence(monkeypatch, pinned, client, public, expec
     assert flow.redirect_uri == expected
     assert bool(bound) == (public is None)
     assert (receiver is not None) == bool(bound)
+
+
+@pytest.mark.parametrize("state", [None, "starting", "unavailable", "off"])
+def test_enabled_config_without_serving_process_listener_keeps_loopback(chat_oauth, monkeypatch, state):
+    home, listeners = chat_oauth
+    (home / "config.yaml").write_text(
+        "webapp:\n  enabled: true\n  public_url: https://other-process.example\n")
+    if state is not None:
+        _listener(monkeypatch, state)
+    else:
+        monkeypatch.delitem(sys.modules, "gateway.run")
+    out = _connect()
+    redirect = parse_qs(urlparse(out["targets"][0]["connect_url"]).query)["redirect_uri"][0]
+    assert redirect == "http://127.0.0.1:54321/callback"
+    assert len(listeners) == 1
+    assert "gateway machine" in out["note"]
+    assert "next message" not in out["note"]
+
+
+@pytest.mark.parametrize("profile_config", ["", "webapp:\n  public_url: https://wrong-profile.example\n"])
+def test_chat_uses_process_listener_not_turn_profile(chat_oauth, monkeypatch, profile_config):
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    home, listeners = chat_oauth
+    profile = home / "secondary"
+    profile.mkdir()
+    (profile / "config.yaml").write_text(profile_config)
+    _listener(monkeypatch)
+    token = set_hermes_home_override(profile)
+    try:
+        out = _connect()
+        assert (hermes_home_key(), "chat") in mcp._LATE_ATTEMPTS
+    finally:
+        reset_hermes_home_override(token)
+    redirect = parse_qs(urlparse(out["targets"][0]["connect_url"]).query)["redirect_uri"][0]
+    assert redirect == "https://agent.example/hermes/api/mcp/oauth/callback/reports"
+    assert listeners == []
+    assert "next message" in out["note"]
+
+
+def test_saved_redirect_does_not_claim_public_completion(chat_oauth, monkeypatch):
+    from hermes_cli import mcp_config
+
+    (chat_oauth[0] / "config.yaml").write_text(
+        "webapp:\n  enabled: true\n  public_url: https://agent.example/hermes\n")
+    _listener(monkeypatch)
+    cfg = {"url": "https://mcp.example/mcp", "auth": "oauth",
+           "oauth": {"redirect_uri": "http://127.0.0.1:54321/callback"}}
+    monkeypatch.setattr(mcp_config, "_get_mcp_servers", lambda: {"reports": cfg})
+    out = _connect()
+    assert "next message" not in out["note"]
+    assert "gateway machine" in out["note"]
+    assert len(chat_oauth[1]) == 1
+
+
+@pytest.mark.parametrize("action", ["enable", "install", "authorize"])
+def test_no_oauth_url_has_no_callback_guidance(chat_oauth, monkeypatch, action):
+    monkeypatch.setattr(mcp._CatalogBackend, "enable", lambda _self, _name: [])
+    monkeypatch.setattr(mcp._CatalogBackend, "installs_with_oauth", lambda _self, _name: False)
+    monkeypatch.setattr(mcp._CatalogBackend, "install", lambda _self, _name, _env: [])
+
+    def fail(_self, _name):
+        raise RuntimeError("fixture start failed")
+
+    monkeypatch.setattr(mcp._CatalogBackend, "start_oauth", fail)
+    out = _connect(action)
+    assert all(not target.get("connect_url") for target in out["targets"])
+    assert "gateway machine" not in out["note"]
+    assert "next message" not in out["note"]
+
+
+def test_attempt_without_auth_url_has_no_callback_guidance():
+    attempt = SimpleNamespace(auth_url="", flow=SimpleNamespace(redirect_uri="http://127.0.0.1/callback"))
+    runner = SimpleNamespace(backend=SimpleNamespace(public_base=None),
+                             work={"reports": SimpleNamespace(attempt=attempt)})
+    assert mcp._chat_oauth_note(runner) == mcp.NO_CARD_NOTE
+
+
+@pytest.mark.parametrize("status,expired", [
+    ("approved", True), ("error", True), ("cancelled", True),
+    ("approved", False), ("authorization_required", True),
+])
+def test_chat_parking_prunes_only_expired_finished_attempts(chat_oauth, status, expired):
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+    flow = DashboardOAuthFlow(flow_id="old", server_name="old", profile=None,
+                              hermes_home=str(chat_oauth[0]), redirect_uri="")
+    flow.created_at = time.time() - (mcp_oauth_sessions._SESSION_TTL_SECONDS + 1 if expired else 0)
+    flow.status = "authorization_required"
+    if status == "approved":
+        flow.mark_approved()
+    elif status in {"error", "cancelled"}:
+        flow.mark_error("fixture ended", cancelled=status == "cancelled")
+    old_key = ("abandoned-profile", "abandoned-session")
+    mcp._LATE_ATTEMPTS[old_key] = {"old": mcp_oauth.OAuthAttempt(auth_url="", flow=flow)}
+    _connect()
+    assert (old_key in mcp._LATE_ATTEMPTS) == (not expired or status == "authorization_required")
+    assert "reports" in mcp._LATE_ATTEMPTS[(hermes_home_key(), "chat")]

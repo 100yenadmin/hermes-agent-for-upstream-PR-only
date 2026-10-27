@@ -4,6 +4,7 @@ import contextlib
 import contextvars
 import json
 import logging
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -809,28 +810,42 @@ def retry(operation: ConnectionOperation, names: list[str]) -> Optional[str]:
 
 
 def _chat_public_base() -> Optional[str]:
-    from gateway.webapp_listener import webapp_settings
-    from hermes_constants import get_hermes_home
-
-    settings = webapp_settings(get_hermes_home())
-    return settings.public_url if settings.enabled and settings.public_url else None
+    runner_ref = getattr(sys.modules.get("gateway.run"), "_gateway_runner_ref", None)
+    runner = runner_ref() if callable(runner_ref) else None
+    if runner is None or getattr(runner, "webapp_status", {}).get("state") != "serving":
+        return None
+    app = getattr(getattr(runner, "session_api", None), "app", None)
+    return getattr(getattr(app, "state", None), "listener_public_url", None) or None
 
 
 def _chat_oauth_note(runner: _Runner) -> str:
     public_base = getattr(runner.backend, "public_base", None)
     redirects = [getattr(getattr(work.attempt, "flow", None), "redirect_uri", "")
-                 for work in runner.work.values() if work.attempt is not None]
+                 for work in runner.work.values() if work.attempt is not None and work.attempt.auth_url]
     public = [bool(public_base and uri.startswith(f"{public_base}/api/mcp/oauth/callback/"))
               for uri in redirects]
     note = NO_CARD_NOTE
     if any(public):
         note += (" After they finish signing in through the Webapp, the tools become available on "
                  "their next message; do not ask them to confirm.")
-    if not public or not all(public):
+    if public and not all(public):
         note += (" A loopback sign-in link only completes in a browser on the gateway machine. "
                  "For public callbacks the operator must enable the Webapp and set webapp.public_url; "
                  "a provider's pinned loopback redirect still requires the gateway browser.")
     return note
+
+
+def _prune_chat_attempts() -> None:
+    from tui_gateway.mcp_oauth_sessions import _SESSION_TTL_SECONDS
+
+    cutoff = time.time() - _SESSION_TTL_SECONDS
+    for key, attempts in list(_LATE_ATTEMPTS.items()):
+        for name, attempt in list(attempts.items()):
+            flow = attempt.flow
+            if flow.created_at < cutoff and flow.snapshot()["status"] in {"approved", "error"}:
+                attempts.pop(name, None)
+        if not attempts:
+            _LATE_ATTEMPTS.pop(key, None)
 
 
 def _no_card_result(runner: _Runner, names: list[str], action: str, session_key: str) -> str:
@@ -839,6 +854,7 @@ def _no_card_result(runner: _Runner, names: list[str], action: str, session_key:
     operation = DetachedOperation([Target(n, "mcp", action) for n in names], session_key=session_key)
     for target in operation.targets:
         runner.run(_NO_CARD, operation, target)
+    _prune_chat_attempts()
     for name, work in runner.work.items():
         if work.attempt is not None:
             _LATE_ATTEMPTS.setdefault(_late_key(operation), {})[name] = work.attempt
