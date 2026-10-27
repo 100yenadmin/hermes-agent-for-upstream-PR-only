@@ -43,6 +43,7 @@ def hooks(monkeypatch):
     monkeypatch.setattr(lifecycle, "has_hook", lambda name: name in ("tool_decision", "pre_tool_call"))
     monkeypatch.setattr(tool_decision, "_pending", OrderedDict())
     monkeypatch.setattr(tool_decision, "_emitted", OrderedDict())
+    monkeypatch.setattr(tool_decision, "_abandoned", OrderedDict())
     yield rec
     # Raw arguments never reach a subscriber, on any path.
     assert SECRET not in repr(rec.decisions)
@@ -166,6 +167,36 @@ def test_a_second_terminal_emission_for_the_same_call_is_dropped(hooks):
     _terminal_emit()
     [event] = hooks.decisions
     assert event["verdict"] == "allowed"
+
+
+def test_abandoned_call_is_not_re_reported_when_its_worker_settles_late(hooks, monkeypatch):
+    """The late worker may report in a later turn and after many other calls have been reported."""
+    monkeypatch.setattr(tool_decision, "_MAX_EMITTED", 2)
+    _terminal_emit(status="timeout", error_type="tool_timeout")
+    agent = _agent()
+    for n in range(5):  # evicts the abandoned call from the general repeat table
+        emit_terminal_post_tool_call(agent, function_name="read_file", function_args={}, result="r",
+                                     effective_task_id="task-1", tool_call_id=f"other-{n}")
+    agent._current_turn_id = "turn-2"
+    emit_terminal_post_tool_call(agent, function_name="write_file", function_args={"path": "a"}, result="r",
+                                 effective_task_id=IDS["task_id"], tool_call_id=IDS["tool_call_id"])
+    assert [e["tool_call_id"] for e in hooks.decisions].count(IDS["tool_call_id"]) == 1
+    assert len(hooks.decisions) == 6
+
+
+def test_dispatch_without_a_tool_call_id_fires_nothing(hooks, monkeypatch):
+    """execute_code RPC callbacks dispatch with only a task id: their verdicts cannot be attributed,
+    so they report nothing rather than a false ``allowed``."""
+    monkeypatch.setattr(approval, "_match_user_deny_rule", lambda command: "rm*")
+
+    def terminal_handler(name, args, **kwargs):
+        approval.check_all_command_guards(args["command"], "local")
+        return '{"error": "blocked"}'
+
+    with patch("model_tools.registry.dispatch", side_effect=terminal_handler):
+        model_tools.handle_function_call("terminal", {"command": "rm notes.txt"}, task_id="task-1")
+    assert hooks.decisions == []
+    assert tool_decision._pending == {}
 
 
 def test_block_inside_a_suppressed_dispatch_reaches_the_outer_emission(hooks):

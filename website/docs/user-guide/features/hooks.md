@@ -450,7 +450,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 |---|---|---|---|---|
 | [`pre_tool_call`](#pre_tool_call) | Directive/control | Once before execution; any valid `block` wins over any `approve` (then the first valid `approve`), and `modify` returns are shallow-merged into the tool arguments. | `tool_name`, `args`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `middleware_trace` | Raw arguments may contain user content, paths, commands, or secrets. |
 | `post_tool_call` | Observer | After blocked, error, or successful result; return ignored. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message`, `middleware_trace` | Result/error text may contain arbitrary tool or user content and secrets. |
-| [`tool_decision`](#tool_decision) | Observer | Exactly once per tool call, immediately before its terminal `post_tool_call`: the final allow/refuse verdict and the gate that decided it; return ignored. Calls skipped by an interrupt before any gate ran fire none. | `tool_name`, `args_sha256`, `verdict`, `source`, `initiator`, `session_id`, `turn_id`, `tool_call_id`, `task_id`, `api_request_id` | No raw arguments: only a sha256 digest of their canonical JSON. |
+| [`tool_decision`](#tool_decision) | Observer | Exactly once per model-issued tool call (one with a `tool_call_id`), immediately before its terminal `post_tool_call`: the final allow/refuse verdict and the gate that decided it; return ignored. Calls skipped by an interrupt before any gate ran fire none. | `tool_name`, `args_sha256`, `verdict`, `source`, `initiator`, `session_id`, `turn_id`, `tool_call_id`, `task_id`, `api_request_id` | No raw arguments: only a sha256 digest of their canonical JSON. |
 | `transform_tool_result` | Transform | After `post_tool_call`, before conversation append; first string replaces the result. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message` | Exposes the full model-bound result and arguments. |
 | `transform_terminal_output` | Transform | After bounded foreground process capture, before final output limiting; first string replaces output. | `command`, `output`, `returncode`, `task_id`, `env_type` | Command/output may contain credentials. |
 | `pre_transcription` | Transform | Fired by the STT dispatcher after provider resolution and before any backend (built-in, command-type, or plugin-registered) is invoked; dict results are applied in registration order, last-writer-wins per field (`prompt`, `language`, `model`; `file_path` is read-only). | `file_path`, `provider`, `model`, `language`, `prompt`, `source` | The final prompt is uploaded to the configured STT provider with the audio — keep secrets out of hook returns. |
@@ -678,7 +678,7 @@ def register(ctx):
 
 ### `tool_decision`
 
-Fires **exactly once per tool call**, with the final allow/refuse verdict and the gate that decided it, so an audit or policy plugin can record every decision in one place. It fires immediately before the call's terminal `post_tool_call`, on every dispatch path (sequential and concurrent agent loop, inline agent tools, direct `handle_function_call`). Approval prompts for shell commands and `execute_code` run inside the tool, so the verdict is only final when the call returns; a refused call fires as soon as it is refused. Core keeps no sink.
+Fires **exactly once per tool call the model issued** (every call that carries a `tool_call_id`), with the final allow/refuse verdict and the gate that decided it, so an audit or policy plugin can record every decision in one place. It fires immediately before the call's terminal `post_tool_call`, on every dispatch path (sequential and concurrent agent loop, inline agent tools, direct `handle_function_call`). Approval prompts for shell commands and `execute_code` run inside the tool, so the verdict is only final when the call returns; a refused call fires as soon as it is refused. Core keeps no sink.
 
 **Callback signature:**
 
@@ -697,7 +697,7 @@ def my_callback(tool_name: str, args_sha256: str, verdict: str, source: str, ini
 
 **Return value:** ignored. A raising or slow subscriber never changes the verdict or blocks the call (callbacks are timeout-bounded like `post_tool_call`).
 
-Known limits: shell commands run under yolo or `approvals.mode: off` skip dangerous-command detection, so they report `allowed`; tools that an `execute_code` script calls back into carry no `tool_call_id`, so an approval decided for them is not attributed to the `execute_code` call.
+Not covered: dispatches without a `tool_call_id` (tools an `execute_code` script calls back into, direct programmatic calls) fire no `tool_decision`, because their gate verdicts cannot be attributed; the `execute_code` call itself reports its own verdict. Shell commands run under yolo or `approvals.mode: off` skip dangerous-command detection, so they report `allowed`.
 
 **Example — append every decision to a JSONL audit log:**
 

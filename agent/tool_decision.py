@@ -43,9 +43,14 @@ _OUTCOME_VERDICTS = {"denied": "denied_by_user", "timeout": "timeout"}
 _MAX_PENDING = 1024  # notes whose call never reached the funnel are dropped oldest-first
 
 _pending: OrderedDict[tuple[str, str], tuple[str, str]] = OrderedDict()
-# (session_id, turn_id, tool_call_id) already reported: a call whose terminal post_tool_call is
-# published twice (a late worker after its timeout result) still yields one decision.
-_emitted: OrderedDict[tuple[str, str, str], None] = OrderedDict()
+# (session_id, tool_call_id) already reported (ids are uniquified per session before dispatch), so a call
+# whose terminal post_tool_call is published twice still yields one decision. A call published as
+# abandoned (deadline / interrupt) is also held in ``_abandoned`` until its late worker reports, so a
+# worker that settles long after its deadline is never re-reported by eviction from ``_emitted``.
+_emitted: OrderedDict[tuple[str, str], None] = OrderedDict()
+_abandoned: OrderedDict[tuple[str, str], None] = OrderedDict()
+_ABANDON_ERROR_TYPES = frozenset({"tool_timeout", "tool_interrupted", "keyboard_interrupt", "thread_missing_result"})
+_MAX_EMITTED = 8192
 _lock = threading.Lock()
 _deferred: ContextVar[bool] = ContextVar("tool_decision_deferred", default=False)
 
@@ -144,16 +149,20 @@ def _pop(session_id: str, tool_call_id: str) -> Optional[tuple[str, str]]:
         return _pending.pop((session_id or "", tool_call_id), None)
 
 
-def _already_emitted(session_id: str, turn_id: str, tool_call_id: str) -> bool:
-    if not tool_call_id:
-        return False
-    key = (session_id or "", turn_id or "", tool_call_id)
+def _already_emitted(session_id: str, tool_call_id: str, error_type: Optional[str]) -> bool:
+    key = (session_id or "", tool_call_id)
     with _lock:
+        if key in _abandoned:
+            del _abandoned[key]  # the abandoned call's worker settled; its late report is dropped
+            return True
         if key in _emitted:
             return True
         _emitted[key] = None
-        while len(_emitted) > _MAX_PENDING:
-            _emitted.popitem(last=False)
+        if error_type in _ABANDON_ERROR_TYPES:
+            _abandoned[key] = None
+        for table, cap in ((_emitted, _MAX_EMITTED), (_abandoned, _MAX_PENDING)):
+            while len(table) > cap:
+                table.popitem(last=False)
     return False
 
 
@@ -180,11 +189,13 @@ def _resolve(status: Optional[str], error_type: Optional[str], noted: Optional[t
 
 def emit_for_call(*, tool_name: str, args: Any, status: Optional[str], error_type: Optional[str],
                   session_id: str, tool_call_id: str, turn_id: str, task_id: str, api_request_id: str) -> None:
-    """Fire ``tool_decision`` for one call from its terminal post_tool_call. Never raises."""
+    """Fire ``tool_decision`` for one call from its terminal post_tool_call. Never raises. Dispatches
+    without a tool_call_id (tools an ``execute_code`` script calls back into, direct programmatic calls)
+    are not model tool calls and their gate verdicts cannot be attributed, so they fire nothing."""
     try:
         noted = _pop(session_id, tool_call_id)
-        if error_type in _SKIPPED_ERROR_TYPES or not _has_subscriber() or _already_emitted(
-                session_id, turn_id, tool_call_id):
+        if (not tool_call_id or error_type in _SKIPPED_ERROR_TYPES or not _has_subscriber()
+                or _already_emitted(session_id, tool_call_id, error_type)):
             return
         verdict, source = _resolve(status, error_type, noted)
         from hermes_cli.lifecycle import invoke_hook
