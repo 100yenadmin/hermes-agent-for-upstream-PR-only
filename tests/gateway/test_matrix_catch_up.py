@@ -231,24 +231,26 @@ async def test_checkpoint_failure_advances_and_dispatches_once_per_streak(harnes
     await connect(adapter, home)
     client = clients[-1]
     adapter._client = client
-    target = Path if failure == "write_text" else catch_up.os
-    original = getattr(target, failure)
+    target = Path if failure == "write_text" else catch_up
+    original = getattr(target, failure, None)
     with caplog.at_level(logging.WARNING):
-        monkeypatch.setattr(target, failure, MagicMock(side_effect=OSError("read-only fixture")))
+        monkeypatch.setattr(target, failure, MagicMock(side_effect=OSError("read-only fixture")), raising=False)
         for i in (2, 3):
             assert await adapter._absorb_sync(client, batch([event(i, 1)], f"s{i}")) == f"s{i}"
             assert await client.sync_store.get_next_batch() == f"s{i}"
         assert delivered(adapter) == {"$event2", "$event3"}
-        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        warnings = [r for r in caplog.records if r.name == catch_up.logger.name
+                    and "could not save catch-up checkpoint" in r.message]
         assert len(warnings) == 1
         assert str(store / "sync_token.json") in warnings[0].message
-        assert "restart may miss messages" in warnings[0].message
+        assert "restart is skipped until a checkpoint is saved again" in warnings[0].message
         monkeypatch.setattr(target, failure, original)
         await adapter._absorb_sync(client, batch([event(4, 1)], "s4"))
         monkeypatch.setattr(target, failure, MagicMock(side_effect=OSError("read-only fixture")))
         await adapter._absorb_sync(client, batch([event(5, 1)], "s5"))
     assert delivered(adapter) == {f"$event{i}" for i in (2, 3, 4, 5)}
-    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 2
+    assert len([r for r in caplog.records if r.name == catch_up.logger.name
+                and "could not save catch-up checkpoint" in r.message]) == 2
 
 
 @pytest.mark.asyncio
@@ -315,12 +317,113 @@ async def test_overall_cap_keeps_newest_hundred(harness, caplog):
 
 
 @pytest.mark.asyncio
-async def test_own_messages_do_not_consume_room_cap(harness):
+@pytest.mark.parametrize("sender", [USER, "@BOT:example.org"])
+async def test_own_messages_do_not_consume_room_cap(harness, sender):
     make, _ = harness
-    own = [dict(event(i, 50 - i), sender=USER) for i in range(25)]
+    own = [dict(event(i, 50 - i), sender=sender) for i in range(25)]
     data = {"next_batch": "s1", "rooms": {"join": {
         ROOM: {"timeline": {"events": [event("human", 100), *own]}}}}}
     adapter, store, home = make(3600, [data])
     seed(store)
     await connect(adapter, home)
     assert delivered(adapter) == {"$eventhuman"}
+
+
+@pytest.mark.asyncio
+async def test_failed_checkpoint_removed_before_restart(harness, monkeypatch):
+    make, clients = harness
+    first, store, home = make(3600, [batch([event(0)])], check_checkpoint=False)
+    seed(store)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "write_text", MagicMock(side_effect=OSError("full disk fixture")))
+        await connect(first, home)
+    assert delivered(first) == {"$event0"}
+    assert await clients[-1].sync_store.get_next_batch() == "s1"
+    assert not (store / "sync_token.json").exists()
+
+    second, _, home = make(3600, [batch([event(0)])])
+    await connect(second, home)
+    clients[-1].sync.assert_awaited_once_with(timeout=10000, full_state=True)
+    assert delivered(second) == set()
+
+
+@pytest.mark.asyncio
+async def test_failed_checkpoint_unlink_logs_one_replay_error(harness, monkeypatch, caplog):
+    from plugins.platforms.matrix import catch_up
+    make, clients = harness
+    adapter, store, home = make(3600, check_checkpoint=False)
+    seed(store)
+    await connect(adapter, home)
+    path = store / "sync_token.json"
+    original_unlink = Path.unlink
+
+    def fail_checkpoint_unlink(target, *args, **kwargs):
+        if target == path:
+            raise OSError("read-only fixture")
+        return original_unlink(target, *args, **kwargs)
+
+    adapter._client = clients[-1]
+    with caplog.at_level(logging.WARNING):
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "write_text", MagicMock(side_effect=OSError("full disk fixture")))
+            patch.setattr(Path, "unlink", fail_checkpoint_unlink)
+            for i in (2, 3):
+                await adapter._absorb_sync(clients[-1], batch([event(i, 1)], f"s{i}"))
+    assert delivered(adapter) == {"$event2", "$event3"}
+    assert await clients[-1].sync_store.get_next_batch() == "s3"
+    assert json.loads(path.read_text())["next_batch"] == "s1"
+    errors = [r for r in caplog.records if r.name == catch_up.logger.name and r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert str(path) in errors[0].message
+    assert "restart may repeat up to 100 messages" in errors[0].message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("join_age,expected", [(170, set()), (400, {"$event0"})])
+async def test_state_only_rejoin_with_host_clock_behind(harness, join_age, expected):
+    make, _ = harness
+    # Checkpoint host time is 100s behind the homeserver; pre-checkpoint history
+    # can pass the event bound, so the recent own join must exclude this room.
+    data = batch([event(0, 180)])
+    data["rooms"]["join"][ROOM].update({
+        "timeline": {"limited": True, "events": [event(0, 180)]},
+        "state": {"events": [{"type": "m.room.member", "state_key": USER,
+            "origin_server_ts": (NOW - join_age) * 1000, "content": {"membership": "join"}}]}})
+    adapter, store, home = make(3600, [data])
+    seed(store, saved_at=NOW - 220)
+    await connect(adapter, home)
+    assert delivered(adapter) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["timeline", "state"])
+@pytest.mark.parametrize("previous", ["join", "leave", None])
+async def test_own_member_profile_change_is_not_rejoin(harness, source, previous):
+    make, _ = harness
+    data = batch([event(0)])
+    member = {"type": "m.room.member", "state_key": USER, "sender": USER,
+              "origin_server_ts": (NOW - 70) * 1000,
+              "content": {"membership": "join", "displayname": "New name"}}
+    if previous is not None:
+        member["unsigned"] = {"prev_content": {"membership": previous}}
+    data["rooms"]["join"][ROOM].setdefault(source, {"events": []})["events"].append(member)
+    adapter, store, home = make(3600, [data])
+    seed(store)
+    await connect(adapter, home)
+    assert delivered(adapter) == ({"$event0"} if previous == "join" else set())
+
+
+@pytest.mark.asyncio
+async def test_disabled_window_removes_checkpoint_before_reenable(harness):
+    make, clients = harness
+    disabled, store, home = make(responses=[batch([event(0, 1)])])
+    seed(store)
+    await connect(disabled, home)
+    assert delivered(disabled) == {"$event0"}
+    assert not (store / "sync_token.json").exists()
+    clients[-1].sync.assert_awaited_once_with(timeout=10000, full_state=True)
+
+    restarted, _, home = make(3600, [batch([event(0)])])
+    await connect(restarted, home)
+    clients[-1].sync.assert_awaited_once_with(timeout=10000, full_state=True)
+    assert delivered(restarted) == set()

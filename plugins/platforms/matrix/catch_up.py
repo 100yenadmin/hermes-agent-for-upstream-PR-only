@@ -1,8 +1,8 @@
 """Opt-in Matrix startup replay; importing this module does not require mautrix."""
 import json
 import logging
-import os
 import time
+from os import replace
 
 logger = logging.getLogger("plugins.platforms.matrix.adapter")
 
@@ -14,6 +14,7 @@ def persistent_sync_store(store_dir, user_id):
     class PersistentSyncStore(MemorySyncStore):
         """Checkpoint token and saved_at before dispatch, without blocking sync on I/O failure."""
         _checkpoint_failed = False
+        _checkpoint_unlink_failed = False
 
         async def put_next_batch(self, token):
             if token == await self.get_next_batch():
@@ -23,13 +24,20 @@ def persistent_sync_store(store_dir, user_id):
             try:
                 temporary.write_text(json.dumps({
                     "user_id": user_id, "next_batch": token, "saved_at": time.time()}), encoding="utf-8")
-                os.replace(temporary, path)
+                replace(temporary, path)
             except OSError:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    if not self._checkpoint_unlink_failed:
+                        logger.error("Matrix: could not remove stale catch-up checkpoint %s; a restart may repeat up to 100 messages", path)
+                    self._checkpoint_unlink_failed = True
                 if not self._checkpoint_failed:
-                    logger.warning("Matrix: could not save catch-up checkpoint %s; catch-up after a restart may miss messages", path)
+                    logger.warning("Matrix: could not save catch-up checkpoint %s; catch-up after a restart is skipped until a checkpoint is saved again", path)
                 self._checkpoint_failed = True
             else:
                 self._checkpoint_failed = False
+                self._checkpoint_unlink_failed = False
             await super().put_next_batch(token)
 
     return PersistentSyncStore()
@@ -56,6 +64,13 @@ def resolve_catch_up_window(extra) -> int:
         return 0
 
 
+def _joined_since_checkpoint(event, user_id, saved_at):
+    return (event.get("type") == "m.room.member" and event.get("state_key") == user_id
+            and event.get("content", {}).get("membership") == "join"
+            and event.get("unsigned", {}).get("prev_content", {}).get("membership") != "join"
+            and event.get("origin_server_ts", 0) / 1000 >= saved_at - 5)
+
+
 def select_catch_up_ids(sync_data, startup_ts, window, cap=20, *, saved_at, user_id) -> set[str]:
     """Guard replay by window, saved_at, own-join rooms, and per-room/overall caps."""
     candidates = []
@@ -67,14 +82,17 @@ def select_catch_up_ids(sync_data, startup_ts, window, cap=20, *, saved_at, user
         if timeline.get("limited"):
             limited.append(room)
         events = timeline.get("events", [])
-        if any(event.get("type") == "m.room.member" and event.get("state_key") == user_id
-               and event.get("content", {}).get("membership") == "join" for event in events):
+        # The saved_at guards cover clock skew: a host behind skips more own-join
+        # rooms; a host ahead rejects pre-checkpoint history at the per-event bound.
+        if any(_joined_since_checkpoint(event, user_id, saved_at)
+               for event in events + data.get("state", {}).get("events", [])):
             continue
         room_candidates = []
         for event in events:
             timestamp = event.get("origin_server_ts", 0) / 1000
             if (event.get("type") in ("m.room.message", "m.room.encrypted") and event.get("event_id")
-                    and event.get("sender") != user_id and oldest <= timestamp < startup_ts - 5):
+                    and event.get("sender", "").strip().casefold() != user_id.strip().casefold()
+                    and oldest <= timestamp < startup_ts - 5):
                 room_candidates.append((timestamp, event["event_id"]))
         overflow = overflow or len(room_candidates) > cap
         candidates.extend(sorted(room_candidates, reverse=True)[:cap])
@@ -86,6 +104,17 @@ def select_catch_up_ids(sync_data, startup_ts, window, cap=20, *, saved_at, user
 
 
 class MatrixCatchUpMixin:
+    def _prepare_catch_up_store(self, client):
+        if self._catch_up_window:
+            client.sync_store = persistent_sync_store(self._store_dir, self._user_id)
+        else:
+            path = self._store_dir / "sync_token.json"
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError as exc:
+                logger.debug("Matrix: could not remove disabled catch-up checkpoint %s: %s", path, exc)
+
     async def _catch_up_initial_sync(self, client):
         since = load_since(self._store_dir, self._user_id)
         if since:

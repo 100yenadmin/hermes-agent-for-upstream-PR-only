@@ -79,7 +79,7 @@ from gateway.platforms.base import (
 from gateway.platforms.base import transcode_to_ogg_opus
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.platforms.helpers import ThreadParticipationTracker
-from plugins.platforms.matrix.catch_up import MatrixCatchUpMixin, persistent_sync_store, resolve_catch_up_window
+from plugins.platforms.matrix.catch_up import MatrixCatchUpMixin, resolve_catch_up_window
 from plugins.platforms.matrix.voice_mention import ParkedVoices, VoiceGate, has_voice_marker, is_voice_event
 
 logger = logging.getLogger(__name__)
@@ -1337,8 +1337,7 @@ class MatrixAdapter(MatrixCatchUpMixin, BasePlatformAdapter):
         self._client = client
         if not await self._connect_authenticate(client, api):
             return False
-        if self._catch_up_window:
-            client.sync_store = persistent_sync_store(self._store_dir, self._user_id)
+        self._prepare_catch_up_store(client)
         if self._encryption and not await self._connect_setup_e2ee(client, api, state_store):
             return False
         from mautrix.client import InternalEventType as IntEvt

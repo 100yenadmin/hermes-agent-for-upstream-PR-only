@@ -333,7 +333,7 @@ platforms:
       catch_up_window_seconds: 3600
 ```
 
-On restart, a saved per-profile sync cursor makes the newest 20 old messages per room within the window eligible, up to 100 overall; normal room, ignore-pattern, and mention rules still apply. The first start has no saved cursor and does not replay history. Catch-up excludes your account's own messages, events older than the saved checkpoint (with a 5-second tolerance), and rooms whose timeline contains your account's join event. Older cursor files without a checkpoint time also start without replay.
+On restart, a saved per-profile sync cursor makes the newest 20 old messages per room within the window eligible, up to 100 overall; normal room, ignore-pattern, and mention rules still apply. The first start has no saved cursor and does not replay history. Catch-up excludes your account's own messages, events older than the saved checkpoint (with a 5-second tolerance), and rooms whose state or timeline contains your account's join or rejoin at or after that bound. Display-name or avatar changes with a previous membership of `join` do not count; without previous membership, a join is treated as real and the room is skipped (lossy, safe direction).
 
 Limited timelines after long downtime are logged; their gaps are not recovered. The cursor is saved before dispatch: a crash mid-batch loses messages rather than duplicating them. See also Telegram's [drop_pending_on_cold_boot](./telegram.md) and Discord's [missed_message_backfill](./discord.md).
 
