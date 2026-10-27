@@ -564,6 +564,10 @@ class GatewayTurnPersistenceMixin:
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
             response = ""
+        if _intentional_silence or (agent_result.get("interrupted") and not response):
+            from hermes_cli.observability.shared_metrics_gateway import end_reply_clock
+            end_reply_clock(source, source.chat_id, "silent" if _intentional_silence else "interrupted",
+                            token=getattr(event, "_reply_clock_token", None), session_key=session_key)
 
         adapter = self._delivery_adapter_for(source)
         # Auto voice reply (TTS audio before the text) unless streaming TTS already delivered audio.
