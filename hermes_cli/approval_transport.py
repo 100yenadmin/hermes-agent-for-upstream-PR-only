@@ -104,6 +104,7 @@ def invoke_approval_transport(
     present: ApprovalPresentFn, request: ApprovalRequest, *, timeout_seconds: float,
     poll_interval: float = 1.0, on_poll: Callable[[], None] | None = None,
     is_interrupted: Callable[[], bool] | None = None,
+    worker_slots: threading.BoundedSemaphore | None = None,
 ) -> ApprovalTransportResult:
     """Run a sync or async transport on a bounded daemon worker.
 
@@ -111,8 +112,10 @@ def invoke_approval_transport(
     loop. A callback must return before the host timeout; late results are discarded and cannot
     authorize another request.
     """
-    if not _transport_worker_slots.acquire(blocking=False):
-        logger.warning("Approval transport worker capacity exhausted")
+    slots = _transport_worker_slots if worker_slots is None else worker_slots
+    if not slots.acquire(blocking=False):
+        logger.log(logging.WARNING if worker_slots is None else logging.DEBUG,
+                   "Approval transport worker capacity exhausted")
         return _deny("busy")
 
     results: queue.Queue[tuple[str, object, float]] = queue.Queue(maxsize=1)
@@ -133,13 +136,13 @@ def invoke_approval_transport(
             except queue.Full:
                 pass
         finally:
-            _transport_worker_slots.release()
+            slots.release()
 
     worker = threading.Thread(target=_run, name=f"approval-transport-{request.request_id[:8]}", daemon=True)
     try:
         worker.start()
     except BaseException:
-        _transport_worker_slots.release()
+        slots.release()
         logger.warning("Could not start approval transport worker")
         return _deny("error")
     while True:

@@ -3,17 +3,24 @@
 import asyncio
 import inspect
 import logging
+import threading
 
 from agent.memory_provider import ctx_bound, spawn_context_thread
+from hermes_cli.approval_transport import _MAX_ACTIVE_TRANSPORT_WORKERS
 from tools import approval_context as _ctx
 
 logger = logging.getLogger("tools.approval")
+_mirror_worker_slots = threading.BoundedSemaphore(_MAX_ACTIVE_TRANSPORT_WORKERS)
 
 
-async def _present(present, request):
-    """Keep async callback execution inside the same scope as sync callbacks."""
+async def _await_value(value):
+    return await value
+
+
+def _present(present, request):
+    """Call sync plugins without a loop; await async bodies in the same bound scope."""
     value = present(request)
-    return await value if inspect.isawaitable(value) else value
+    return asyncio.run(_await_value(value)) if inspect.isawaitable(value) else value
 
 
 def _run_mirror(session_key, entry, registered, request):
@@ -23,10 +30,11 @@ def _run_mirror(session_key, entry, registered, request):
     try:
         # invoke_approval_transport starts another worker: bind that hop too, including the
         # coroutine body (binding only the call that creates a coroutine would lose its scope).
-        present = ctx_bound(lambda req: asyncio.run(_present(registered.present, req)))
+        present = ctx_bound(lambda req: _present(registered.present, req))
         result = invoke_approval_transport(
             present, request, timeout_seconds=request.timeout_seconds,
             is_interrupted=entry.event.is_set,
+            worker_slots=_mirror_worker_slots,
         )
         if result.failure is not None:
             logger.debug("Mirrored approval transport did not answer (%s)", result.failure)
@@ -40,6 +48,8 @@ def _run_mirror(session_key, entry, registered, request):
 def start_mirror(session_key, entry):
     """Start only for a published leader; all answers use the queue's atomic resolver."""
     if _ctx._get_approval_transport_mode() != "mirror" or entry.event.is_set():
+        return
+    if not _ctx.is_local_interactive_session() or not entry.data.get("transport_eligible", False):
         return
     try:
         from agent.redact import redact_sensitive_text
@@ -59,8 +69,8 @@ def start_mirror(session_key, entry):
             description=redact_sensitive_text(data.get("description", ""), force=True),
             pattern_key=key, pattern_keys=tuple(data.get("pattern_keys", [key])),
             session_key=session_key, surface=entry.surface,
-            allow_session=data.get("allow_session", True),
-            allow_permanent=data.get("allow_permanent", True),
+            allow_session=data.get("allow_session", False),
+            allow_permanent=data.get("allow_permanent", False),
             timeout_seconds=_ctx._get_approval_timeout(), request_id=data["request_id"],
         )
         spawn_context_thread(_run_mirror, name=f"approval-mirror-{request.request_id[:8]}",

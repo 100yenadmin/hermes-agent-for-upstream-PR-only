@@ -1,5 +1,7 @@
 """A phone transport and the built-in prompt share one bounded approval decision."""
 
+import asyncio
+import queue
 import threading
 
 import pytest
@@ -9,13 +11,14 @@ import hermes_cli.approval_transport as transport
 from agent.memory_provider import spawn_context_thread
 from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
-from tools import approval, approval_context, approval_gateway_wait, approval_prompt
+from tools import approval, approval_context, approval_gateway_wait, approval_mirror, approval_prompt
+from gateway.session_policy import LocalSessionPolicy, _ACTIVE_POLICY
 
 
 SESSION = "mirror-fixture"
 DATA = {"command": "rm -rf build", "description": "recursive delete",
         "pattern_key": "rm", "pattern_keys": ["rm"],
-        "allow_session": True, "allow_permanent": True}
+        "allow_session": True, "allow_permanent": True, "transport_eligible": True}
 
 
 @pytest.fixture
@@ -49,15 +52,21 @@ def mirror(tmp_path, monkeypatch):
             "security:\n  approval:\n    transport: phone\n" + mode_line)
         config._LOAD_CONFIG_CACHE.clear()
 
-    def start(notify, data=None, guard=False):
+    def start(notify, data=None, guard=False, source="tui", gate=None, producer=None):
         outcome = {}
 
         def run():
             try:
-                if guard:
-                    approval.register_gateway_notify(SESSION, notify)
+                _ACTIVE_POLICY.set(LocalSessionPolicy(
+                    source=source, platform=source, cwd=str(home), model=None, toolsets=(),
+                    config_json="{}", request_json="{}", terminal_json="{}") if source else None)
+                approval_context.set_current_session_key(SESSION)
+                approval.register_gateway_notify(SESSION, notify)
+                if producer:
+                    outcome["value"] = producer()
+                elif guard or gate:
                     outcome["value"] = approval._human_decision(
-                        approval._COMMAND_GATE, command=DATA["command"], description=DATA["description"],
+                        gate or approval._COMMAND_GATE, command=DATA["command"], description=DATA["description"],
                         pattern_key="rm", pattern_keys=["rm"], session_key=SESSION,
                         approval_callback=None, is_cli=False, is_gateway=True, is_ask=False)
                 else:
@@ -167,7 +176,7 @@ def test_transport_failure_leaves_builtin_live(mirror, monkeypatch, failure):
         return request.respond("deny")
 
     if failure == "busy":
-        monkeypatch.setattr(transport, "_transport_worker_slots", threading.BoundedSemaphore(0))
+        monkeypatch.setattr(approval_mirror, "_mirror_worker_slots", threading.BoundedSemaphore(0))
     monkeypatch.setattr(transport, "invoke_approval_transport", invoke)
     mirror.register(present)
     thread, outcome = mirror.start(seen.append)
@@ -230,3 +239,123 @@ def test_classic_cli_mirror_uses_builtin_only(mirror):
     assert result["approved"] is True
     assert len(seen) == 1
     assert requests == []
+
+
+def _observe_mirror(monkeypatch):
+    """Observe the producer-thread admission before checking that no worker was spawned."""
+    considered, workers = threading.Event(), []
+    real_start, real_spawn = approval_mirror.start_mirror, approval_mirror.spawn_context_thread
+
+    def start(*args):
+        try:
+            return real_start(*args)
+        finally:
+            considered.set()
+
+    def spawn(*args, **kwargs):
+        worker = real_spawn(*args, **kwargs)
+        workers.append(worker)
+        return worker
+
+    monkeypatch.setattr(approval_mirror, "start_mirror", start)
+    monkeypatch.setattr(approval_mirror, "spawn_context_thread", spawn)
+    return considered, workers
+
+
+@pytest.mark.parametrize("source", [None, "telegram", "discord", "webhook", "api_server", "cron", "kanban"])
+def test_nonlocal_session_keeps_builtin_only(mirror, monkeypatch, source):
+    considered, workers = _observe_mirror(monkeypatch)
+    requests, seen = [], []
+    mirror.register(lambda req: requests.append(req) or req.respond("once"))
+    # A cannot be answered remotely, so it cannot leave a remotely-settled stale card
+    # whose session-oldest button would consume B.
+    for command in ("request A", "request B"):
+        considered.clear()
+        thread, outcome = mirror.start(seen.append, {**DATA, "command": command}, source=source)
+        assert considered.wait(2)
+        assert workers == []
+        assert requests == []
+        assert approval.list_gateway_approvals(SESSION)[0]["request_id"] == seen[-1]["request_id"]
+        assert approval.resolve_gateway_approval(SESSION, "once") == 1
+        assert _done(thread, outcome)["choice"] == "once"
+
+
+@pytest.mark.parametrize("source", ["tui", "gui", "acp"])
+@pytest.mark.parametrize("gate", [approval._COMMAND_GATE, approval._EXECUTE_CODE_GATE])
+def test_local_transport_eligible_producers_mirror(mirror, source, gate):
+    requests, seen = [], []
+    mirror.register(lambda req: requests.append(req) or req.respond("once"))
+    thread, outcome = mirror.start(seen.append, source=source, gate=gate)
+    assert _done(thread, outcome)["approved"] is True
+    assert requests[0].request_id == seen[0]["request_id"]
+
+
+@pytest.mark.parametrize("producer", ["action", "protected_write", "elicitation", "editor"])
+def test_nontransport_producers_keep_builtin_only(mirror, monkeypatch, producer):
+    from acp_adapter.edit_approval import EditProposal
+    from gateway.session_local_editor import request_editor_edit
+    from tools.file_tools_write_guards import _request_protected_instruction_approval
+
+    considered, workers = _observe_mirror(monkeypatch)
+    monkeypatch.setattr(approval_context, "_is_gateway_approval_context", lambda: True)
+    calls = {
+        "protected_write": lambda: _request_protected_instruction_approval(["AGENTS.md"]),
+        "elicitation": lambda: approval_prompt.request_elicitation_consent("Continue?", "MCP consent"),
+        "editor": lambda: request_editor_edit(EditProposal("write_file", "file.txt", None, "text", {})),
+    }
+    mirror.register(lambda req: req.respond("once"))
+    seen = []
+    thread, outcome = mirror.start(seen.append, source="acp", gate=approval._ACTION_GATE,
+                                   producer=calls.get(producer))
+    assert considered.wait(2)
+    assert workers == []
+    assert approval.resolve_gateway_approval(SESSION, "deny", request_id=seen[0]["request_id"]) == 1
+    result = _done(thread, outcome)
+    if producer == "action":
+        assert result["approved"] is False
+    elif producer == "protected_write":
+        assert "BLOCKED" in result
+    else:
+        assert result in (False, "decline")
+
+
+def test_mirror_capacity_cannot_starve_replace(mirror):
+    presented, release = queue.Queue(), threading.Event()
+    mirror.releases.append(release)
+
+    def present(request):
+        presented.put(request)
+        release.wait(10)
+        return request.respond("once")
+
+    mirror.register(present)
+    for _ in range(transport._MAX_ACTIVE_TRANSPORT_WORKERS):
+        thread, outcome = mirror.start(lambda data: None)
+        request = presented.get(timeout=2)
+        assert approval.resolve_gateway_approval(SESSION, "once", request_id=request.request_id) == 1
+        assert _done(thread, outcome)["choice"] == "once"
+    # All plugin callbacks still occupy their mirror slots after the built-in answers.
+    result = transport.invoke_approval_transport(lambda req: req.respond("once"), request, timeout_seconds=1)
+    assert result.failure is None
+    assert result.choice == "once"
+
+
+def test_sync_transport_can_run_its_own_event_loop(mirror):
+    async def answer(request):
+        assert get_hermes_home() == mirror.home
+        return request.respond("once")
+
+    mirror.register(lambda request: asyncio.run(answer(request)))
+    thread, outcome = mirror.start(lambda data: None)
+    assert _done(thread, outcome)["choice"] == "once"
+
+
+def test_missing_scope_flags_offer_once_or_deny(mirror):
+    requests, seen = [], []
+    mirror.register(lambda req: requests.append(req) or req.respond("always"))
+    data = {key: value for key, value in DATA.items() if key not in ("allow_session", "allow_permanent")}
+    thread, outcome = mirror.start(seen.append, data)
+    assert mirror.finished.wait(2)
+    assert requests[0].allowed_choices == ("once", "deny")
+    assert approval.resolve_gateway_approval(SESSION, "deny", request_id=seen[0]["request_id"]) == 1
+    assert _done(thread, outcome)["choice"] == "deny"
