@@ -253,24 +253,6 @@ def test_display_stop_disarms_handback(rig, monkeypatch, state):
         [("route-A", False)] if state == "pending" else [])
 
 
-@pytest.mark.platforms("linux")
-@pytest.mark.parametrize("state", ["forced-human", "refused-human", "pending"])
-def test_screen_cli_stop_disarms_handback(rig, monkeypatch, state):
-    from hermes_cli.subcommands.computer_use_screen import _screen_stop
-
-    monkeypatch.setattr(runtime, "stop", lambda: True)
-    _act()
-    if state == "pending":
-        _hand_back()
-    else:
-        lease.acquire("v")
-    assert _screen_stop(SimpleNamespace(force=state == "forced-human")) == int(state == "refused-human")
-    lease.release("v")
-    rig.drain()
-    assert [(call.route["session_key"], call.pending) for call in rig.calls] == (
-        [("route-A", False)] if state == "pending" else [])
-
-
 @pytest.mark.parametrize("superseded", ["action", "human"])
 def test_pending_wake_is_cancelled_when_control_is_used_again(rig, superseded):
     _act()

@@ -48,8 +48,7 @@ def _screen_start(args) -> int:
 
 
 def _screen_stop(args) -> int:
-    from tools.bot_desktop import handback, runtime
-    handback.forget()
+    from tools.bot_desktop import runtime
     if runtime.is_supported_host():
         # Same door as display.stop: a human mid-takeover is never yanked by a runbook or a stray
         # `screen stop`; the decision is taken under the lease lock so a takeover cannot race it.

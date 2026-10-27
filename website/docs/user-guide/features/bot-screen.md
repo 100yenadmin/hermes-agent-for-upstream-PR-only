@@ -174,7 +174,9 @@ once, with a notice to re-capture before acting. Every screen action supersedes 
 previous driver, including group, cron and background side-agent actions, which cannot
 arm continuation. Slack group DMs are excluded; Matrix may classify an unnamed
 multi-member room marked direct as a DM. Otherwise, tell the bot to continue.
-**Stop** disarms continuation, including when a human holds the screen.
+Stopping the screen through the gateway (the `display.stop` RPC) disarms continuation, even when
+the stop is refused because a human holds the screen; `hermes computer-use screen stop` runs in its
+own process and does not.
 Automatic continuation needs the release
 to happen in the same gateway process: a release from another process (for example,
 the `hermes computer-use screen` CLI), a gateway restart, or more than an hour since
