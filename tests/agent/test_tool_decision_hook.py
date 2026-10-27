@@ -32,9 +32,10 @@ def hooks(monkeypatch):
     """Capture tool_decision events; ``rec.pre`` is what pre_tool_call subscribers return."""
     from hermes_cli import lifecycle
 
-    rec = SimpleNamespace(decisions=[], pre=[], fail=False)
+    rec = SimpleNamespace(decisions=[], pre=[], fail=False, events=[])
 
     def fake_invoke(name, **kwargs):
+        rec.events.append((name, kwargs))
         if name == "tool_decision":
             if rec.fail:
                 raise RuntimeError("subscriber exploded")
@@ -67,9 +68,9 @@ def cli_prompt(monkeypatch):
     return answer
 
 
-def _call(name="read_file", args=None, dispatch=None):
+def _call(name="read_file", args=None, dispatch=None, ids=None):
     with patch("model_tools.registry.dispatch", side_effect=dispatch or (lambda *a, **k: '{"ok": true}')) as mock:
-        result = model_tools.handle_function_call(name, dict(args or ARGS), **IDS)
+        result = model_tools.handle_function_call(name, dict(args or ARGS), **(ids or IDS))
     return result, mock
 
 
@@ -142,13 +143,14 @@ def test_executor_owned_terminal_event_is_the_only_one(hooks, monkeypatch):
         approval.check_all_command_guards(args["command"], "local")
         return '{"error": "blocked"}'
 
+    ids = dict(IDS, turn_id=tool_decision.DispatchTurn(IDS["turn_id"]))
     with model_tools.suppress_post_tool_call_hook():
-        _call("terminal", {"command": "rm notes.txt"}, dispatch=terminal_handler)
+        _call("terminal", {"command": "rm notes.txt"}, dispatch=terminal_handler, ids=ids)
     assert hooks.decisions == []
     agent = SimpleNamespace(session_id=IDS["session_id"], _current_turn_id=IDS["turn_id"], _current_api_request_id="")
     emit_terminal_post_tool_call(agent, function_name="terminal", function_args={"command": "rm notes.txt"},
                                  result='{"error": "blocked"}', effective_task_id=IDS["task_id"],
-                                 tool_call_id=IDS["tool_call_id"])
+                                 tool_call_id=IDS["tool_call_id"], dispatch_turn_id=ids["turn_id"])
     [event] = hooks.decisions
     assert event["verdict"] == "denied_by_rule"
     assert tool_decision._pending == {}
@@ -205,12 +207,13 @@ def test_dispatch_without_a_tool_call_id_fires_nothing(hooks, monkeypatch):
 def test_block_inside_a_suppressed_dispatch_reaches_the_outer_emission(hooks):
     """Sequential path: an ACP edit denial inside handle_function_call is reported by the executor's
     single terminal emission, which carries no blocked status of its own."""
+    ids = dict(IDS, turn_id=tool_decision.DispatchTurn(IDS["turn_id"]))
     with patch("acp_adapter.edit_approval.maybe_require_edit_approval", return_value='{"error": "rejected"}'), \
             model_tools.suppress_post_tool_call_hook():
-        _, dispatch = _call("write_file", {"path": "a", "content": SECRET})
+        _, dispatch = _call("write_file", {"path": "a", "content": SECRET}, ids=ids)
     dispatch.assert_not_called()
     assert hooks.decisions == []
-    _terminal_emit()
+    _terminal_emit(dispatch_turn_id=ids["turn_id"])
     [event] = hooks.decisions
     assert (event["verdict"], event["source"]) == ("denied_by_user", "acp_edit_approval")
 
@@ -224,7 +227,7 @@ def test_notes_made_while_deferred_are_dropped(hooks):
         tool_decision.note("user_approved", "approval_prompt")
     finally:
         approval_context.reset_current_observability_context(tokens)
-    assert tool_decision._pending == {("sess-1", "call-1"): ("user_approved", "approval_prompt")}
+    assert tool_decision._pending == {("sess-1", "call-1", ""): ("user_approved", "approval_prompt")}
 
 
 def test_call_skipped_by_interrupt_emits_no_decision(hooks):
@@ -266,13 +269,13 @@ def test_a_refusal_outranks_an_earlier_approval_for_the_same_call():
 
 
 def test_reused_call_id_in_a_new_dispatch_turn_is_not_an_old_abandoned_call(hooks):
-    ids = dict(IDS, tool_call_id="call_0")  # sequential ids recur after compaction
+    ids = dict(IDS, tool_call_id="call_0", turn_id=tool_decision.DispatchTurn("turn-1"))  # ids recur after compaction
     model_tools._emit_post_tool_call_hook(function_name="read_file", function_args={}, result="timeout",
                                          status="timeout", error_type="tool_timeout", **ids)
     with patch.object(model_tools.registry, "dispatch", return_value="ok"):
         model_tools.handle_function_call("read_file", {}, **dict(ids, turn_id="turn-2"))
     assert [e["turn_id"] for e in hooks.decisions] == ["turn-1", "turn-2"]
-    assert ("sess-1", "call_0", "turn-1") in tool_decision._abandoned
+    assert ("sess-1", "call_0", ids["turn_id"].dispatch_id) in tool_decision._abandoned
     model_tools._emit_post_tool_call_hook(function_name="read_file", function_args={}, result="late", **ids)
     assert len(hooks.decisions) == 2
 
@@ -368,3 +371,85 @@ def test_unserializable_arguments_still_emit_a_digest(hooks, circular):
     model_tools._emit_post_tool_call_hook(function_name="read_file", function_args=args, result="ok", **IDS)
     [event] = hooks.decisions
     assert event["args_sha256"] == hashlib.sha256(repr(args).encode("utf-8")).hexdigest()
+
+
+def _dispatch_ref(turn_id="turn-1"):
+    from agent.tool_executor import _ParsedCall
+
+    pc = _ParsedCall(SimpleNamespace(id="call-1"), "read_file", {}, [], None, None)
+    return pc.ref("task-1", turn_id)
+
+
+def _note_for_ref(ref, verdict="denied_by_user"):
+    ids = model_tools._CallIds(ref.task_id, "sess-1", ref.call_id, ref.dispatch_turn_id)
+    with model_tools._approval_observability(ids):
+        tool_decision.note(verdict, "approval_prompt")
+
+
+def test_repeated_id_after_compaction_in_one_turn_emits_both_dispatches(hooks):
+    messages = [{"role": "assistant", "tool_calls": [{"id": "call-1"}]}]
+    _call()
+    messages.clear()  # compaction removed the old id; the provider can reuse it
+    _call()
+    assert [event["turn_id"] for event in hooks.decisions] == ["turn-1", "turn-1"]
+    assert all(type(event["turn_id"]) is str and "dispatch_id" not in event for event in hooks.decisions)
+
+
+@pytest.mark.parametrize("next_turn", ["turn-1", "turn-2"])
+def test_timeout_late_worker_and_reused_id_are_distinct_dispatches(hooks, next_turn):
+    old = _dispatch_ref()
+    old.emit_post(_agent(), "timeout", status="timeout", error_type="tool_timeout")
+    current = _dispatch_ref(next_turn)
+    current.emit_post(_agent(), "ok")
+    old.emit_post(_agent(), "late")
+    assert [(e["turn_id"], e["verdict"]) for e in hooks.decisions] == [
+        ("turn-1", "abandoned"), (next_turn, "allowed"),
+    ]
+
+
+def test_late_abandoned_refusal_does_not_contaminate_reused_id(hooks):
+    old = _dispatch_ref()
+    old.emit_post(_agent(), "timeout", status="timeout", error_type="tool_timeout")
+    _note_for_ref(old)
+    current = _dispatch_ref("turn-2")
+    current.emit_post(_agent(), "ok")
+    old.emit_post(_agent(), "late")
+    assert [e["verdict"] for e in hooks.decisions] == ["abandoned", "allowed"]
+
+
+def test_late_abandoned_worker_cannot_consume_new_dispatch_denial(hooks):
+    old = _dispatch_ref()
+    old.emit_post(_agent(), "timeout", status="timeout", error_type="tool_timeout")
+    current = _dispatch_ref("turn-2")
+    _note_for_ref(current)
+    old.emit_post(_agent(), "late")  # dropped before consuming any gate note
+    current.emit_post(_agent(), "blocked")
+    assert [e["verdict"] for e in hooks.decisions] == ["abandoned", "denied_by_user"]
+
+
+def test_unattended_approve_does_not_detect_danger_without_subscriber(monkeypatch):
+    monkeypatch.setattr(tool_decision, "_has_subscriber", lambda: False)
+    monkeypatch.setattr(approval, "_floor_block", lambda *a, **k: None)
+    monkeypatch.setattr(approval, "_yolo_active", lambda: False)
+    monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(approval, "_command_matches_permanent_allowlist", lambda command: False)
+    monkeypatch.setattr(approval, "_presence", lambda cb: (None, False, False, False))
+    monkeypatch.setattr(approval, "_unattended_contexts", lambda: ["cron"])
+    monkeypatch.setattr(approval, "_unattended_deny", lambda *a: None)
+    with patch.object(approval, "detect_dangerous_command", return_value=(True, "fixture", "fixture")) as detect:
+        assert approval.check_all_command_guards("fixture command", "local")["approved"]
+    detect.assert_not_called()
+
+
+@pytest.mark.parametrize("turn_id", ["", "turn-1"])
+def test_dispatch_notes_survive_empty_turn_and_stay_private(hooks, cli_prompt, turn_id, monkeypatch):
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
+    hooks.pre = [{"action": "approve", "message": "needs a human"}]
+    cli_prompt.choice = "once"
+    for _ in range(2):
+        _call(ids=dict(IDS, turn_id=turn_id))
+    assert [(e["turn_id"], e["verdict"]) for e in hooks.decisions] == [
+        (turn_id, "user_approved"), (turn_id, "user_approved"),
+    ]
+    assert all(type(e["turn_id"]) is str and "dispatch_id" not in e for _, e in hooks.events)
+    assert tool_decision._pending == {}

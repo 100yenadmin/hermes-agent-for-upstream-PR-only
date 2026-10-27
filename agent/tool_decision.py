@@ -17,6 +17,7 @@ import threading
 from collections import OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
+from itertools import count
 from typing import Any, Iterator, Optional
 
 logger = logging.getLogger(__name__)
@@ -42,8 +43,8 @@ _SKIPPED_ERROR_TYPES = frozenset({"user_interrupt"})
 _OUTCOME_VERDICTS = {"denied": "denied_by_user", "timeout": "timeout"}
 _MAX_PENDING = 1024  # notes whose call never reached the funnel are dropped oldest-first
 
-_pending: OrderedDict[tuple[str, str], tuple[str, str]] = OrderedDict()
-# (session_id, tool_call_id, dispatch turn) already reported (ids can recur after compaction), so a call
+_pending: OrderedDict[tuple[str, str, str], tuple[str, str]] = OrderedDict()
+# (session_id, tool_call_id, dispatch id) already reported (ids can recur after compaction), so a call
 # whose terminal post_tool_call is published twice still yields one decision. A call published as
 # abandoned (deadline / interrupt) is also held in ``_abandoned`` until its late worker reports, so a
 # worker that settles long after its deadline is never re-reported by eviction from ``_emitted``.
@@ -53,6 +54,23 @@ _ABANDON_ERROR_TYPES = frozenset({"tool_timeout", "tool_interrupted", "keyboard_
 _MAX_EMITTED = 8192
 _lock = threading.Lock()
 _deferred: ContextVar[bool] = ContextVar("tool_decision_deferred", default=False)
+_dispatch_ids = count()
+
+
+def new_dispatch_id() -> str:
+    """Process-wide monotonic identity; next(count) is atomic in CPython."""
+    return str(next(_dispatch_ids))
+
+
+class DispatchTurn(str):
+    """Internal turn carrier; hook boundaries strip the private dispatch identity."""
+
+    def __new__(cls, turn_id):
+        if isinstance(turn_id, cls):
+            return turn_id
+        value = super().__new__(cls, turn_id or "")
+        value.dispatch_id = new_dispatch_id()
+        return value
 
 
 def _has_subscriber() -> bool:
@@ -89,10 +107,12 @@ def notes_deferred() -> Iterator[None]:
         _deferred.reset(token)
 
 
-def _store(session_id: str, tool_call_id: str, decision: tuple[str, str]) -> None:
+def _store(session_id: str, tool_call_id: str, decision: tuple[str, str], turn_id=None) -> None:
     if not tool_call_id or _deferred.get() or not _has_subscriber():
         return
-    key = (session_id or "", tool_call_id)
+    from tools.approval_context import _approval_turn_id
+    turn_id = _approval_turn_id.get() if turn_id is None else turn_id
+    key = (session_id or "", tool_call_id, getattr(turn_id, "dispatch_id", ""))
     with _lock:
         _pending[key] = _merge(_pending.pop(key, None), decision)
         while len(_pending) > _MAX_PENDING:
@@ -110,12 +130,12 @@ def note(verdict: str, source: str) -> None:
 
 
 def note_suppressed_outcome(*, status: Optional[str], error_type: Optional[str], session_id: str,
-                            tool_call_id: str) -> None:
+                            tool_call_id: str, turn_id: str = "") -> None:
     """A dispatch whose terminal post_tool_call an outer executor owns hands its own block
     (e.g. an ACP edit denial) to that executor's single emission."""
     try:
         if status == "blocked" or (error_type in _BY_ERROR_TYPE and error_type not in _SKIPPED_ERROR_TYPES):
-            _store(session_id, tool_call_id, _resolve(status, error_type, None))
+            _store(session_id, tool_call_id, _resolve(status, error_type, None), turn_id)
     except Exception:
         logger.warning("tool_decision note failed", exc_info=True)
 
@@ -145,15 +165,15 @@ def note_approval_result(result: Any, gate: str) -> None:
         note("blocked_by_policy", f"{gate}:{result.get('outcome') or 'blocked'}")
 
 
-def _pop(session_id: str, tool_call_id: str) -> Optional[tuple[str, str]]:
+def _pop(session_id: str, tool_call_id: str, turn_id: str) -> Optional[tuple[str, str]]:
     if not tool_call_id:
         return None
     with _lock:
-        return _pending.pop((session_id or "", tool_call_id), None)
+        return _pending.pop((session_id or "", tool_call_id, getattr(turn_id, "dispatch_id", "")), None)
 
 
 def _already_emitted(session_id: str, tool_call_id: str, turn_id: str, error_type: Optional[str]) -> bool:
-    key = (session_id or "", tool_call_id, turn_id or "")
+    key = (session_id or "", tool_call_id, getattr(turn_id, "dispatch_id", ""))
     with _lock:
         if key in _abandoned:
             del _abandoned[key]  # the abandoned call's worker settled; its late report is dropped
@@ -198,14 +218,14 @@ def emit_for_call(*, tool_name: str, args: Any, status: Optional[str], error_typ
     without a tool_call_id (tools an ``execute_code`` script calls back into, direct programmatic calls)
     are not model tool calls and their gate verdicts cannot be attributed, so they fire nothing."""
     try:
-        noted = _pop(session_id, tool_call_id)
         if (not tool_call_id or error_type in _SKIPPED_ERROR_TYPES or not _has_subscriber()
                 or _already_emitted(session_id, tool_call_id, turn_id, error_type)):
             return
+        noted = _pop(session_id, tool_call_id, turn_id)
         verdict, source = _resolve(status, error_type, noted)
         from hermes_cli.lifecycle import invoke_hook
         invoke_hook(HOOK, tool_name=tool_name, args_sha256=args_digest(args), verdict=verdict, source=source,
-                    initiator=_initiator(), session_id=session_id, turn_id=turn_id, tool_call_id=tool_call_id,
+                    initiator=_initiator(), session_id=session_id, turn_id=str(turn_id or ""), tool_call_id=tool_call_id,
                     task_id=task_id, api_request_id=api_request_id)
     except Exception:
         logger.warning("tool_decision hook dispatch failed for %s", tool_name, exc_info=True)

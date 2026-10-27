@@ -678,7 +678,7 @@ def register(ctx):
 
 ### `tool_decision`
 
-Fires **exactly once per tool call the model issued** (every call that carries a `tool_call_id`), with the final allow/refuse verdict and the gate that decided it, so an audit or policy plugin can record every decision in one place. It fires immediately before the call's terminal `post_tool_call`, on every dispatch path (sequential and concurrent agent loop, inline agent tools, direct `handle_function_call`). Approval prompts for shell commands and `execute_code` run inside the tool, so the verdict is only final when the call returns; a refused call fires as soon as it is refused. Core keeps no sink.
+Fires **once per tool call, subject to the limits below** (every call that carries a `tool_call_id`), with the final allow/refuse verdict and the gate that decided it, so an audit or policy plugin can record every decision in one place. It fires immediately before the call's terminal `post_tool_call`, on every dispatch path (sequential and concurrent agent loop, inline agent tools, direct `handle_function_call`). Approval prompts for shell commands and `execute_code` run inside the tool, so the verdict is only final when the call returns; a refused call fires as soon as it is refused. Core keeps no sink.
 
 **Callback signature:**
 

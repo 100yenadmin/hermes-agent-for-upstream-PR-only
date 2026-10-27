@@ -2021,7 +2021,7 @@ def _dispatch_pre_tool_call_hooks(
 ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
     """Invoke ``pre_tool_call`` hooks once; return ``(block_message, modified_args)`` — the resolved
     block/approve message (``None`` to proceed) and merged ``modify`` args (``None`` if none)."""
-    details = _get_pre_tool_call_directive_details(tool_name, args, **hook_kwargs)
+    details = _get_pre_tool_call_directive_details(tool_name, args, **dict(hook_kwargs, turn_id=str(hook_kwargs.get("turn_id") or "")))
     block_msg = _resolve_block_from_details(
         details, tool_name, **{k: hook_kwargs.get(k, "") for k in ("turn_id", "tool_call_id", "session_id")})
     return (block_msg, details.modified_args)

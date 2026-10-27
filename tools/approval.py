@@ -1202,7 +1202,7 @@ def check_all_command_guards(command: str, env_type: str,
             result = _unattended_deny(command, ctx)
             if result is not None:
                 return result
-        return _approved("unattended_approve" if contexts and detect_dangerous_command(command)[0] else None)
+        return _approved("unattended_approve" if contexts and tool_decision._has_subscriber() and detect_dangerous_command(command)[0] else None)
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
     session_key = get_current_session_key()
