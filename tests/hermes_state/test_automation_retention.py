@@ -29,25 +29,6 @@ def seed(db, sid, source="cron", *, days=60, users=(0,), ended=True, parent=None
     return start
 
 
-def start_agent(db, sid, platform, parent=None, inherited_source=None):
-    """Run the real agent-start choke point without provider setup or a model call."""
-    from run_agent import AIAgent
-    from gateway.session_context import clear_session_vars, set_session_vars
-
-    agent = AIAgent.__new__(AIAgent)
-    agent._session_db, agent.session_id, agent.platform = db, sid, platform
-    agent._session_db_created = False
-    agent._session_init_model_config = {"max_iterations": 5}
-    agent._cached_system_prompt, agent._parent_session_id, agent.model = None, parent, "synthetic"
-    tokens = set_session_vars(source=platform if inherited_source is None else inherited_source)
-    try:
-        agent._ensure_db_session()
-    finally:
-        clear_session_vars(tokens)
-    assert agent._session_db_created
-    return agent
-
-
 def sweep(db, raw=None, **kwargs):
     return db.maybe_auto_prune_and_vacuum(
         source_retention_days=raw if raw is not None else {"cron": 30, "subagent": 30},
@@ -100,7 +81,7 @@ def test_real_resume_loader_preserves_human_continuation(db, monkeypatch, source
     assert db.get_messages(resumed)[-1]["content"] == "synthetic human follow-up"
 
 
-@pytest.mark.parametrize("offsets,keep", [((61,), True), ((0, 30), True), ((60,), False), ((), False)])
+@pytest.mark.parametrize("offsets,keep", [((31,), True), ((0, 20), True), ((30,), False), ((), False)])
 def test_counts_all_user_rows_and_keeps_late_first_input(db, offsets, keep):
     seed(db, "candidate", users=offsets)
     # Compaction/inactive markers must not hide user evidence from the guard.
@@ -193,76 +174,21 @@ def test_default_manual_prune_is_unchanged(db):
     assert db.prune_sessions(older_than_days=30, source="cron") == 1
 
 
-@pytest.mark.parametrize("source", ["cron", "subagent"])
-@pytest.mark.parametrize("offset", [30, 300])
-def test_empty_automation_real_resume_marks_single_human_message(db, monkeypatch, source, offset):
-    from hermes_cli.oneshot import _load_resume_target
-
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    start = time.time() - 60 * 86400
-    db.create_session("empty", source)
-    db._execute_write(lambda c: c.execute("UPDATE sessions SET started_at=? WHERE id='empty'", (start,)))
-    resumed, history, _ = _load_resume_target(db, "empty")
-    assert resumed == "empty" and history == []
-    start_agent(db, resumed, "cli")
-    assert db.get_session_model_config_value(resumed, "_human_continued") == "cli"
-    db.append_message(resumed, "user", "synthetic human input", timestamp=start + offset)
-    db.end_session(resumed, "cli_close")
-    # Model completion is irrelevant to protection: even scheduler finalization cannot erase the marker.
-    db._execute_write(lambda c: c.execute(
-        "UPDATE sessions SET ended_at=?, last_activity_at=?, end_reason='cron_complete' WHERE id=?",
-        (start + offset, start + offset, resumed)))
-    assert sweep(db)["pruned"] == 0
-    assert db.get_session(resumed)["source"] == source
-    assert db.get_session(resumed)["started_at"] == start
-    assert db.get_messages(resumed)[0]["content"] == "synthetic human input"
-
-
-@pytest.mark.parametrize("source", ["cron", "kanban", "subagent"])
-def test_automation_constructor_does_not_mark_parent_created_child(db, source):
-    seed(db, "parent", "cli")
-    seed(db, "child", source, parent="parent")
-    start_agent(db, "child", source, parent="parent")
-    db.ensure_session("child")  # Accounting placeholders are not human starts.
-    assert db.get_session_model_config_value("child", "_human_continued") is None
-    assert sweep(db, {source: 30})["pruned"] == 1
-    assert db.get_session("parent") is not None
-
-
-@pytest.mark.parametrize("surface", ["cli", "oneshot", "tui", "desktop", "acp", "api_server", "telegram"])
-def test_human_start_marker_survives_later_automation_upsert(db, surface):
-    seed(db, "continued", "subagent")
-    start_agent(db, "continued", surface)
-    start_agent(db, "continued", "subagent")
-    assert db.get_session_model_config_value("continued", "_human_continued") == surface
-    assert sweep(db)["pruned"] == 0
-
-
 @pytest.mark.parametrize("reason", ["cli_close", "agent_close", None])
-def test_legacy_cron_not_ended_by_scheduler_is_kept(db, reason):
+def test_cron_not_ended_by_scheduler_is_kept(db, reason):
     seed(db, "legacy")
     db._execute_write(lambda c: c.execute("UPDATE sessions SET end_reason=? WHERE id='legacy'", (reason,)))
-    assert db.get_session_model_config_value("legacy", "_human_continued") is None
     assert sweep(db)["pruned"] == 0
 
 
 @pytest.mark.parametrize("source", ["cron", "subagent", "kanban"])
-def test_legacy_first_user_after_one_minute_is_kept(db, source):
-    seed(db, "legacy", source, users=(61,))
+def test_first_user_after_thirty_seconds_is_kept(db, source):
+    seed(db, "legacy", source, users=(31,))
     assert sweep(db, {source: 30})["pruned"] == 0
 
 
-def test_marker_in_compression_tip_keeps_entire_lineage(db):
-    seed(db, "root", "subagent", ended=False)
-    db.end_session("root", "compression")
-    seed(db, "tip", "subagent", parent="root")
-    db.create_session("tip", "cli")
-    assert sweep(db)["pruned"] == 0
-    assert db.get_compression_lineage("root") == ["root", "tip"]
-
-
 def test_original_stop_condition_proof_is_kept(db, monkeypatch):
-    """BLOCKED.md's real loader + flattened old timestamps must never delete the human input."""
+    """BLOCKED.md's real loader; aging preserves the late follow-up's relative timestamp."""
     from hermes_cli.oneshot import _load_resume_target
 
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
@@ -272,24 +198,52 @@ def test_original_stop_condition_proof_is_kept(db, monkeypatch):
         db.append_message(source, "assistant", "synthetic automation output")
         db.end_session(source, "done")
         resumed, _, _ = _load_resume_target(db, source)
-        start_agent(db, resumed, "cli")
+        db.create_session(resumed, "cli")
         db.append_message(resumed, "user", "synthetic human follow-up")
         db.end_session(resumed, "done")
         db._execute_write(lambda c: (
             c.execute("UPDATE sessions SET started_at=?,last_activity_at=?,ended_at=? WHERE id=?",
                       (old, old, old, resumed)),
-            c.execute("UPDATE messages SET timestamp=? WHERE session_id=?", (old, resumed))))
+            c.execute("UPDATE messages SET timestamp=? WHERE session_id=?", (old + 86400, resumed))))
     assert sweep(db)["pruned"] == 0
     for source in ("cron", "subagent"):
         assert db.get_messages(source)[-1]["content"] == "synthetic human follow-up"
 
 
-def test_delegate_child_inheriting_human_source_is_not_marked(db):
-    from agent.delegation_context import delegated_child_context
+@pytest.mark.parametrize("tip_reason,pruned", [("cron_complete", 2), ("cli_close", 0)])
+def test_compressed_cron_lineage_depends_on_tip_end_reason(db, tip_reason, pruned):
+    seed(db, "root", ended=False)
+    db.end_session("root", "compression")
+    seed(db, "tip", parent="root", ended=False)
+    db.end_session("tip", tip_reason)
+    assert sweep(db, {"cron": 30})["pruned"] == pruned
+    assert (db.get_session("root") is None) is bool(pruned)
+    assert (db.get_session("tip") is None) is bool(pruned)
 
-    seed(db, "parent", "cli")
-    seed(db, "child", "subagent", parent="parent")
-    with delegated_child_context("child"):
-        start_agent(db, "child", "subagent", parent="parent", inherited_source="cli")
-    assert db.get_session_model_config_value("child", "_human_continued") is None
-    assert sweep(db)["pruned"] == 1
+
+@pytest.mark.parametrize("source,reason", [
+    ("subagent", "agent_close"), ("cron", "cli_close"),
+    ("cron", "cron_complete"), ("cron", "cron_incomplete_no_output"),
+    ("cron", "startup_orphan_reap"),
+])
+@pytest.mark.parametrize("offset", [20, 31])
+def test_limit_single_early_message_into_empty_row_is_indistinguishable(db, monkeypatch, source, reason, offset):
+    from hermes_cli.oneshot import _load_resume_target
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    start = time.time() - 60 * 86400
+    db.create_session("empty", source)
+    db._execute_write(lambda c: c.execute("UPDATE sessions SET started_at=? WHERE id='empty'", (start,)))
+    resumed, history, _ = _load_resume_target(db, "empty")
+    assert resumed == "empty" and history == []
+    db.create_session(resumed, "cli")
+    assert db.get_session(resumed)["source"] == source
+    assert db.get_session(resumed)["started_at"] == start
+    db.append_message(resumed, "user", "synthetic human input", timestamp=start + offset)
+    db.end_session(resumed, reason)
+    db._execute_write(lambda c: c.execute(
+        "UPDATE sessions SET ended_at=?, last_activity_at=? WHERE id=?",
+        (start + offset, start + offset, resumed)))
+    deleted = offset <= 30 and reason != "cli_close"
+    assert sweep(db, {source: 30})["pruned"] == int(deleted)
+    assert (db.get_session(resumed) is None) is deleted

@@ -211,7 +211,6 @@ def insert_session_row_in_transaction(
     validated before entry; this helper never opens or commits a DB.
     """
     from hermes_state_sessions import _UPSERT_KEEP_EXISTING_SQL
-    from agent.delegation_context import is_dispatcher_owned_worker_context
     from hermes_state_mutation_retirement import RETIRED_PREFIX
     # A delayed constructor/accounting backfill must not recreate a deleted session
     # beside its durable tombstone (the exact delete retry would then report a stale
@@ -274,10 +273,6 @@ def insert_session_row_in_transaction(
             display_name, time.time(),
         ),
     )
-    if source not in ("cron", "kanban", "subagent", "unknown") and is_dispatcher_owned_worker_context():
-        conn.execute("UPDATE sessions SET model_config=json_set(COALESCE(model_config,'{}'), "
-                     "'$._human_continued', ?) WHERE id=? AND source IN ('cron','kanban','subagent')",
-                     (source, session_id))
     if system_prompt_hash is not None:
         self._delete_unreferenced_system_prompts(conn)
     if parent_session_id:
