@@ -104,12 +104,33 @@ async def test_registered_service_updates_and_restart():
 
 
 @pytest.mark.asyncio
+async def test_registered_private_topic_creation_preserves_dm_opener():
+    owner = adapter()
+    owner._is_user_authorized_from_message = lambda msg: True
+    try:
+        assert await dispatch(registered_app(owner), message(
+            created="Private topic", chat_type="private", forum=False, chat_id=321))
+        opener = message(thread=None, chat_type="private", forum=False, chat_id=321)
+        event = owner._build_message_event(opener, MessageType.TEXT)
+        assert event.source.thread_id == "42"
+        assert owner._dm_topics == {}
+        owner.handle_message.assert_not_awaited()
+    finally:
+        await owner.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_rebuilt_application_registers_service_handler(monkeypatch):
     owner = adapter()
-    old = registered_app(owner)
+
+    class FailingInitialize(Application):  # PTB 22 Application attributes are read-only
+        async def initialize(self):
+            raise OSError("synthetic network failure")
+
+    old = (Application.builder().application_class(FailingInitialize).token("123456:public-test-fixture")
+           .request(NoNetwork()).get_updates_request(NoNetwork()).build())
+    owner._register_handlers(old)
     rebuilt = registered_app(owner)
-    old.initialize = AsyncMock(side_effect=OSError("synthetic network failure"))
-    rebuilt.initialize = AsyncMock(wraps=rebuilt.initialize)
     owner._app = old
     monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", AsyncMock())
     monkeypatch.setattr("plugins.platforms.telegram.adapter._shutdown_abandoned_app", AsyncMock())
