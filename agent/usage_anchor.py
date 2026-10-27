@@ -48,20 +48,23 @@ def message_fingerprint(msg: Any) -> Optional[str]:
     return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
 
 
+def _priced_row(msg, old):
+    values = tuple(msg.get(k) for k in _FINGERPRINT_KEYS)
+    hit = old is not None and old[0] is msg and all(
+        value is saved and (value is None or isinstance(value, str))
+        for value, saved in zip(values, old[1]))
+    return (msg, values, old[2] if hit else message_fingerprint(msg)), hit
+
+
 def _priced_rows(messages, base_count, memo=()):
     rows, unchanged = [], len(memo) == base_count
     for i, msg in enumerate(messages[:base_count]):
         if not isinstance(msg, dict):
             return [], False
-        values = tuple(msg.get(k) for k in _FINGERPRINT_KEYS)
-        old = memo[i] if i < len(memo) else None
-        hit = old is not None and old[0] is msg and all(
-            value is saved and (value is None or isinstance(value, str))
-            for value, saved in zip(values, old[1]))
-        fp = old[2] if hit else message_fingerprint(msg)
-        if not fp:
+        row, hit = _priced_row(msg, memo[i] if i < len(memo) else None)
+        if not row[2]:
             return [], False
-        rows.append((msg, values, fp))
+        rows.append(row)
         unchanged = unchanged and hit
     return rows, unchanged
 
@@ -121,8 +124,13 @@ def _anchor_matches(messages: list[dict[str, Any]], anchor: dict[str, Any]) -> b
     if not isinstance(base_msg, dict) or base_msg.get("role") != anchor.get("base_last_role"):
         return False
     fp = anchor.get("base_last_fp")
-    rows, unchanged = _priced_rows(messages, base_count, getattr(anchor, "_rows", ()))
-    if not isinstance(fp, str) or not fp or not rows or rows[-1][2] != fp:
+    memo = getattr(anchor, "_rows", ())
+    # The last row first: a stale anchor fails on one hash instead of the whole prefix.
+    last_old = memo[base_count - 1] if len(memo) == base_count else None
+    if not isinstance(fp, str) or not fp or _priced_row(base_msg, last_old)[0][2] != fp:
+        return False
+    rows, unchanged = _priced_rows(messages, base_count, memo)
+    if not rows:
         return False
     prefix_fp = anchor.get("base_prefix_fp")
     matches = (

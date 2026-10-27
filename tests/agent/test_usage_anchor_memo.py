@@ -65,6 +65,17 @@ def test_cli_redraw_never_rehashes_rows(monkeypatch):
     assert counter.call_count == 0
 
 
+def test_stale_last_row_fails_on_one_hash(monkeypatch):
+    """A changed last priced row is rejected before the prefix walk, as on base."""
+    plain = ua._serialize(ua.capture_usage_anchor(10_000, 100, _messages()))
+    db = SimpleNamespace(get_session_model_config_value=lambda *args: plain)
+    fresh = _messages()
+    fresh[-1]["content"] = "edited"
+    counter = _counter(monkeypatch)
+    assert ua.persisted_anchor_tokens(db, "test-session", fresh) is None
+    assert counter.call_count == 1
+
+
 def test_same_length_earlier_rewrite_is_stale():
     messages = _messages(4)
     anchor = ua.capture_usage_anchor(100, 10, messages)
