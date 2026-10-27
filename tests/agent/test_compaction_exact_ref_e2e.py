@@ -191,7 +191,7 @@ def test_every_emitted_ref_resolves_exactly(db):
 
     # b. Quoted user messages carry refs that resolve to their originals.
     quotes = _section(summary, _LEAN_USER_MESSAGES_HEADING)
-    quoted = re.findall(r"^> \[(m:[0-9a-f]{12})\] (.*)$", quotes, flags=re.M)
+    quoted = re.findall(r"^> \[(m:[0-9a-f]{12})\] (.*)$", quotes, flags=re.MULTILINE)
     assert quoted, quotes
     for ref, text in quoted:
         anchor = _anchor(_search(db, ref=ref))
@@ -266,7 +266,7 @@ def test_a_transcript_without_uids_emits_todays_exact_text(db):
         f"session_search(query='<keywords>', session_id='{SESSION_ID}') — do not guess at lost specifics "
         "when you can look them up.")
     quotes = _section(summary, _LEAN_USER_MESSAGES_HEADING)
-    assert "[m:" not in quotes and re.search(r"^> Run recent check", quotes, flags=re.M)
+    assert "[m:" not in quotes and re.search(r"^> Run recent check", quotes, flags=re.MULTILINE)
 
 
 # ── Deterministic sections, unit level ───────────────────────────────────────
@@ -293,7 +293,8 @@ def test_redaction_leaves_refs_intact():
 
 def test_helpers_fall_back_when_the_uid_is_absent_or_not_hex():
     from agent.context_compressor import (
-        _build_recovery_footer, _build_verbatim_user_section, _lean_recovery_stub)
+        _build_recovery_footer, _build_verbatim_user_section)
+    from agent.context_compressor_tail import _lean_recovery_stub
     uid = "3f2a9c1e0b7d" + "0" * 20
     assert _lean_recovery_stub("terminal", 2000, "sid", uid).endswith(
         "chars preserved in session history. Recover exactly with session_search(ref='m:3f2a9c1e0b7d')]")

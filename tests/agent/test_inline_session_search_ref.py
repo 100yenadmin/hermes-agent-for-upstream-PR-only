@@ -44,7 +44,8 @@ def test_every_schema_property_reaches_the_tool_through_the_inline_executor(monk
     monkeypatch.setattr(tool_module, "session_search", fake_session_search)
     properties = SESSION_SEARCH_SCHEMA["parameters"]["properties"]
     sentinels = {name: object() for name in properties}
+    sentinels["exclude_session_ids"] = ["already-inspected"]  # main coerces scalar array arguments
     agent = SimpleNamespace(_get_session_db_for_recall=lambda: object(), session_id="s1")
     INLINE_TOOL_EXECUTORS["session_search"](agent, dict(sentinels), _ctx())
-    dropped = sorted(name for name, sentinel in sentinels.items() if received.get(name) is not sentinel)
+    dropped = sorted(name for name, sentinel in sentinels.items() if received.get(name) != sentinel)
     assert dropped == [], f"schema properties the inline executor does not forward: {dropped}"
