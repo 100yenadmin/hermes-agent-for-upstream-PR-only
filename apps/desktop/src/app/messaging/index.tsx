@@ -47,6 +47,7 @@ import { SettingsProfileScope } from '../settings/profile-scope'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 
 import { AllowlistField } from './allowlist-field'
+import { DiscordBotCheck } from './discord-bot-check'
 import { PlatformAvatar } from './platform-icon'
 import { TelegramQrSetup } from './telegram-qr-setup'
 
@@ -840,6 +841,15 @@ function PlatformDetail({
           <SectionTitle>{m.telegramQr.quickSetup}</SectionTitle>
           <div className="mt-3">
             <TelegramQrSetup onApplied={onTelegramApplied} platform={platform} scopeProfile={scopeProfile} />
+          </div>
+        </section>
+      )}
+
+      {platform.id === 'discord' && (
+        <section>
+          <SectionTitle>{m.discordCheck.checkBot}</SectionTitle>
+          <div className="mt-3">
+            <DiscordBotCheck key={scopeProfile} platform={platform} scopeProfile={scopeProfile} />
           </div>
         </section>
       )}

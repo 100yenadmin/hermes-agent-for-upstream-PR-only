@@ -4,7 +4,7 @@ The Developer Portal is where Discord setup goes wrong: a token copied from the 
 Message Content Intent left off (Discord then refuses the bot's connection), an invite URL built
 by hand, and Developer Mode just to learn your own user ID. ``GET /applications/@me`` with the
 bot token answers all of it at once — the token works, which intents are on, how many servers the
-bot is in, and who owns the application — so the CLI wizard and the dashboard/Desktop check route
+bot is in, and who owns the application — so the CLI wizard and ``POST /api/messaging/discord/check``
 both read :func:`check_bot_token` instead of asking the user to verify those by hand.
 """
 
@@ -53,6 +53,15 @@ class DiscordBotCheck:
     @property
     def bot_settings_url(self) -> str:
         return f"https://discord.com/developers/applications/{self.app_id}/bot"
+
+    def as_payload(self) -> dict:
+        return {
+            "app_id": self.app_id, "bot_name": self.bot_name,
+            "owners": [{"id": uid, "username": name} for uid, name in self.owners],
+            "message_content": self.message_content, "server_members": self.server_members,
+            "server_count": self.server_count, "invite_url": self.invite_url,
+            "bot_settings_url": self.bot_settings_url,
+        }
 
 
 def _owners(app: dict) -> tuple[tuple[str, str], ...]:
