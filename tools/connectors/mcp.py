@@ -835,17 +835,27 @@ def _chat_oauth_note(runner: _Runner) -> str:
     return note
 
 
-def _prune_chat_attempts() -> None:
-    from tui_gateway.mcp_oauth_sessions import _SESSION_TTL_SECONDS
+# Attempts parked by chat turns (attempt object, parked time). Only these are ever pruned: card
+# entries and anything adopted or replaced since are left to adopt_late_connections.
+_CHAT_PARKED: dict[tuple[str, str], dict[str, tuple[Any, float]]] = {}
+_CHAT_PARK_SECONDS = 24 * 3600
 
-    cutoff = time.time() - _SESSION_TTL_SECONDS
-    for key, attempts in list(_LATE_ATTEMPTS.items()):
-        for name, attempt in list(attempts.items()):
-            flow = attempt.flow
-            if flow.created_at < cutoff and flow.snapshot()["status"] in {"approved", "error"}:
-                attempts.pop(name, None)
-        if not attempts:
-            _LATE_ATTEMPTS.pop(key, None)
+
+def _prune_chat_attempts() -> None:
+    """Drop chat attempts that finished and were never adopted within a day (abandoned chats)."""
+    cutoff = time.time() - _CHAT_PARK_SECONDS
+    for key, parked in list(_CHAT_PARKED.items()):
+        attempts = _LATE_ATTEMPTS.get(key) or {}
+        for name, (attempt, parked_at) in list(parked.items()):
+            if attempts.get(name) is not attempt:
+                parked.pop(name)
+            elif parked_at < cutoff and attempt.flow.snapshot()["status"] in {"approved", "error"}:
+                attempts.pop(name)
+                parked.pop(name)
+        if key in _LATE_ATTEMPTS and not attempts:
+            _LATE_ATTEMPTS.pop(key)
+        if not parked:
+            _CHAT_PARKED.pop(key)
 
 
 def _no_card_result(runner: _Runner, names: list[str], action: str, session_key: str) -> str:
@@ -858,6 +868,7 @@ def _no_card_result(runner: _Runner, names: list[str], action: str, session_key:
     for name, work in runner.work.items():
         if work.attempt is not None:
             _LATE_ATTEMPTS.setdefault(_late_key(operation), {})[name] = work.attempt
+            _CHAT_PARKED.setdefault(_late_key(operation), {})[name] = (work.attempt, time.time())
     payload = operation.result(with_urls=True)
     payload["status"] = "initiated" if any(t.state == TargetState.initiated for t in operation.targets) else "settled"
     payload["note"] = _chat_oauth_note(runner)
