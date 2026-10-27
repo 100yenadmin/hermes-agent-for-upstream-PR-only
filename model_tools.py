@@ -675,6 +675,10 @@ def _emit_post_tool_call_hook(
     fields are derived from the result only past that gate when status is None."""
     if _post_tool_call_hook_suppressed.get():
         return
+    ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id).hook_kwargs()
+    # tool_decision rides this funnel because it runs exactly once per call on every dispatch path.
+    from agent.tool_decision import emit_for_call
+    emit_for_call(tool_name=function_name, args=function_args, status=status, error_type=error_type, **ids)
     try:
         from hermes_cli.lifecycle import has_hook, invoke_hook
         if not has_hook("post_tool_call"):
@@ -682,8 +686,7 @@ def _emit_post_tool_call_hook(
         if status is None:
             status, error_type, error_message = _tool_result_observer_fields(function_name, result)
         invoke_hook(
-            "post_tool_call", tool_name=function_name, args=function_args, result=result,
-            **_CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id).hook_kwargs(),
+            "post_tool_call", tool_name=function_name, args=function_args, result=result, **ids,
             duration_ms=duration_ms, status=status, error_type=error_type, error_message=error_message,
             middleware_trace=list(middleware_trace or []),
         )
