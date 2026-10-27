@@ -196,6 +196,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             return is_intentional_silence_agent_result(agent_result, response)
         except Exception:
             return False
+
     async def _hmwa_stop_typing_for_turn(self, event, source):
         """Stop the typing indicator (never raises). Slack AI status is scoped to a thread/
         workspace, so preserve the routing metadata used by the response delivery path."""
@@ -278,9 +279,8 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
             )
-            _turn_ended_monotonic = time.monotonic()
-            _turn_seconds = _turn_ended_monotonic - _turn_started_monotonic
-            finish_agent_timing(event, agent_result, _turn_ended_monotonic)
+            _turn_seconds = time.monotonic() - _turn_started_monotonic
+            finish_agent_timing(event, agent_result, _turn_started_monotonic + _turn_seconds)
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
             # send (bracketed by the adapter against this event) must be ledgered under that
