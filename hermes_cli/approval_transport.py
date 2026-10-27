@@ -56,7 +56,7 @@ class ApprovalRequest:
     def create(
         cls, *, command: str, description: str, pattern_key: str, pattern_keys: tuple[str, ...],
         session_key: str, surface: str, allow_session: bool, allow_permanent: bool,
-        timeout_seconds: float = 300,
+        timeout_seconds: float = 300, request_id: str | None = None,
     ) -> ApprovalRequest:
         choices: list[ApprovalChoice] = ["once"]
         if allow_session:
@@ -65,7 +65,7 @@ class ApprovalRequest:
             choices.append("always")
         choices.append("deny")
         fields = dict(
-            schema_version=1, request_id=uuid.uuid4().hex, command=command,
+            schema_version=1, request_id=request_id or uuid.uuid4().hex, command=command,
             description=description, pattern_key=pattern_key, pattern_keys=list(pattern_keys),
             surface=surface, timeout_seconds=timeout_seconds, allowed_choices=choices,
         )

@@ -312,6 +312,7 @@ Return the result of
 `request.respond(choice)`; unbound dictionaries and stale or changed request
 IDs/digests are rejected. A plugin cannot return a scope that the host did not
 offer (for example, `always` on a once-only request).
+With `security.approval.transport_mode: mirror`, `present()` may run while a built-in prompt is live; late answers are discarded.
 
 Registration alone does nothing. Enabling the plugin and explicitly selecting
 its transport are separate consent steps:
@@ -326,7 +327,7 @@ security:
     transport_fallback: deny     # default
 ```
 
-Transport exceptions, timeouts, unavailable registrations, invalid choices,
+In the default `transport_mode: replace`, transport exceptions, timeouts, unavailable registrations, invalid choices,
 and stale responses deny by default. To deliberately show the prompt on the
 ordinary CLI/TUI/gateway/ACP surface when the selected transport fails, set
 `transport_fallback: builtin`. Without that exact opt-in, Hermes never

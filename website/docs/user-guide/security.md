@@ -285,6 +285,32 @@ On messaging platforms, the agent sends the dangerous command details to the cha
 
 The `HERMES_EXEC_ASK=1` environment variable is automatically set when running the gateway.
 
+### Plugin approval transports
+
+A selected [plugin approval transport](features/plugins.md#approval-transports),
+such as a phone push prompt, replaces the built-in prompt by default
+(`security.approval.transport_mode: replace`). To answer from either place:
+
+```yaml
+security:
+  approval:
+    transport: my-ui
+    transport_mode: mirror
+```
+
+In `mirror` mode the chat buttons, TUI/Desktop card, or ACP prompt remain live
+while the selected transport presents the same request. The first valid answer
+wins; late answers are discarded. Transport errors, busy workers, and timeouts
+leave the built-in prompt live until it is answered or its usual timeout expires.
+Classic CLI prompts using blocking input stay built-in only in mirror mode.
+Only the exact value `mirror` enables mirroring; missing or other values keep
+the default `replace` behavior.
+
+Anyone who can answer the selected transport can approve the operation, with
+the same trust as `replace` mode. Enable only transports whose recipients and
+response authentication you trust. Mirroring does not broaden the choices
+offered for a request (Smart DENY overrides still offer only once/deny).
+
 ### Permanent Allowlist
 
 Commands approved with "always" are saved to `~/.hermes/config.yaml`:

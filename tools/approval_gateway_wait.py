@@ -24,10 +24,12 @@ logger = logging.getLogger("tools.approval")
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("acknowledged", "cancelled", "data", "event", "expired", "observers", "reason", "result", "settle")
+    __slots__ = ("acknowledged", "cancelled", "data", "event", "expired", "observers", "reason", "result", "settle",
+                 "surface")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
+        self.surface = "gateway"
         self.data = dict(data)
         self.data.setdefault("request_id", uuid.uuid4().hex)
         self.acknowledged = False
@@ -165,6 +167,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     }
     keys = list(approval_data.get("pattern_keys") or [])
     entry = _ApprovalEntry(approval_data)
+    entry.surface = surface
     # Captured before the entry is published: a coalesced follower can find it while the pre-request
     # hooks still run, and must wait this same timeout rather than re-read a since-edited config.
     timeout_s = entry.data["timeout_s"] = _ctx._get_approval_timeout()
@@ -245,6 +248,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             human.outcome = "notify_failed"
             return {"resolved": False, "choice": None, "notify_failed": True}
 
+        from tools.approval_mirror import start_mirror
+        start_mirror(session_key, entry)
         state = _poll_event(entry.event, session_key, timeout_s=timeout_s,
                             interrupt_log="Approval wait interrupted — returning deny for session %s")
         cancelled = _cancel_cause(state, entry)
