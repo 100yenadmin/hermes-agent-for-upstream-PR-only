@@ -1,4 +1,8 @@
 """Cron refusal evidence comes from real turns, including middleware replacements (#135544)."""
+import json
+from copy import deepcopy
+from types import SimpleNamespace
+from threading import Event, Thread
 from unittest.mock import MagicMock
 
 import pytest
@@ -26,7 +30,7 @@ def test_turn_counts_attempts_and_real_dispatch(monkeypatch, policy):
     result = _run(agent, replies)
     assert result["completed"] is True
     assert result["tool_calls_attempted"] == 1
-    assert result["tool_calls_executed"] == (1 if policy == "allowed" else 0)
+    assert result["tool_calls_refused"] == (0 if policy == "allowed" else 1)
     assert result["tool_calls_refused_names"] == ([] if policy == "allowed" else [_PROBE])
     assert dispatch.call_count == (1 if policy == "allowed" else 0)
     # Cached agents start each turn clean, including a text-only turn after a refusal.
@@ -38,3 +42,98 @@ def test_text_only_turn_has_no_tally():
     result = _run(_loop_agent(), lambda _: _mock_response(content="hello"))
     assert result["completed"] is True
     assert not any(key.startswith("tool_calls_") for key in result)
+
+
+@pytest.mark.parametrize("finish", ["refused", "exception"])
+def test_stale_worker_updates_only_its_original_tally(finish):
+    from agent import turn_tool_tally as tally
+    agent = SimpleNamespace()
+    tally.reset(agent)
+    original = agent._turn_tool_tally
+    started, release = Event(), Event()
+    errors = []
+
+    @tally.track_attempt
+    def run(_agent, **kwargs):
+        started.set()
+        assert release.wait(5)
+        if finish == "exception":
+            raise RuntimeError("middleware failed")
+        return SimpleNamespace(blocked=True, dispatched=False, result="refused")
+
+    def worker():
+        try:
+            run(agent, function_name="terminal")
+        except RuntimeError as exc:
+            errors.append(str(exc))
+
+    thread = Thread(target=worker)
+    thread.start()
+    try:
+        assert started.wait(5)
+        tally.reset(agent)
+        current = deepcopy(agent._turn_tool_tally)
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert agent._turn_tool_tally == current
+    assert original["attempted"] == 1
+    assert original["refused"] == (1 if finish == "refused" else 0)
+    assert errors == (["middleware failed"] if finish == "exception" else [])
+
+
+def test_exception_and_abandoned_attempt_are_not_positive_refusals():
+    from agent import turn_tool_tally as tally
+    from cron.scheduler_turn_verdict import refused_turn_error
+    agent = SimpleNamespace()
+    tally.reset(agent)
+    started, release = Event(), Event()
+
+    @tally.track_attempt
+    def run(_agent, **kwargs):
+        started.set()
+        assert release.wait(5)
+        raise RuntimeError("middleware failed")
+
+    def worker():
+        with pytest.raises(RuntimeError, match="middleware failed"):
+            run(agent, function_name="terminal")
+
+    thread = Thread(target=worker)
+    thread.start()
+    try:
+        assert started.wait(5)
+        result = {}
+        tally.export(agent, result)
+        assert result["tool_calls_attempted"] == 1
+        assert refused_turn_error(result, "done") is None
+    finally:
+        release.set()
+        thread.join(5)
+    result = {}
+    tally.export(agent, result)
+    assert refused_turn_error(result, "done") is None
+
+
+@pytest.mark.parametrize("output, refused", [
+    ('{"status":"blocked"}', True), (' {"status":"pending_approval"}', True),
+    ('{"approval_pending":true}', True), ('{"status":"error","exit_code":1}', False),
+    (json.dumps({"output": '{"status":"blocked"}', "exit_code": 1}), False),
+    ('{"approval_pending":false}', False), ('["blocked"]', False),
+    ('{"status":', False), ('ordinary output', False),
+    ('{"status":"blocked","padding":"' + 'x' * 65536 + '"}', False),
+], ids=["blocked", "pending", "flag", "error", "nested", "false", "array", "invalid", "text", "oversized"])
+def test_structured_guard_refusals_only(output, refused):
+    from agent import turn_tool_tally as tally
+    agent = SimpleNamespace()
+    tally.reset(agent)
+
+    @tally.track_attempt
+    def run(_agent, **kwargs):
+        return SimpleNamespace(blocked=False, dispatched=True, result=output)
+
+    run(agent, function_name="terminal")
+    result = {}
+    tally.export(agent, result)
+    assert result["tool_calls_refused"] == int(refused)

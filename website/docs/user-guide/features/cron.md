@@ -926,7 +926,7 @@ under `~/.hermes/cron/output/` for triage. The marker is strict: mentioning or q
 else in a report leaves the run successful. Script-only (`no_agent`) jobs ignore it — a script signals failure
 with a non-zero exit code.
 
-A run in which every tool call was refused by a plugin, guardrail, scope or middleware is recorded as
+A run in which every tool call was refused by a plugin, guardrail, scope, middleware or approval policy is recorded as
 failed automatically. A run where at least one tool ran, or a text-only run, is unchanged.
 
 ## Script timeout

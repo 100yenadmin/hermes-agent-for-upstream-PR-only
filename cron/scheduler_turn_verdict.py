@@ -1,4 +1,5 @@
 """Turn-level failure evidence shared by cron execution and receipt recovery."""
+import logging
 from typing import Optional
 
 CRON_FAILURE_MARKER = "[CRON_FAILURE]"
@@ -14,11 +15,12 @@ def _cron_failure_marker_error(text: str) -> Optional[str]:
 
 
 def refused_turn_error(result: dict, final_response: str) -> Optional[str]:
-    """A completed turn that dispatched nothing cannot claim its attempted work succeeded."""
+    """Only positive refusals of every attempt declare a failed turn."""
     if _cron_failure_marker_error(final_response) is not None:
         return None
-    attempted, executed = result.get("tool_calls_attempted"), result.get("tool_calls_executed")
-    if attempted is None or executed is None or attempted <= 0 or executed > 0:
+    attempted, refused = result.get("tool_calls_attempted"), result.get("tool_calls_refused")
+    if attempted is None or attempted <= 0 or refused != attempted:
         return None
-    names = ", ".join(result.get("tool_calls_refused_names") or [])
-    return f"Every tool call this run attempted ({attempted}: {names}) was refused before it ran; no work was done."
+    logging.getLogger(__name__).info("Cron turn refused tools: %s", result.get("tool_calls_refused_names") or [])
+    return ("Every tool call in this run was refused before it ran "
+            "(by a plugin, guardrail, scope, middleware or approval policy); no work was done.")

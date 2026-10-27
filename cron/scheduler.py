@@ -2049,7 +2049,7 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
     max_iteration_summary = is_max_iteration_handoff(result)
     if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
         raise RuntimeError(result.get("error") or final_response_text or "agent reported failure")
-    if (err := refused_turn_error(result, final_response_text)):
+    if (err := refused_turn_error(result, result.get("final_response") or "")):
         raise RuntimeError(err)
     if max_iteration_summary:
         logger.warning(
