@@ -181,6 +181,25 @@ describe('MessagingView Discord bot check', () => {
     expect(screen.queryByText(/Discord will refuse/)).toBeNull()
   })
 
+  it('drops an old result once a different token is saved', async () => {
+    checkDiscordBot.mockResolvedValue(result)
+    updateMessagingPlatform.mockResolvedValue({ hot_served: false })
+    await showDiscord()
+    fireEvent.click(await screen.findByRole('button', { name: 'Check bot' }))
+    expect(await screen.findByText('Test bot')).toBeTruthy()
+    const saved = await getMessagingPlatforms('discord_test')
+    const field = saved.platforms[0].env_vars[0]
+    getMessagingPlatforms.mockResolvedValue({
+      platforms: [{ ...saved.platforms[0], env_vars: [{ ...field, redacted_value: '••••new' }] }]
+    })
+    fireEvent.change(await screen.findByLabelText('Bot token'), { target: { value: 'another-bot-token' } })
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Save changes/ }))
+    })
+    await waitFor(() => expect(screen.queryByText('Test bot')).toBeNull())
+    expect(screen.queryByRole('button', { name: 'Add to a server' })).toBeNull()
+  })
+
   it('requires a saved token before checking', async () => {
     await showDiscord(false)
     expect((await screen.findByRole('button', { name: 'Check bot' })).hasAttribute('disabled')).toBe(true)
