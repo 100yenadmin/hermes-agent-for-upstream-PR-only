@@ -157,6 +157,11 @@ class MessageEvent:
         if self.reply_expected is not True and other.reply_expected is not False:
             self.reply_expected = other.reply_expected
 
+    def absorb_merged(self, other: "MessageEvent") -> None:
+        """*other* was merged into this turn: carry its reply expectation and envelope sender."""
+        self.absorb_reply_expected(other)
+        absorb_envelope_sender(self, other)
+
     def _command_text(self) -> str:
         """Return the message text with leading Desktop attachment refs stripped.
 
