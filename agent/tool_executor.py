@@ -35,6 +35,7 @@ from agent.interrupt_control import _REASON_USER_INTERRUPT, interrupt_skip_wordi
 from agent.message_sanitization import coalesce_tool_call_id
 from agent.onboarding import observe_tool_result as observe_onboarding_result
 from agent import plugin_live_notes
+from agent import turn_tool_tally
 from agent.lsp import deferred as lsp_deferred
 from agent.inline_tool_executors import (
     INLINE_TOOL_EXECUTORS,
@@ -756,11 +757,13 @@ def _dispatch_authorized_once(
     from tools.connectors.data_use import collect_data_use
     with bound_tool_progress(agent.tool_progress_callback, ref.name, ref.call_id), collect_data_use() as data_use:
         try:
+            turn_tool_tally.note_executed(agent)
             return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
         finally:
             state.data_use = frozenset(data_use)
 
 
+@turn_tool_tally.track_attempt
 def _run_agent_tool_execution_middleware(
     agent,
     *,
