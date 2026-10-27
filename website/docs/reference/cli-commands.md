@@ -396,7 +396,7 @@ the full guide, supported languages, and configuration knobs.
 ## `hermes setup`
 
 ```bash
-hermes setup [model|tts|terminal|gateway|tools|agent] [--non-interactive] [--reset] [--quick] [--reconfigure] [--portal]
+hermes setup [model|tts|terminal|gateway|tools|agent] [--non-interactive] [--reset] [--quick] [--reconfigure] [--portal] [--no-verify]
 ```
 
 **Easiest path:** `hermes setup --portal` — OAuth into Nous Portal and opt into the [Tool Gateway](../user-guide/features/tool-gateway.md) in one shot.
@@ -422,6 +422,7 @@ Options:
 | Option | Description |
 |--------|-------------|
 | `--quick` | On returning-user runs: only prompt for items that are missing or unset. Skip items you already have configured. |
+| `--no-verify` | Skip the live model check at setup completion (also `HERMES_SETUP_SKIP_VERIFY=1`). App-server and other unsupported runtimes report a skip. |
 | `--non-interactive` | Use defaults / environment values without prompts. |
 | `--reset` | Reset configuration to defaults before setup. |
 | `--reconfigure` | Backwards-compat alias — bare `hermes setup` on an existing install now does this by default. |
