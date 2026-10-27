@@ -58,10 +58,14 @@ def _connect(action="authorize"):
 
 
 def _listener(monkeypatch, state="serving", public_url="https://agent.example/hermes"):
+    from gateway.run_api import GatewayDashboardMount
+
+    # A real, not-yet-mounted listener: the dashboard loads lazily on its first request.
+    mount = GatewayDashboardMount(None, SimpleNamespace(webapp=SimpleNamespace(public_url=public_url)))
+    assert not mount.loaded
     runner = SimpleNamespace(
         webapp_status={"state": state, "url": "http://127.0.0.1:8080"},
-        session_api=SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
-            listener_public_url=public_url))))
+        session_api=SimpleNamespace(app=mount))
     monkeypatch.setitem(sys.modules, "gateway.run", SimpleNamespace(_gateway_runner_ref=lambda: runner))
 
 

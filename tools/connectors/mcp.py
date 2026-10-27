@@ -814,8 +814,8 @@ def _chat_public_base() -> Optional[str]:
     runner = runner_ref() if callable(runner_ref) else None
     if runner is None or getattr(runner, "webapp_status", {}).get("state") != "serving":
         return None
-    app = getattr(getattr(runner, "session_api", None), "app", None)
-    return getattr(getattr(app, "state", None), "listener_public_url", None) or None
+    # The dashboard mounts lazily; the listener knows its public address before the first request.
+    return getattr(getattr(getattr(runner, "session_api", None), "app", None), "public_url", None) or None
 
 
 def _chat_oauth_note(runner: _Runner) -> str:
