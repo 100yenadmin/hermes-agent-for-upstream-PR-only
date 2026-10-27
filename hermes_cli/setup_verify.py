@@ -6,7 +6,6 @@ fallback may issue two. Never use call_llm or aux_probe_mode here. External runt
 """
 
 import logging
-import os
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
@@ -37,13 +36,9 @@ def verification_scope(args):
         _SKIP.reset(token)
 
 
-def _disabled():
-    return _SKIP.get() or os.environ.get("HERMES_SETUP_SKIP_VERIFY", "").lower() in {"1", "true", "yes", "on"}  # health: allow HX002 -- SPEC requires this setup-only test/automation opt-out
-
-
 def finish_model_setup(config):
     """Shared epilogue; a skipped check must not perturb existing setup output."""
-    if not _disabled():
+    if not _SKIP.get():
         print_verify_result(verify_model_route(config))
 
 
@@ -102,33 +97,53 @@ def _request(runtime, model, timeout):
     if not runtime.get("base_url") or not runtime.get("api_key"):
         raise ValueError("The configured route is incomplete")
     # Bind concrete endpoint/key rather than re-resolving provider pools or auxiliary defaults.
-    client, _ = resolve_provider_client(
-        "custom", model=model, explicit_base_url=runtime["base_url"], explicit_api_key=runtime["api_key"],
-        api_mode=runtime["api_mode"], main_runtime=runtime,
-    )
+    if runtime["api_mode"] == "anthropic_messages":
+        from agent.anthropic_adapter import build_anthropic_client
+        from agent.anthropic_credentials import anthropic_route_is_oauth
+        from agent.auxiliary_client import AnthropicAuxiliaryClient
+        client = AnthropicAuxiliaryClient(
+            build_anthropic_client(runtime["api_key"], runtime["base_url"], timeout=timeout),
+            model, runtime["api_key"], runtime["base_url"],
+            is_oauth=anthropic_route_is_oauth(runtime["base_url"], runtime["api_key"], provider=runtime["provider"]),
+        )
+    else:
+        client, _ = resolve_provider_client(
+            "custom", model=model, explicit_base_url=runtime["base_url"], explicit_api_key=runtime["api_key"],
+            api_mode=runtime["api_mode"], main_runtime=runtime,
+        )
     headers = _endpoint_default_headers(runtime["base_url"], runtime["provider"]) or {}
     if runtime["provider"] == "openrouter":
         headers = {**build_or_headers(), **headers}
     headers.update(get_custom_provider_extra_headers(runtime["base_url"]))
     kwargs = {"extra_headers": headers} if headers else {}
+    from utils import model_forces_max_completion_tokens
+    kwargs["max_completion_tokens" if model_forces_max_completion_tokens(model) else "max_tokens"] = 16
     client.chat.completions.create(model=model, messages=[{"role": "user", "content": "Reply with the word OK."}],
-                                   max_tokens=16, timeout=timeout, **kwargs)
+                                   timeout=timeout, **kwargs)
 
 
 def _verify(provider, model, start, timeout):
     endpoint = "the configured endpoint"
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        runtime = resolve_runtime_provider(requested=provider, target_model=model)
+        from hermes_cli.left_core_migration import installs_held
+        with installs_held():
+            runtime = resolve_runtime_provider(requested=provider, target_model=model)
         provider = runtime["provider"]
         reason = _unsupported(runtime)
         if reason:
             return VerifyResult(False, "skipped", provider, model, detail=reason)
+        from hermes_cli.model_normalize import _AGGREGATOR_PROVIDERS, normalize_model_for_provider
+        from hermes_cli.anon_auth import pin_model_for_route
+        if provider not in _AGGREGATOR_PROVIDERS:
+            model = normalize_model_for_provider(model, provider)
+        model = pin_model_for_route(provider, runtime["base_url"], model)
         parsed = urlsplit(runtime["base_url"])
         endpoint = f"{parsed.scheme}://{parsed.hostname}" if parsed.hostname else endpoint
-        if time.monotonic() - start >= timeout:
+        remaining = timeout - (time.monotonic() - start)
+        if remaining <= 0:
             raise TimeoutError("Resolution exceeded the deadline")
-        _request(runtime, model, timeout)
+        _request(runtime, model, remaining)
         return VerifyResult(True, "ok", provider, model, time.monotonic() - start)
     except Exception as exc:  # health: allow BLE001 -- optional diagnostic reports sanitized failures
         return _failure(exc, provider, model, start, endpoint)
@@ -142,7 +157,7 @@ def verify_model_route(config, *, timeout=20.0) -> VerifyResult:
         section = config.get("model", {})
         provider = section.get("provider", "") if isinstance(section, dict) else ""
         model = section.get("default", "") if isinstance(section, dict) else section
-        if _disabled() or not provider or not model:
+        if _SKIP.get() or not provider or not model:
             return VerifyResult(False, "skipped")
         results = Queue(maxsize=1)
         def request():
@@ -151,6 +166,10 @@ def verify_model_route(config, *, timeout=20.0) -> VerifyResult:
         Thread(target=copy_context().run, args=(request,), daemon=True).start()
         try:
             return results.get(timeout=max(0, timeout - (time.monotonic() - start)))
+        except KeyboardInterrupt:
+            from hermes_cli.setup import print_info
+            print_info("Model check skipped.")
+            return VerifyResult(False, "skipped")
         except Empty:
             return VerifyResult(False, "network", provider, model, time.monotonic() - start,
                                 f"no answer within {timeout:g} s", "the configured endpoint")

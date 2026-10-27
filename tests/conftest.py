@@ -191,7 +191,6 @@ os.environ["HERMES_TEST_ISOLATION"] = os.environ.get("HERMES_HOME", "") or "1"
 # ran a real `uv pip install boto3` into the shared venv while other files raced
 # on whether botocore was importable yet.
 os.environ["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
-os.environ["HERMES_SETUP_SKIP_VERIFY"] = "1"
 
 #: HERMES_HOME as it stood when conftest was imported - i.e. before any test
 #: module could import code that configures logging. Recorded so the guard in
@@ -417,7 +416,6 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     # makes ensure() raise FeatureUnavailable immediately instead.
     # extras tests override this var in both directions.
     monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
-    monkeypatch.setenv("HERMES_SETUP_SKIP_VERIFY", "1")
 
     # 5. Reset plugin singleton so tests don't leak plugins from
     #    ~/.hermes/plugins/ (which, per step 3, is now empty — but the

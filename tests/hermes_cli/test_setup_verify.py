@@ -5,12 +5,19 @@ import logging
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 
 import pytest
 
+from hermes_cli.setup_verify import verify_model_route as verify_model_route_for_test
 
 CONFIG = {"model": {"provider": "custom", "default": "configured-model"}}
+pytestmark = pytest.mark.usefixtures("real_setup_model_verification")
+
+
+@pytest.fixture
+def real_setup_model_verification():
+    """Opt out of the suite's skipped setup check for this module."""
 
 
 @pytest.fixture
@@ -19,7 +26,6 @@ def route(monkeypatch):
     import agent.auxiliary_client as aux
     import hermes_cli.runtime_provider as rp
 
-    monkeypatch.delenv("HERMES_SETUP_SKIP_VERIFY", raising=False)
     runtime = {"provider": "custom", "api_mode": "chat_completions",
                "base_url": "https://route.invalid/v1", "api_key": "fixture-key"}
     resolve = Mock(return_value=runtime)
@@ -41,7 +47,8 @@ def test_configured_request_and_elapsed_time(route):
     route.resolve.assert_called_once_with(requested="custom", target_model="configured-model")
     route.create.assert_called_once_with(model="configured-model",
                                         messages=[{"role": "user", "content": "Reply with the word OK."}],
-                                        max_tokens=16, timeout=20.0)
+                                        max_tokens=16, timeout=ANY)
+    assert 0 < route.create.call_args.kwargs["timeout"] <= 20
     kwargs = route.factory.call_args.kwargs
     assert kwargs["model"] == "configured-model"
     assert kwargs["explicit_base_url"] == route.runtime["base_url"]
@@ -72,10 +79,9 @@ def test_failure_classification_and_safe_copy(route, capsys, name, status, code,
     route.create.assert_called_once()
 
 
-@pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
-def test_env_skip_is_silent(route, monkeypatch, capsys, value):
-    monkeypatch.setenv("HERMES_SETUP_SKIP_VERIFY", value)
-    result = route.verify.verify_model_route(CONFIG)
+def test_scoped_skip_is_silent(route, capsys):
+    with route.verify.verification_scope(SimpleNamespace(no_verify=True)):
+        result = route.verify.verify_model_route(CONFIG)
     assert result.kind == "skipped"
     route.verify.print_verify_result(result)
     assert capsys.readouterr().out == ""
@@ -129,15 +135,14 @@ def test_deadline_returns_and_late_completion_is_silent(route, capsys, caplog):
     assert "sk-test-late-log" not in caplog.text
 
 
-def test_anthropic_same_model_fallback(route):
-    from agent.auxiliary_client import AnthropicAuxiliaryClient
+def test_anthropic_same_model_fallback(route, monkeypatch):
+    import agent.anthropic_adapter as adapter
     response = SimpleNamespace(content=[], stop_reason="end_turn", usage=None)
     messages = SimpleNamespace(stream=Mock(side_effect=RuntimeError("streaming is not supported")),
                                create=Mock(return_value=response))
     native = SimpleNamespace(messages=messages, base_url="https://route.invalid")
     route.runtime["api_mode"] = "anthropic_messages"
-    route.factory.return_value = (AnthropicAuxiliaryClient(native, "configured-model", "fixture-key",
-                                                          "https://route.invalid"), "configured-model")
+    monkeypatch.setattr(adapter, "build_anthropic_client", Mock(return_value=native))
     result = route.verify.verify_model_route(CONFIG)
     assert result.ok
     messages.stream.assert_called_once()
@@ -148,7 +153,6 @@ def test_anthropic_same_model_fallback(route):
 @pytest.fixture
 def flows(monkeypatch, tmp_path):
     from hermes_cli import setup, setup_quick, setup_verify
-    monkeypatch.delenv("HERMES_SETUP_SKIP_VERIFY", raising=False)
     config = {"model": dict(CONFIG["model"])}
     check = Mock(return_value=setup_verify.VerifyResult(True, "ok", "custom", "configured-model", 0.1, ""))
     monkeypatch.setattr(setup_verify, "verify_model_route", check)
@@ -281,3 +285,116 @@ def test_resolution_error_logs_are_suppressed(route, caplog):
     assert result.kind == "other"
     assert result.detail == "RuntimeError"
     assert "sk-test-provider-error" not in caplog.text
+
+
+@pytest.mark.parametrize("provider,model,base_url,expected", [
+    ("deepseek", "deepseek-chat", "https://route.invalid/v1", "deepseek-flash"),
+    ("openai-codex", "openai/gpt-5.4", "https://route.invalid/v1", "gpt-5.4"),
+    ("zai", "zai/glm-5.1", "https://route.invalid/v1", "glm-5.1"),
+    ("kimi-coding", "kimi-coding/kimi-k2.5", "https://route.invalid/v1", "kimi-k2.5"),
+    ("minimax", "minimax/MiniMax-M2.5", "https://route.invalid/v1", "MiniMax-M2.5"),
+    ("opencode-zen", "anthropic/claude-opus-4.6", "https://route.invalid/v1", "claude-opus-4-6"),
+    ("nous", "another/model", "https://welcome-api.nousresearch.com/v1", "nous/welcome"),
+    ("openrouter", "another/model", "https://route.invalid/v1", "another/model"),
+])
+def test_r2_request_uses_first_turn_model(route, provider, model, base_url, expected):
+    route.runtime.update(provider=provider, base_url=base_url)
+    result = route.verify.verify_model_route({"model": {"provider": provider, "default": model}})
+    assert result.ok
+    assert route.create.call_args.kwargs["model"] == expected
+    assert result.model == expected
+
+
+def test_r2_anthropic_oauth_request_has_identity_transform(route, monkeypatch):
+    import agent.anthropic_adapter as adapter
+    from agent.auxiliary_client import AnthropicAuxiliaryClient
+
+    model = "claude-sonnet-4-6"
+    route.runtime.update(provider="anthropic", api_mode="anthropic_messages",
+                         base_url="https://api.anthropic.com", api_key="sk-ant-oat-fixture")
+    messages = SimpleNamespace(stream=Mock(side_effect=RuntimeError("streaming is not supported")),
+                               create=Mock(return_value=SimpleNamespace(content=[], stop_reason="end_turn", usage=None)))
+    native = SimpleNamespace(messages=messages, base_url=route.runtime["base_url"])
+    build = Mock(return_value=native)
+    monkeypatch.setattr(adapter, "build_anthropic_client", build)
+    # Reproduce the resolver's existing non-OAuth wrapper on the base.
+    route.factory.return_value = (AnthropicAuxiliaryClient(native, model, route.runtime["api_key"],
+                                                          route.runtime["base_url"]), model)
+    result = route.verify.verify_model_route({"model": {"provider": "anthropic", "default": model}})
+    assert result.ok
+    assert messages.create.call_args.kwargs["system"][0]["text"] == adapter._CLAUDE_CODE_SYSTEM_PREFIX
+    assert 0 < build.call_args.kwargs["timeout"] <= 20
+
+
+def test_r2_chat_completion_reasoning_model_uses_supported_token_cap(route):
+    result = route.verify.verify_model_route({"model": {"provider": "custom", "default": "gpt-5"}})
+    assert result.ok
+    assert route.create.call_args.kwargs["max_completion_tokens"] == 16
+    assert "max_tokens" not in route.create.call_args.kwargs
+
+
+@pytest.mark.parametrize("flow", ["quick", "portal"])
+def test_r2_ctrl_c_during_wait_still_records_completion(flows, monkeypatch, capsys, flow):
+    from hermes_cli import portal_cli, setup_verify
+
+    monkeypatch.setattr(setup_verify.Queue, "get", Mock(side_effect=KeyboardInterrupt))
+    monkeypatch.setattr(setup_verify.Thread, "start", Mock())
+    monkeypatch.setattr(setup_verify, "verify_model_route", verify_model_route_for_test)
+    if flow == "quick":
+        monkeypatch.setattr(flows.setup, "load_config", lambda: flows.config)
+        monkeypatch.setattr(flows.setup, "is_interactive_stdin", lambda: True)
+        monkeypatch.setattr(flows.setup, "get_env_value", lambda _name: "")
+        monkeypatch.setattr("hermes_cli.auth.get_active_provider", lambda: None)
+        monkeypatch.setattr(flows.setup, "offer_agent_import", lambda _home: "import fixture")
+        try:
+            flows.setup.run_setup_wizard(SimpleNamespace())
+        except KeyboardInterrupt:
+            pytest.fail("Ctrl-C during the optional check must not cancel setup")
+        flows.setup._print_setup_summary.assert_called_once()
+    else:
+        monkeypatch.setattr(portal_cli, "load_config", lambda: flows.config)
+        assert portal_cli.portal_command(SimpleNamespace(portal_command=None)) == 0
+    flows.setup._record_setup_completed.assert_called_once_with(flows.config)
+    output = capsys.readouterr().out
+    assert "Model check skipped." in output
+    assert "cancelled" not in output
+
+
+def test_r2_resolution_cannot_install_provider_plugin(route):
+    from hermes_cli.left_core_migration import _installs_held
+
+    observed = []
+    def resolve(**_kwargs):
+        observed.append(_installs_held.get())
+        return route.runtime
+    route.resolve.side_effect = resolve
+    assert route.verify.verify_model_route(CONFIG).ok
+    assert observed == [True]
+    assert not _installs_held.get()
+
+
+def test_r2_request_receives_only_time_left_after_resolution(route, monkeypatch):
+    import hermes_cli.setup_verify as verify
+
+    now = [100.0]
+    monkeypatch.setattr(verify.time, "monotonic", lambda: now[0])
+    def resolve(**_kwargs):
+        now[0] += 7
+        return route.runtime
+    route.resolve.side_effect = resolve
+    assert verify.verify_model_route(CONFIG).ok
+    assert route.create.call_args.kwargs["timeout"] == 13
+
+
+@pytest.mark.parametrize("argv", [["portal", "--no-verify"], ["portal", "login", "--no-verify"],
+                                  ["portal", "--no-verify", "login"]])
+def test_r2_portal_no_verify_is_invocation_scoped(flows, monkeypatch, argv):
+    from hermes_cli import portal_cli
+
+    parser = argparse.ArgumentParser()
+    portal_cli.add_parser(parser.add_subparsers())
+    monkeypatch.setattr(portal_cli, "load_config", lambda: flows.config)
+    assert portal_cli.portal_command(parser.parse_args(argv)) == 0
+    flows.check.assert_not_called()
+    assert portal_cli.portal_command(parser.parse_args(["portal"])) == 0
+    flows.check.assert_called_once_with(flows.config)
