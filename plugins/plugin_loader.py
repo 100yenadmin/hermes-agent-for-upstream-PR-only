@@ -289,12 +289,13 @@ class ForwardingPluginContext:
         return host.load_instance(plugin_dir, module_name=module_name, capture=capture, base_ref=base_ref,
                                   ctx=self, before_reload=drop_hooks)
 
-    def register_hook(self, hook_name, callback):
+    def register_hook(self, hook_name, callback, *, hold_stream=False):
         if not self._forward:
             return None
         context = self._plugin_context()
         with context._manager._discovery_lock:
-            return context._manager._register_fallback_hook(context, self._hook_source, hook_name, callback)
+            return context._manager._register_fallback_hook(
+                context, self._hook_source, hook_name, callback, hold_stream=hold_stream)
 
     def register_cli_command(self, *args, **kwargs):
         pass  # CLI registration happens via each category's own CLI discovery
