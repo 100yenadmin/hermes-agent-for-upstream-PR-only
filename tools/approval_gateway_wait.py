@@ -186,7 +186,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             if not preparing_terminal_approval():
                 leader = next((e for e in _approval._gateway_queues.get(session_key, [])
                                if e.data.get("command") == approval_data.get("command")
-                               and list(e.data.get("pattern_keys") or []) == keys), None)
+                               and list(e.data.get("pattern_keys") or []) == keys
+                               # A request the phone may not answer never adopts a mirrored answer.
+                               and e.data.get("transport_eligible") == approval_data.get("transport_eligible")),
+                              None)
             if leader is None:
                 _enqueue()
                 break

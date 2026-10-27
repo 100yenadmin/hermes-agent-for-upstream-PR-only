@@ -262,7 +262,7 @@ def _observe_mirror(monkeypatch):
     return considered, workers
 
 
-@pytest.mark.parametrize("source", [None, "telegram", "discord", "webhook", "api_server", "cron", "kanban"])
+@pytest.mark.parametrize("source", [None, "cli", "telegram", "discord", "webhook", "api_server", "cron", "kanban"])
 def test_nonlocal_session_keeps_builtin_only(mirror, monkeypatch, source):
     considered, workers = _observe_mirror(monkeypatch)
     requests, seen = [], []

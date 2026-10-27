@@ -304,8 +304,10 @@ wins; late answers are discarded. Transport errors, busy workers, and timeouts
 leave the built-in prompt live until it is answered or its usual timeout expires.
 Chat apps stay built-in only: their buttons answer the session's oldest pending
 request rather than the card's request ID, so mirroring could apply stale consent.
-Classic CLI prompts using blocking input and gateway/ask sessions without a notify
-callback also stay on the built-in path, without a transport prompt in mirror mode.
+Classic CLI sessions (including ones attached to the gateway) stay built-in only: their
+prompt blocks on terminal input that a remote answer cannot withdraw. Gateway/ask
+sessions without a notify callback also stay on the built-in path, without a transport
+prompt in mirror mode.
 Webhook, API server, cron, and kanban sessions are not mirrored.
 Only the exact value `mirror` enables mirroring; missing or other values keep
 the default `replace` behavior.

@@ -45,11 +45,22 @@ def _run_mirror(session_key, entry, registered, request):
         logger.debug("Mirrored approval transport failed")
 
 
+# Sessions whose built-in prompt is a cancellable card answered by request id. Classic CLI
+# ("cli") is left out: its prompt blocks on terminal input that a phone answer cannot withdraw.
+_MIRROR_SOURCES = frozenset({"tui", "gui", "acp"})
+
+
+def _mirror_session() -> bool:
+    from gateway.session_policy import active_policy
+    policy = active_policy()
+    return policy is not None and policy.source in _MIRROR_SOURCES
+
+
 def start_mirror(session_key, entry):
     """Start only for a published leader; all answers use the queue's atomic resolver."""
     if _ctx._get_approval_transport_mode() != "mirror" or entry.event.is_set():
         return
-    if not _ctx.is_local_interactive_session() or not entry.data.get("transport_eligible", False):
+    if not _mirror_session() or not entry.data.get("transport_eligible", False):
         return
     try:
         from agent.redact import redact_sensitive_text
