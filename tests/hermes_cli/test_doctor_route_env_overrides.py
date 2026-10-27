@@ -20,7 +20,7 @@ from hermes_cli.doctor_connectivity import _model_cfg
 
 _ROUTE_VARS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
                "ANTHROPIC_AUTH_TOKEN", "OPENAI_BASE_URL", "OPENAI_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_API_KEY",
-               "DEEPSEEK_API_KEY_2", "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL", "CUSTOM_BASE_URL",
+               "DEEPSEEK_API_KEY_2", "DEEPSEEK_API_KEY_3", "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL", "CUSTOM_BASE_URL",
                "HERMES_INFERENCE_PROVIDER")
 _API_KEY = "sk-ant-api03-SECRETKEYVALUE0000"
 
@@ -195,6 +195,35 @@ def test_suppressed_env_credential_does_not_carry_the_base_url(home, monkeypatch
     assert deo.find_route_env_overrides(_model_cfg()) == []
 
 
+def test_openrouter_pool_answers_before_custom_base_url(home, monkeypatch):
+    # No custom endpoint for the pool gate (OPENAI/OPENROUTER_BASE_URL, config mirror): the env-seeded
+    # OpenRouter pool row resolves first, at openrouter.ai, so CUSTOM_BASE_URL is never consulted.
+    _configure(home, {"provider": "openrouter"})
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-SECRETVALUE")
+    monkeypatch.setenv("CUSTOM_BASE_URL", "https://custom.example.test/v1")
+    assert deo.find_route_env_overrides(_model_cfg()) == []
+
+
+def test_numbered_key_beyond_a_suppressed_sibling_still_carries_the_base_url(home, monkeypatch):
+    _configure(home, {"provider": "deepseek"})
+    (home / "auth.json").write_text(json.dumps({"providers": {}, "suppressed_sources": {"deepseek": ["env:DEEPSEEK_API_KEY_2"]}}),
+                                    encoding="utf-8")
+    monkeypatch.setenv("DEEPSEEK_API_KEY_2", "sk-deepseek-SECRETVALUE02")
+    monkeypatch.setenv("DEEPSEEK_API_KEY_3", "sk-deepseek-SECRETVALUE03")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://env.example.test/v1")
+    (override,) = deo.find_route_env_overrides(_model_cfg())
+    assert override.warn and "DEEPSEEK_API_KEY_3" in override.overrides
+
+
+def test_suppressed_env_oauth_token_leaves_the_stored_login_in_charge(home, monkeypatch):
+    _configure(home, {"provider": "anthropic"})
+    _store_hermes_login(home)
+    (home / "auth.json").write_text(json.dumps({"providers": {}, "suppressed_sources": {"anthropic": ["env:ANTHROPIC_TOKEN"]}}),
+                                    encoding="utf-8")
+    monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-ENVTOKEN")
+    assert deo.find_route_env_overrides(_model_cfg()) == []
+
+
 def test_secrets_in_urls_and_credentials_never_reach_output(home, monkeypatch, capsys):
     _configure(home, {"provider": "anthropic"})
     monkeypatch.setenv("ANTHROPIC_API_KEY", _API_KEY)
@@ -253,6 +282,7 @@ def test_env_credential_without_a_stored_login_is_info_only(home, monkeypatch, c
     ({"provider": "openrouter", "base_url": "https://cfg.example.test/api/v1"},
      {"OPENROUTER_API_KEY": "sk-or-v1-SECRETVALUE", "OPENROUTER_BASE_URL": "https://env.example.test/api/v1"}, False),
     ({"provider": "custom", "base_url": "http://127.0.0.1:11434/v1"}, {"CUSTOM_BASE_URL": "https://env.example.test/v1"}, True),
+    ({"provider": "openrouter"}, {"OPENROUTER_API_KEY": "sk-or-v1-SECRETVALUE", "CUSTOM_BASE_URL": "https://env.example.test/v1"}, False),
 ])
 def test_doctor_agrees_with_the_runtime_resolver(home, monkeypatch, model, env, warns):
     """Ground truth: the doctor warns exactly when the real resolver lands somewhere config does not say."""

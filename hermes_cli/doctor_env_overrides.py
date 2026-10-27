@@ -114,12 +114,21 @@ def _route_override(var: str, provider: str, env_url: str, configured: str, via:
     return EnvOverride(var, _source(var), what, fix, warn=not same)
 
 
+def _numbered(name: str):
+    """``name`` and its consecutive ``name_2``, ``name_3`` … siblings (``_env_key_var_candidates``)."""
+    yield name
+    n = 2
+    while _env(f"{name}_{n}"):
+        yield f"{name}_{n}"
+        n += 1
+
+
 def _seeding_key_var(provider: str, names) -> str:
-    """First env API-key variable ``_seed_from_env`` turns into a pool row: numbered ``_2`` siblings count
-    (``_env_key_var_candidates``), a source the user suppressed with ``hermes auth remove`` does not."""
+    """First env API-key variable ``_seed_from_env`` turns into a pool row; a source the user suppressed
+    with ``hermes auth remove`` seeds none."""
     from hermes_cli.auth import suppressed_credential_sources
     suppressed = suppressed_credential_sources(provider)
-    return next((v for name in names for v in (name, f"{name}_2") if _env(v) and f"env:{v}" not in suppressed), "")
+    return next((v for name in names for v in _numbered(name) if _env(v) and f"env:{v}" not in suppressed), "")
 
 
 def _registry_base_url_override(provider: str, model_cfg: dict) -> EnvOverride | None:
@@ -163,6 +172,17 @@ def _openai_alias_override(raw_provider: str, model_cfg: dict) -> EnvOverride | 
                            "(provider: openai follows it)")
 
 
+def _openrouter_pool_wins(model_cfg: dict) -> bool:
+    """``provider: openrouter`` resolves from its credential pool, ahead of the endpoint variables, when no
+    custom endpoint is set (``_openrouter_should_use_pool``) and the pool holds a credential."""
+    from hermes_cli.auth import _load_auth_store
+    from hermes_cli.runtime_provider import _openrouter_should_use_pool
+    if not _openrouter_should_use_pool("openrouter", model_cfg, None, None):
+        return False
+    stored = (_load_auth_store().get("credential_pool") or {}).get("openrouter")
+    return bool(stored or _seeding_key_var("openrouter", ("OPENROUTER_API_KEY",)))
+
+
 def _openrouter_override(raw_provider: str, model_cfg: dict) -> EnvOverride | None:
     """OpenRouter / bare ``custom`` endpoint (``_resolve_openrouter_runtime``): CUSTOM_BASE_URL > trusted
     ``model.base_url`` > OPENROUTER_BASE_URL > the OpenRouter default."""
@@ -173,6 +193,8 @@ def _openrouter_override(raw_provider: str, model_cfg: dict) -> EnvOverride | No
     trusted = bool(cfg_url) and (raw_provider == "openrouter"
                                  or _config_base_url_trustworthy_for_bare_custom(cfg_url, raw_provider))
     configured = cfg_url if trusted else OPENROUTER_BASE_URL.rstrip("/")
+    if raw_provider == "openrouter" and _openrouter_pool_wins(model_cfg):
+        return None  # the pool rung answers first, at the canonical endpoint
     for var in ("CUSTOM_BASE_URL", "OPENROUTER_BASE_URL"):
         env_url = (get_secret_str(var, "") or "").strip().rstrip("/")
         if env_url and (var == "CUSTOM_BASE_URL" or not trusted):
@@ -180,10 +202,25 @@ def _openrouter_override(raw_provider: str, model_cfg: dict) -> EnvOverride | No
     return None
 
 
+def _anthropic_env_credential_var() -> str:
+    """The env credential Anthropic turns use. A suppressed OAuth variable seeds no pool row, so a stored
+    login answers first; ANTHROPIC_API_KEY without any OAuth variable prunes OAuth logins from the pool
+    (``_seed_anthropic_singletons``) and then wins in ``resolve_anthropic_token`` even when suppressed."""
+    from hermes_cli.auth import suppressed_credential_sources
+    suppressed = suppressed_credential_sources("anthropic")
+    oauth_set = [v for v in _ANTHROPIC_OAUTH_VARS if _env(v)]
+    live = next((v for v in oauth_set if f"env:{v}" not in suppressed), "")
+    if live:
+        return live
+    if _env("ANTHROPIC_API_KEY") and not (oauth_set and "env:ANTHROPIC_API_KEY" in suppressed):
+        return "ANTHROPIC_API_KEY"
+    return ""
+
+
 def _anthropic_auth_override() -> EnvOverride | None:
     """Which env credential Anthropic requests authenticate with, against a stored Hermes OAuth login.
     Claude Code's borrowed login is not read here: on macOS that is a Keychain read doctor must not trigger."""
-    var = next((v for v in (*_ANTHROPIC_OAUTH_VARS, "ANTHROPIC_API_KEY") if _env(v)), "")
+    var = _anthropic_env_credential_var()
     if not var:
         return None
     from agent.anthropic_credentials import _is_oauth_token, read_hermes_oauth_credentials
