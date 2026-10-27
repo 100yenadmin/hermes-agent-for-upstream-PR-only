@@ -68,11 +68,20 @@ def _in_dotenv(var: str) -> bool:
     return bool(saved) and saved == _env(var)
 
 
+def _in_project_dotenv(var: str) -> bool:
+    from dotenv import dotenv_values
+    from hermes_cli.config import get_project_root
+    saved = str(dotenv_values(get_project_root() / ".env").get(var) or "").strip()
+    return bool(saved) and saved == _env(var)
+
+
 def _source(var: str) -> str:
     from hermes_cli.env_loader import get_secret_source
     from hermes_constants import display_hermes_home
     if _in_dotenv(var):
         return f"{display_hermes_home()}/.env"
+    if _in_project_dotenv(var):
+        return "the project .env"
     label = get_secret_source(var)
     return f"secret source '{label}'" if label else "the process environment"
 
@@ -81,6 +90,8 @@ def _unset_hint(var: str) -> str:
     if _in_dotenv(var):
         from hermes_constants import display_hermes_home
         return f"remove {var} from {display_hermes_home()}/.env"
+    if _in_project_dotenv(var):
+        return f"remove {var} from the project .env"
     return f"unset {var} in the shell or service that launches Hermes"
 
 
@@ -113,7 +124,7 @@ def _route_override(var: str, provider: str, env_url: str, configured: str, via:
     else:
         tail = " (same host, different path or port)" if env_o == cfg_o else ""
         what = f"{provider} route {cfg_o} → {env_o} {via}{tail}"
-    stored = _stored_could_win(provider)
+    stored = _stored_could_win(provider, _anthropic_env_credential_var() if provider == "anthropic" else "")
     if stored and not same:
         what += " (may override if the stored credential is unavailable)"
     fix = (f"{var} ({_source(var)}) redirects {provider} requests away from config.yaml: {_unset_hint(var)}, "
@@ -140,9 +151,17 @@ def _suppressed_sources(provider: str):
     return (_auth_metadata(_auth_file_path()).get("suppressed_sources") or {}).get(provider, ())
 
 
-def _stored_could_win(provider: str) -> bool:
-    if _stored_rows(provider):
-        return True  # includes the root fallback; do not refresh or validate stored credentials
+def _stored_could_win(provider: str, env_var: str = "") -> bool:
+    # Env rows are persisted references to the same variables, not competing credentials.
+    rows = [row for row in _stored_rows(provider) if not row.get("source", "").startswith("env:")]
+    if rows:
+        if provider != "anthropic":
+            return True  # includes the root fallback; never refresh or validate credentials
+        from agent.credential_pool import _ANTHROPIC_SOURCE_RANK, _is_manual_source
+        rank = _ANTHROPIC_SOURCE_RANK.get(f"env:{env_var}", len(_ANTHROPIC_SOURCE_RANK))
+        return any(_is_manual_source(row.get("source", "")) or
+                   _ANTHROPIC_SOURCE_RANK.get(row.get("source", ""), len(_ANTHROPIC_SOURCE_RANK)) < rank
+                   for row in rows)
     if provider == "anthropic" and any(_env(v) for v in _ANTHROPIC_OAUTH_VARS):
         from agent.anthropic_credentials import read_hermes_oauth_credentials
         return bool(read_hermes_oauth_credentials())
@@ -260,7 +279,7 @@ def _anthropic_auth_override() -> EnvOverride | None:
         what = f"Anthropic auth: static {mode} from {var} ahead of the stored (refreshable) Hermes OAuth login"
     fix = (f"{var} ({_source(var)}) replaces your stored Anthropic login: {_unset_hint(var)} to use the login, "
            "or save the desired credential with 'hermes model' in the profile .env")
-    stored_wins = _stored_could_win("anthropic")
+    stored_wins = _stored_could_win("anthropic", var)
     if stored_wins:
         what += " (may override if the stored credential is unavailable)"
     return EnvOverride(var, _source(var), what, fix,
