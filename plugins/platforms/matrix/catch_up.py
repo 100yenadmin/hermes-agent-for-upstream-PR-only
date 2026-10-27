@@ -65,7 +65,8 @@ def resolve_catch_up_window(extra) -> int:
 
 
 def _joined_since_checkpoint(event, user_id, saved_at):
-    return (event.get("type") == "m.room.member" and event.get("state_key") == user_id
+    return (event.get("type") == "m.room.member"
+            and str(event.get("state_key", "")).strip().casefold() == user_id.strip().casefold()
             and event.get("content", {}).get("membership") == "join"
             and event.get("unsigned", {}).get("prev_content", {}).get("membership") != "join"
             and event.get("origin_server_ts", 0) / 1000 >= saved_at - 5)
@@ -113,7 +114,8 @@ class MatrixCatchUpMixin:
                 if path.exists():
                     path.unlink()
             except OSError as exc:
-                logger.debug("Matrix: could not remove disabled catch-up checkpoint %s: %s", path, exc)
+                logger.warning("Matrix: could not remove disabled catch-up checkpoint %s (re-enabling catch-up may repeat "
+                               "messages): %s", path, exc)
 
     async def _catch_up_initial_sync(self, client):
         since = load_since(self._store_dir, self._user_id)

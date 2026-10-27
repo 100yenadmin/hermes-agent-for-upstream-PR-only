@@ -396,6 +396,20 @@ async def test_state_only_rejoin_with_host_clock_behind(harness, join_age, expec
 
 
 @pytest.mark.asyncio
+async def test_state_only_rejoin_matches_own_id_case_insensitively(harness):
+    make, _ = harness
+    data = batch([event(0, 180)])
+    data["rooms"]["join"][ROOM].update({
+        "timeline": {"limited": True, "events": [event(0, 180)]},
+        "state": {"events": [{"type": "m.room.member", "state_key": USER.upper(),
+            "origin_server_ts": (NOW - 170) * 1000, "content": {"membership": "join"}}]}})
+    adapter, store, home = make(3600, [data])
+    seed(store, saved_at=NOW - 220)
+    await connect(adapter, home)
+    assert delivered(adapter) == set()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["timeline", "state"])
 @pytest.mark.parametrize("previous", ["join", "leave", None])
 async def test_own_member_profile_change_is_not_rejoin(harness, source, previous):
