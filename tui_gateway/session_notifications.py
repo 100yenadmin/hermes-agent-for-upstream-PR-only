@@ -529,7 +529,7 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
         session["_kanban_pending"] = [text for text in pending if split and isinstance(text, DiagnosticText) != diagnostic]
     try:
         started = _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch),
-                      "kanban notification dispatch failed",
+                      "kanban notification dispatch failed", report_ownership_refusal=False,
                       **({"display_metadata": {"notification_category": "diagnostic"}} if diagnostic else {}))
     except Exception:
         logger.exception("kanban notification dispatch failed; retaining batch for retry")
@@ -537,7 +537,7 @@ def _notif_poll_kanban_scoped(sid: str, session: dict) -> None:
     if started is False:
         # Submit raises before thread.start(); later failures run on the worker, so restoring is safe.
         # Restored items are memory-only (lost on close/retirement); released delegation rows stay pending
-        # until their delivery-attempt budget runs out.
+        # until their delivery-attempt budget runs out. The next poll retries the batch.
         with session["history_lock"]:
             session["_kanban_pending"] = batch + list(session.get("_kanban_pending") or [])
 

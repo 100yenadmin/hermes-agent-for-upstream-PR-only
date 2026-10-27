@@ -270,7 +270,7 @@ class TestNotificationPollerLoopKanbanWiring:
         monkeypatch.setattr(
             server, "_emit", lambda event, sid, payload=None: emits.append((event, payload))
         )
-        def accept(rid, sid, sess, text):
+        def accept(rid, sid, sess, text, **_kwargs):
             # Model execution is replaced, including its concrete admission receipt.
             server._emit("message.start", sid)
             submits.append(text)
