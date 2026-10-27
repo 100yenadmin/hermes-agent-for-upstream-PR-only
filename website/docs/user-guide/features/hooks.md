@@ -697,7 +697,7 @@ def my_callback(tool_name: str, args_sha256: str, verdict: str, source: str, ini
 
 **Return value:** ignored. A raising or slow subscriber never changes the verdict or blocks the call (callbacks are timeout-bounded like `post_tool_call`).
 
-Shell commands run under yolo or `approvals.mode: off` skip dangerous-command detection, so they report `allowed`.
+Known limits: shell commands run under yolo or `approvals.mode: off` skip dangerous-command detection, so they report `allowed`; tools that an `execute_code` script calls back into carry no `tool_call_id`, so an approval decided for them is not attributed to the `execute_code` call.
 
 **Example — append every decision to a JSONL audit log:**
 

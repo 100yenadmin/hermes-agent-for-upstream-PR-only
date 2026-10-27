@@ -42,6 +42,7 @@ def hooks(monkeypatch):
     monkeypatch.setattr(lifecycle, "invoke_hook", fake_invoke)
     monkeypatch.setattr(lifecycle, "has_hook", lambda name: name in ("tool_decision", "pre_tool_call"))
     monkeypatch.setattr(tool_decision, "_pending", OrderedDict())
+    monkeypatch.setattr(tool_decision, "_emitted", OrderedDict())
     yield rec
     # Raw arguments never reach a subscriber, on any path.
     assert SECRET not in repr(rec.decisions)
@@ -148,6 +149,48 @@ def test_executor_owned_terminal_event_is_the_only_one(hooks, monkeypatch):
     [event] = hooks.decisions
     assert event["verdict"] == "denied_by_rule"
     assert tool_decision._pending == {}
+
+
+def _agent():
+    return SimpleNamespace(session_id=IDS["session_id"], _current_turn_id=IDS["turn_id"], _current_api_request_id="")
+
+
+def _terminal_emit(**outcome):
+    emit_terminal_post_tool_call(_agent(), function_name="write_file", function_args={"path": "a"}, result="r",
+                                 effective_task_id=IDS["task_id"], tool_call_id=IDS["tool_call_id"], **outcome)
+
+
+def test_a_second_terminal_emission_for_the_same_call_is_dropped(hooks):
+    """A worker finishing after its timeout result was published must not report the call twice."""
+    _terminal_emit(status="timeout", error_type="tool_timeout")
+    _terminal_emit()
+    [event] = hooks.decisions
+    assert event["verdict"] == "allowed"
+
+
+def test_block_inside_a_suppressed_dispatch_reaches_the_outer_emission(hooks):
+    """Sequential path: an ACP edit denial inside handle_function_call is reported by the executor's
+    single terminal emission, which carries no blocked status of its own."""
+    with patch("acp_adapter.edit_approval.maybe_require_edit_approval", return_value='{"error": "rejected"}'), \
+            model_tools.suppress_post_tool_call_hook():
+        _, dispatch = _call("write_file", {"path": "a", "content": SECRET})
+    dispatch.assert_not_called()
+    assert hooks.decisions == []
+    _terminal_emit()
+    [event] = hooks.decisions
+    assert (event["verdict"], event["source"]) == ("denied_by_user", "acp_edit_approval")
+
+
+def test_notes_made_while_deferred_are_dropped(hooks):
+    tokens = approval_context.set_current_observability_context(tool_call_id="call-1", session_id="sess-1")
+    try:
+        with tool_decision.notes_deferred():
+            tool_decision.note("denied_by_user", "approval_prompt")
+        assert tool_decision._pending == {}
+        tool_decision.note("user_approved", "approval_prompt")
+    finally:
+        approval_context.reset_current_observability_context(tokens)
+    assert tool_decision._pending == {("sess-1", "call-1"): ("user_approved", "approval_prompt")}
 
 
 def test_call_skipped_by_interrupt_emits_no_decision(hooks):

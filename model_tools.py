@@ -673,11 +673,13 @@ def _emit_post_tool_call_hook(
 ) -> None:
     """Emit the ``post_tool_call`` observer hook; gated on has_hook, and ok/error
     fields are derived from the result only past that gate when status is None."""
+    from agent.tool_decision import emit_for_call, note_suppressed_outcome
     if _post_tool_call_hook_suppressed.get():
+        note_suppressed_outcome(status=status, error_type=error_type, session_id=session_id or "",
+                                tool_call_id=tool_call_id or "")
         return
     ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id).hook_kwargs()
-    # tool_decision rides this funnel because it runs exactly once per call on every dispatch path.
-    from agent.tool_decision import emit_for_call
+    # tool_decision rides this funnel because it runs once per call on every dispatch path.
     emit_for_call(tool_name=function_name, args=function_args, status=status, error_type=error_type, **ids)
     try:
         from hermes_cli.lifecycle import has_hook, invoke_hook

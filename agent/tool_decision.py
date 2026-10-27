@@ -15,7 +15,9 @@ import json
 import logging
 import threading
 from collections import OrderedDict
-from typing import Any, Optional
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +43,11 @@ _OUTCOME_VERDICTS = {"denied": "denied_by_user", "timeout": "timeout"}
 _MAX_PENDING = 1024  # notes whose call never reached the funnel are dropped oldest-first
 
 _pending: OrderedDict[tuple[str, str], tuple[str, str]] = OrderedDict()
+# (session_id, turn_id, tool_call_id) already reported: a call whose terminal post_tool_call is
+# published twice (a late worker after its timeout result) still yields one decision.
+_emitted: OrderedDict[tuple[str, str, str], None] = OrderedDict()
 _lock = threading.Lock()
+_deferred: ContextVar[bool] = ContextVar("tool_decision_deferred", default=False)
 
 
 def _has_subscriber() -> bool:
@@ -64,21 +70,44 @@ def _merge(old: Optional[tuple[str, str]], new: tuple[str, str]) -> tuple[str, s
     return new if _APPROVAL_RANK[new[0]] >= _APPROVAL_RANK[old[0]] else old
 
 
+@contextmanager
+def notes_deferred() -> Iterator[None]:
+    """Drop notes made in this block: a guard evaluated ahead of its call (terminal batch
+    preparation) is reported when the call consumes it, not when it is prepared."""
+    token = _deferred.set(True)
+    try:
+        yield
+    finally:
+        _deferred.reset(token)
+
+
+def _store(session_id: str, tool_call_id: str, decision: tuple[str, str]) -> None:
+    if not tool_call_id or _deferred.get() or not _has_subscriber():
+        return
+    key = (session_id or "", tool_call_id)
+    with _lock:
+        _pending[key] = _merge(_pending.pop(key, None), decision)
+        while len(_pending) > _MAX_PENDING:
+            _pending.popitem(last=False)
+
+
 def note(verdict: str, source: str) -> None:
     """Record a gate verdict for the tool call bound to the approval observability context.
     No-op without a ``tool_decision`` subscriber or outside a call that has a tool_call_id."""
     try:
-        if not _has_subscriber():
-            return
         from tools.approval_context import _approval_session_id, _approval_tool_call_id
-        tool_call_id = _approval_tool_call_id.get()
-        if not tool_call_id:
-            return
-        key = (_approval_session_id.get() or "", tool_call_id)
-        with _lock:
-            _pending[key] = _merge(_pending.pop(key, None), (verdict, source))
-            while len(_pending) > _MAX_PENDING:
-                _pending.popitem(last=False)
+        _store(_approval_session_id.get(), _approval_tool_call_id.get(), (verdict, source))
+    except Exception:
+        logger.warning("tool_decision note failed", exc_info=True)
+
+
+def note_suppressed_outcome(*, status: Optional[str], error_type: Optional[str], session_id: str,
+                            tool_call_id: str) -> None:
+    """A dispatch whose terminal post_tool_call an outer executor owns hands its own block
+    (e.g. an ACP edit denial) to that executor's single emission."""
+    try:
+        if status == "blocked" or (error_type in _BY_ERROR_TYPE and error_type not in _SKIPPED_ERROR_TYPES):
+            _store(session_id, tool_call_id, _resolve(status, error_type, None))
     except Exception:
         logger.warning("tool_decision note failed", exc_info=True)
 
@@ -115,6 +144,19 @@ def _pop(session_id: str, tool_call_id: str) -> Optional[tuple[str, str]]:
         return _pending.pop((session_id or "", tool_call_id), None)
 
 
+def _already_emitted(session_id: str, turn_id: str, tool_call_id: str) -> bool:
+    if not tool_call_id:
+        return False
+    key = (session_id or "", turn_id or "", tool_call_id)
+    with _lock:
+        if key in _emitted:
+            return True
+        _emitted[key] = None
+        while len(_emitted) > _MAX_PENDING:
+            _emitted.popitem(last=False)
+    return False
+
+
 def _initiator() -> str:
     """Best-effort initiator kind: cron, subagent, api, else session (a user or injected turn)."""
     from agent.delegation_context import is_delegated_child_process_context
@@ -141,7 +183,8 @@ def emit_for_call(*, tool_name: str, args: Any, status: Optional[str], error_typ
     """Fire ``tool_decision`` for one call from its terminal post_tool_call. Never raises."""
     try:
         noted = _pop(session_id, tool_call_id)
-        if error_type in _SKIPPED_ERROR_TYPES or not _has_subscriber():
+        if error_type in _SKIPPED_ERROR_TYPES or not _has_subscriber() or _already_emitted(
+                session_id, turn_id, tool_call_id):
             return
         verdict, source = _resolve(status, error_type, noted)
         from hermes_cli.lifecycle import invoke_hook
