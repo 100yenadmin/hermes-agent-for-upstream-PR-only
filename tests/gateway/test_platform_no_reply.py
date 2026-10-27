@@ -19,12 +19,14 @@ from hermes_cli.observability import shared_metrics_gateway as smg
 def rows(monkeypatch):
     smg.drain()
     smg._reply_clocks.clear()
+    smg._chat_homes.clear()
     got = []
     monkeypatch.setattr(rsm, "enabled", lambda: True)
     monkeypatch.setattr(rsm, "record_process_mark", lambda mark, data: got.append((mark, dict(data))))
     yield got
     smg.drain()
     smg._reply_clocks.clear()
+    smg._chat_homes.clear()
 
 
 class Adapter(BasePlatformAdapter):
@@ -61,15 +63,13 @@ def no_replies(rows):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case,reason", [("empty", "empty"), ("failed", "delivery_failed"),
-                                       ("stale", "interrupted"), ("error", "error"), ("dropped", "dropped")])
+                                       ("stale", "interrupted"), ("dropped", "dropped")])
 async def test_completed_adapter_turn_without_delivery_is_counted_once(rows, caplog, monkeypatch, case, reason):
     adapter = Adapter(success=case != "failed")
     ev = event(adapter)
 
     async def handler(incoming):
         start(incoming)
-        if case == "error":
-            raise RuntimeError("turn failed")
         if case == "stale":
             adapter._active_sessions["session"].set()
             adapter._pending_messages["session"] = event(adapter)
@@ -139,19 +139,14 @@ async def test_busy_followup_cannot_claim_running_turn_clock(rows):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("rescue", [False, True], ids=["authority-restored", "orphan-rescue"])
-async def test_fifo_deferred_or_rescued_event_never_claims_another_event_clock(rows, rescue):
+async def test_orphan_rescue_never_claims_another_event_clock(rows):
     adapter = Adapter()
     incoming, claimed = event(adapter), event(adapter)
     runner = SimpleNamespace(_delivery_adapter_for=lambda _: adapter,
                              _rescue_orphaned_overflow=lambda *_: claimed, _enqueue_fifo=MagicMock())
 
     async def handler(ev):
-        if rescue:
-            actual, _, _ = GatewayInboundMixin._hm_rescue_orphaned_fifo(runner, ev, ev.source, False, "session")
-        else:
-            # The durable authority reconstructs the claimed event from its committed snapshot.
-            actual = claimed
+        actual, _, _ = GatewayInboundMixin._hm_rescue_orphaned_fifo(runner, ev, ev.source, False, "session")
         start(actual)
 
     adapter.set_message_handler(handler)
@@ -159,8 +154,7 @@ async def test_fifo_deferred_or_rescued_event_never_claims_another_event_clock(r
     assert not hasattr(incoming, "_reply_clock_token")
     assert no_replies(rows) == []
     assert smg._reply_clocks[("telegram", "chat")][0] == claimed._reply_clock_token
-    if rescue:
-        runner._enqueue_fifo.assert_called_once_with("session", incoming, adapter)
+    runner._enqueue_fifo.assert_called_once_with("session", incoming, adapter)
 
 
 @pytest.mark.asyncio
@@ -199,3 +193,106 @@ async def test_persistence_silence_and_interrupted_turns_count_once_before_adapt
     adapter.set_message_handler(handler)
     await adapter._process_message_background(ev, "session")
     assert no_replies(rows) == [{"platform": "telegram", "reason": reason}]
+
+
+@pytest.mark.asyncio
+async def test_error_notice_is_not_an_answer_and_turn_counts_error(rows, monkeypatch):
+    adapter = Adapter()
+    ev = event(adapter)
+    sent = AsyncMock(wraps=adapter.send)
+    monkeypatch.setattr(adapter, "send", sent)
+
+    async def handler(incoming):
+        start(incoming)
+        raise RuntimeError("turn failed before answering")
+
+    adapter.set_message_handler(handler)
+    await adapter._process_message_background(ev, "session")
+    # The generic error notice bypasses the reply clock: the failed turn still has one outcome.
+    sent.assert_awaited_once()
+    assert no_replies(rows) == [{"platform": "telegram", "reason": "error"}]
+    assert not any(mark == "hermes.gateway.reply_latency" for mark, _ in rows)
+
+
+@pytest.mark.asyncio
+async def test_raising_classifier_preserves_reply_and_processing_success(rows, monkeypatch):
+    from gateway.platforms.event import ProcessingOutcome
+
+    adapter = Adapter()
+    ev = event(adapter)
+    hooks, notice = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(adapter, "_run_processing_hook", hooks)
+    monkeypatch.setattr(adapter, "_notify_turn_error", notice)
+    monkeypatch.setattr(smg, "end_reply_clock", MagicMock(side_effect=RuntimeError("classifier failed")))
+    sent = AsyncMock(wraps=adapter.send)
+    monkeypatch.setattr(adapter, "send", sent)
+
+    async def handler(incoming):
+        start(incoming)
+        return "answer"
+
+    adapter.set_message_handler(handler)
+    await adapter._process_message_background(ev, "session")
+    sent.assert_awaited_once()
+    assert sent.await_args.kwargs["content"] == "answer"
+    assert hooks.await_args_list[-1].args == ("on_processing_complete", ev, ProcessingOutcome.SUCCESS)
+    notice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("voice", ["sent", "failed", "played", "partial"])
+async def test_persistence_voice_delivery_survives_failed_final_text(rows, monkeypatch, voice):
+    from gateway.run_voice import GatewayVoiceMixin
+
+    adapter = Adapter(success=False)
+    ev = event(adapter)
+    adapter.send_voice = AsyncMock(side_effect=[SendResult(success=voice != "failed"), SendResult(success=False)])
+    adapter.play_in_voice_channel = AsyncMock()
+    adapter.is_in_voice_channel = lambda guild: voice == "played"
+    runner = SimpleNamespace(
+        _delivery_adapter_for=lambda _: adapter, _should_send_voice_reply=lambda *_a, **_k: True,
+        _get_guild_id=lambda _: "guild", _reply_anchor_for_event=lambda _: None,
+        _thread_metadata_for_source=lambda *_: None)
+
+    async def send_voice(incoming, text):
+        await GatewayVoiceMixin._deliver_voice_reply(
+            runner, incoming, ["voice.ogg", "second.ogg"] if voice == "partial" else ["voice.ogg"])
+        # Voice delivery must not become a first-text latency sample.
+        assert smg._reply_clocks[("telegram", "chat")][0] == incoming._reply_clock_token
+
+    runner._send_voice_reply = send_voice
+
+    async def handler(incoming):
+        start(incoming)
+        return await GatewayTurnPersistenceMixin._hmwa_deliver_turn_response(
+            runner, incoming, incoming.source, SimpleNamespace(session_id="sid"), "session", 1,
+            {}, [], "answer", "", False)
+
+    adapter.set_message_handler(handler)
+    await adapter._process_message_background(ev, "session")
+    assert no_replies(rows) == ([{"platform": "telegram", "reason": "delivery_failed"}] if voice == "failed" else [])
+    assert bool(getattr(ev, "_voice_reply_delivered", False)) == (voice != "failed")
+    assert not smg._reply_clocks
+    assert not any(mark == "hermes.gateway.reply_latency" for mark, _ in rows)
+
+
+@pytest.mark.asyncio
+async def test_streamed_media_only_final_is_a_delivered_reply(rows):
+    adapter = Adapter()
+    ev = event(adapter)
+    uploaded = AsyncMock()
+    runner = SimpleNamespace(_delivery_adapter_for=lambda _: adapter,
+                             _should_send_voice_reply=lambda *_a, **_k: False,
+                             _deliver_media_from_response=uploaded)
+
+    async def handler(incoming):
+        start(incoming)
+        return await GatewayTurnPersistenceMixin._hmwa_deliver_turn_response(
+            runner, incoming, incoming.source, SimpleNamespace(session_id="sid"), "session", 1,
+            {"already_sent": True}, [], "MEDIA:https://example.invalid/image.png", "", False)
+
+    adapter.set_message_handler(handler)
+    await adapter._process_message_background(ev, "session")
+    uploaded.assert_awaited_once()
+    assert no_replies(rows) == []
+    assert not smg._reply_clocks

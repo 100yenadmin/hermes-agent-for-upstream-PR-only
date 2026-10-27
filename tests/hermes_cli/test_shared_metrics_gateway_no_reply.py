@@ -24,6 +24,7 @@ def rows(monkeypatch):
     yield got
     smg.drain()
     smg._reply_clocks.clear()
+    smg._chat_homes.clear()
 
 
 def source(platform="telegram", chat_id="chat"):
@@ -107,3 +108,27 @@ def test_end_clock_is_best_effort_even_if_adapter_resolution_raises(rows):
             raise RuntimeError("broken adapter")
 
     assert smg.end_reply_clock(Broken(), "chat", "empty", token=1) is False
+
+
+def test_catalog_platform_no_reply_matches_latency_in_owning_home(rows, tmp_path, monkeypatch):
+    from hermes_cli.observability import shared_metrics_catalog as catalog
+    from tests.hermes_cli.test_shared_metrics_gateway import _install_platform_plugin
+
+    home = tmp_path / "owner"
+    cleanup = _install_platform_plugin(home, monkeypatch, dir_name="vk", platform="vk", catalog_name="vk-platform")
+    src = source("vk")
+    scope = set_hermes_home_override(str(home))
+    try:
+        smg.start_reply_clock(src)
+        smg.stop_reply_clock(src, src.chat_id)
+        token = smg.start_reply_clock(src)
+    finally:
+        reset_hermes_home_override(scope)
+    try:
+        assert smg.end_reply_clock(src, src.chat_id, "silent", token=token)
+        smg.drain()
+        assert {mark for mark, _, _ in rows} == {"hermes.gateway.no_reply", "hermes.gateway.reply_latency"}
+        assert all(dims["platform"] == "vk-platform" and owner == str(home) for _, dims, owner in rows)
+    finally:
+        cleanup()
+        catalog._catalog_platform_owner.cache_clear()

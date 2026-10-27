@@ -578,10 +578,13 @@ class GatewayTurnPersistenceMixin:
             event, response, agent_messages, already_sent=bool(agent_result.get("already_sent")),
         ):
             await self._send_voice_reply(event, response)
+        if getattr(event, "_voice_reply_delivered", False):
+            event._turn_reply_delivered = True
 
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.
         if agent_result.get("already_sent") and not agent_result.get("failed"):
+            event._turn_reply_delivered = True
             # The queued-follow-up lane uploads this response's attachments itself; re-scanning here
             # would upload every file a second time.
             if response and adapter and not agent_result.get("media_already_delivered"):
