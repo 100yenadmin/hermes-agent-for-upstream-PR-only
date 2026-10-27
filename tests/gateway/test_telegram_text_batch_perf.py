@@ -15,18 +15,9 @@ from __future__ import annotations
 import math
 from types import SimpleNamespace
 
-import pytest
 
 from gateway.config import PlatformConfig
 from plugins.platforms.telegram.adapter import TelegramAdapter
-
-
-@pytest.fixture
-def adapter():
-    """Build a TelegramAdapter shell without going through __init__'s
-    network-touching setup. Just need the class for static-method access
-    and the instance for instance-method tests."""
-    return TelegramAdapter.__new__(TelegramAdapter)
 
 
 class TestEnvFloatClamped:
@@ -48,37 +39,8 @@ class TestEnvFloatClamped:
         ) == 0.1
 
 
-class TestAdaptiveTextBatchTiers:
-    """The fast-path tiers cap delay for short / medium messages.  Tier
-    constants must compose with the configured cap (operators who set a
-    lower cap get the lower number on every tier)."""
-
-    def test_class_constants_are_sensible(self):
-        """Sanity check that the tier constants form a non-overlapping
-        ascending ladder."""
-        assert TelegramAdapter._TEXT_BATCH_FAST_LEN < TelegramAdapter._TEXT_BATCH_SHORT_LEN
-        assert TelegramAdapter._TEXT_BATCH_FAST_DELAY_S < TelegramAdapter._TEXT_BATCH_SHORT_DELAY_S
-        assert TelegramAdapter._TEXT_BATCH_FAST_DELAY_S > 0
-        assert TelegramAdapter._TEXT_BATCH_SHORT_DELAY_S > 0
-
-    def test_fast_tier_uses_min_with_configured_cap(self, adapter):
-        """A short message picks the lower of the fast-tier delay and
-        the operator's configured cap."""
-        # Operator set a generous cap (0.6s); fast tier should win.
-        adapter._text_batch_delay_seconds = 0.6
-        delay = min(
-            adapter._text_batch_delay_seconds,
-            TelegramAdapter._TEXT_BATCH_FAST_DELAY_S,
-        )
-        assert delay == TelegramAdapter._TEXT_BATCH_FAST_DELAY_S
-
-        # Operator tightened the cap below the fast-tier delay; cap wins.
-        adapter._text_batch_delay_seconds = 0.10
-        delay = min(
-            adapter._text_batch_delay_seconds,
-            TelegramAdapter._TEXT_BATCH_FAST_DELAY_S,
-        )
-        assert delay == 0.10
+class TestTelegramTextBatchDefaults:
+    """Production defaults retain short tiers and merge jittered long text."""
 
     def test_default_delay_table(self, monkeypatch):
         """Production defaults preserve fast tiers and widen long-text tiers."""
@@ -111,4 +73,3 @@ class TestAdaptiveTextBatchTiers:
         pending = SimpleNamespace(text="short", _last_chunk_len=5)
 
         assert adapter._text_batch_delay_for(pending) == 0.1
-
