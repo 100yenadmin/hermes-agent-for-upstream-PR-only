@@ -117,8 +117,10 @@ def test_exception_and_abandoned_attempt_are_not_positive_refusals():
 
 
 @pytest.mark.parametrize("output, refused", [
-    ('{"status":"blocked"}', True), (' {"status":"pending_approval"}', True),
-    ('{"approval_pending":true}', True), ('{"status":"error","exit_code":1}', False),
+    ('{"output":"","exit_code":-1,"error":"denied","status":"blocked"}', True),
+    (' {"output":"","exit_code":-1,"error":"","status":"pending_approval"}', True),
+    ('{"output":"","exit_code":-1,"error":"","approval_pending":true}', True),
+    ('{"status":"error","exit_code":1}', False),
     (json.dumps({"output": '{"status":"blocked"}', "exit_code": 1}), False),
     ('{"approval_pending":false}', False), ('["blocked"]', False),
     ('{"status":', False), ('ordinary output', False),
@@ -137,3 +139,33 @@ def test_structured_guard_refusals_only(output, refused):
     result = {}
     tally.export(agent, result)
     assert result["tool_calls_refused"] == int(refused)
+
+
+@pytest.mark.parametrize("function_name, body", [
+    ("plugin_record", {"status": "blocked"}),
+    ("plugin_record", {"output": "", "exit_code": -1, "error": "denied", "status": "blocked"}),
+    ("terminal", {"status": "blocked"}),
+    ("terminal", {"exit_code": -1, "error": "denied", "status": "blocked"}),
+    ("terminal", {"output": "", "error": "denied", "status": "blocked"}),
+    ("terminal", {"output": "", "exit_code": -1, "status": "blocked"}),
+    ("terminal", {"output": "ran", "exit_code": -1, "error": "failed", "status": "blocked"}),
+    ("terminal", {"output": "", "exit_code": 1, "error": "failed", "status": "blocked"}),
+    ("terminal", {"output": "", "exit_code": 0, "error": None, "approval_pending": True}),
+], ids=["plugin-status", "plugin-envelope", "status-only", "missing-output", "missing-exit",
+        "missing-error", "ran-output", "ran-nonzero", "ran-zero"])
+def test_dispatched_results_outside_terminal_guard_envelope_are_not_refused(function_name, body):
+    from agent import turn_tool_tally as tally
+    from cron.scheduler_turn_verdict import refused_turn_error
+    agent = SimpleNamespace()
+    tally.reset(agent)
+
+    @tally.track_attempt
+    def run(_agent, **kwargs):
+        return SimpleNamespace(blocked=False, dispatched=True, result=json.dumps(body))
+
+    run(agent, function_name=function_name)
+    result = {}
+    tally.export(agent, result)
+    assert result["tool_calls_attempted"] == 1
+    assert result["tool_calls_refused"] == 0
+    assert refused_turn_error(result, "done") is None

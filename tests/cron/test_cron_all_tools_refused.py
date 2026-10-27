@@ -128,21 +128,54 @@ def test_refused_names_do_not_change_classification_or_incident_signature(names,
     with caplog.at_level(logging.INFO, logger="cron.scheduler_turn_verdict"):
         error = refused_turn_error(_result(tool_calls_executed=0, tool_calls_attempted=len(names), tool_calls_refused=len(names),
                                           tool_calls_refused_names=names), "done")
+        records = [r for r in caplog.records if r.name == "cron.scheduler_turn_verdict"]
     baseline = refused_turn_error(_result(tool_calls_executed=0), "done")
     assert error == baseline
     assert _error_signature("job", error) == _error_signature("job", baseline)
     assert classify_cron_failure_reason(error) == "unknown"
     assert _classify_failure_type(error) == "unknown"
     assert all(name not in error for name in names)
-    assert len(caplog.records) == 1
-    assert all(name in caplog.records[0].message for name in names)
+    assert len(records) == 1
+    assert all(name in records[0].message for name in names)
+
+
+@pytest.mark.parametrize("function_name, body", [
+    ("kanban_block", {"ok": True, "task_id": "card", "run_id": None,
+                      "status": "blocked", "block_kind": "needs_input"}),
+    ("kanban_create", {"ok": True, "task_id": "card", "status": "blocked",
+                       "gated": False, "subscribed": False}),
+    ("plugin_record", {"status": "blocked"}),
+], ids=["kanban-block", "kanban-create-initial-blocked", "plugin-status"])
+def test_successful_blocked_records_are_booked_success(monkeypatch, run_result, function_name, body):
+    from agent import turn_tool_tally as tally
+    from cron.scheduler_turn_verdict import refused_turn_error
+    agent = SimpleNamespace()
+    tally.reset(agent)
+
+    @tally.track_attempt
+    def dispatch(_agent, **kwargs):
+        return SimpleNamespace(blocked=False, dispatched=True, result=json.dumps(body))
+
+    dispatch(agent, function_name=function_name)
+    value, run = run_result
+    value.clear()
+    value.update(final_response="done", completed=True)
+    tally.export(agent, value)
+    monkeypatch.setattr("cron.scheduler_authority.run_canonical_job", run)
+    monkeypatch.setattr(s, "save_job_output", lambda *_: "saved.md")
+    marked = []
+    monkeypatch.setattr(s, "mark_job_run", lambda *a, **kw: marked.append(a))
+    assert s._run_one_job_body({"id": "park-card", "prompt": "park the card", "deliver": "local"})
+    assert marked[0][1] is True
+    assert refused_turn_error(value, "done") is None
+    assert value["tool_calls_attempted"] == 1 and value["tool_calls_refused"] == 0
 
 
 @pytest.mark.parametrize("policy", ["blocked", "pending_approval", "ran_nonzero"])
 def test_terminal_guard_verdict_books_only_positive_refusals(monkeypatch, run_result, policy):
     from tools import terminal_tool as terminal
     from tests.agent.test_run_agent import _mock_response, _mock_tool_call
-    from tests.agent.test_turn_user_intervened import _PROBE, _loop_agent, _run
+    from tests.agent.test_turn_user_intervened import _loop_agent, _run
 
     plan = SimpleNamespace(config={}, env_type="local", effective_task_id="refusal-test",
                            cwd=".", effective_timeout=5, promoted_from_foreground_timeout=None)
@@ -154,8 +187,10 @@ def test_terminal_guard_verdict_books_only_positive_refusals(monkeypatch, run_re
     executed = MagicMock(return_value=json.dumps({"output": "command failed", "exit_code":1, "error":None}))
     monkeypatch.setattr(terminal, "_run_foreground", executed)
     monkeypatch.setattr("model_tools.handle_function_call", lambda *_a, **_k: terminal.terminal_tool("exit 1"))
-    result = _run(_loop_agent(), MagicMock(side_effect=[
-        _mock_response(content=None, finish_reason="tool_calls", tool_calls=[_mock_tool_call(name=_PROBE)]),
+    agent = _loop_agent()
+    agent.valid_tool_names = {"terminal"}
+    result = _run(agent, MagicMock(side_effect=[
+        _mock_response(content=None, finish_reason="tool_calls", tool_calls=[_mock_tool_call(name="terminal")]),
         _mock_response(content="done"),
     ]))
     value, run = run_result

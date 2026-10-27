@@ -19,15 +19,16 @@ def export(agent, result):
                           tool_calls_refused_names=list(tally["refused_names"]))
 
 
-def _guard_refused(result):
-    if not isinstance(result, str) or len(result) >= 65536 or not result.lstrip().startswith("{"):
+def _guard_refused(name, result):
+    if name != "terminal" or not isinstance(result, str) or len(result) >= 65536 or not result.lstrip().startswith("{"):
         return False
     try:
         body = json.loads(result)
     except ValueError:
         return False
-    return isinstance(body, dict) and (body.get("status") in ("blocked", "pending_approval")
-                                     or body.get("approval_pending") is True)
+    return (isinstance(body, dict) and body.get("output") == "" and body.get("exit_code") == -1
+            and "error" in body and (body.get("status") in ("blocked", "pending_approval")
+                                     or body.get("approval_pending") is True))
 
 
 def track_attempt(run):
@@ -39,7 +40,7 @@ def track_attempt(run):
             if tally is not None:
                 tally["attempted"] += 1
         state = run(agent, **kwargs)
-        if tally is not None and (state.blocked or not state.dispatched or _guard_refused(state.result)):
+        if tally is not None and (state.blocked or not state.dispatched or _guard_refused(kwargs["function_name"], state.result)):
             with _lock:
                 tally["refused"] += 1
                 name = kwargs["function_name"]
