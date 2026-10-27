@@ -8,7 +8,7 @@ from threading import Lock
 from time import monotonic
 
 from gateway.session_context import get_session_env
-from hermes_constants import hermes_home_key
+from hermes_constants import hermes_home_key, reset_hermes_home_override, set_hermes_home_override
 from tools.bot_desktop import lease
 
 logger = logging.getLogger(__name__)
@@ -27,10 +27,12 @@ class _Driver:
     route: dict
     epoch: int
     timestamp: float
+    generation: int
 
 
 _lock = Lock()
 _drivers: dict[str, _Driver] = {}
+_generations: dict[str, int] = {}
 _subscribed = False
 
 
@@ -51,13 +53,16 @@ def note_driver() -> None:
         "platform", "chat_id", "chat_type", "thread_id", "user_id", "user_name", "scope_id")}
     route.update(session_key=get_session_env("HERMES_SESSION_KEY"),
                  parent_session_id=get_session_env("HERMES_SESSION_ID"))
+    if route["platform"] != "local" and (not route["platform"] or route["chat_type"] != "dm"):
+        return
     key = hermes_home_key()
     global _subscribed
     with _lock:
         if not _subscribed:
             lease.on_change(_on_lease_change)
             _subscribed = True
-        _drivers[key] = _Driver(runner, route, lease.get(key).epoch, monotonic())
+        _generations[key] = _generations.get(key, 0) + 1
+        _drivers[key] = _Driver(runner, route, lease.get(key).epoch, monotonic(), _generations[key])
 
 
 def _on_lease_change(profile_key: str, current: lease.Lease) -> None:
@@ -69,10 +74,19 @@ def _on_lease_change(profile_key: str, current: lease.Lease) -> None:
             _drivers.pop(profile_key)
             if monotonic() - record.timestamp >= MAX_AGE_SECONDS:
                 return
+        from hermes_cli.config import load_config_readonly
+
+        token = set_hermes_home_override(profile_key)
+        try:
+            if not (load_config_readonly().get("bot_desktop") or {}).get("resume_on_handback", False):
+                return
+        finally:
+            reset_hermes_home_override(token)
 
         def still_pending():
             with _lock:
-                return profile_key not in _drivers and lease.get(profile_key).holder == lease.AGENT
+                return (_generations[profile_key] == record.generation
+                        and lease.get(profile_key).holder == lease.AGENT)
 
         from agent.async_utils import safe_schedule_threadsafe
         from gateway.wake import wake_route

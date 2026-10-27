@@ -22,6 +22,7 @@ def rig(monkeypatch):
         handback = None
     if handback is not None:
         monkeypatch.setattr(handback, "_drivers", {})
+        monkeypatch.setattr(handback, "_generations", {}, raising=False)
         monkeypatch.setattr(handback, "_subscribed", False)
     monkeypatch.setattr(lease, "_listeners", [])
     monkeypatch.setattr(runtime, "ensure_started_for_tool", lambda: None)
@@ -53,10 +54,11 @@ def rig(monkeypatch):
     monkeypatch.setattr(wake, "wake_route", observe)
 
     def bind(name="A", **kwargs):
-        session_context.set_session_vars(platform="local", chat_id="chat-" + name, chat_type="dm",
+        values = dict(platform="local", chat_id="chat-" + name, chat_type="dm",
             thread_id="thread-" + name, user_id="user-" + name, user_name="name-" + name,
             scope_id="scope-" + name, session_key="route-" + name, session_id="parent-" + name,
-            cron_session="", **kwargs)
+            cron_session="")
+        session_context.set_session_vars(**(values | kwargs))
 
     async def drain():
         while scheduled:
@@ -134,6 +136,76 @@ def test_last_driver_wins(rig):
     assert len(rig.scheduled) == 1
     rig.drain()
     assert [call.route["session_key"] for call in rig.calls] == ["route-B"]
+
+
+def test_consumed_newer_driver_still_supersedes_pending_wake(rig):
+    _act()
+    _hand_back()  # A's wake has not checked still_pending yet.
+    rig.bind("B")
+    _act()
+    _hand_back()  # B's record is popped too before either wake runs.
+    assert len(rig.scheduled) == 2
+    rig.drain()
+    assert [(call.route["session_key"], call.pending) for call in rig.calls] == [
+        ("route-A", False), ("route-B", True)]
+
+
+@pytest.mark.parametrize("platform,chat_type,eligible", [
+    ("telegram", "group", False), ("discord", "channel", False),
+    ("slack", "thread", False), ("telegram", "", False),
+    ("telegram", "dm", True), ("local", "", True),
+])
+def test_only_single_person_routes_record_and_wake(rig, platform, chat_type, eligible):
+    rig.bind(platform=platform, chat_type=chat_type)
+    _act()
+    assert bool(rig.handback._drivers) is eligible
+    _hand_back()
+    assert len(rig.scheduled) == int(eligible)
+    rig.drain()
+    if eligible:
+        assert rig.calls[0].pending
+
+
+def test_disabling_after_recording_disarms_handback(rig):
+    _act()
+    rig.config.write_text(json.dumps({"bot_desktop": {"resume_on_handback": False}}))
+    _hand_back()
+    assert not rig.scheduled
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_listener_reads_record_profile_config_and_restores_ambient_home(rig, tmp_path, enabled):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    rig.config.write_text(json.dumps({"bot_desktop": {"resume_on_handback": enabled}}))
+    # Record while enabled, then make its profile differ from the lease writer's context.
+    if not enabled:
+        rig.config.write_text(json.dumps({"bot_desktop": {"resume_on_handback": True}}))
+    _act()
+    rig.config.write_text(json.dumps({"bot_desktop": {"resume_on_handback": enabled}}))
+    other = tmp_path / "other-profile"
+    other.mkdir()
+    (other / "config.yaml").write_text(json.dumps({"bot_desktop": {"resume_on_handback": not enabled}}))
+    token = set_hermes_home_override(other)
+    try:
+        lease.acquire("v", profile_key=str(rig.config.parent))
+        lease.release("v", profile_key=str(rig.config.parent))
+        assert get_hermes_home() == other
+    finally:
+        reset_hermes_home_override(token)
+    assert len(rig.scheduled) == int(enabled)
+    rig.drain()
+
+
+def test_background_side_scope_does_not_replace_conversation_driver(rig):
+    _act()
+    # session_tui_side._side_scope binds only task identity and workspace/profile data.
+    session_context.set_session_vars(session_key="bg_fixture", session_id="bg_fixture")
+    _act()
+    assert [record.route["session_key"] for record in rig.handback._drivers.values()] == ["route-A"]
+    _hand_back()
+    rig.drain()
+    assert [(call.route["session_key"], call.pending) for call in rig.calls] == [("route-A", True)]
 
 
 @pytest.mark.parametrize("superseded", ["action", "human"])
