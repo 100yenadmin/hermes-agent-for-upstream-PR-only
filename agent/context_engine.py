@@ -29,6 +29,25 @@ _MEMORY_CONTEXT_TAIL_CHARS = 1_500
 _CONTEXT_ENGINE_SHUTDOWN_FALLBACK_LOCK = threading.Lock()
 
 
+def shutdown_memory_and_context(agent: Any, messages: list | None = None) -> None:
+    """Preserve provider teardown ownership and always release the agent's engine."""
+    from run_agent import _notify_context_engine_session_end, _quietly, logger
+
+    if getattr(agent, "_memory_provider_shutdown", False):
+        return
+    agent._memory_provider_shutdown = True
+    try:
+        if agent._memory_manager and agent._memory_manager.claim_teardown(session_end=True):
+            try:
+                agent._memory_manager.on_session_end(messages or [])
+            except Exception as e:
+                logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
+            _quietly(lambda: agent._memory_manager.shutdown_all())
+        _notify_context_engine_session_end(agent, messages)
+    finally:
+        shutdown_context_engine(agent)
+
+
 def shutdown_context_engine(agent: Any) -> None:
     """Select teardown once under the lock; invoke outside it for re-entrant plugins."""
     engine = None
@@ -95,7 +114,7 @@ class ContextEngine(ABC):
     emit_automatic_compaction_status: bool = True
 
     @abstractmethod
-    def update_from_response(self, usage: Dict[str, Any]) -> None:
+    def update_from_response(self, usage: dict[str, Any]) -> None:
         """Update tracked token usage after every LLM call.
 
         ``prompt_tokens``/``completion_tokens``/``total_tokens`` are always present; the
@@ -104,10 +123,10 @@ class ContextEngine(ABC):
         """
 
     @abstractmethod
-    def should_compress(self, prompt_tokens: int = None) -> bool:
+    def should_compress(self, prompt_tokens: int | None = None) -> bool:
         """Return True if compaction should fire this turn."""
 
-    def should_compress_info(self, prompt_tokens: int = None) -> "tuple[bool, str | None]":
+    def should_compress_info(self, prompt_tokens: int | None = None) -> tuple[bool, str | None]:
         """Return ``(should_compress, reason)``.
 
         Engines with block reasons (summary-LLM cooldown, anti-thrashing guard) override
@@ -118,9 +137,9 @@ class ContextEngine(ABC):
 
     @abstractmethod
     def compress(
-        self, messages: List[Dict[str, Any]], current_tokens: Optional[int] = None,
+        self, messages: list[dict[str, Any]], current_tokens: Optional[int] = None,
         focus_topic: Optional[str] = None, force: bool = False, memory_context: str = "",
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Compact ``messages`` into a valid OpenAI-format list that fits the budget.
 
         ``focus_topic`` comes from manual ``/compress <focus>`` (prioritise that topic);
@@ -130,8 +149,8 @@ class ContextEngine(ABC):
         """
 
     def prune_tool_results_only(
-        self, messages: List[Dict[str, Any]], current_tokens: int | None = None,
-    ) -> tuple[List[Dict[str, Any]], int]:
+        self, messages: list[dict[str, Any]], current_tokens: int | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
         """Deterministically trim old tool-result payloads without an LLM call.
 
         Runs on a low, cost-oriented trigger independent of ``should_compress`` so
@@ -141,9 +160,9 @@ class ContextEngine(ABC):
         return messages, 0
 
     def select_context(
-        self, request_messages: List[Dict[str, Any]], *, conversation_messages: List[Dict[str, Any]] = None,
-        incoming_message: Dict[str, Any] = None, budget_tokens: int = 0,
-    ) -> List[Dict[str, Any]]:
+        self, request_messages: list[dict[str, Any]], *, conversation_messages: list[dict[str, Any]] | None = None,
+        incoming_message: dict[str, Any] | None = None, budget_tokens: int = 0,
+    ) -> list[dict[str, Any]]:
         """Optionally *select* (replace) the context for THIS request, pre-generation.
 
         Runs on every provider request (also retries), independent of
@@ -162,7 +181,7 @@ class ContextEngine(ABC):
         """
         return None
 
-    def on_turn_complete(self, messages: List[Dict[str, Any]], usage: Dict[str, Any] = None, **kwargs: Any) -> None:
+    def on_turn_complete(self, messages: list[dict[str, Any]], usage: dict[str, Any] | None = None, **kwargs: Any) -> None:
         """Observe a finished turn (complement of ``select_context()``) to index/update
         routing state for the next request.
 
@@ -173,9 +192,9 @@ class ContextEngine(ABC):
         ``None`` when no provider response was reached (interrupt). ``kwargs`` may include
         ``turn_id``, ``task_id``, ``api_call_count``, ``interrupted``, ``failed``, ``turn_exit_reason``.
         """
-        return None
+        return
 
-    def should_compress_preflight(self, messages: List[Dict[str, Any]]) -> bool:
+    def should_compress_preflight(self, messages: list[dict[str, Any]]) -> bool:
         """Cheap rough check before the API call (no real token count yet); default skips."""
         return False
 
@@ -195,7 +214,7 @@ class ContextEngine(ABC):
         """
         return default_message if self.emit_automatic_compaction_status else None
 
-    def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
+    def has_content_to_compress(self, messages: list[dict[str, Any]]) -> bool:
         """Preflight guard for gateway ``/compress``: False reports "nothing to
         compress yet" without an LLM call (e.g. transcript entirely protected)."""
         return True
@@ -203,7 +222,7 @@ class ContextEngine(ABC):
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Session begins: load persisted state. kwargs may include hermes_home, platform, model."""
 
-    def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+    def on_session_end(self, session_id: str, messages: list[dict[str, Any]]) -> None:
         """Real session boundary (CLI exit, /reset, gateway expiry) — never per-turn."""
 
     def shutdown(self) -> None:
@@ -234,16 +253,16 @@ class ContextEngine(ABC):
         self.last_total_tokens = 0
         self.compression_count = 0
 
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         """Tool schemas this engine exposes to the agent (default: none)."""
         return []
 
-    def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
+    def handle_tool_call(self, name: str, args: dict[str, Any], **kwargs) -> str:
         """Handle a call to one of this engine's tools; must return a JSON string.
         kwargs may include ``messages`` (live in-memory list)."""
         return json.dumps({"error": f"Unknown context engine tool: {name}"})
 
-    def get_status(self) -> Dict[str, Any]:
+    def get_status(self) -> dict[str, Any]:
         """Status dict with the standard fields run_agent.py expects."""
         # Clamp the -1 "compression just ran, awaiting real usage" sentinel to 0 so no
         # reader sees a negative usage_percent on the transitional turn.
