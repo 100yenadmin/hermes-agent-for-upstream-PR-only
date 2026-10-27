@@ -452,8 +452,10 @@ def _audit_one(npm_bin: str, npm_dir, label: str, audit_extra: list[str], manual
             check_ok(f"{label} deps", f"({moderate} moderate {_plural(moderate)})")
     except subprocess.TimeoutExpired:
         check_warn(f"{label} deps", "(npm audit did not complete: timed out after 30s)")
+    except OSError:
+        check_warn(f"{label} deps", "(npm audit did not complete: npm could not be started)")
     except Exception:  # health: allow BLE001 -- audit boundary: unexpected failures warn without failing offline health gates
-        check_warn(f"{label} deps", "(npm audit did not complete: unexpected output)")
+        check_warn(f"{label} deps", "(npm audit did not complete: unexpected error)")
 
 
 @doctor_check()

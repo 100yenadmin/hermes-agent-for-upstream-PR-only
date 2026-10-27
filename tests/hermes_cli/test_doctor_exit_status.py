@@ -94,7 +94,7 @@ def test_doctor_crashed_check_keeps_partial_findings(monkeypatch, capsys):
     assert finding.fixed == 1
     assert finding.manual_issues == [
         "existing manual repair",
-        "Doctor could not finish the partial check (RuntimeError); re-run `hermes doctor` and report it if it repeats",
+        "Doctor could not finish the partial check (RuntimeError); check the settings it reads, re-run `hermes doctor`, and report it if it repeats",
     ]
     monkeypatch.setattr(doctor, "DOCTOR_CHECKS", ((None, lambda fix: finding),))
     assert doctor.run_doctor(SimpleNamespace(fix=True, ack=None, live=False)) == 1

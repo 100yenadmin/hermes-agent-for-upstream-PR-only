@@ -89,7 +89,7 @@ def doctor_check(on_error: str | None = None, detail: str = ""):
                         check_warn(f"{label} check could not finish", f"({type(e).__name__})")
                     f.manual_issues.append(
                         f"Doctor could not finish the {label} check ({type(e).__name__}); "
-                        "re-run `hermes doctor` and report it if it repeats"
+                        "check the settings it reads, re-run `hermes doctor`, and report it if it repeats"
                     )
             return f
         return check

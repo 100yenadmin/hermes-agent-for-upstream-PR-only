@@ -94,7 +94,8 @@ def test_incomplete_npm_audit_warns_without_issue(capsys, stdout, reason):
 
 @pytest.mark.parametrize("error,reason", [
     (subprocess.TimeoutExpired("npm audit", 30), "timed out after 30s"),
-    (OSError("fixture launch failure"), "unexpected output"),
+    (OSError("fixture launch failure"), "npm could not be started"),
+    (ValueError("fixture failure"), "unexpected error"),
 ])
 def test_npm_audit_subprocess_failure_warns_without_issue(capsys, error, reason):
     issues = []
