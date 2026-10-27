@@ -23,11 +23,18 @@ Never reported, because nothing consults them for the configured route: ``ANTHRO
 Anthropic client omits the SDK's env fallback, ``_new_sdk_client``), ``OPENAI_BASE_URL`` under
 OpenRouter / custom (``_resolve_openrouter_runtime`` never picks an endpoint from it), and any variable
 of a provider other than the configured one. Values are never printed: the variable name, where it came
-from, and for URLs only scheme + host.
+from, and for URLs only scheme + host. Saved profile ``.env`` settings are INFO-only; WARN requires
+an inherited process value and no stored credential that could take precedence.
+
+Not covered: a stale ``env:OPENROUTER_API_KEY`` pool row with its variable unset can hide a
+``CUSTOM_BASE_URL`` redirect. Stored rows are treated as potentially usable without validating or
+refreshing credentials. Borrowed external logins are not inspected (no Keychain access).
 """
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
 from typing import NamedTuple
 from urllib.parse import urlsplit
 
@@ -46,7 +53,7 @@ class EnvOverride(NamedTuple):
     source: str     # where the value came from — never the value itself
     overrides: str  # what it changes: the route host, or the auth mode
     fix: str
-    warn: bool      # True: points away from config; False: matches config / is the only source
+    warn: bool      # True: inherited override certainly applies; False: saved / matching / uncertain
 
 
 def _env(var: str) -> str:
@@ -57,7 +64,8 @@ def _env(var: str) -> str:
 
 def _in_dotenv(var: str) -> bool:
     from hermes_cli.config import load_env
-    return bool(str(load_env().get(var) or "").strip())
+    saved = str(load_env().get(var) or "").strip()
+    return bool(saved) and saved == _env(var)
 
 
 def _source(var: str) -> str:
@@ -86,49 +94,69 @@ def _origin(url: str) -> str:
     return f"{parts.scheme}://{host}" if parts.scheme and host else "an unparseable URL"
 
 
-def _route_key(url: str, *, strip_v1: bool) -> tuple:
-    """Comparable base URL: scheme, host, port, path without a trailing ``/`` (and ``/v1`` on the
-    Anthropic wire, which the adapter strips before appending ``/v1/messages``)."""
+def _route_key(url: str) -> tuple:
+    """Comparable base URL: scheme, host, port, path without trailing ``/`` or ``/v1``."""
     try:
         parts = urlsplit(url.strip())
         port = parts.port
     except ValueError:
         return (url.strip(),)
-    path = parts.path.rstrip("/")
-    if strip_v1 and path.endswith("/v1"):
-        path = path[:-3]
+    path = parts.path.rstrip("/").removesuffix("/v1")
     return (parts.scheme.lower(), (parts.hostname or "").lower(), port, path)
 
 
 def _route_override(var: str, provider: str, env_url: str, configured: str, via: str) -> EnvOverride:
-    strip_v1 = provider == "anthropic"
-    same = _route_key(env_url, strip_v1=strip_v1) == _route_key(configured, strip_v1=strip_v1)
+    same = _route_key(env_url) == _route_key(configured)
     env_o, cfg_o = _origin(env_url), _origin(configured)
     if same:
         what = f"{provider} route {env_o} {via} (matches the configured route)"
     else:
         tail = " (same host, different path or port)" if env_o == cfg_o else ""
         what = f"{provider} route {cfg_o} → {env_o} {via}{tail}"
+    stored = _stored_could_win(provider)
+    if stored and not same:
+        what += " (may override if the stored credential is unavailable)"
     fix = (f"{var} ({_source(var)}) redirects {provider} requests away from config.yaml: {_unset_hint(var)}, "
-           "or put the endpoint in config.yaml if the redirect is intended")
-    return EnvOverride(var, _source(var), what, fix, warn=not same)
+           "or configure a named providers: entry and select it in config.yaml if the redirect is intended")
+    return EnvOverride(var, _source(var), what, fix,
+                       warn=not same and not stored and _source(var) == "the process environment")
 
 
-def _numbered(name: str):
-    """``name`` and its consecutive ``name_2``, ``name_3`` … siblings (``_env_key_var_candidates``)."""
-    yield name
-    n = 2
-    while _env(f"{name}_{n}"):
-        yield f"{name}_{n}"
-        n += 1
+def _auth_metadata(path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8-sig")) if path and path.exists() else {}
+
+
+def _stored_rows(provider: str) -> list:
+    from hermes_cli.auth import _auth_file_path, _global_auth_file_path
+    for path in (_auth_file_path(), _global_auth_file_path()):
+        rows = (_auth_metadata(path).get("credential_pool") or {}).get(provider)
+        if rows:
+            return rows
+    return []
+
+
+def _suppressed_sources(provider: str):
+    from hermes_cli.auth import _auth_file_path
+    return (_auth_metadata(_auth_file_path()).get("suppressed_sources") or {}).get(provider, ())
+
+
+def _stored_could_win(provider: str) -> bool:
+    if _stored_rows(provider):
+        return True  # includes the root fallback; do not refresh or validate stored credentials
+    if provider == "anthropic" and any(_env(v) for v in _ANTHROPIC_OAUTH_VARS):
+        from agent.anthropic_credentials import read_hermes_oauth_credentials
+        return bool(read_hermes_oauth_credentials())
+    return False
 
 
 def _seeding_key_var(provider: str, names) -> str:
     """First env API-key variable ``_seed_from_env`` turns into a pool row; a source the user suppressed
     with ``hermes auth remove`` seeds none."""
-    from hermes_cli.auth import suppressed_credential_sources
-    suppressed = suppressed_credential_sources(provider)
-    return next((v for name in names for v in _numbered(name) if _env(v) and f"env:{v}" not in suppressed), "")
+    from agent.credential_pool import _env_key_var_candidates
+    suppressed = _suppressed_sources(provider)
+    entries = [SimpleNamespace(source=row.get("source", "")) for row in _stored_rows(provider)]
+    return next((v for v in _env_key_var_candidates(list(names), entries)
+                 if _env(v) and f"env:{v}" not in suppressed), "")
 
 
 def _registry_base_url_override(provider: str, model_cfg: dict) -> EnvOverride | None:
@@ -163,9 +191,8 @@ def _is_openai_alias(raw_provider: str) -> bool:
 def _openai_alias_override(raw_provider: str, model_cfg: dict) -> EnvOverride | None:
     """The expanded ``provider: openai`` route goes to ``OPENAI_BASE_URL`` ahead of the public endpoint —
     unless ``model.openai_runtime: codex_app_server`` hands the turn to the app-server, which ignores it."""
-    from agent.secret_scope import get_secret_str
     from hermes_cli.runtime_provider_custom import _DIRECT_API_BASE_URLS
-    env_url = (get_secret_str("OPENAI_BASE_URL", "") or "").strip().rstrip("/")
+    env_url = _env("OPENAI_BASE_URL").rstrip("/")
     if not env_url or str(model_cfg.get("openai_runtime") or "").strip().lower() == "codex_app_server":
         return None
     return _route_override("OPENAI_BASE_URL", raw_provider, env_url, _DIRECT_API_BASE_URLS[raw_provider],
@@ -175,11 +202,10 @@ def _openai_alias_override(raw_provider: str, model_cfg: dict) -> EnvOverride | 
 def _openrouter_pool_wins(model_cfg: dict) -> bool:
     """``provider: openrouter`` resolves from its credential pool, ahead of the endpoint variables, when no
     custom endpoint is set (``_openrouter_should_use_pool``) and the pool holds a credential."""
-    from hermes_cli.auth import _load_auth_store
     from hermes_cli.runtime_provider import _openrouter_should_use_pool
     if not _openrouter_should_use_pool("openrouter", model_cfg, None, None):
         return False
-    stored = (_load_auth_store().get("credential_pool") or {}).get("openrouter")
+    stored = _stored_rows("openrouter")
     return bool(stored or _seeding_key_var("openrouter", ("OPENROUTER_API_KEY",)))
 
 
@@ -193,7 +219,7 @@ def _openrouter_override(raw_provider: str, model_cfg: dict) -> EnvOverride | No
     trusted = bool(cfg_url) and (raw_provider == "openrouter"
                                  or _config_base_url_trustworthy_for_bare_custom(cfg_url, raw_provider))
     configured = cfg_url if trusted else OPENROUTER_BASE_URL.rstrip("/")
-    if raw_provider == "openrouter" and _openrouter_pool_wins(model_cfg):
+    if raw_provider == "openrouter" and _openrouter_pool_wins(model_cfg) and not _stored_could_win("openrouter"):
         return None  # the pool rung answers first, at the canonical endpoint
     for var in ("CUSTOM_BASE_URL", "OPENROUTER_BASE_URL"):
         env_url = (get_secret_str(var, "") or "").strip().rstrip("/")
@@ -206,8 +232,7 @@ def _anthropic_env_credential_var() -> str:
     """The env credential Anthropic turns use. A suppressed OAuth variable seeds no pool row, so a stored
     login answers first; ANTHROPIC_API_KEY without any OAuth variable prunes OAuth logins from the pool
     (``_seed_anthropic_singletons``) and then wins in ``resolve_anthropic_token`` even when suppressed."""
-    from hermes_cli.auth import suppressed_credential_sources
-    suppressed = suppressed_credential_sources("anthropic")
+    suppressed = _suppressed_sources("anthropic")
     oauth_set = [v for v in _ANTHROPIC_OAUTH_VARS if _env(v)]
     live = next((v for v in oauth_set if f"env:{v}" not in suppressed), "")
     if live:
@@ -234,9 +259,12 @@ def _anthropic_auth_override() -> EnvOverride | None:
     else:
         what = f"Anthropic auth: static {mode} from {var} ahead of the stored (refreshable) Hermes OAuth login"
     fix = (f"{var} ({_source(var)}) replaces your stored Anthropic login: {_unset_hint(var)} to use the login, "
-           "or drop the login ('hermes auth list anthropic', then 'hermes auth remove anthropic <id>') if the "
-           "env credential is the one you want")
-    return EnvOverride(var, _source(var), what, fix, warn=True)
+           "or save the desired credential with 'hermes model' in the profile .env")
+    stored_wins = _stored_could_win("anthropic")
+    if stored_wins:
+        what += " (may override if the stored credential is unavailable)"
+    return EnvOverride(var, _source(var), what, fix,
+                       warn=not stored_wins and _source(var) == "the process environment")
 
 
 def find_route_env_overrides(model_cfg: dict) -> list:
@@ -258,9 +286,13 @@ def find_route_env_overrides(model_cfg: dict) -> list:
 
 @doctor_check(on_error="Environment overrides", detail="(could not check: {e})")
 def _check_route_env_overrides(should_fix: bool, f) -> None:
-    """Warn when an inherited or ``.env`` variable redirects/re-authenticates the configured model route."""
+    """Warn only for certain inherited overrides; saved settings and uncertain precedence are INFO."""
     from hermes_cli.doctor_connectivity import _model_cfg
-    overrides = find_route_env_overrides(_model_cfg())
+    try:
+        overrides = find_route_env_overrides(_model_cfg())
+    except (OSError, ValueError):
+        check_info("Environment override precedence could not be checked: credential metadata is unreadable")
+        return
     if not any(o.warn for o in overrides):
         check_ok("No environment variable overrides the configured model route")
     for o in overrides:

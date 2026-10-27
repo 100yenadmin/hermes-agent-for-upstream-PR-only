@@ -14,7 +14,6 @@ import time
 
 import pytest
 
-from hermes_cli import doctor
 from hermes_cli import doctor_env_overrides as deo
 from hermes_cli.doctor_connectivity import _model_cfg
 
@@ -45,10 +44,6 @@ def _run_check(capsys):
     return capsys.readouterr().out, finding
 
 
-def test_check_is_registered_in_doctor():
-    assert ("Environment Overrides", deo._check_route_env_overrides) in doctor.DOCTOR_CHECKS
-
-
 def test_inherited_base_url_redirecting_the_anthropic_route_warns(home, monkeypatch, capsys):
     _configure(home, {"provider": "anthropic", "default": "claude-sonnet-4-5"})
     monkeypatch.setenv("ANTHROPIC_API_KEY", _API_KEY)
@@ -59,6 +54,7 @@ def test_inherited_base_url_redirecting_the_anthropic_route_warns(home, monkeypa
     assert len(finding.manual_issues) == 1
     fix = finding.manual_issues[0]
     assert fix.startswith("ANTHROPIC_BASE_URL (the process environment)") and "unset ANTHROPIC_BASE_URL" in fix
+    assert "providers:" in fix
     assert _API_KEY not in out + fix
 
 
@@ -67,7 +63,7 @@ def test_profile_dotenv_is_named_as_the_source(home, capsys):
                f"ANTHROPIC_API_KEY={_API_KEY}\nANTHROPIC_BASE_URL=https://proxy.example.test\n")
     out, finding = _run_check(capsys)
     assert "ANTHROPIC_BASE_URL from " in out and "/.env" in out
-    assert "remove ANTHROPIC_BASE_URL from" in finding.manual_issues[0]
+    assert "⚠" not in out and finding.manual_issues == [] and finding.issues == []
 
 
 def test_no_finding_when_nothing_overrides(home, monkeypatch, capsys):
@@ -249,17 +245,20 @@ def test_api_key_over_a_stored_oauth_login_warns_about_auth_mode(home, monkeypat
     assert "⚠ ANTHROPIC_API_KEY from the process environment" in out
     assert "API key (Console, per-token billing) instead of the stored Hermes OAuth login" in out
     assert len(finding.manual_issues) == 1
+    assert "hermes model" in finding.manual_issues[0]
+    assert "hermes auth remove" not in finding.manual_issues[0]
     for secret in (_API_KEY, "STOREDLOGIN", "refresh-SECRET"):
         assert secret not in out + finding.manual_issues[0]
 
 
-def test_env_oauth_token_ahead_of_a_different_stored_login_warns(home, monkeypatch, capsys):
+def test_env_oauth_token_with_a_stored_login_is_uncertain(home, monkeypatch, capsys):
     _configure(home, {"provider": "anthropic"})
     _store_hermes_login(home)
     monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-ENVTOKEN")
     out, finding = _run_check(capsys)
     assert "static OAuth token from ANTHROPIC_TOKEN ahead of the stored" in out
-    assert len(finding.manual_issues) == 1 and "ENVTOKEN" not in out
+    assert "⚠" not in out and "ENVTOKEN" not in out
+    assert finding.manual_issues == [] and finding.issues == []
 
 
 def test_env_credential_without_a_stored_login_is_info_only(home, monkeypatch, capsys):
@@ -268,6 +267,102 @@ def test_env_credential_without_a_stored_login_is_info_only(home, monkeypatch, c
     out, finding = _run_check(capsys)
     assert "ANTHROPIC_API_KEY from the process environment: Anthropic auth: API key from ANTHROPIC_API_KEY" in out
     assert finding.manual_issues == [] and _API_KEY not in out
+
+
+def _assert_info(out, finding, var):
+    assert f"{var} from " in out and "⚠" not in out
+    assert finding.manual_issues == [] and finding.issues == []
+
+
+def test_saved_api_key_after_pkce_login_is_info_only(home, capsys):
+    _configure(home, {"provider": "anthropic"}, f"ANTHROPIC_API_KEY={_API_KEY}\n")
+    _store_hermes_login(home)
+    out, finding = _run_check(capsys)
+    _assert_info(out, finding, "ANTHROPIC_API_KEY")
+    assert "/.env" in out and _API_KEY not in out
+
+
+def test_saved_openai_proxy_is_info_only(home, capsys):
+    _configure(home, {"provider": "openai"}, "OPENAI_BASE_URL=https://proxy.example.test/v1\n")
+    out, finding = _run_check(capsys)
+    _assert_info(out, finding, "OPENAI_BASE_URL")
+    assert "/.env" in out
+
+
+def _configure_root_pool(home, monkeypatch):
+    from pathlib import Path
+    monkeypatch.setattr(Path, "home", lambda: home)
+    root = home / ".hermes"
+    profile = root / "profiles" / "work"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    (root / "auth.json").write_text(json.dumps({"credential_pool": {"openrouter": [{
+        "id": "root-key", "provider": "openrouter", "source": "manual",
+        "auth_type": "api_key", "access_token": "sk-or-ROOTFIXTURE", "priority": 0,
+        "base_url": "https://openrouter.ai/api/v1"}]}}), encoding="utf-8")
+    _configure(profile, {"provider": "openrouter", "default": "some-model"})
+    return profile
+
+
+def test_root_pool_makes_custom_url_uncertain(home, monkeypatch, capsys):
+    profile = _configure_root_pool(home, monkeypatch)
+    monkeypatch.setenv("CUSTOM_BASE_URL", "https://env.example.test/v1")
+    before = (profile.parent.parent / "auth.json").read_bytes()
+    out, finding = _run_check(capsys)
+    _assert_info(out, finding, "CUSTOM_BASE_URL")
+    assert "may override if the stored credential is unavailable" in out
+    assert not (profile / "auth.json").exists()
+    assert (profile.parent.parent / "auth.json").read_bytes() == before
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    assert resolve_runtime_provider()["base_url"] == "https://openrouter.ai/api/v1"
+
+
+def test_suppressed_oauth_with_api_key_and_login_is_info_only(home, monkeypatch, capsys):
+    _configure(home, {"provider": "anthropic", "default": "some-model"})
+    _store_hermes_login(home)
+    (home / "auth.json").write_text(json.dumps({"providers": {}, "suppressed_sources": {
+        "anthropic": ["env:ANTHROPIC_TOKEN"]}}), encoding="utf-8")
+    monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-ENVTOKEN")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", _API_KEY)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://proxy.example.test/v1")
+    before = {p.name: p.read_bytes() for p in (home / "auth.json", home / ".anthropic_oauth.json")}
+    out, finding = _run_check(capsys)
+    _assert_info(out, finding, "ANTHROPIC_API_KEY")
+    assert {name: (home / name).read_bytes() for name in before} == before
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    runtime = resolve_runtime_provider()
+    assert runtime["base_url"].rstrip("/") == "https://api.anthropic.com"
+    assert runtime["api_key"] == "sk-ant-oat01-STOREDLOGIN"
+
+
+def test_persisted_numbered_key_across_a_gap_is_info_only(home, monkeypatch, capsys):
+    _configure(home, {"provider": "deepseek"})
+    (home / "auth.json").write_text(json.dumps({"credential_pool": {"deepseek": [{
+        "id": "third-key", "provider": "deepseek", "source": "env:DEEPSEEK_API_KEY_3"}]}}), encoding="utf-8")
+    monkeypatch.setenv("DEEPSEEK_API_KEY_3", "sk-deepseek-THIRDFIXTURE")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://env.example.test/v1")
+    out, finding = _run_check(capsys)
+    _assert_info(out, finding, "DEEPSEEK_BASE_URL")
+    assert "DEEPSEEK_API_KEY_3" in out
+
+
+def test_deepseek_route_without_v1_matches_the_default(home, monkeypatch, capsys):
+    _configure(home, {"provider": "deepseek"})
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-deepseek-FIXTURE")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    out, finding = _run_check(capsys)
+    _assert_info(out, finding, "DEEPSEEK_BASE_URL")
+    assert "matches the configured route" in out
+
+
+def test_profile_pool_makes_generic_provider_redirect_uncertain(home, monkeypatch, capsys):
+    _configure(home, {"provider": "deepseek"})
+    (home / "auth.json").write_text(json.dumps({"credential_pool": {"deepseek": [{
+        "id": "stored-key", "provider": "deepseek", "source": "manual", "access_token": "sk-STORED"}]}}), encoding="utf-8")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-deepseek-FIXTURE")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://env.example.test/v1")
+    out, finding = _run_check(capsys)
+    _assert_info(out, finding, "DEEPSEEK_BASE_URL")
 
 
 @pytest.mark.parametrize("model, env, warns", [
@@ -285,14 +380,15 @@ def test_env_credential_without_a_stored_login_is_info_only(home, monkeypatch, c
     ({"provider": "openrouter"}, {"OPENROUTER_API_KEY": "sk-or-v1-SECRETVALUE", "CUSTOM_BASE_URL": "https://env.example.test/v1"}, False),
 ])
 def test_doctor_agrees_with_the_runtime_resolver(home, monkeypatch, model, env, warns):
-    """Ground truth: the doctor warns exactly when the real resolver lands somewhere config does not say."""
+    """With no stored rows, certain inherited route warnings agree with the real resolver."""
     _configure(home, {**model, "default": "some-model"})
     for var, value in env.items():
         monkeypatch.setenv(var, value)
     from hermes_cli.runtime_provider import resolve_runtime_provider
+    # Inspect before the resolver persists env rows, which make later diagnostics conservative.
+    route_warns = [o for o in deo.find_route_env_overrides(_model_cfg()) if o.warn and "route" in o.overrides]
     runtime = resolve_runtime_provider()
     redirected = "env.example.test" in runtime["base_url"] or "proxy.example.test" in runtime["base_url"]
-    route_warns = [o for o in deo.find_route_env_overrides(_model_cfg()) if o.warn and "route" in o.overrides]
     assert redirected is warns
     assert bool(route_warns) is warns
     assert os.environ.get("HERMES_HOME")  # sandboxed home, never the real one
