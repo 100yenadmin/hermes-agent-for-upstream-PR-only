@@ -47,6 +47,35 @@ async def test_codex_verification_honors_notice_privacy_and_ignored_channels(set
 
 
 @pytest.mark.asyncio
+async def test_local_codex_verification_reaches_session_viewers_before_poll(setup, monkeypatch):
+    from gateway import session_authorities
+
+    runner, adapter, _, _ = setup
+    published = []
+    live = SimpleNamespace(event_stream=SimpleNamespace(
+        publish=lambda sid, payload, event_type: published.append((sid, event_type, payload["text"]))))
+    authority = SimpleNamespace(sessions={"test-chat": live})
+    monkeypatch.setattr(session_authorities, "active_authority", lambda _runner: authority)
+    poll = _device_code(monkeypatch)
+    at_poll = []
+
+    def polled(*args, **kwargs):
+        at_poll.extend(published)
+        raise RuntimeError("test-stop-after-delivery")
+
+    poll.side_effect = polled
+    assert "Codex sign-in started" in await runner._handle_login_command(_event(platform=Platform.LOCAL))
+    await _finish(runner)
+
+    poll.assert_called_once()
+    assert [(sid, kind) for sid, kind, _ in at_poll] == [("test-chat", "notification.show")] * 3
+    assert [text for _, _, text in at_poll][:2] == ["https://auth.openai.com/codex/device", "TEST-CODE"]
+    assert len(published) == 4
+    assert "did not complete" in published[-1][2]
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_delivery_timeout_cancels_pending_verification_before_abort(setup, monkeypatch):
     runner, adapter, _, profile = setup
     del runner._deliver_platform_notice

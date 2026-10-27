@@ -30,11 +30,30 @@ class _SignInAttempt:
     source: Any
     cancelled: bool = False
     provider: str = "nous"
+    saving: bool = False   # past the final cancel check: the save is committed, a replacement waits
 
 
-# These adapters use "dm" for a broadcast topic, a channel, or an agent peer. Sending a consent
-# link and sign-in code there would publish them rather than deliver them to one person.
+# These adapters use "dm" for a broadcast topic, a channel, or an agent peer. Sending a sign-in
+# link and code there would publish them rather than deliver them to one person.
 _LOGIN_BLOCKED_PLATFORMS = frozenset({"ntfy", "raft", "a2a"})
+
+
+def _publish_local_notice(runner, source, text: str) -> bool:
+    """A LOCAL session's adapter ``send`` is a no-op (viewers read the event stream), so the
+    sign-in link/code/result reach its viewers as a sticky ``notification.show``. False when
+    *source* is not a live local session (the platform push applies)."""
+    from gateway.config import Platform
+    if getattr(source, "platform", None) != Platform.LOCAL:
+        return False
+    from gateway.session_authorities import active_authority
+    authority = active_authority(runner)
+    live = authority.sessions.get(source.chat_id) if authority is not None else None
+    if live is None:
+        return False
+    live.event_stream.publish(source.chat_id, {"text": text, "level": "info", "kind": "sticky",
+                                               "key": "login:" + uuid4().hex[:8]},
+                              event_type="notification.show")
+    return True
 
 
 class GatewayLoginCommandsMixin:
@@ -94,7 +113,7 @@ class GatewayLoginCommandsMixin:
             live = attempts.get(_LOGIN_SINGLE)
             if live is not None and live.provider == "openai-codex":
                 return anon_auth.LOGIN_BUSY_ELSEWHERE
-            if live is not None and live.key != key:
+            if live is not None and (live.key != key or live.saving):
                 return anon_auth.LOGIN_BUSY_ELSEWHERE
             if live is not None:
                 live.cancelled = True
@@ -107,7 +126,7 @@ class GatewayLoginCommandsMixin:
             live = attempts.get(_LOGIN_SINGLE)
             if live is not None and live.provider == "openai-codex":
                 return anon_auth.LOGIN_BUSY_ELSEWHERE
-            if live is not None and live.key != key:
+            if live is not None and (live.key != key or live.saving):
                 return anon_auth.LOGIN_BUSY_ELSEWHERE
             if live is not None:
                 live.cancelled = True
@@ -146,6 +165,8 @@ class GatewayLoginCommandsMixin:
 
         async def deliver(link, code):
             for text in (link, code, "Never share this code. Waiting for Codex sign-in..."):
+                if _publish_local_notice(self, attempt.source, text):
+                    continue
                 if not await self._deliver_platform_notice(attempt.source, text):
                     raise RuntimeError("Private code delivery failed")
 
@@ -190,11 +211,18 @@ class GatewayLoginCommandsMixin:
             with lock:
                 return attempt.cancelled
 
-        gen = anon_auth.run_sign_in(
-            timeout_seconds=15.0,
-            cancelled=_cancelled,
-            cancel_wins_after_promotion=False,
-        )
+        @contextlib.contextmanager
+        def _persist_guard():
+            # The final cancel check claims the save under the registry lock, so a replacing /login
+            # either cancels first or is told a sign-in is finishing. The save itself runs outside
+            # the lock: the event loop takes that lock, and a save can wait on the auth store.
+            with lock:
+                if not attempt.cancelled:
+                    attempt.saving = True
+                may_persist = attempt.saving
+            yield may_persist
+
+        gen = anon_auth.run_sign_in(timeout_seconds=15.0, cancelled=_cancelled, persist_guard=_persist_guard)
         pushed_terminal = False
         try:
             while True:
@@ -229,6 +257,8 @@ class GatewayLoginCommandsMixin:
     async def _push_login(self, attempt: _SignInAttempt, text: str) -> None:
         """Push one notice without allowing a transport failure to abort the state drain."""
         try:
+            if _publish_local_notice(self, attempt.source, text):
+                return
             await self._deliver_platform_notice(attempt.source, text)
         except Exception as exc:
             logger.warning("/login %s: push failed", attempt.attempt_id, exc_info=(
