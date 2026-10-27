@@ -18,7 +18,7 @@ import re
 import time
 from pathlib import Path
 from urllib.parse import unquote as _unquote
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator, bounded_put
@@ -125,7 +125,7 @@ class MattermostAdapter(BasePlatformAdapter):
         self._last_post_status: Optional[int] = None  # POST-only, read by the broken-thread-root fallback
         self._last_post_error: str = ""
         self._dedup = MessageDeduplicator()
-        self._mention_users: Dict[str, Tuple[bool, float]] = {}
+        self._mention_users: dict[str, tuple[Optional[bool], float]] = {}
         self._groups = config.extra.get("groups") if isinstance(config.extra.get("groups"), dict) else {}
         dm_policy = str(config.extra.get("dm_policy") or "").strip().lower()
         self._dm_policy = "disabled" if dm_policy == "allowlist" else dm_policy
@@ -462,28 +462,49 @@ class MattermostAdapter(BasePlatformAdapter):
         allowed = _channel_id_set(raw)
         return "*" in allowed or sender_id in allowed
 
-    async def _strip_peer_bot_mentions(self, text: str) -> str:
-        """Authorized-only cleanup: four concurrent lookups, two seconds total, 60s miss TTL."""
-        matches = list(re.finditer(r"(?<![\w.@-])@([A-Za-z0-9._-]{1,64})(?![\w.-])", text))
-        now = time.monotonic()
-        names = list(dict.fromkeys(m.group(1).lower().rstrip(".") for m in matches))
-        names = [n for n in names if n and n not in {"channel", "here", "all"}
-                 and self._mention_users.get(n, (False, 0))[1] <= now][:4]
-        if names:
-            try:
-                users = await asyncio.wait_for(asyncio.gather(
-                    *(self._api_get(f"users/username/{n}") for n in names)), timeout=2)
-            except TimeoutError:
-                users = [{} for _ in names]  # preserve text; retry after the miss TTL
-            for name, user in zip(names, users):
-                bot = isinstance(user, dict) and user.get("username", "").lower() == name and user.get("is_bot") is True
+    async def _peer_bot_mention_length(self, name: str, budget: list[int]) -> int:
+        """Resolve exact accounts before suffix fallback; unknown/error verdicts preserve text."""
+        while name and name not in {"channel", "here", "all"}:
+            bot, expiry = self._mention_users.get(name, (None, 0))
+            if expiry <= time.monotonic():
+                if not budget[0]:
+                    return 0
+                budget[0] -= 1
+                try:
+                    user = await self._api_get(f"users/username/{name}")
+                except Exception:  # optional cleanup must not prevent delivery; cancellation propagates
+                    logger.debug("mattermost: peer-bot lookup for %s failed", name, exc_info=True)
+                    user = None
+                username = user.get("username") if isinstance(user, dict) else None
+                bot = (isinstance(username, str) and username.lower() == name and user.get("is_bot") is True
+                       if user != {} else None)
                 bounded_put(self._mention_users, name, (bot, time.monotonic() + 60), 512)
-        spans = []
-        for match in matches:
-            name = match.group(1).lower().rstrip(".")
-            bot, expiry = self._mention_users.get(name, (False, 0))
-            if bot and expiry > time.monotonic():
-                spans.append((match.start(), match.start(1) + len(name)))
+            if bot is not None:
+                return len(name) if bot else 0
+            if name[-1] not in ".-_":
+                return 0
+            name = name[:-1]
+        return 0
+
+    async def _strip_peer_bot_mentions(self, text: str) -> str:
+        """Authorized-only cleanup: four lookups, two seconds total, 60s verdict TTL."""
+        protected = [m.span() for m in re.finditer(
+            r"(?P<ticks>`+)[\s\S]*?(?P=ticks)|(?P<fence>~{3,})[\s\S]*?(?P=fence)"
+            r"|\]\([^\n)]*\)|\b[A-Za-z][A-Za-z0-9+.-]*://[^\s<>]+", text)]
+        matches = [m for m in re.finditer(r"(?<![\w.@-])@([A-Za-z0-9._-]{1,64})(?![\w.-])", text)
+                   if not any(start <= m.start() < end for start, end in protected)]
+        names = list(dict.fromkeys(m.group(1).lower() for m in matches))
+        budget = [4]
+        try:
+            lengths = await asyncio.wait_for(asyncio.gather(
+                *(self._peer_bot_mention_length(n, budget) for n in names)), timeout=2)
+        except TimeoutError:
+            lengths = [0 for _ in names]
+            for name in names:
+                bounded_put(self._mention_users, name, (False, time.monotonic() + 60), 512)
+        resolved = dict(zip(names, lengths))
+        spans = [(m.start(), m.start(1) + resolved[m.group(1).lower()]) for m in matches
+                 if resolved[m.group(1).lower()]]
         for start, end in reversed(spans):
             before, after = text[:start], text[end:]
             if before[-1:] in {" ", "\t"} and after[:1] in {" ", "\t"}:

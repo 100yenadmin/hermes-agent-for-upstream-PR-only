@@ -16,6 +16,7 @@ def make_adapter(**extra):
     adapter = MattermostAdapter(PlatformConfig(enabled=True, token="test-token", extra=extra))
     adapter._bot_user_id, adapter._bot_username = "own-bot", "hermes-bot"
     adapter.handle_message = AsyncMock()
+    adapter._download_attachments = AsyncMock(return_value=([], []))
     adapter.set_authorization_check(lambda *args: True)
     return adapter
 
@@ -40,6 +41,8 @@ async def test_peer_mentions_strip_bots_preserve_humans_and_cache(mention):
     adapter = make_adapter()
     async def lookup(path):
         username = path.rsplit("/", 1)[-1]
+        if username.endswith("."):
+            return {}
         return {"username": username, **({"is_bot": True} if username == "peer-bot" else {})}
     adapter._api_get = AsyncMock(side_effect=lookup)
     for index in range(2):
@@ -47,7 +50,7 @@ async def test_peer_mentions_strip_bots_preserve_humans_and_cache(mention):
             f"@hermes-bot ask {mention} and @human-user via mail@peer-bot or @here", post=str(index)))
         assert adapter.handle_message.call_args[0][0].text == (
             "ask " + (". " if mention.endswith(".") else "") + "and @human-user via mail@peer-bot or @here")
-    assert adapter._api_get.await_count == 2
+    assert adapter._api_get.await_count == (3 if mention.endswith(".") else 2)
 
 
 @pytest.mark.asyncio
@@ -130,3 +133,63 @@ async def test_mention_lookups_bounded_concurrent_and_authorized():
     adapter.set_authorization_check(lambda *args: True)
     await adapter._handle_ws_event(posted(text, post="authorized"))
     assert adapter._api_get.await_count == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exact_bot", [False, True])
+async def test_exact_username_precedes_punctuation_fallback(exact_bot):
+    adapter = make_adapter()
+    async def lookup(path):
+        name = path.rsplit("/", 1)[-1]
+        return {"username": name, "is_bot": exact_bot if name.endswith(".") else not exact_bot}
+    adapter._api_get = AsyncMock(side_effect=lookup)
+    for index in range(2):
+        await adapter._handle_ws_event(posted("@hermes-bot ask @peer-bot. please", post=str(index)))
+        assert adapter.handle_message.call_args[0][0].text == (
+            "ask please" if exact_bot else "ask @peer-bot. please")
+    adapter._api_get.assert_awaited_once_with("users/username/peer-bot.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("literal", [
+    "`@peer-bot`", "``@peer-bot ` literal``", "```text\n@peer-bot\n```",
+    "~~~text\n@peer-bot\n~~~", "https://example.org/@peer-bot/guide",
+    "[guide](https://example.org/@peer-bot/guide)",
+    "[guide](/@peer-bot/guide)",
+])
+async def test_peer_mentions_preserve_code_and_url_destinations(literal):
+    adapter = make_adapter()
+    adapter._api_get = AsyncMock(return_value={"username": "peer-bot", "is_bot": True})
+    await adapter._handle_ws_event(posted(f"@hermes-bot read {literal} then ask @peer-bot please"))
+    assert adapter.handle_message.call_args[0][0].text == f"read {literal} then ask please"
+    adapter._api_get.assert_awaited_once_with("users/username/peer-bot")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [json.JSONDecodeError("bad JSON", "", 0), {"username": None}])
+async def test_peer_lookup_failure_keeps_delivery_and_drains_siblings(failure):
+    adapter = make_adapter()
+    sibling_started, sibling_finished = asyncio.Event(), asyncio.Event()
+    async def lookup(path):
+        if path.endswith("/peer-bot"):
+            await sibling_started.wait()
+            if isinstance(failure, Exception):
+                raise failure
+            return failure
+        sibling_started.set()
+        try:
+            return {"username": "other-bot", "is_bot": True}
+        finally:
+            sibling_finished.set()
+    adapter._api_get = AsyncMock(side_effect=lookup)
+    event = posted("@hermes-bot ask @peer-bot and @other-bot please")
+    await adapter._handle_ws_event(event)
+    assert sibling_finished.is_set()
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.call_args[0][0].text == "ask @peer-bot and please"
+    await adapter._handle_ws_event(event)
+    adapter.handle_message.assert_awaited_once()
+    adapter._api_get = AsyncMock(return_value={"username": "next-bot", "is_bot": True})
+    await adapter._handle_ws_event(posted("@hermes-bot ask @next-bot please", post="next"))
+    assert adapter.handle_message.await_count == 2
+    assert adapter.handle_message.call_args[0][0].text == "ask please"
