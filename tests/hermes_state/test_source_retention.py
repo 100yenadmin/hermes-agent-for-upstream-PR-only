@@ -13,6 +13,8 @@ import time
 
 import pytest
 
+from hermes_cli.config import load_config_readonly
+
 
 @pytest.fixture()
 def db(tmp_path, monkeypatch):
@@ -43,9 +45,10 @@ def test_cron_override_ages_cron_not_human(db, tmp_path, monkeypatch):
     _seed(db, "cron-recent", "cron", 10)
     _seed(db, "human-old", "whatsapp", 60)
 
-    _write_config(tmp_path, "    cron: 30\n")
+    _write_config(tmp_path, "    cron: 30\n    whatsapp: 30\n")
     result = db.maybe_auto_prune_and_vacuum(
-        retention_days=90, min_interval_hours=0, vacuum=False)
+        retention_days=90, min_interval_hours=0, vacuum=False,
+        source_retention_days=load_config_readonly().get("sessions", {}).get("source_retention_days"))
 
     assert db.get_session("cron-old") is None, "cron rows past the 30d override must prune"
     assert db.get_session("cron-recent") is not None
@@ -59,10 +62,12 @@ def test_no_map_keeps_global_behavior(db, tmp_path, monkeypatch):
 
     # No config file at all.
     result = db.maybe_auto_prune_and_vacuum(
-        retention_days=90, min_interval_hours=0, vacuum=False)
+        retention_days=90, min_interval_hours=0, vacuum=False,
+        source_retention_days=load_config_readonly().get("sessions", {}).get("source_retention_days"))
 
     assert db.get_session("cron-old") is not None
     assert db.get_session("human-old") is not None
+    assert result["pruned"] == 0
 
 
 def test_invalid_map_is_ignored(db, tmp_path, monkeypatch):
@@ -71,9 +76,11 @@ def test_invalid_map_is_ignored(db, tmp_path, monkeypatch):
     (tmp_path / "config.yaml").write_text(
         "sessions:\n  source_retention_days: banana\n")
     result = db.maybe_auto_prune_and_vacuum(
-        retention_days=90, min_interval_hours=0, vacuum=False)
+        retention_days=90, min_interval_hours=0, vacuum=False,
+        source_retention_days=load_config_readonly().get("sessions", {}).get("source_retention_days"))
 
     assert db.get_session("cron-old") is not None
+    assert result["pruned"] == 0
 
 
 def test_global_pass_still_applies_to_unmapped_sources(db, tmp_path, monkeypatch):
@@ -83,7 +90,8 @@ def test_global_pass_still_applies_to_unmapped_sources(db, tmp_path, monkeypatch
 
     _write_config(tmp_path, "    cron: 30\n")
     db.maybe_auto_prune_and_vacuum(
-        retention_days=90, min_interval_hours=0, vacuum=False)
+        retention_days=90, min_interval_hours=0, vacuum=False,
+        source_retention_days=load_config_readonly().get("sessions", {}).get("source_retention_days"))
 
     # >90d rows go via the global pass regardless of the map; <90d unmapped stay.
     assert db.get_session("cron-old") is None
