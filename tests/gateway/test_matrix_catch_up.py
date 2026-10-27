@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -40,7 +41,7 @@ def harness(tmp_path, monkeypatch):
     from mautrix.client import Client
     clients = []
 
-    def make(window=0, responses=None, home=None):
+    def make(window=0, responses=None, home=None, check_checkpoint=True):
         adapter = matrix.MatrixAdapter(PlatformConfig(enabled=True, token="fixture",
             extra={"homeserver": "https://matrix.example.org", "user_id": USER,
                    "e2ee_mode": "off", "catch_up_window_seconds": window}))
@@ -61,7 +62,9 @@ def harness(tmp_path, monkeypatch):
             def handle_sync(self, data):
                 # Production _absorb_sync must advance durable state BEFORE any handler runs.
                 path = adapter._store_dir / "sync_token.json"
-                if window and path.exists():
+                if window:
+                    assert self.sync_store.next_batch == data["next_batch"]
+                if window and check_checkpoint and path.exists():
                     assert json.loads(path.read_text())["next_batch"] == data["next_batch"]
                 return [asyncio.create_task(adapter._on_room_message(SimpleNamespace(
                     **raw, room_id=room, timestamp=raw["origin_server_ts"])))
@@ -89,9 +92,10 @@ async def connect(adapter, home):
     await adapter.disconnect()
 
 
-def seed(store, user=USER, token="s0"):
+def seed(store, user=USER, token="s0", saved_at=NOW - 120):
     store.mkdir(parents=True, exist_ok=True)
-    (store / "sync_token.json").write_text(json.dumps({"user_id": user, "next_batch": token}))
+    (store / "sync_token.json").write_text(json.dumps({
+        "user_id": user, "next_batch": token, "saved_at": saved_at}))
 
 
 def delivered(adapter):
@@ -126,13 +130,17 @@ async def test_since_window_and_restart_never_replays_first_batch(harness):
 
 
 @pytest.mark.asyncio
-async def test_cap_newest_twenty_across_rooms(harness, caplog):
+async def test_per_room_cap_preserves_dm(harness, caplog):
     make, _ = harness
-    adapter, store, home = make(3600, [batch([event(i, 100 - i) for i in range(30)])])
+    data = {"next_batch": "s1", "rooms": {"join": {
+        ROOM: {"timeline": {"events": [event(i, 50 - i) for i in range(25)]}},
+        QUIET: {"timeline": {"events": [event("dm", 100)]}},
+    }}}
+    adapter, store, home = make(3600, [data])
     seed(store)
     with caplog.at_level(logging.INFO):
         await connect(adapter, home)
-    assert delivered(adapter) == {f"$event{i}" for i in range(10, 30)}
+    assert delivered(adapter) == {"$eventdm"} | {f"$event{i}" for i in range(5, 25)}
     assert len([r for r in caplog.records if "overflow" in r.message]) == 1
 
 
@@ -192,7 +200,7 @@ def test_selection_includes_encrypted_and_logs_limited(caplog):
     data = batch([event(0, kind="m.room.encrypted"), event(1, 3601)])
     data["rooms"]["join"][ROOM]["timeline"]["limited"] = True
     with caplog.at_level(logging.INFO):
-        assert select_catch_up_ids(data, NOW, 3600) == {"$event0"}
+        assert select_catch_up_ids(data, NOW, 3600, saved_at=NOW - 120, user_id=USER) == {"$event0"}
     assert len([r for r in caplog.records if "limited" in r.message and ROOM in r.message]) == 1
 
 
@@ -206,8 +214,113 @@ async def test_persistent_store_skips_unchanged_and_bad_files(harness, tmp_path)
     await store.put_next_batch("s1")
     assert path.stat().st_mtime_ns == before.st_mtime_ns
     assert await store.get_next_batch() == "s1"
-    assert load_since(tmp_path, USER) == "s1"
+    assert load_since(tmp_path, USER) == ("s1", NOW)
     assert load_since(tmp_path, "@other:example.org") is None
     for raw in ("invalid", "[]", "{}", '{"user_id": "@bot:example.org", "next_batch": 3}'):
         path.write_text(raw)
         assert load_since(tmp_path, USER) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["write_text", "replace"])
+async def test_checkpoint_failure_advances_and_dispatches_once_per_streak(harness, monkeypatch, caplog, failure):
+    from plugins.platforms.matrix import catch_up
+    make, clients = harness
+    adapter, store, home = make(3600, check_checkpoint=False)
+    seed(store)
+    await connect(adapter, home)
+    client = clients[-1]
+    adapter._client = client
+    target = Path if failure == "write_text" else catch_up.os
+    original = getattr(target, failure)
+    with caplog.at_level(logging.WARNING):
+        monkeypatch.setattr(target, failure, MagicMock(side_effect=OSError("read-only fixture")))
+        for i in (2, 3):
+            assert await adapter._absorb_sync(client, batch([event(i, 1)], f"s{i}")) == f"s{i}"
+            assert await client.sync_store.get_next_batch() == f"s{i}"
+        assert delivered(adapter) == {"$event2", "$event3"}
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert str(store / "sync_token.json") in warnings[0].message
+        assert "restart may miss messages" in warnings[0].message
+        monkeypatch.setattr(target, failure, original)
+        await adapter._absorb_sync(client, batch([event(4, 1)], "s4"))
+        monkeypatch.setattr(target, failure, MagicMock(side_effect=OSError("read-only fixture")))
+        await adapter._absorb_sync(client, batch([event(5, 1)], "s5"))
+    assert delivered(adapter) == {f"$event{i}" for i in (2, 3, 4, 5)}
+    assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 2
+
+
+@pytest.mark.asyncio
+async def test_own_join_room_history_not_exempt(harness):
+    make, _ = harness
+    data = batch([event(0), event(1)])
+    data["rooms"]["join"][ROOM]["timeline"]["events"].append({
+        "event_id": "$join", "type": "m.room.member", "state_key": USER,
+        "sender": USER, "origin_server_ts": (NOW - 70) * 1000,
+        "content": {"membership": "join"}})
+    adapter, store, home = make(3600, [data])
+    seed(store)
+    await connect(adapter, home)
+    assert delivered(adapter) == {"$event1"}
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_time_excludes_already_synced_history(harness):
+    make, _ = harness
+    adapter, store, home = make(3600, [batch([event(0, 180), event(1), event(2, 125), event(3, 126)])])
+    seed(store)
+    await connect(adapter, home)
+    assert delivered(adapter) == {"$event1", "$event2"}  # checkpoint - 5s is inclusive
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("saved_at", [None, "missing", "bad", True])
+async def test_checkpoint_without_numeric_time_falls_back(harness, saved_at):
+    make, clients = harness
+    adapter, store, home = make(3600, [batch([event(0)])])
+    seed(store, saved_at=saved_at)
+    if saved_at == "missing":
+        (store / "sync_token.json").write_text(json.dumps({"user_id": USER, "next_batch": "s0"}))
+    await connect(adapter, home)
+    clients[-1].sync.assert_awaited_once_with(timeout=10000, full_state=True)
+    assert delivered(adapter) == set()
+
+
+@pytest.mark.asyncio
+async def test_since_reconnect_replaces_stale_joined_rooms(harness):
+    make, _ = harness
+    adapter, store, home = make(3600)
+    seed(store)
+    adapter._joined_rooms.add("!left:example.org")
+    await connect(adapter, home)
+    assert "!left:example.org" not in adapter._joined_rooms
+    assert {ROOM, QUIET} <= adapter._joined_rooms
+
+
+@pytest.mark.asyncio
+async def test_overall_cap_keeps_newest_hundred(harness, caplog):
+    make, _ = harness
+    data = {"next_batch": "s1", "rooms": {"join": {
+        f"!room{r}:example.org": {"timeline": {"events": [
+            event(r * 20 + i, 130 - (r * 20 + i)) for i in range(20)]}}
+        for r in range(6)}}}
+    adapter, store, home = make(3600, [data])
+    seed(store, saved_at=NOW - 200)
+    with caplog.at_level(logging.INFO):
+        await connect(adapter, home)
+    assert adapter._handle_text_message.await_count == 100
+    assert delivered(adapter) == {f"$event{i}" for i in range(20, 120)}
+    assert len([r for r in caplog.records if "overflow" in r.message]) == 1
+
+
+@pytest.mark.asyncio
+async def test_own_messages_do_not_consume_room_cap(harness):
+    make, _ = harness
+    own = [dict(event(i, 50 - i), sender=USER) for i in range(25)]
+    data = {"next_batch": "s1", "rooms": {"join": {
+        ROOM: {"timeline": {"events": [event("human", 100), *own]}}}}}
+    adapter, store, home = make(3600, [data])
+    seed(store)
+    await connect(adapter, home)
+    assert delivered(adapter) == {"$eventhuman"}
