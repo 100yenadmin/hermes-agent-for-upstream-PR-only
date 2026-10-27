@@ -43,12 +43,10 @@ def chat_oauth(monkeypatch):
     monkeypatch.setattr(mcp_oauth, "_start_loopback_receiver", receiver)
     monkeypatch.setattr(mcp_oauth, "run_worker", worker)
     mcp._LATE_ATTEMPTS.clear()
-    mcp._CHAT_PARKED.clear()
     mcp_oauth._ACTIVE.clear()
     mcp_oauth_sessions._sessions.clear()
     yield home, listeners
     mcp._LATE_ATTEMPTS.clear()
-    mcp._CHAT_PARKED.clear()
     mcp_oauth._ACTIVE.clear()
     mcp_oauth_sessions._sessions.clear()
 
@@ -231,47 +229,3 @@ def test_attempt_without_auth_url_has_no_callback_guidance():
     runner = SimpleNamespace(backend=SimpleNamespace(public_base=None),
                              work={"reports": SimpleNamespace(attempt=attempt)})
     assert mcp._chat_oauth_note(runner) == mcp.NO_CARD_NOTE
-
-
-@pytest.mark.parametrize("status", ["authorization_required", "approved", "error", "cancelled"])
-@pytest.mark.parametrize("expired", [True, False])
-def test_chat_parking_prunes_only_expired_finished_chat_attempts(chat_oauth, status, expired):
-    from tools.mcp_dashboard_oauth import DashboardOAuthFlow
-
-    def attempt(flow_id):
-        flow = DashboardOAuthFlow(flow_id=flow_id, server_name=flow_id, profile=None,
-                                  hermes_home=str(chat_oauth[0]), redirect_uri="")
-        flow.status = "authorization_required"
-        if status == "approved":
-            flow.mark_approved()
-        elif status in {"error", "cancelled"}:
-            flow.mark_error("fixture ended", cancelled=status == "cancelled")
-        return mcp_oauth.OAuthAttempt(auth_url="", flow=flow)
-
-    parked_at = time.time() - (mcp._CHAT_PARK_SECONDS + 1 if expired else 60)
-    chat_key, card_key = ("abandoned-profile", "chat-session"), ("abandoned-profile", "card-session")
-    chat_attempt, card_attempt = attempt("old"), attempt("card")
-    mcp._LATE_ATTEMPTS[chat_key] = {"old": chat_attempt}
-    mcp._CHAT_PARKED[chat_key] = {"old": (chat_attempt, parked_at)}
-    # A card entry is never pruned, however old its flow is.
-    card_attempt.flow.created_at = time.time() - 10 * mcp._CHAT_PARK_SECONDS
-    mcp._LATE_ATTEMPTS[card_key] = {"card": card_attempt}
-    _connect()
-    assert (chat_key in mcp._LATE_ATTEMPTS) == (not expired or status == "authorization_required")
-    assert mcp._LATE_ATTEMPTS[card_key] == {"card": card_attempt}
-    assert "reports" in mcp._LATE_ATTEMPTS[(hermes_home_key(), "chat")]
-
-
-def test_chat_prune_skips_attempts_adopted_or_replaced_since(chat_oauth):
-    from tools.mcp_dashboard_oauth import DashboardOAuthFlow
-
-    flow = DashboardOAuthFlow(flow_id="x", server_name="x", profile=None,
-                              hermes_home=str(chat_oauth[0]), redirect_uri="")
-    flow.mark_approved()
-    stale, replacement = mcp_oauth.OAuthAttempt(auth_url="", flow=flow), mcp_oauth.OAuthAttempt(auth_url="", flow=flow)
-    key = ("profile", "session")
-    mcp._CHAT_PARKED[key] = {"x": (stale, 0.0)}
-    mcp._LATE_ATTEMPTS[key] = {"x": replacement}  # a card start replaced the chat attempt
-    _connect()
-    assert mcp._LATE_ATTEMPTS[key] == {"x": replacement}
-    assert key not in mcp._CHAT_PARKED
