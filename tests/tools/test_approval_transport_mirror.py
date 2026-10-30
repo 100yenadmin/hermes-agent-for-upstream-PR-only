@@ -127,6 +127,22 @@ def test_transport_once_shares_request_and_settles_builtin_once(mirror, async_pr
     assert approval.resolve_gateway_approval(SESSION, "deny", request_id=requests[0].request_id) == 0
 
 
+def test_transport_waits_the_timeout_captured_for_the_request(mirror):
+    requests = []
+
+    def notify(data):
+        mirror.configure(timeout=7)  # edited while the prompt is being published
+
+    def present(request):
+        requests.append(request)
+        return request.respond("deny")
+
+    mirror.register(present)
+    thread, outcome = mirror.start(notify)
+    assert _done(thread, outcome)["choice"] == "deny"
+    assert requests[0].timeout_seconds == 2
+
+
 def test_builtin_first_interrupts_transport_and_discards_late_answer(mirror):
     presented, returned, release = threading.Event(), threading.Event(), threading.Event()
     mirror.releases.append(release)

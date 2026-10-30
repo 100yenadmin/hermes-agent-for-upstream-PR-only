@@ -85,7 +85,8 @@ def start_mirror(session_key, entry):
             session_key=session_key, surface=entry.surface,
             allow_session=data.get("allow_session", False),
             allow_permanent=data.get("allow_permanent", False),
-            timeout_seconds=_ctx._get_approval_timeout(), request_id=data["request_id"],
+            # The timeout the built-in wait captured, so a config edit mid-request cannot split the two.
+            timeout_seconds=data.get("timeout_s") or _ctx._get_approval_timeout(), request_id=data["request_id"],
         )
         spawn_context_thread(_run_mirror, name=f"approval-mirror-{request.request_id[:8]}",
                              args=(session_key, entry, registered, request)).start()
