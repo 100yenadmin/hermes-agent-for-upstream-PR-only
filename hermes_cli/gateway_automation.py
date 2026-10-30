@@ -105,8 +105,9 @@ class GatewayGoalManager(_Remote):
     def pause(self, reason="user-paused"):
         return self._rpc("pause", reason=reason)
 
-    def resume(self, *, reset_budget=True):
-        return self._rpc("resume", reset_budget=reset_budget)
+    def resume(self, *, reset_budget=True, max_turns=None):
+        kwargs = {"max_turns": max_turns} if max_turns is not None else {}
+        return self._rpc("resume", reset_budget=reset_budget, **kwargs)
 
     def clear(self):
         self._rpc("clear")
