@@ -208,18 +208,6 @@ def _refuse_introduced_json_constant(path: str, content: str,
         "string instead and retry."))
 
 
-def _batch_already_applied(content: str, edits: list) -> bool:
-    """A re-sent batch: no edit still matches ``content`` (fuzzy matching included, so a whitespace variant
-    of an old string is not taken for applied) and each passes the single-edit already-applied check."""
-    from tools.fuzzy_match import fuzzy_find_and_replace, is_already_applied
-    for edit in edits:
-        old, new = edit["old_string"], edit["new_string"]
-        _, count, _, error = fuzzy_find_and_replace(content, old, new, edit.get("replace_all", False))
-        if (count and not error) or not is_already_applied(content, old, new):
-            return False
-    return True
-
-
 class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
     """File operations over any terminal backend exposing ``execute(command, cwd)``
     returning ``{"output": str, "returncode": int}``.
@@ -1678,10 +1666,8 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
                 new_content, old_string, new_string, edit.get("replace_all", False), correction_notes=correction_notes)
             if error or match_count == 0:
                 result = self._no_match_result(path, new_content, old_string, new_string, match_count, error)
-                if multi and _batch_already_applied(content, edits):
-                    return PatchResult(success=True, no_change=True, note=(
-                        f"File already contains every edit's target text; the batch appears to be already "
-                        f"applied to {path}. No write performed; do not re-send this patch."))
+                # No already-applied shortcut for a batch: without the pre-batch file a re-send cannot be told
+                # from a batch with an edit still pending, and a false success is worse than a re-read.
                 if multi:
                     return PatchResult(error=f"edit {i} of {len(edits)}: {result.error or error}")
                 return result

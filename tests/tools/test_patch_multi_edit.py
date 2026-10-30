@@ -168,7 +168,7 @@ def test_unknown_mode_still_fails(target):
     assert path.read_bytes() == b"alpha\nbravo\n"
 
 
-def test_resent_batch_is_a_no_change_success(target, monkeypatch):
+def test_resent_batch_fails_without_writing(target, monkeypatch):
     path, ops = target
     edits = [{"old_string": "alpha", "new_string": "omega first"},
              {"old_string": "bravo", "new_string": "omega second"}]
@@ -177,26 +177,24 @@ def test_resent_batch_is_a_no_change_success(target, monkeypatch):
     writer = Mock(wraps=ops.write_file)
     monkeypatch.setattr(ops, "write_file", writer)
     result = call_patch(path, edits=edits)
-    assert result["success"] and result["no_change"] and not result.get("error"), result
-    assert "already applied" in result["note"]
+    assert result["error"].startswith("edit 1 of 2:"), result
     assert path.read_bytes() == after
     writer.assert_not_called()
-    # Only a wholly present batch is a no-op; a missing edit still fails, naming the first unmatched one.
-    partial = call_patch(path, edits=[edits[0], {"old_string": "missing anchor", "new_string": "no"}])
-    assert partial["error"].startswith("edit 1 of 2:"), partial
 
 
-def test_edit_that_still_matches_is_not_taken_for_applied(target):
+@pytest.mark.parametrize("content,replace_all", [
+    (b"first completed\nsetting  = 0\nsetting = 1\n", True),  # edit 2 still fuzzy-matches
+    (b"first completed\nsetting  = 0\nsetting  = 0\nsetting = 1\n", False),  # edit 2 is ambiguous
+])
+def test_batch_with_a_pending_edit_is_never_reported_applied(target, content, replace_all):
     path, _ = target
-    path.write_bytes(b"first completed\nsetting  = 0\nsetting = 1\n")
-    before = path.read_bytes()
-    # Edit 2's text is already present AND its old text still fuzzy-matches the double-spaced line.
+    path.write_bytes(content)
     result = call_patch(path, edits=[
         {"old_string": "zzzzzzzz", "new_string": "first completed"},
-        {"old_string": "setting = 0", "new_string": "setting = 1", "replace_all": True},
+        {"old_string": "setting = 0", "new_string": "setting = 1", "replace_all": replace_all},
     ])
     assert result["error"].startswith("edit 1 of 2:"), result
-    assert path.read_bytes() == before
+    assert path.read_bytes() == content
 
 
 @pytest.mark.parametrize("blank", [
