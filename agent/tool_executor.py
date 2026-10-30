@@ -748,7 +748,7 @@ def _dispatch_authorized_once(
         if guardrail_decision.allows_execution:
             guardrail_decision = None
     elif block_error_type == "tool_scope_block":
-        guardrail_decision = agent._tool_guardrails.before_call(*_bridge_rejection_target(ref.name, ref.args))
+        guardrail_decision = agent._tool_guardrails.before_call(*_bridge_rejection_target(ref.name, ref.args), loop_caps=False)
         if guardrail_decision.allows_execution:
             guardrail_decision = None
         else:

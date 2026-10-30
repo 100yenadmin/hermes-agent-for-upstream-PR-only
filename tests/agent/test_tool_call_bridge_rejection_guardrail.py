@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 
+from agent.tool_guardrails import LoopCapConfig, ToolCallGuardrailConfig, ToolCallGuardrailController
 from tests.agent.test_tool_call_guardrail_runtime import _make_agent, _mock_tool_call
 from tools.registry import registry
 
@@ -18,19 +19,20 @@ TOOL = "mcp_bridge_guardrail_probe"
 def deferred_tool(monkeypatch, request):
     calls = []
     tool_name = getattr(request, "param", TOOL)
+    argument = "query" if tool_name == "web_search" else "value"
     schema = {
         "name": tool_name,
         "description": "Deferred loop-guard probe",
         "parameters": {
             "type": "object",
-            "properties": {"value": {"type": "string"}},
-            "required": ["value"],
+            "properties": {argument: {"type": "string"}},
+            "required": [argument],
         },
     }
 
     def handler(args, **kwargs):
         calls.append(dict(args))
-        return json.dumps({"ok": args["value"]})
+        return json.dumps({"ok": args[argument]})
 
     monkeypatch.setattr(
         "model_tools.get_tool_definitions",
@@ -178,3 +180,47 @@ def test_plugin_blocks_stay_unobserved(deferred_tool, concurrent):
     assert len(messages) == 5
     assert all("plugin policy" in message["content"] for message in messages)
     assert all("repeated_exact_failure_warning" not in message["content"] for message in messages)
+
+
+def test_before_call_without_loop_caps_neither_spends_nor_meets_search_cap():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(loop_caps=LoopCapConfig(max_web_searches=1))
+    )
+    args = {"query": "x"}
+
+    assert controller.before_call("web_search", args, loop_caps=False).allows_execution
+    assert controller._turn_web_search_count == 0
+    assert controller.before_call("web_search", args).allows_execution
+    assert controller._turn_web_search_count == 1
+    assert controller.before_call("web_search", args, loop_caps=False).allows_execution
+    assert controller._turn_web_search_count == 1
+    assert controller.halt_decision is None
+
+    decision = controller.before_call("web_search", args)
+    assert decision.code == "loop_web_search_cap"
+    assert decision.should_halt
+    assert controller._turn_web_search_count == 1
+
+
+@pytest.mark.parametrize("deferred_tool", ["web_search"], indirect=True)
+def test_attended_rejected_search_preserves_cap_for_corrected_call(deferred_tool, monkeypatch):
+    config = {
+        "tools": {"tool_search": {"defer": ["web_search"]}},
+        "tool_loop_guardrails": {"loop_caps": {"max_web_searches": 1}},
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
+    agent = _make_agent(
+        "tool_call", "web_search", platform="cli", config=config,
+    )
+    messages = []
+
+    _execute(agent, messages, ["missing-query"], tool_name="web_search")
+    assert "missing required argument(s): query" in messages[-1]["content"]
+    assert deferred_tool == []
+    _execute(agent, messages, ["corrected-query"], tool_name="web_search", args={"query": "x"})
+
+    assert deferred_tool == [{"query": "x"}]
+    assert json.dumps({"ok": "x"}) in messages[-1]["content"]
+    assert all("loop_web_search_cap" not in message["content"] for message in messages)
+    assert agent._tool_guardrails._turn_web_search_count == 1
+    assert agent._tool_guardrail_halt_decision is None
