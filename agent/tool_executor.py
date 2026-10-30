@@ -747,11 +747,17 @@ def _dispatch_authorized_once(
         guardrail_decision = agent._tool_guardrails.before_call(ref.name, ref.args)
         if guardrail_decision.allows_execution:
             guardrail_decision = None
+    elif block_error_type == "tool_scope_block":
+        guardrail_decision = agent._tool_guardrails.before_call(*_bridge_rejection_target(ref.name, ref.args))
+        if guardrail_decision.allows_execution:
+            guardrail_decision = None
+        else:
+            block_body = None
 
     if block_body is not None or guardrail_decision is not None:
         _advance_start_order()
         state.blocked = True
-        state.bridge_rejected = block_error_type == "tool_scope_block"
+        state.bridge_rejected = block_error_type == "tool_scope_block" and guardrail_decision is None
         return _blocked_tool_result(
             agent, ref,
             block_body=block_body, block_error_type=block_error_type, guardrail_decision=guardrail_decision,

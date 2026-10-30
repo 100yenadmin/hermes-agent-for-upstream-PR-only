@@ -15,10 +15,11 @@ TOOL = "mcp_bridge_guardrail_probe"
 
 
 @pytest.fixture
-def deferred_tool(monkeypatch):
+def deferred_tool(monkeypatch, request):
     calls = []
+    tool_name = getattr(request, "param", TOOL)
     schema = {
-        "name": TOOL,
+        "name": tool_name,
         "description": "Deferred loop-guard probe",
         "parameters": {
             "type": "object",
@@ -31,19 +32,20 @@ def deferred_tool(monkeypatch):
         calls.append(dict(args))
         return json.dumps({"ok": args["value"]})
 
-    registry.register(TOOL, "mcp-bridge-guardrail-probe", schema, handler)
     monkeypatch.setattr(
         "model_tools.get_tool_definitions",
         lambda **kwargs: [{"type": "function", "function": schema}],
     )
-    yield calls
-    registry.deregister(TOOL)
+    with patch.dict(registry._tools):
+        registry.register(tool_name, "mcp-bridge-guardrail-probe", schema, handler, override=True)
+        yield calls
+        registry.deregister(tool_name)
 
 
-def _execute(agent, messages, call_ids, *, args=None, concurrent=False):
+def _execute(agent, messages, call_ids, *, args=None, concurrent=False, tool_name=TOOL):
     calls = [
         _mock_tool_call(
-            "tool_call", json.dumps({"name": TOOL, "arguments": args or {}}), call_id,
+            "tool_call", json.dumps({"name": tool_name, "arguments": args or {}}), call_id,
         )
         for call_id in call_ids
     ]
@@ -90,6 +92,29 @@ def test_attended_rejection_keeps_schema_and_appends_warning(deferred_tool):
     assert deferred_tool == []
 
 
+@pytest.mark.parametrize("deferred_tool", ["process_manage"], indirect=True)
+@pytest.mark.parametrize("platform", ["telegram", "cli"])
+def test_rejected_poller_replay_obeys_surface_hard_stop(deferred_tool, platform):
+    agent = _make_agent("tool_call", "process_manage", platform=platform)
+    messages = []
+    with patch.object(agent, "_append_guardrail_observation", wraps=agent._append_guardrail_observation) as observe:
+        for index in range(6):
+            _execute(agent, messages, [f"poll-{index}"], tool_name="process_manage")
+
+    assert deferred_tool == []
+    assert len(messages) == 6
+    if platform == "telegram":
+        assert "repeated_exact_failure_block" in messages[-1]["content"]
+        assert agent._tool_guardrail_halt_decision.code == "repeated_exact_failure_block"
+        assert agent._tool_guardrail_halt_decision.tool_name == "process_manage"
+        assert observe.call_count == 5
+    else:
+        assert "repeated_exact_failure_warning" in messages[-1]["content"]
+        assert "repeated_exact_failure_block" not in messages[-1]["content"]
+        assert agent._tool_guardrail_halt_decision is None
+        assert observe.call_count == 6
+
+
 def test_concurrent_rejections_observed_on_main_thread_in_call_order(deferred_tool):
     agent = _make_agent("tool_call", TOOL, platform="cron")
     messages, observations = [], []
@@ -124,7 +149,8 @@ def test_corrected_call_resets_underlying_tool_failure_count(deferred_tool):
     messages = []
 
     for index in range(8):
-        _execute(agent, messages, [f"bad-{index}"])
+        # Distinct failures exercise per-tool reset without triggering exact replay blocking.
+        _execute(agent, messages, [f"bad-{index}"], args={"attempt": index})
         assert agent._tool_guardrails._same_tool_failure_counts == {TOOL: 1}
         _execute(agent, messages, [f"fixed-{index}"], args={"value": f"fixed-{index}"})
         assert agent._tool_guardrails._same_tool_failure_counts == {}
