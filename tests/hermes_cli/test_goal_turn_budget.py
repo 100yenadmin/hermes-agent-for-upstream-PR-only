@@ -143,6 +143,7 @@ def test_gateway_proxy_forwards_resume_budget(mgr, monkeypatch):
     ("draft ship it", True), ("--turns 60 draft ship it", True), ("--turns=60 draft ship it", True),
     ("--turns 60 Draft ship it", True), ("DRAFT ship it", True),
     ("--turns 60 ship it", False), ("--turns 0 draft ship it", False),
+    ("-- draft ship it", False), ("--turns 60 -- draft ship it", False), ("drafty ship it", False),
 ])
 def test_classic_cli_drafts_budgeted_goals_on_the_gateway(mgr, monkeypatch, arg, on_gateway):
     from hermes_cli import gateway_automation
