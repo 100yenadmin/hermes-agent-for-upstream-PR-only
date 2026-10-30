@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from agent.message_metadata import message_uid_or_none, record_absorbed_message
 from agent.message_sanitization import coalesce_tool_call_id
 from agent.model_metadata import estimate_messages_tokens_rough
 
@@ -86,8 +87,9 @@ def _ensure_compressed_keeps_last_assistant_reply(
     if index is None:
         logger.warning(
             "Compression: engine folded away the just-delivered assistant reply and the surviving tool "
-            "rounds reuse tool-call ids, so its slot cannot be located; not reinserting it (session=%s).",
-            session_id or "none",
+            "rounds reuse tool-call ids, so its slot cannot be located; not reinserting it "
+            "(session=%s, reply=%s, neighbour=tool_call).",
+            session_id or "none", message_uid_or_none(reply) or "none",
         )
         return None
     # Either neighbour already being a non-tool assistant twin means the reply is
@@ -154,8 +156,7 @@ def _absorb_into_assistant_neighbour(
     Returns True when an assistant row holds the slot (absorbed, or skipped for a reason logged
     here), False when the slot is free and the caller may insert.
     """
-    from agent.context_compressor import is_compaction_summary_message
-    from agent.conversation_compression import _message_text
+    from agent.turn_context import drop_stale_api_content
 
     pos = next(
         (
@@ -170,21 +171,15 @@ def _absorb_into_assistant_neighbour(
     if pos is None:
         return False
     neighbour = compressed[pos]
-    older_reply_texts = {
-        _message_text(message).strip()
-        for message in original_messages[:reply_pos]
-        if isinstance(message, dict) and message.get("role") == "assistant" and not message.get("tool_calls")
-    }
-    if (
-        pos != index - 1
-        or neighbour.get("tool_calls")
-        or is_compaction_summary_message(neighbour)
-        or _message_text(neighbour).strip() not in older_reply_texts
-    ):
+    reply_row = original_messages[reply_pos]
+    reply_uid = message_uid_or_none(reply_row) or "none"
+    kind = _neighbour_kind(neighbour, pos != index - 1, original_messages[:reply_pos])
+    if kind:
         logger.warning(
             "Compression: engine folded away the just-delivered assistant reply and left a non-matching "
-            "assistant row at its slot; not reinserting it to keep strict role alternation (session=%s).",
-            session_id or "none",
+            "assistant row at its slot; not reinserting it to keep strict role alternation "
+            "(session=%s, reply=%s, neighbour=%s).",
+            session_id or "none", reply_uid, kind,
         )
         return True
     if _reply_would_block_shrinking(original_messages, compressed, anchor):
@@ -196,15 +191,43 @@ def _absorb_into_assistant_neighbour(
     if not _append_text_to_row(neighbour, reply_text):
         logger.warning(
             "Compression: engine folded away the just-delivered assistant reply and the assistant row at "
-            "its slot carries no visible text to merge into; not reinserting it (session=%s).",
-            session_id or "none",
+            "its slot carries no visible text to merge into; not reinserting it "
+            "(session=%s, reply=%s, neighbour=empty).",
+            session_id or "none", reply_uid,
         )
         return True
+    drop_stale_api_content(neighbour)
+    record_absorbed_message(neighbour, reply_row)
     logger.info(
         "Compression: engine folded away the just-delivered assistant reply; merged it into the assistant "
-        "row at its slot instead of adding a peer (session=%s).", session_id or "none",
+        "row at its slot instead of adding a peer (session=%s, reply=%s).", session_id or "none", reply_uid,
     )
     return True
+
+
+def _neighbour_kind(neighbour: dict, following: bool, older_messages: list) -> Optional[str]:
+    """Name an unmergeable neighbour without changing its provider-owned replay state."""
+    from agent.agent_runtime_helpers import _is_codex_interim
+    from agent.context_compressor import is_compaction_summary_message
+    from agent.conversation_compression import _message_text
+
+    if following:
+        return "following"
+    if neighbour.get("tool_calls"):
+        return "tool_call"
+    if is_compaction_summary_message(neighbour):
+        return "summary"
+    if _is_codex_interim(neighbour):
+        return "codex"
+    older_reply_texts = {
+        _message_text(message).strip()
+        for message in older_messages
+        if isinstance(message, dict) and message.get("role") == "assistant" and not message.get("tool_calls")
+    }
+    text = _message_text(neighbour).strip()
+    if text not in older_reply_texts:
+        return "paraphrase" if text else "empty"
+    return None
 
 
 def _append_text_to_row(row: dict, text: str) -> bool:
