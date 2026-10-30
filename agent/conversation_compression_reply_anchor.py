@@ -16,6 +16,10 @@ from agent.model_metadata import estimate_messages_tokens_rough
 
 logger = logging.getLogger(__name__)
 
+# Live-only ordered carriers that replay INSTEAD of ``content`` (native Anthropic, Bedrock Converse). A merged
+# row without them replays from ``content`` and the persisted ``reasoning_details``, as its durable copy does.
+_ORDERED_REPLAY_CARRIERS = ("anthropic_content_blocks", "bedrock_content_blocks")
+
 def _ensure_compressed_keeps_last_assistant_reply(
     original_messages: list, compressed: list, *, session_id: Optional[str] = None,
 ) -> Optional[dict]:
@@ -150,12 +154,18 @@ def _absorb_into_assistant_neighbour(
     Not mergeable, and logged as before: a tool-call neighbour (that row owns an atomic call group,
     and it can sit on either side of the slot), a compaction summary row, and an assistant neighbour
     on the FOLLOWING side (nothing after the slot is older than the reply). The no-growth pre-check
-    applies here too: the text costs the tokens it would cost as a peer row, and a compaction that
-    stops shrinking is refused at the commit site.
+    applies here too, charged what the merge adds to that row: a compaction that stops shrinking is
+    refused at the commit site.
+
+    The merge lands on a copy that replaces the neighbour in ``compressed``: an engine's kept row can be
+    the live original, which must stay as stored if this compaction is refused later. The copy is
+    ``model_only`` for display, as micro-compaction's user-turn join is: both source rows stay in
+    display history, so showing the join too would paint the reply twice.
 
     Returns True when an assistant row holds the slot (absorbed, or skipped for a reason logged
     here), False when the slot is free and the caller may insert.
     """
+    from agent.context_compressor import MODEL_ONLY_DISPLAY_METADATA_KEY
     from agent.turn_context import drop_stale_api_content
 
     pos = next(
@@ -182,13 +192,8 @@ def _absorb_into_assistant_neighbour(
             session_id or "none", reply_uid, kind,
         )
         return True
-    if _reply_would_block_shrinking(original_messages, compressed, anchor):
-        logger.info(
-            "Compression: not carrying the just-delivered assistant reply into the compacted transcript; "
-            "it would stop this compaction from shrinking it (session=%s).", session_id or "none",
-        )
-        return True
-    if not _append_text_to_row(neighbour, reply_text):
+    merged = dict(neighbour)
+    if not _append_text_to_row(merged, reply_text):
         logger.warning(
             "Compression: engine folded away the just-delivered assistant reply and the assistant row at "
             "its slot carries no visible text to merge into; not reinserting it "
@@ -196,8 +201,18 @@ def _absorb_into_assistant_neighbour(
             session_id or "none", reply_uid,
         )
         return True
-    drop_stale_api_content(neighbour)
-    record_absorbed_message(neighbour, reply_row)
+    drop_stale_api_content(merged)
+    for carrier in _ORDERED_REPLAY_CARRIERS:
+        merged.pop(carrier, None)
+    merged["display_metadata"] = {**(merged.get("display_metadata") or {}), MODEL_ONLY_DISPLAY_METADATA_KEY: True}
+    if _reply_would_block_shrinking(original_messages, compressed, merged, replaced=neighbour):
+        logger.info(
+            "Compression: not carrying the just-delivered assistant reply into the compacted transcript; "
+            "it would stop this compaction from shrinking it (session=%s).", session_id or "none",
+        )
+        return True
+    record_absorbed_message(merged, reply_row)
+    compressed[pos] = merged
     logger.info(
         "Compression: engine folded away the just-delivered assistant reply; merged it into the assistant "
         "row at its slot instead of adding a peer (session=%s, reply=%s).", session_id or "none", reply_uid,
@@ -248,17 +263,20 @@ def _append_text_to_row(row: dict, text: str) -> bool:
     return False
 
 
-def _reply_would_block_shrinking(original_messages: list, compressed: list, anchor: dict) -> bool:
+def _reply_would_block_shrinking(
+    original_messages: list, compressed: list, anchor: dict, *, replaced: Optional[dict] = None,
+) -> bool:
     """True when carrying the reply would stop this compaction from shrinking the transcript.
 
     Measured with the same rough estimate as the commit-site no-growth guard and mirroring its
     comparison (it refuses only on ``>``, so exact break-even is still accepted). The estimate is a
     per-row sum, so the reply's cost is added to the candidate rather than re-estimating the whole
-    transcript.
+    transcript; a merge passes the row its ``anchor`` replaces, so only the growth of that row counts.
     """
     rough_in = estimate_messages_tokens_rough(original_messages)
     rough_out = estimate_messages_tokens_rough(compressed)
-    return rough_out < rough_in < rough_out + estimate_messages_tokens_rough([anchor])
+    added = estimate_messages_tokens_rough([anchor]) - estimate_messages_tokens_rough([replaced] if replaced else [])
+    return rough_out < rough_in < rough_out + added
 
 
 def _same_visible_content(left: dict, right: dict, right_text: str) -> bool:

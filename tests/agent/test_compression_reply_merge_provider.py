@@ -4,6 +4,9 @@ from copy import deepcopy
 
 import pytest
 
+from agent.anthropic_message_convert import _convert_assistant_message
+from agent.bedrock_adapter import _assistant_blocks
+from agent.context_compressor import MODEL_ONLY_DISPLAY_METADATA_KEY
 from agent.conversation_compression_reply_anchor import _ensure_compressed_keeps_last_assistant_reply
 from agent.message_metadata import ABSORBED_MESSAGE_UIDS, MESSAGE_UID
 from agent.turn_context import _reset_per_turn_agent_state, build_api_messages
@@ -47,12 +50,13 @@ def _request(agent, messages):
 def test_merge_records_original_reply_uid_and_keeps_survivor_identity(caplog):
     original, compressed = _merge_case()
     original[-2][ABSORBED_MESSAGE_UIDS] = ["earlier-fold"]
-    survivor = compressed[1]
 
     with caplog.at_level("INFO", logger="agent.conversation_compression_reply_anchor"):
         assert _ensure_compressed_keeps_last_assistant_reply(original, compressed) is None
 
+    survivor = compressed[1]
     assert REPLY.strip() in survivor["content"]
+    assert survivor["display_metadata"][MODEL_ONLY_DISPLAY_METADATA_KEY] is True
     assert survivor[MESSAGE_UID] == "older-reply"
     assert survivor["_row_id"] == 2
     assert survivor[ABSORBED_MESSAGE_UIDS] == ["delivered-reply", "earlier-fold"]
@@ -116,6 +120,45 @@ def test_skip_warning_identifies_neighbour_and_reply(kind, neighbour_fields, rep
     )
 
 
+def test_merge_leaves_a_shared_live_original_as_stored():
+    original, compressed = _merge_case()
+    compressed[1] = original[1]  # an engine may keep the live dict itself
+    assert _ensure_compressed_keeps_last_assistant_reply(original, compressed) is None
+    assert original[1] == {"role": "assistant", "content": "noted", MESSAGE_UID: "older-reply", "_row_id": 2}
+    assert compressed[1] is not original[1] and REPLY.strip() in compressed[1]["content"]
+
+
+THINKING = [{"type": "thinking", "thinking": "plan", "signature": "sig"}]
+
+
+@pytest.mark.parametrize(
+    ("carrier", "replay"),
+    [
+        ({"anthropic_content_blocks": [{"type": "text", "text": "noted"}]},
+         lambda m: _convert_assistant_message(m)["content"]),
+        ({"bedrock_content_blocks": [{"text": "noted"}]}, lambda m: _assistant_blocks(m, m["content"])),
+    ],
+    ids=["anthropic", "bedrock"],
+)
+def test_native_ordered_carrier_replays_the_merged_reply(carrier, replay):
+    original, compressed = _merge_case()
+    compressed[1].update(carrier, reasoning_details=THINKING)
+    assert _ensure_compressed_keeps_last_assistant_reply(original, compressed) is None
+    merged = compressed[1]
+    assert REPLY.strip() in str(replay(merged))
+    assert merged["reasoning_details"] == THINKING  # the persisted carrier the replay falls back to
+
+
+def test_merge_is_charged_its_growth_not_a_peer_row():
+    """The delivered row's reasoning never moves into the merge, so it must not count against it."""
+    original, compressed = _merge_case()
+    original[-2]["reasoning_content"] = "r" * 4000
+    compressed[0] = {"role": "user", "content": SUMMARY + " s" * 1000}
+    assert _ensure_compressed_keeps_last_assistant_reply(original, compressed) is None
+    assert REPLY.strip() in compressed[1]["content"]
+    assert "reasoning_content" not in compressed[1]
+
+
 def test_api_sidecar_merge_reaches_next_request_and_durable_active_set(tmp_path):
     fold = [
         {"role": "user", "content": SUMMARY},
@@ -147,5 +190,9 @@ def test_api_sidecar_merge_reaches_next_request_and_durable_active_set(tmp_path)
             assert "api_content" not in survivor
             assert reply_uid in survivor[ABSORBED_MESSAGE_UIDS]
             assert all(MESSAGE_UID not in m and ABSORBED_MESSAGE_UIDS not in m for m in request)
+        # Full history (the warm-switch read) shows each source row once and not the model-only join.
+        display = db.get_messages_as_conversation(session_id, include_ancestors=True, include_compacted=True)
+        assert sum(str(m.get("content", "")).count(REPLY.strip()) for m in display) == 1
+        assert sum(m.get("content") == "noted" for m in display) == 1
     finally:
         db.close()
