@@ -94,12 +94,22 @@ def test_public_rpc_keeps_the_loopback_listener_for_other_pages(public_oauth, mo
     assert public_oauth == [flow]
 
 
-def test_public_rpc_matches_the_public_url_case_port_and_slash(public_oauth, monkeypatch):
-    _listener(monkeypatch)
-    out = _start_rpc(public_callback="HTTPS://Agent.Example:443/hermes/")
+@pytest.mark.parametrize("public_url,page_base", [
+    (PUBLIC_BASE, "HTTPS://Agent.Example:443/hermes/"),
+    ("https://bücher.example/hermes", "https://xn--bcher-kva.example/hermes"),
+])
+def test_public_rpc_matches_the_public_url_case_port_slash_and_idn(public_oauth, monkeypatch, public_url, page_base):
+    _listener(monkeypatch, public_url=public_url)
+    out = _start_rpc(public_callback=page_base)
     flow = sessions._sessions[out["result"]["session_id"]]["flow"]
-    assert flow.redirect_uri == f"{PUBLIC_BASE}/api/mcp/oauth/callback/{quote(SERVER, safe='')}"
+    assert flow.redirect_uri == f"{public_url}/api/mcp/oauth/callback/{quote(SERVER, safe='')}"
     assert public_oauth == []
+
+
+def test_public_rpc_does_not_read_port_zero_as_the_default(public_oauth, monkeypatch):
+    _listener(monkeypatch)
+    out = _start_rpc(public_callback="https://agent.example:0/hermes")
+    assert sessions._sessions[out["result"]["session_id"]]["flow"].redirect_uri == "http://127.0.0.1:8412/callback"
 
 
 def test_public_rpc_refuses_client_redirect(public_oauth, monkeypatch):

@@ -62,8 +62,11 @@ def finish_flow(session_id: str) -> None:
 
 def _base_key(url: str) -> tuple:
     parts = urlsplit(url)
-    port = parts.port or {"http": 80, "https": 443}.get(parts.scheme.lower())
-    return parts.scheme.lower(), (parts.hostname or "").lower(), port, parts.path.rstrip("/")
+    port = parts.port if parts.port is not None else {"http": 80, "https": 443}.get(parts.scheme.lower())
+    host = (parts.hostname or "").lower()
+    with suppress(UnicodeError):  # browsers send a Unicode public_url host as punycode
+        host = host.encode("idna").decode("ascii")
+    return parts.scheme.lower(), host, port, parts.path.rstrip("/")
 
 
 def public_callback_base(client_redirect_uri: Optional[str], page_base: str) -> Optional[str]:
