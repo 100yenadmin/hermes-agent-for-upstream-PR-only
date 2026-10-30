@@ -264,7 +264,7 @@ def _drafts(arg):
             arg = goal_command._parse_turns(arg)[1]
         except ValueError:
             return False
-    return arg.split(None, 1)[:1] == ["draft"]
+    return [token.lower() for token in arg.split(None, 1)[:1]] == ["draft"]  # main lowercases the verb
 
 
 def dispatch_goal_command(mgr, arg, *, authorize_gate, last_user_message=None, progress=None):
