@@ -60,7 +60,7 @@ def test_public_rpc_flow_completes_through_webapp_callback(public_oauth, monkeyp
     from hermes_cli.web_routers.mcp import mcp_oauth_callback
 
     _listener(monkeypatch)
-    out = _start_rpc(public_callback=True)
+    out = _start_rpc(public_callback=PUBLIC_BASE)
     assert "error" not in out
     result = out["result"]
     assert result["ok"] is True
@@ -79,22 +79,32 @@ def test_public_rpc_flow_completes_through_webapp_callback(public_oauth, monkeyp
     assert replay.status_code == 404
 
 
-@pytest.mark.parametrize("state,public_url", [
-    ("off", PUBLIC_BASE), ("starting", PUBLIC_BASE), ("serving", None),
+@pytest.mark.parametrize("state,public_url,page_base", [
+    ("off", PUBLIC_BASE, PUBLIC_BASE), ("starting", PUBLIC_BASE, PUBLIC_BASE), ("serving", None, PUBLIC_BASE),
+    ("serving", PUBLIC_BASE, "http://192.168.1.20:9120"), ("serving", PUBLIC_BASE, "https://agent.example"),
 ])
-def test_public_rpc_without_a_public_url_keeps_the_loopback_listener(public_oauth, monkeypatch, state, public_url):
-    """LAN mode or a hostname with no webapp.public_url: the browser may be on the gateway machine."""
+def test_public_rpc_keeps_the_loopback_listener_for_other_pages(public_oauth, monkeypatch, state, public_url, page_base):
+    """No public URL (LAN mode), or a page served under another name or path: the browser may be on
+    the gateway machine, as on base."""
     _listener(monkeypatch, state=state, public_url=public_url)
-    out = _start_rpc(public_callback=True)
+    out = _start_rpc(public_callback=page_base)
     assert out["result"]["ok"] is True
     flow = sessions._sessions[out["result"]["session_id"]]["flow"]
     assert flow.redirect_uri == "http://127.0.0.1:8412/callback"
     assert public_oauth == [flow]
 
 
+def test_public_rpc_matches_the_public_url_case_port_and_slash(public_oauth, monkeypatch):
+    _listener(monkeypatch)
+    out = _start_rpc(public_callback="HTTPS://Agent.Example:443/hermes/")
+    flow = sessions._sessions[out["result"]["session_id"]]["flow"]
+    assert flow.redirect_uri == f"{PUBLIC_BASE}/api/mcp/oauth/callback/{quote(SERVER, safe='')}"
+    assert public_oauth == []
+
+
 def test_public_rpc_refuses_client_redirect(public_oauth, monkeypatch):
     _listener(monkeypatch)
-    out = _start_rpc(public_callback=True, client_redirect_uri="http://127.0.0.1:8412/callback")
+    out = _start_rpc(public_callback=PUBLIC_BASE, client_redirect_uri="http://127.0.0.1:8412/callback")
     assert out["error"]["code"] == 4001
     assert "client_redirect_uri" in out["error"]["message"]
     assert not sessions._sessions

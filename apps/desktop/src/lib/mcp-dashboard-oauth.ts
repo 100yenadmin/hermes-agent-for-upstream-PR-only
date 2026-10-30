@@ -109,7 +109,9 @@ export async function completeMcpDesktopOAuth({
       checkCancelled()
     }
 
-    const callbackParams = publicCallback ? { public_callback: true } : {}
+    // The gateway uses its public callback only when this page is served from its public URL.
+    const pageBase = `${window.location.origin}${browserBootstrap()?.basePath || ''}`
+    const callbackParams = publicCallback ? { public_callback: pageBase } : {}
     const started = await request('start', listener ? { client_redirect_uri: listener.redirectUri } : callbackParams)
     sessionId = started.session_id
     authUrl = started.auth_url

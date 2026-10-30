@@ -11,6 +11,7 @@ import threading
 import time
 from contextlib import suppress
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit
 
 from tools.connectors.mcp_oauth import (
     _validate_client_redirect_uri,
@@ -59,15 +60,23 @@ def finish_flow(session_id: str) -> None:
         _shutdown_listener(rec)
 
 
-def public_callback_base(client_redirect_uri: Optional[str]) -> Optional[str]:
-    """The serving Webapp's public address, never a client-supplied one. None when the Webapp
-    is not serving or has no ``webapp.public_url``: the loopback listener then applies, as
-    without the flag, for a browser on the gateway machine (LAN mode, a hostname)."""
+def _base_key(url: str) -> tuple:
+    parts = urlsplit(url)
+    port = parts.port or {"http": 80, "https": 443}.get(parts.scheme.lower())
+    return parts.scheme.lower(), (parts.hostname or "").lower(), port, parts.path.rstrip("/")
+
+
+def public_callback_base(client_redirect_uri: Optional[str], page_base: str) -> Optional[str]:
+    """The serving Webapp's ``webapp.public_url`` when the requesting page is served from it; the
+    page's own address is only compared, never used. None when the Webapp is not serving, has no
+    public URL, or the page is on another name (the gateway machine's LAN address, a hostname):
+    the loopback listener then applies, as without the flag."""
     from tools.connectors.mcp import _chat_public_base
 
     if client_redirect_uri is not None:
         raise ValueError("public_callback and client_redirect_uri cannot be used together")
-    return _chat_public_base()
+    public_base = _chat_public_base()
+    return public_base if public_base and _base_key(public_base) == _base_key(page_base) else None
 
 
 def start_flow(

@@ -104,7 +104,7 @@ describe('Webapp MCP public callback', () => {
     const result = await completeMcpDesktopOAuth({ serverName })
     expect(result.status).toBe('approved')
     expect(rpc).toHaveBeenCalledWith('local', 'default', 'mcp.servers.oauth.start',
-      { name: serverName, public_callback: true }, 60_000)
+      { name: serverName, public_callback: `https://agent.example${basePath}` }, 60_000)
     expect(openExternal).toHaveBeenCalledOnce()
   })
 
@@ -119,7 +119,7 @@ describe('Webapp MCP public callback', () => {
     const { rpc, openExternal } = browserHarness('http://192.168.1.20:9119', redirectUri)
     await expect(completeMcpDesktopOAuth({ serverName: 'reports' })).resolves.toMatchObject({ status: 'approved' })
     expect(rpc).toHaveBeenCalledWith('local', 'default', 'mcp.servers.oauth.start',
-      { name: 'reports', public_callback: true }, 60_000)
+      { name: 'reports', public_callback: 'http://192.168.1.20:9119' }, 60_000)
     expect(openExternal).toHaveBeenCalledOnce()
   })
 

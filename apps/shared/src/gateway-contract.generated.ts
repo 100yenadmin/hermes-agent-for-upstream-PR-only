@@ -4319,12 +4319,12 @@ export interface McpServersRemoveResult {
   ok: boolean
   removed: boolean
 }
-/** With ``client_redirect_uri`` the CLIENT hosts the loopback and relays the code via ``mcp.servers.oauth.callback``. With ``public_callback`` the redirect goes to the serving Webapp's own callback when ``webapp.public_url`` is set, else to the usual loopback. */
+/** With ``client_redirect_uri`` the CLIENT hosts the loopback and relays the code via ``mcp.servers.oauth.callback``. ``public_callback`` is the Webapp page's own base URL: when it is the serving Webapp's ``webapp.public_url`` the redirect goes to that Webapp's callback, else to the usual loopback. The gateway only compares it and never redirects to a client value. */
 export interface McpOauthStartParams {
   profile?: string | null
   name: string
   client_redirect_uri?: string | null
-  public_callback?: boolean
+  public_callback?: string | null
 }
 export interface McpOauthStartResult {
   ok: boolean

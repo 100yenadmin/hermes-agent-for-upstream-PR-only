@@ -1624,7 +1624,8 @@ def _(rid, params: dict) -> dict:
         cfg["auth"] = "oauth"
         hermes_home = str(_tools_mod("hermes_constants").get_hermes_home().expanduser().resolve(strict=False))
         sessions = _tools_mod("tui_gateway.mcp_oauth_sessions")
-        public_base = sessions.public_callback_base(client_redirect_uri) if params.get("public_callback") else None
+        page_base = _str_arg(params, "public_callback")
+        public_base = sessions.public_callback_base(client_redirect_uri, page_base) if page_base else None
         result = sessions.start_flow(
             hermes_home, name, cfg, client_redirect_uri=client_redirect_uri, public_base=public_base)
     except ValueError as e:
