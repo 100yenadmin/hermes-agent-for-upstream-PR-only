@@ -166,3 +166,33 @@ def test_unknown_mode_still_fails(target):
     assert "Unknown mode: multi_edit" in result["error"]
     assert build_edit_proposal("patch", {"path": str(path), "mode": "multi_edit", "edits": EDITS}) is None
     assert path.read_bytes() == b"alpha\nbravo\n"
+
+
+def test_resent_batch_is_a_no_change_success(target, monkeypatch):
+    path, ops = target
+    edits = [{"old_string": "alpha", "new_string": "omega first"},
+             {"old_string": "bravo", "new_string": "omega second"}]
+    assert not call_patch(path, edits=edits).get("error")
+    after = path.read_bytes()
+    writer = Mock(wraps=ops.write_file)
+    monkeypatch.setattr(ops, "write_file", writer)
+    result = call_patch(path, edits=edits)
+    assert result["success"] and result["no_change"] and not result.get("error"), result
+    assert "already applied" in result["note"]
+    assert path.read_bytes() == after
+    writer.assert_not_called()
+    # Only a wholly present batch is a no-op; a missing edit still fails, naming the first unmatched one.
+    partial = call_patch(path, edits=[edits[0], {"old_string": "missing anchor", "new_string": "no"}])
+    assert partial["error"].startswith("edit 1 of 2:"), partial
+
+
+@pytest.mark.parametrize("blank", [
+    {"old_string": "", "new_string": ""}, {"old_string": ""}, {"new_string": ""},
+])
+def test_blank_single_edit_fields_count_as_absent(target, blank):
+    path, _ = target
+    proposal = build_edit_proposal("patch", {"path": str(path), "edits": EDITS, **blank})
+    assert proposal.new_text == "omega\nbravo\n"
+    result = call_patch(path, edits=EDITS, **blank)
+    assert not result.get("error"), result
+    assert path.read_bytes() == b"omega\nbravo\n"

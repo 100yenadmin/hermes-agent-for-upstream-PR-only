@@ -109,7 +109,7 @@ def _proposal_for_patch_multi(arguments: dict[str, Any]) -> EditProposal:
     path = _required_path(arguments)
     edits = arguments["edits"]
     validate_patch_edits(edits)
-    if arguments.get("old_string") is not None or arguments.get("new_string") is not None:
+    if arguments.get("old_string") or arguments.get("new_string"):
         raise ValueError("Use edits or old_string/new_string, one or the other")
     old_text = _read_text_if_exists(path)
     if old_text is None:

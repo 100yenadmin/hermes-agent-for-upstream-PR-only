@@ -963,7 +963,7 @@ def _dispatch_patch(file_ops, mode, path, old_string, new_string, replace_all, p
             raise ValueError("path required")
         target = resolved.get(path) or path
         if edits is not None:
-            if old_string is not None or new_string is not None:
+            if old_string or new_string:  # '' is how schema-filling models leave the other shape unused
                 raise ValueError("Use edits or old_string/new_string, one or the other")
             return file_ops.patch_multi(target, edits)
         if old_string is None or new_string is None:
