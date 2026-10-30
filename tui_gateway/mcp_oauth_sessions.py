@@ -61,11 +61,13 @@ def finish_flow(session_id: str) -> None:
 
 
 def _base_key(url: str) -> tuple:
+    import idna  # an httpx dependency; UTS #46 maps a Unicode host the way browsers report it
+
     parts = urlsplit(url)
     port = parts.port if parts.port is not None else {"http": 80, "https": 443}.get(parts.scheme.lower())
     host = (parts.hostname or "").lower()
-    with suppress(UnicodeError):  # browsers send a Unicode public_url host as punycode
-        host = host.encode("idna").decode("ascii")
+    with suppress(UnicodeError):  # IPv6 literals and invalid labels compare as written
+        host = idna.encode(host, uts46=True).decode("ascii")
     return parts.scheme.lower(), host, port, parts.path.rstrip("/")
 
 

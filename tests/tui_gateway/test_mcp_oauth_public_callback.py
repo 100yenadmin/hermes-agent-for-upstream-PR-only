@@ -97,6 +97,7 @@ def test_public_rpc_keeps_the_loopback_listener_for_other_pages(public_oauth, mo
 @pytest.mark.parametrize("public_url,page_base", [
     (PUBLIC_BASE, "HTTPS://Agent.Example:443/hermes/"),
     ("https://bücher.example/hermes", "https://xn--bcher-kva.example/hermes"),
+    ("https://faß.example/hermes", "https://xn--fa-hia.example/hermes"),
 ])
 def test_public_rpc_matches_the_public_url_case_port_slash_and_idn(public_oauth, monkeypatch, public_url, page_base):
     _listener(monkeypatch, public_url=public_url)
@@ -106,9 +107,13 @@ def test_public_rpc_matches_the_public_url_case_port_slash_and_idn(public_oauth,
     assert public_oauth == []
 
 
-def test_public_rpc_does_not_read_port_zero_as_the_default(public_oauth, monkeypatch):
-    _listener(monkeypatch)
-    out = _start_rpc(public_callback="https://agent.example:0/hermes")
+@pytest.mark.parametrize("public_url,page_base", [
+    (PUBLIC_BASE, "https://agent.example:0/hermes"),  # port 0 is not the default port
+    ("https://faß.example/hermes", "https://fass.example/hermes"),  # IDNA 2003 would map ß to ss
+])
+def test_public_rpc_keeps_loopback_for_a_near_miss(public_oauth, monkeypatch, public_url, page_base):
+    _listener(monkeypatch, public_url=public_url)
+    out = _start_rpc(public_callback=page_base)
     assert sessions._sessions[out["result"]["session_id"]]["flow"].redirect_uri == "http://127.0.0.1:8412/callback"
 
 
