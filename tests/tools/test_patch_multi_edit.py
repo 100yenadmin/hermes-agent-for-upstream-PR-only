@@ -186,6 +186,19 @@ def test_resent_batch_is_a_no_change_success(target, monkeypatch):
     assert partial["error"].startswith("edit 1 of 2:"), partial
 
 
+def test_edit_that_still_matches_is_not_taken_for_applied(target):
+    path, _ = target
+    path.write_bytes(b"first completed\nsetting  = 0\nsetting = 1\n")
+    before = path.read_bytes()
+    # Edit 2's text is already present AND its old text still fuzzy-matches the double-spaced line.
+    result = call_patch(path, edits=[
+        {"old_string": "zzzzzzzz", "new_string": "first completed"},
+        {"old_string": "setting = 0", "new_string": "setting = 1", "replace_all": True},
+    ])
+    assert result["error"].startswith("edit 1 of 2:"), result
+    assert path.read_bytes() == before
+
+
 @pytest.mark.parametrize("blank", [
     {"old_string": "", "new_string": ""}, {"old_string": ""}, {"new_string": ""},
 ])
