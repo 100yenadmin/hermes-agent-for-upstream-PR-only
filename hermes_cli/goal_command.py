@@ -54,8 +54,7 @@ def _resume(mgr, arg, render):
     key, default = "gateway.goal.resumed", "▶ Goal resumed: {goal}"
     if budget is not None:
         key = "gateway.goal.resumed_budget"
-        default = ("▶ Goal resumed with a {budget}-turn budget: {goal}\n"
-                   "Continuing now — I'll take the next step right away.")
+        default = "▶ Goal resumed with a {budget}-turn budget: {goal}"  # one line, like "resumed"
     return GoalCommandResult(render(key, default, goal=state.goal, budget=state.max_turns),
                              prompt=mgr.next_continuation_prompt())
 

@@ -255,12 +255,24 @@ class GatewayHeartbeatManager(_Remote):
         return bool(self._rpc("abandon_fire"))
 
 
+def _drafts(arg):
+    """``/goal draft <text>``, also behind a valid ``--turns N`` (main's dispatcher reports a bad one)."""
+    from hermes_cli import goal_command
+    arg = (arg or "").strip()
+    if arg.startswith("--turns"):
+        try:
+            arg = goal_command._parse_turns(arg)[1]
+        except ValueError:
+            return False
+    return arg.split(None, 1)[:1] == ["draft"]
+
+
 def dispatch_goal_command(mgr, arg, *, authorize_gate, last_user_message=None, progress=None):
     """``goal_command.dispatch_goal_command`` for the classic CLI: on a gateway manager ``/goal draft``
     (its contract drafter is an auxiliary-model call) runs whole on the gateway; every other form is
     main's dispatcher over the proxy, so its output strings stay main's."""
     from hermes_cli import goal_command
-    if isinstance(mgr, GatewayGoalManager) and (arg or "").split(None, 1)[:1] == ["draft"]:
+    if isinstance(mgr, GatewayGoalManager) and _drafts(arg):
         if progress is not None:
             progress("Drafting completion contract…")
         return mgr.command(arg, last_user_message)

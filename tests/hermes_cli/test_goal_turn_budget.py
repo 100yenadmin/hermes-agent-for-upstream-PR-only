@@ -137,3 +137,37 @@ def test_gateway_proxy_forwards_resume_budget(mgr, monkeypatch):
     result = dispatch(proxy, "resume 40")
     assert "40-turn budget" in result.output
     assert mgr.state.max_turns == 40
+
+
+@pytest.mark.parametrize("arg, on_gateway", [
+    ("draft ship it", True), ("--turns 60 draft ship it", True), ("--turns=60 draft ship it", True),
+    ("--turns 60 ship it", False), ("--turns 0 draft ship it", False),
+])
+def test_classic_cli_drafts_budgeted_goals_on_the_gateway(mgr, monkeypatch, arg, on_gateway):
+    from hermes_cli import gateway_automation
+    from hermes_cli.goal_command import GoalCommandResult
+    proxy = object.__new__(gateway_automation.GatewayGoalManager)
+    proxy._state = mgr.state
+    sent = []
+    monkeypatch.setattr(proxy, "command", lambda a, last=None: sent.append(a) or GoalCommandResult("drafted"))
+    def rpc(call, *args, **kwargs):
+        proxy._state = getattr(mgr, call)(*args, **kwargs)
+        return proxy._state
+    monkeypatch.setattr(proxy, "_rpc", rpc)
+    monkeypatch.setattr(goals, "draft_contract", lambda text: pytest.fail("drafted in the CLI process"))
+    result = gateway_automation.dispatch_goal_command(proxy, arg, authorize_gate=lambda: None)
+    assert sent == ([arg] if on_gateway else [])
+    if arg == "--turns 60 ship it":
+        assert mgr.state.max_turns == 60 and not result.error
+
+
+def test_resume_budget_reply_has_one_next_step_line(mgr):
+    from agent.i18n import t
+    mgr.set("original", max_turns=2)
+    mgr.pause()
+    # CLI and TUI render the code default and print their own next-step line after it.
+    assert "\n" not in dispatch(mgr, "resume 40").output
+    mgr.pause()
+    gateway = dispatch_goal_command(mgr, "resume 40", authorize_gate=lambda: None,
+                                    render=lambda key, default, **values: t(key, **values))
+    assert gateway.output.count("Continuing now") == 1 and "40-turn budget" in gateway.output
