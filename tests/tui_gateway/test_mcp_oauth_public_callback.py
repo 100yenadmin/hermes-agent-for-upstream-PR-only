@@ -98,6 +98,7 @@ def test_public_rpc_keeps_the_loopback_listener_for_other_pages(public_oauth, mo
     (PUBLIC_BASE, "HTTPS://Agent.Example:443/hermes/"),
     ("https://bücher.example/hermes", "https://xn--bcher-kva.example/hermes"),
     ("https://faß.example/hermes", "https://xn--fa-hia.example/hermes"),
+    ("https://☃.example/hermes", "https://xn--n3h.example/hermes"),  # a symbol IDNA 2008 rejects
 ])
 def test_public_rpc_matches_the_public_url_case_port_slash_and_idn(public_oauth, monkeypatch, public_url, page_base):
     _listener(monkeypatch, public_url=public_url)

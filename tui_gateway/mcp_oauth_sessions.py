@@ -60,15 +60,23 @@ def finish_flow(session_id: str) -> None:
         _shutdown_listener(rec)
 
 
-def _base_key(url: str) -> tuple:
-    import idna  # an httpx dependency; UTS #46 maps a Unicode host the way browsers report it
+def _ascii_host(host: str) -> str:
+    """The host as a browser reports it: the UTS #46 mapping, then Punycode per label. The validity
+    checks a browser also runs only stop a URL from loading; they never change this result."""
+    import idna  # an httpx dependency
 
+    host = host.lower()
+    with suppress(UnicodeError):  # an unmappable host compares as written
+        mapped = idna.uts46_remap(host, std3_rules=False, transitional=False)
+        host = ".".join(label if label.isascii() else "xn--" + label.encode("punycode").decode("ascii")
+                        for label in mapped.split("."))
+    return host
+
+
+def _base_key(url: str) -> tuple:
     parts = urlsplit(url)
     port = parts.port if parts.port is not None else {"http": 80, "https": 443}.get(parts.scheme.lower())
-    host = (parts.hostname or "").lower()
-    with suppress(UnicodeError):  # IPv6 literals and invalid labels compare as written
-        host = idna.encode(host, uts46=True).decode("ascii")
-    return parts.scheme.lower(), host, port, parts.path.rstrip("/")
+    return parts.scheme.lower(), _ascii_host(parts.hostname or ""), port, parts.path.rstrip("/")
 
 
 def public_callback_base(client_redirect_uri: Optional[str], page_base: str) -> Optional[str]:
