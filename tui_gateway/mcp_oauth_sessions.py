@@ -59,9 +59,22 @@ def finish_flow(session_id: str) -> None:
         _shutdown_listener(rec)
 
 
+def public_callback_base(client_redirect_uri: Optional[str]) -> str:
+    """Resolve only the serving Webapp's address, never a client-supplied public URI."""
+    from tools.connectors.mcp import _chat_public_base
+
+    if client_redirect_uri is not None:
+        raise ValueError("public_callback and client_redirect_uri cannot be used together")
+    public_base = _chat_public_base()
+    if public_base is None:
+        raise ValueError("For public callbacks, enable the Webapp and set webapp.public_url")
+    return public_base
+
+
 def start_flow(
     hermes_home: str, server_name: str, cfg: dict, *, reconnect_live: bool = False,
-    url_timeout: float = 30.0, client_redirect_uri: Optional[str] = None) -> dict[str, Any]:
+    url_timeout: float = 30.0, client_redirect_uri: Optional[str] = None,
+    public_base: Optional[str] = None) -> dict[str, Any]:
     """Begin an MCP OAuth flow and return ``{session_id, auth_url, flow}``; blocks up to
     ``url_timeout`` for the authorization URL. With ``client_redirect_uri`` (invalid values
     raise ``ValueError``) no gateway-side listener is bound."""
@@ -83,7 +96,7 @@ def start_flow(
     flow = DashboardOAuthFlow(
         flow_id=session_id, server_name=server_name, profile=None, hermes_home=hermes_home,
         redirect_uri="", reconnect_live=reconnect_live)
-    httpd = choose_callback_receiver(flow, cfg, client_redirect_uri)
+    httpd = choose_callback_receiver(flow, cfg, client_redirect_uri, public_base=public_base)
     rec = register_flow(flow, httpd=httpd)
     threading.Thread(
         target=run_worker, args=(hermes_home, server_name, dict(cfg), reconnect_live),

@@ -94,6 +94,11 @@ on your next message, without confirming again. Without it, the link only
 completes in a browser on the gateway machine. Providers with a pinned loopback
 redirect still require that local browser.
 
+In the Webapp, an MCP server's **Authenticate** button also works from a remote
+browser when the serving gateway has `webapp.public_url` set to the Webapp's
+public address (including any reverse-proxy path prefix). Sign-in returns to
+that Webapp's public callback instead of a loopback listener on the gateway.
+
 ```bash
 hermes mcp                   # interactive picker (default)
 hermes mcp catalog           # plain-text list, scriptable

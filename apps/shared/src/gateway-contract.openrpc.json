@@ -22614,6 +22614,11 @@
             ],
             "default": null,
             "title": "Client Redirect Uri"
+          },
+          "public_callback": {
+            "default": false,
+            "title": "Public Callback",
+            "type": "boolean"
           }
         },
         "required": [

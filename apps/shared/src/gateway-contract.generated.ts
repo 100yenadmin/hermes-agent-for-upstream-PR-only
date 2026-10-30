@@ -4324,6 +4324,7 @@ export interface McpOauthStartParams {
   profile?: string | null
   name: string
   client_redirect_uri?: string | null
+  public_callback?: boolean
 }
 export interface McpOauthStartResult {
   ok: boolean

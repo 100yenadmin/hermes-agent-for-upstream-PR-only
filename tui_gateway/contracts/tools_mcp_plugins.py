@@ -510,6 +510,7 @@ class McpOauthStartParams(McpServerNameParams):
     ``mcp.servers.oauth.callback``."""
 
     client_redirect_uri: str | None = None
+    public_callback: bool = False
 
 
 class McpOauthStartResult(Result):

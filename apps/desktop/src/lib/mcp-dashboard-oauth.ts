@@ -1,7 +1,9 @@
 import { capabilityScoped, type ProfileScope } from '@/api/client'
 import { type McpOAuthFlow, mcpOAuthRpc } from '@/api/mcp'
 
+import { browserBootstrap } from './browser-transport'
 import { isMissingRpcMethod } from './gateway-rpc'
+import { isBrowserHostedDesktop } from './platform'
 
 interface CompleteOptions {
   serverName: string
@@ -32,8 +34,13 @@ export class McpOAuthCancelled extends Error {
 const defaultSleep = (milliseconds: number) => new Promise<void>(resolve => window.setTimeout(resolve, milliseconds))
 const UPDATE_BACKEND = 'Update the Hermes backend to support Desktop MCP OAuth callbacks.'
 
-/** Remote gateways require the Desktop callback bridge. An explicitly local
- *  gateway can host its own loopback listener when that capability is absent. */
+function isGatewayLoopbackCallback(redirect: URL): boolean {
+  return redirect.protocol === 'http:' && redirect.hostname === '127.0.0.1' &&
+    Boolean(redirect.port) && Number(redirect.port) !== 0 && redirect.pathname === '/callback' &&
+    !redirect.username && !redirect.password && !redirect.search && !redirect.hash
+}
+
+/** Native clients relay through their bridge; remote Webapp tabs use their public callback. */
 export async function completeMcpDesktopOAuth({
   serverName,
   profile,
@@ -46,6 +53,9 @@ export async function completeMcpDesktopOAuth({
   const scope = capabilityScoped(profile)
   const rpc = mcpOAuthRpc(scope)
   const bridge = window.hermesDesktop.mcpOauth
+
+  const publicCallback = !bridge && isBrowserHostedDesktop() &&
+    !['127.0.0.1', 'localhost', '::1', '[::1]'].includes(window.location.hostname)
 
   // A legacy null connection can resolve to a remote registry primary.
   if (!bridge && scope.connectionId !== 'local') {
@@ -83,7 +93,8 @@ export async function completeMcpDesktopOAuth({
       checkCancelled()
     }
 
-    const started = await request('start', listener ? { client_redirect_uri: listener.redirectUri } : {})
+    const callbackParams = publicCallback ? { public_callback: true } : {}
+    const started = await request('start', listener ? { client_redirect_uri: listener.redirectUri } : callbackParams)
     sessionId = started.session_id
     authUrl = started.auth_url
     // Start may have created a flow while the user cancelled. Keep its id so
@@ -102,21 +113,18 @@ export async function completeMcpDesktopOAuth({
       throw new Error(UPDATE_BACKEND)
     }
 
-    if (!listener) {
+    if (publicCallback) {
+      const redirect = new URL(redirectUri || '')
+      const expectedPath = `${browserBootstrap()?.basePath || ''}/api/mcp/oauth/callback/${serverName}`
+
+      if (redirect.origin !== window.location.origin || decodeURIComponent(redirect.pathname) !== expectedPath) {
+        throw new Error('OAuth server did not provide this Webapp\'s public callback URL')
+      }
+    } else if (!listener) {
       // Match the existing backend-hosted listener, not an arbitrary local URL.
       const redirect = new URL(redirectUri || '')
 
-      if (
-        redirect.protocol !== 'http:' ||
-        redirect.hostname !== '127.0.0.1' ||
-        !redirect.port ||
-        Number(redirect.port) === 0 ||
-        redirect.pathname !== '/callback' ||
-        redirect.username ||
-        redirect.password ||
-        redirect.search ||
-        redirect.hash
-      ) {
+      if (!isGatewayLoopbackCallback(redirect)) {
         throw new Error('OAuth server did not provide a local loopback callback URL')
       }
     }
