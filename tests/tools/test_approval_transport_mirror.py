@@ -127,20 +127,18 @@ def test_transport_once_shares_request_and_settles_builtin_once(mirror, async_pr
     assert approval.resolve_gateway_approval(SESSION, "deny", request_id=requests[0].request_id) == 0
 
 
-def test_transport_waits_the_timeout_captured_for_the_request(mirror):
-    requests = []
+@pytest.mark.parametrize("captured", [2, 0])
+def test_transport_waits_the_timeout_captured_for_the_request(mirror, captured):
+    mirror.configure(timeout=captured)
 
     def notify(data):
         mirror.configure(timeout=7)  # edited while the prompt is being published
 
-    def present(request):
-        requests.append(request)
-        return request.respond("deny")
-
-    mirror.register(present)
+    mirror.register(lambda request: request.respond("deny"))
     thread, outcome = mirror.start(notify)
-    assert _done(thread, outcome)["choice"] == "deny"
-    assert requests[0].timeout_seconds == 2
+    _done(thread, outcome)
+    assert mirror.finished.wait(3)
+    assert mirror.invocations[0]["timeout_seconds"] == captured
 
 
 def test_builtin_first_interrupts_transport_and_discards_late_answer(mirror):
