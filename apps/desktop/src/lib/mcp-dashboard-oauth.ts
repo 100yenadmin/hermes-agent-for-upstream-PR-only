@@ -40,6 +40,22 @@ function isGatewayLoopbackCallback(redirect: URL): boolean {
     !redirect.username && !redirect.password && !redirect.search && !redirect.hash
 }
 
+/** This Webapp's own callback: its origin and base path, then the server's name. */
+function isWebappPublicCallback(redirect: URL, serverName: string): boolean {
+  const prefix = new URL(`${browserBootstrap()?.basePath || ''}/api/mcp/oauth/callback/`, window.location.origin).pathname
+
+  if (redirect.origin !== window.location.origin || !redirect.pathname.startsWith(prefix) ||
+    redirect.username || redirect.password || redirect.search || redirect.hash) {
+    return false
+  }
+
+  try {
+    return decodeURIComponent(redirect.pathname.slice(prefix.length)) === serverName
+  } catch {
+    return false
+  }
+}
+
 /** Native clients relay through their bridge; remote Webapp tabs use their public callback. */
 export async function completeMcpDesktopOAuth({
   serverName,
@@ -113,19 +129,13 @@ export async function completeMcpDesktopOAuth({
       throw new Error(UPDATE_BACKEND)
     }
 
-    if (publicCallback) {
-      const redirect = new URL(redirectUri || '')
-      const expectedPath = `${browserBootstrap()?.basePath || ''}/api/mcp/oauth/callback/${serverName}`
-
-      if (redirect.origin !== window.location.origin || decodeURIComponent(redirect.pathname) !== expectedPath) {
-        throw new Error('OAuth server did not provide this Webapp\'s public callback URL')
-      }
-    } else if (!listener) {
-      // Match the existing backend-hosted listener, not an arbitrary local URL.
+    if (!listener) {
+      // Match the existing backend-hosted listener, not an arbitrary local URL. A gateway
+      // without webapp.public_url keeps it for a public-callback request too.
       const redirect = new URL(redirectUri || '')
 
-      if (!isGatewayLoopbackCallback(redirect)) {
-        throw new Error('OAuth server did not provide a local loopback callback URL')
+      if (!isGatewayLoopbackCallback(redirect) && !(publicCallback && isWebappPublicCallback(redirect, serverName))) {
+        throw new Error(`OAuth server did not provide a local loopback${publicCallback ? ' or Webapp' : ''} callback URL`)
       }
     }
 

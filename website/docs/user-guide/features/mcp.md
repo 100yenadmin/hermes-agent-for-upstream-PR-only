@@ -98,6 +98,8 @@ In the Webapp, an MCP server's **Authenticate** button also works from a remote
 browser when the serving gateway has `webapp.public_url` set to the Webapp's
 public address (including any reverse-proxy path prefix). Sign-in returns to
 that Webapp's public callback instead of a loopback listener on the gateway.
+Without `webapp.public_url` the button keeps the loopback listener, which only a
+browser on the gateway machine can reach.
 
 ```bash
 hermes mcp                   # interactive picker (default)

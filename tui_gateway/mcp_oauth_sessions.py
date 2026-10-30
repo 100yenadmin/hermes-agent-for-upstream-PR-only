@@ -59,16 +59,15 @@ def finish_flow(session_id: str) -> None:
         _shutdown_listener(rec)
 
 
-def public_callback_base(client_redirect_uri: Optional[str]) -> str:
-    """Resolve only the serving Webapp's address, never a client-supplied public URI."""
+def public_callback_base(client_redirect_uri: Optional[str]) -> Optional[str]:
+    """The serving Webapp's public address, never a client-supplied one. None when the Webapp
+    is not serving or has no ``webapp.public_url``: the loopback listener then applies, as
+    without the flag, for a browser on the gateway machine (LAN mode, a hostname)."""
     from tools.connectors.mcp import _chat_public_base
 
     if client_redirect_uri is not None:
         raise ValueError("public_callback and client_redirect_uri cannot be used together")
-    public_base = _chat_public_base()
-    if public_base is None:
-        raise ValueError("For public callbacks, enable the Webapp and set webapp.public_url")
-    return public_base
+    return _chat_public_base()
 
 
 def start_flow(

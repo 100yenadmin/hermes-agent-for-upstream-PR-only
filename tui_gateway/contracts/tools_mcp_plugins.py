@@ -507,7 +507,8 @@ method("mcp.servers.remove", params=McpServerNameParams, result=McpServersRemove
 
 class McpOauthStartParams(McpServerNameParams):
     """With ``client_redirect_uri`` the CLIENT hosts the loopback and relays the code via
-    ``mcp.servers.oauth.callback``."""
+    ``mcp.servers.oauth.callback``. With ``public_callback`` the redirect goes to the serving
+    Webapp's own callback when ``webapp.public_url`` is set, else to the usual loopback."""
 
     client_redirect_uri: str | None = None
     public_callback: bool = False

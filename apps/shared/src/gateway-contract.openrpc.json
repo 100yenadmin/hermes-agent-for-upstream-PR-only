@@ -22585,7 +22585,7 @@
       },
       "McpOauthStartParams": {
         "additionalProperties": false,
-        "description": "With ``client_redirect_uri`` the CLIENT hosts the loopback and relays the code via\n``mcp.servers.oauth.callback``.",
+        "description": "With ``client_redirect_uri`` the CLIENT hosts the loopback and relays the code via\n``mcp.servers.oauth.callback``. With ``public_callback`` the redirect goes to the serving\nWebapp's own callback when ``webapp.public_url`` is set, else to the usual loopback.",
         "properties": {
           "profile": {
             "anyOf": [

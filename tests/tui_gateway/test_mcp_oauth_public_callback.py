@@ -1,6 +1,7 @@
 """The Webapp's Authenticate RPC uses the serving listener's public callback."""
 
 import asyncio
+from types import SimpleNamespace
 from urllib.parse import quote
 
 import pytest
@@ -24,7 +25,12 @@ def public_oauth(monkeypatch):
     _fake_worker_publishes_url(monkeypatch)
     monkeypatch.setattr(mcp_config, "_get_mcp_servers", lambda: {SERVER: CFG})
     bound = []
-    monkeypatch.setattr(mcp_oauth, "_start_loopback_receiver", lambda flow: bound.append(flow))
+
+    def loopback_receiver(flow):
+        bound.append(flow)
+        return SimpleNamespace(server_address=("127.0.0.1", 8412), shutdown=lambda: None, server_close=lambda: None)
+
+    monkeypatch.setattr(mcp_oauth, "_start_loopback_receiver", loopback_receiver)
     yield bound
     for rec in sessions._sessions.values():
         rec["flow"].mark_error("test cleanup", cancelled=True)
@@ -76,13 +82,14 @@ def test_public_rpc_flow_completes_through_webapp_callback(public_oauth, monkeyp
 @pytest.mark.parametrize("state,public_url", [
     ("off", PUBLIC_BASE), ("starting", PUBLIC_BASE), ("serving", None),
 ])
-def test_public_rpc_requires_serving_webapp_and_public_url(public_oauth, monkeypatch, state, public_url):
+def test_public_rpc_without_a_public_url_keeps_the_loopback_listener(public_oauth, monkeypatch, state, public_url):
+    """LAN mode or a hostname with no webapp.public_url: the browser may be on the gateway machine."""
     _listener(monkeypatch, state=state, public_url=public_url)
     out = _start_rpc(public_callback=True)
-    assert out["error"]["code"] == 4001
-    assert "webapp.public_url" in out["error"]["message"]
-    assert not sessions._sessions
-    assert public_oauth == []
+    assert out["result"]["ok"] is True
+    flow = sessions._sessions[out["result"]["session_id"]]["flow"]
+    assert flow.redirect_uri == "http://127.0.0.1:8412/callback"
+    assert public_oauth == [flow]
 
 
 def test_public_rpc_refuses_client_redirect(public_oauth, monkeypatch):
