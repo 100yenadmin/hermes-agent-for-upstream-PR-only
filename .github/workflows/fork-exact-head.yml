@@ -1,5 +1,5 @@
 name: Fork exact-head validation
-run-name: "Fork exact-head validation ${{ inputs.target_sha }}"
+run-name: "Fork exact-head validation ${{ inputs.target_sha }} ${{ inputs.only }}"
 
 on:
   workflow_dispatch:
@@ -8,17 +8,23 @@ on:
         description: Exact 40-character commit SHA to validate
         required: true
         type: string
+      only:
+        description: Run one job only (python-tests, windows-tests or nix-check); empty runs all three
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 concurrency:
-  group: fork-exact-head-${{ inputs.target_sha }}
+  group: fork-exact-head-${{ inputs.target_sha }}-${{ inputs.only }}
   cancel-in-progress: false
 
 jobs:
   python-tests:
     name: Python tests (portable runner)
+    if: inputs.only == '' || inputs.only == 'python-tests'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -83,7 +89,12 @@ jobs:
           scripts/run_tests.sh
 
   windows-tests:
-    name: Windows-only tests (portable runner)
+    name: Windows tests ${{ matrix.slice }} (portable runner)
+    if: inputs.only == '' || inputs.only == 'windows-tests'
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: ['1/2', '2/2']
     runs-on: windows-latest
     timeout-minutes: 90
     env:
@@ -105,45 +116,44 @@ jobs:
           fi
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+      - name: Set up locked Python and test dependencies
+        uses: ./.github/actions/setup-pm
         with:
-          version: "0.12.13"
-          enable-cache: true
-          cache-dependency-glob: |
-            pyproject.toml
-            uv.lock
+          packages: git,ripgrep
+          extras: '["all", "telegram", "anthropic", "mistral", "fal", "modal", "daytona", "parallel-web", "keychain"]'
+          test-environment: 'true'
+          prune-python-cache: true
 
-      - name: Set up Python 3.14
-        uses: ./.github/actions/retry
-        with:
-          command: uv python install 3.14
-
-      - name: Install locked dependencies
-        uses: ./.github/actions/retry
-        with:
-          command: uv sync --locked --python 3.14 --extra all --group dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra parallel-web --extra keychain
-
-      - name: Run Windows-only tests
+      - name: Run windows tests
+        # Mirrors the windows leg of upstream tests-os.yml at the candidate's base, minus the
+        # desktop-update hand-off tests (upstream runs them only when a PR touches that surface).
         shell: bash
         run: |
           set -uo pipefail
-          list_file="${RUNNER_TEMP}/selected-tests.txt"
-          uv run --no-sync python scripts/ci/list_os_marked_tests.py windows_only > "$list_file"
-          test -s "$list_file"
-          # shellcheck disable=SC2046
-          set -- $(cat "$list_file")
-          status=0
-          uv run --no-sync python -m pytest \
-            "$@" \
-            -m "windows_only and not integration" || status=$?
-          if [ "$status" -eq 5 ]; then
+          LIST="${RUNNER_TEMP:-.}/selected-tests.txt"
+          if ! python scripts/ci/list_os_marked_tests.py windows > "$LIST"; then
+            echo "::error::could not enumerate windows test files"
             exit 1
           fi
-          exit "$status"
+          if [ ! -s "$LIST" ]; then
+            echo "::error::empty windows file list"
+            exit 1
+          fi
+          echo "selected file(s) for windows:"
+          cat "$LIST"
+          SEPARATOR="$(python -c 'import os, sys; sys.stdout.write(os.pathsep)')"
+          FILES="$(tr -d '\r' < "$LIST" | paste -sd "$SEPARATOR" -)"
+          scripts/run_tests.sh --files "$FILES" -- \
+            --ignore-glob='*test_desktop_update_windows_*.py' \
+            -m "platforms and not integration" \
+            -v --tb=short
+        env:
+          HERMES_TEST_WORKERS: '4'
+          HERMES_TEST_SLICE: ${{ matrix.slice }}
 
   nix-check:
     name: Nix flake check (portable runner)
+    if: inputs.only == '' || inputs.only == 'nix-check'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
