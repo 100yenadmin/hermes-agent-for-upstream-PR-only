@@ -23,8 +23,12 @@ concurrency:
 
 jobs:
   python-tests:
-    name: Python tests (portable runner)
+    name: Python tests ${{ matrix.slice }} (portable runner)
     if: inputs.only == '' || inputs.only == 'python-tests'
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: ['1/4', '2/4', '3/4', '4/4']
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -33,6 +37,7 @@ jobs:
       OPENAI_API_KEY: ""
       NOUS_API_KEY: ""
       HERMES_TEST_WORKERS: "4"
+      HERMES_TEST_SLICE: ${{ matrix.slice }}
     steps:
       - name: Checkout exact candidate
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
