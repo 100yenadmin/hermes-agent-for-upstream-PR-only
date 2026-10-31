@@ -71,11 +71,9 @@ async def test_failed_document_upload_sends_a_failure_notice(tmp_path, monkeypat
     )
 
     adapter.send_document.assert_awaited_once()
-    adapter._notify_media_delivery_failure.assert_awaited_once()
-    kwargs = adapter._notify_media_delivery_failure.await_args.kwargs
-    assert adapter._notify_media_delivery_failure.await_args.args[:1] == ("C123CHAN",)
-    assert str(media_file) in adapter._notify_media_delivery_failure.await_args.args[1]
-    assert kwargs["is_voice"] is False
+    adapter._notify_media_delivery_failure.assert_awaited_once_with(
+        "C123CHAN", str(media_file), is_voice=False, metadata={},
+    )
 
 
 @pytest.mark.asyncio
@@ -102,6 +100,61 @@ async def test_failed_image_batch_sends_a_failure_notice(tmp_path, monkeypatch):
     adapter.send_multiple_images.assert_awaited_once()
     adapter._notify_media_delivery_failure.assert_awaited_once()
     assert str(media_file) in adapter._notify_media_delivery_failure.await_args.args[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raises", [False, True])
+async def test_failed_url_image_batch_sends_a_failure_notice(raises):
+    sender = (
+        AsyncMock(side_effect=RuntimeError("transport gone")) if raises
+        else AsyncMock(return_value=SendResult(success=False, error="too large"))
+    )
+    adapter = _adapter(send_multiple_images=sender)
+    metadata = {"thread_id": "thread-1"}
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner(metadata),
+        "![chart](https://example.com/images/chart.png?size=large)", _event(), adapter,
+    )
+
+    adapter.send_multiple_images.assert_awaited_once()
+    adapter._notify_media_delivery_failure.assert_awaited_once_with(
+        "C123CHAN", "chart.png", is_voice=False, metadata=metadata,
+    )
+
+
+@pytest.mark.asyncio
+async def test_malformed_image_url_does_not_drop_the_remaining_media(tmp_path, monkeypatch):
+    """A URL that urlsplit rejects (unclosed IPv6 bracket) still gets its notice, and the
+    MEDIA file after it still goes out."""
+    document = _allowed_media_path(tmp_path, monkeypatch, "report.pdf")
+    adapter = _adapter(send_multiple_images=AsyncMock(return_value=SendResult(success=False, error="bad url")))
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({}), f"![x](https://[::1/x.png)\nMEDIA:{document}", _event(), adapter,
+    )
+
+    adapter._notify_media_delivery_failure.assert_awaited_once_with(
+        "C123CHAN", "x.png", is_voice=False, metadata={},
+    )
+    adapter.send_document.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_voice_upload_preserves_voice_notice(tmp_path, monkeypatch):
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "speech.ogg")
+    adapter = _adapter(send_voice=AsyncMock(return_value=SendResult(success=False, error="rejected")))
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({}), f"[[audio_as_voice]]\nMEDIA:{media_file}", _event(), adapter,
+    )
+
+    adapter.send_voice.assert_awaited_once_with(
+        chat_id="C123CHAN", audio_path=str(media_file), metadata={}, is_voice=True,
+    )
+    adapter._notify_media_delivery_failure.assert_awaited_once_with(
+        "C123CHAN", str(media_file), is_voice=True, metadata={},
+    )
 
 
 @pytest.mark.asyncio

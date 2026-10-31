@@ -301,7 +301,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
                     batch = SendResult(success=False, error=str(e))
-                await _notify_post_stream_upload_failure(adapter, chat_id, image_paths[0], _thread_meta, batch)
+                # Plain string split: urlsplit raises on a malformed host and would end the scan.
+                batch_path = image_paths[0] if image_paths else url_images[0][0].split("?", 1)[0].rsplit("/", 1)[-1]
+                await _notify_post_stream_upload_failure(adapter, chat_id, batch_path, _thread_meta, batch)
             for media_path, is_voice in non_image_media:
                 try:
                     ext = Path(media_path).suffix.lower()
