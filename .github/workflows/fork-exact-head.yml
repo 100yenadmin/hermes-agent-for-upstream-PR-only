@@ -28,7 +28,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: fork-exact-head-${{ inputs.target_sha }}-${{ inputs.only }}-${{ inputs.base_sha }}-${{ inputs.test_files }}
+  # One group per run: a group name built from the inputs grew past GitHub's length limit with long
+  # test_files lists, and those runs failed before any job started.
+  group: fork-exact-head-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
