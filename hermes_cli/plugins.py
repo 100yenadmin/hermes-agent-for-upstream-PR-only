@@ -832,13 +832,14 @@ class PluginContext(PluginCapabilityCtxMixin):
         self, platform: str, factory: Callable, *, reload_safe: bool = False,
     ) -> None:
         """Register ``factory(native, adapter)``, invoked at ``connect()`` before/as the core handlers
-        register (``adapter`` read-only). ``native``: telegram PTB ``Application``, discord
-        ``commands.Bot``, slack ``AsyncApp``, matrix client, teams ``App``, dingtalk
-        ``DingTalkStreamClient``, line aiohttp ``web.Application``, others ``None``. Keep SDK imports
-        inside the factory; exceptions are logged and the platform still connects. Scope handlers in
-        first-match dispatch tables so core flows keep working. Raises ``ValueError`` when not callable
-        or platform is empty. ``reload_safe=True`` opts into a new wiring generation after unload;
-        use it only when the plugin's unload callback removes the prior native handlers."""
+        register (``adapter`` read-only). ``native``: telegram PTB ``Application``, discord ``commands.Bot``,
+        slack ``AsyncApp``, matrix client, teams ``App``, dingtalk ``DingTalkStreamClient``, line aiohttp
+        ``web.Application``, others ``None``. Keep SDK imports inside the factory; exceptions are logged and
+        the platform still connects. Scope handlers in first-match dispatch tables so core flows keep working.
+        Raises ``ValueError`` when not callable or platform is empty. ``reload_safe=True`` opts into a new
+        wiring generation after unload; use it only when the plugin's unload callback removes the prior native
+        handlers. That callback may run off the gateway loop: hand the removal to the loop
+        (``call_soon_threadsafe``); the replacement is wired there after the sweep, so the removal runs first."""
         self._manager._register_platform_handler_factory(self, platform, factory, reload_safe)
 
     def register_telegram_handler(self, factory: Callable, *, reload_safe: bool = False) -> None:
@@ -1114,11 +1115,11 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._approval_transports: dict[str, Any] = {}
         self._slack_action_handlers: list[tuple] = []
         self._platform_handler_factories: dict[str, list[tuple]] = {}
-        # Opted-in factory entry id -> opaque wiring generation. The public accessor remains
-        # ``(factory, plugin_name)`` pairs for compatibility.
+        # Opted-in factory entry id -> opaque wiring generation (the accessor still returns pairs).
         self._platform_handler_reload_generations: dict[int, object] = {}
-        # Process-owned discovery listeners (``on_plugin_loaded``); never cleared by unload().
+        # Process-owned discovery listeners (``on_plugin_loaded``, ``on_plugins_swept``); unload() keeps them.
         self._plugin_loaded_listeners: list[Callable] = []
+        self._plugins_swept_listeners: list[Callable] = []
         # Event bus: owner-tagged subscriptions (unload removes zombies); one daemon worker keeps
         # registration order while emitters never block; per-worker chain depth caps mutual emitters.
         self._subscriptions: dict[str, list[_EventSubscription]] = {}
