@@ -232,6 +232,9 @@ class ContextEngine(ABC):
         once if your plugin hands one instance to every agent. Release only resources this
         instance opened itself (for example a connection your clone_for_agent() reopened);
         never close a backend shared with the registered instance or other agents' clones.
+        Gateway agent-cache evictions (idle TTL, LRU cap, memory pressure) do not call this yet:
+        they release the agent through release_clients(), so a cache-evicted agent's engine
+        keeps its resources until garbage collection or process exit.
         Default: no-op.
         """
 
