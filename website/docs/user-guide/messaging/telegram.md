@@ -1050,6 +1050,12 @@ platforms:
 Hermes learns group/supergroup forum names online from `forum_topic_created` and
 nonempty `forum_topic_edited` service messages. These updates only refresh the cache;
 they do not invoke the agent or generate a reply. Icon-only edits keep the previous name.
+A name is learned only from a sender the gateway authorizes in that group, through the same
+allowlists that gate group messages. A service message also needs the group to be in
+`allowed_chats` when that list is set: it carries no mention, so guest mode cannot admit it.
+With no allowlist configured, the gateway's own decision applies, so a group whose messages it
+would refuse never names a topic. Names learned before a group lost its authorization stay
+listed, as that group's sessions do.
 Names persist in the receiving adapter's profile `state.db`, isolated by transport
 profile, bot identity, chat ID and thread ID, and are available immediately after restart.
 

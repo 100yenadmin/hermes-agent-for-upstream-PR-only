@@ -26,11 +26,11 @@ def adapter(*, token="123456:public-test-fixture", profile="default", topics=Non
     return result
 
 
-def message(*, created=None, edited=None, reply=None, thread=42, chat_type="supergroup", forum=True, chat_id=-100123):
+def message(*, created=None, edited=None, reply=None, thread=42, chat_type="supergroup", forum=True, chat_id=-100123, user=7):
     return Message(
         message_id=100, date=datetime.now(UTC),
         chat=Chat(chat_id, chat_type, title="Workshop", is_forum=forum),
-        from_user=User(7, "Reader", False), message_thread_id=thread,
+        from_user=User(user, "Reader", False), message_thread_id=thread,
         is_topic_message=True, text=None if created or edited is not None else "hello",
         forum_topic_created=ForumTopicCreated(created, 7322096) if created else None,
         forum_topic_edited=ForumTopicEdited(name=edited) if edited is not None else None,
@@ -106,7 +106,7 @@ async def test_registered_service_updates_and_restart():
 @pytest.mark.asyncio
 async def test_registered_private_topic_creation_preserves_dm_opener():
     owner = adapter()
-    owner._is_user_authorized_from_message = lambda msg: True
+    owner._is_user_authorized_from_message = lambda msg, **_: True
     try:
         assert await dispatch(registered_app(owner), message(
             created="Private topic", chat_type="private", forum=False, chat_id=321))
@@ -115,6 +115,45 @@ async def test_registered_private_topic_creation_preserves_dm_opener():
         assert event.source.thread_id == "42"
         assert owner._dm_topics == {}
         owner.handle_message.assert_not_awaited()
+    finally:
+        await owner.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra, learned", [
+    ({"group_allow_from": ["999"]}, False),  # the creator is not authorized in this group
+    ({"allowed_chats": "-100999"}, False),  # the group is outside allowed_chats
+    ({"group_allow_from": ["7"], "allowed_chats": "-100123"}, True),
+])
+async def test_topic_names_need_an_authorized_sender_and_chat(extra, learned):
+    owner = adapter()
+    owner.config.extra.update(extra)
+    try:
+        assert await dispatch(registered_app(owner), message(created="Private plans"))
+        assert (label(owner) == "Private plans") is learned
+        directory = await build_channel_directory({Platform.TELEGRAM: owner})
+        assert any(row["id"] == "-100123:42" for row in directory["platforms"]["telegram"]) is learned
+        owner.handle_message.assert_not_awaited()
+    finally:
+        await owner.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runner_allows", [False, True])
+async def test_without_an_allowlist_the_runner_decides_topic_names(runner_allows):
+    """No allowlist: intake lets unknown senders through for DM pairing; the runner denies their group traffic."""
+    owner = adapter()
+    owner.set_authorization_check(lambda *args, **kwargs: runner_allows)
+    owner._ensure_forum_commands = AsyncMock()
+    owner._enqueue_text_event = lambda event: None
+    app = registered_app(owner)
+    try:
+        await dispatch(app, message(created="From service"))
+        await dispatch(app, message(thread=43, reply=message(created="From reply", thread=43)))
+        assert (label(owner) == "From service") is runner_allows
+        assert (label(owner, message(thread=43)) == "From reply") is runner_allows
+        directory = await build_channel_directory({Platform.TELEGRAM: owner})
+        assert bool(directory["platforms"]["telegram"]) is runner_allows
     finally:
         await owner.disconnect()
 
@@ -152,7 +191,7 @@ async def test_optional_reply_seed_never_rolls_back_rename():
     owner = adapter()
     app = registered_app(owner)
     old_reply = message(created="Original")
-    owner._is_user_authorized_from_message = lambda msg: True
+    owner._is_user_authorized_from_message = lambda msg, **_: True
     owner._gate_or_observe = lambda *args: True
     owner._ensure_forum_commands = AsyncMock()
     owner._enqueue_text_event = lambda event: None

@@ -950,7 +950,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, Teleg
         extra = getattr(getattr(self, "config", None), "extra", None) or {}
         return str(extra.get("unauthorized_dm_behavior", "")).strip().lower() in ("pair", "decline")
 
-    def _is_user_authorized_from_message(self, message: Message) -> bool:
+    def _is_user_authorized_from_message(self, message: Message, *, pairing_shortcut: bool = True) -> bool:
         """Intake auth prefilter, run BEFORE batching/event construction/group observation.
 
         Only rejects when it can make the same context-aware decision the runner would; unknown DMs pass through when
@@ -983,7 +983,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, Teleg
             has_callback = getattr(self, "_authorization_check", None) is not None
             if has_callback or auth_fn is not None:
                 # No allowlist → unknown DMs must reach pairing, not be default-denied here.
-                if not self._telegram_auth_env_configured():
+                if pairing_shortcut and not self._telegram_auth_env_configured():
                     return True
                 decision = self._is_sender_authorized(
                     user_id, chat_type=source.chat_type, chat_id=source.chat_id, is_bot=source.is_bot,

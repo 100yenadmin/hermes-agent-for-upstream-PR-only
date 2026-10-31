@@ -20,7 +20,7 @@ from tests.plugins.test_telegram_forum_names import adapter, dispatch, label, me
 
 def text_ingress(owner):
     """Only auth/trigger and external housekeeping are replaced, not preparation/enqueue."""
-    owner._is_user_authorized_from_message = lambda msg: True
+    owner._is_user_authorized_from_message = lambda msg, **_: True
     owner._gate_or_observe = lambda *args: True
     owner._ensure_forum_commands = AsyncMock()
     enqueued = []
@@ -253,7 +253,7 @@ async def test_only_explicit_reconnect_resumes_cache(monkeypatch):
     from tests.plugins.test_telegram_update_admission import connected
 
     async with connected(monkeypatch) as (owner, app, delivered):
-        update = Update(10, message=message(created="Persisted"))
+        update = Update(10, message=message(created="Persisted", user=88))  # connected() allows user 88 only
         update.set_bot(app.bot)
         await app.process_update(update)
         assert label(owner) == "Persisted"

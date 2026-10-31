@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from plugins.platforms.telegram.telegram_group_topic_cache import TelegramGroupTopicCacheMixin, optional_cache_action
 
 
@@ -80,6 +81,13 @@ class TelegramGroupTopicsMixin(TelegramGroupTopicCacheMixin):
         thread_id = getattr(message, "message_thread_id", None)
         if thread_id is None:
             return
+        # A group message's intake: sender authorization, then the allowed_chats hard gate. A service
+        # event carries no mention, so guest mode never admits one, and a group the bot is not
+        # authorized for never names a topic in the channel directory.
+        allowed = self._telegram_allowed_chats()
+        if not self._sender_may_name_topics(message) or (allowed and self._chat_id_str(message) not in allowed):
+            self._log_blocked_user(message, level=logging.DEBUG, what="forum topic name from")
+            return
         def learn(db):
             key = dict(**self._group_topic_namespace(), chat_id=str(message.chat.id), thread_id=str(thread_id))
             db.record_telegram_group_topic_observation(**key)
@@ -90,11 +98,17 @@ class TelegramGroupTopicsMixin(TelegramGroupTopicCacheMixin):
         self._optional_group_topic_cache(learn)
         self._accept_update()
 
+    def _sender_may_name_topics(self, message) -> bool:
+        """The runner's decision for this sender. Without an allowlist the intake lets unknown senders
+        through so a DM can reach pairing, and the runner then denies their group messages. Naming a
+        topic happens before that runner check, so it asks the runner itself."""
+        return self._is_user_authorized_from_message(message, pairing_shortcut=False)
+
     def _build_observed_message_event(self, message, msg_type, update_id=None):
         """Ingress-only builder: a display lookup is not proof this bot received traffic."""
         if self._is_group_forum(message):
             thread_id = self._effective_message_thread_id(message)
-            if thread_id:
+            if thread_id and self._sender_may_name_topics(message):
                 self._optional_group_topic_cache(lambda db: self._observe_group_topic_message(db, message, thread_id))
         return self._build_message_event(message, msg_type, update_id=update_id)
 
