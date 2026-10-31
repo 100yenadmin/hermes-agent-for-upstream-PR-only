@@ -9,7 +9,17 @@ on:
         required: true
         type: string
       only:
-        description: Run one job only (python-tests, windows-tests or nix-check); empty runs all three
+        description: Run one job only (python-tests, windows-tests, nix-check, focused or check); empty runs the three suites
+        required: false
+        type: string
+        default: ''
+      test_files:
+        description: Space-separated test files for only=focused (one unsliced run of just these files)
+        required: false
+        type: string
+        default: ''
+      base_sha:
+        description: Upstream base commit for scripts/check (health gate); empty skips the check job
         required: false
         type: string
         default: ''
@@ -18,7 +28,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: fork-exact-head-${{ inputs.target_sha }}-${{ inputs.only }}
+  group: fork-exact-head-${{ inputs.target_sha }}-${{ inputs.only }}-${{ inputs.base_sha }}-${{ inputs.test_files }}
   cancel-in-progress: false
 
 jobs:
@@ -92,6 +102,142 @@ jobs:
           uv lock --check
           source .venv/bin/activate
           scripts/run_tests.sh
+
+  focused-tests:
+    name: Focused tests (portable runner)
+    if: inputs.only == 'focused' && inputs.test_files != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      EXPECTED_SHA: ${{ inputs.target_sha }}
+      TEST_FILES: ${{ inputs.test_files }}
+      OPENROUTER_API_KEY: ""
+      OPENAI_API_KEY: ""
+      NOUS_API_KEY: ""
+      HERMES_TEST_WORKERS: "4"
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.target_sha }}
+          fetch-depth: 1
+
+      - name: Verify exact candidate
+        shell: bash
+        run: |
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            exit 2
+          fi
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Install ripgrep (prebuilt binary)
+        shell: bash
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+          rg --version
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.12.13"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.14
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.14
+
+      - name: Install locked dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.14 --extra all --group dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra parallel-web --extra keychain
+
+      - name: Run the selected test files
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          read -r -a files <<< "$TEST_FILES"
+          scripts/run_tests.sh "${files[@]}"
+
+  health-check:
+    name: scripts/check against the upstream base (portable runner)
+    if: inputs.base_sha != '' && (inputs.only == '' || inputs.only == 'check' || inputs.only == 'focused')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      EXPECTED_SHA: ${{ inputs.target_sha }}
+      BASE_SHA: ${{ inputs.base_sha }}
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.target_sha }}
+          fetch-depth: 0
+
+      - name: Verify exact candidate
+        shell: bash
+        run: |
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            exit 2
+          fi
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Install ripgrep (prebuilt binary)
+        shell: bash
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+          rg --version
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.12.13"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.14
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.14
+
+      - name: Install locked dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.14 --extra all --group dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra parallel-web --extra keychain
+
+      - name: Run scripts/check against the base
+        shell: bash
+        run: |
+          if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            exit 2
+          fi
+          git cat-file -e "$BASE_SHA^{commit}"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          source .venv/bin/activate
+          python scripts/check --base "$BASE_SHA"
 
   windows-tests:
     name: Windows tests ${{ matrix.slice }} (portable runner)
