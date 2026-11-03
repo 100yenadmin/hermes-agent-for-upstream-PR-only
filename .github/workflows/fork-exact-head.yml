@@ -103,6 +103,9 @@ jobs:
         run: |
           uv lock --check
           source .venv/bin/activate
+          # run_tests.sh re-runs itself under run-in-hermes-env (core deps only, no extras) unless it gets a
+          # current activation or HERMES_PYTHON; upstream's setup-pm exports HERMES_PYTHON, so use the synced venv.
+          export HERMES_PYTHON="$PWD/.venv/bin/python"
           scripts/run_tests.sh
 
   focused-tests:
@@ -170,6 +173,9 @@ jobs:
         shell: bash
         run: |
           source .venv/bin/activate
+          # run_tests.sh re-runs itself under run-in-hermes-env (core deps only, no extras) unless it gets a
+          # current activation or HERMES_PYTHON; upstream's setup-pm exports HERMES_PYTHON, so use the synced venv.
+          export HERMES_PYTHON="$PWD/.venv/bin/python"
           read -r -a files <<< "$TEST_FILES"
           scripts/run_tests.sh "${files[@]}"
 
