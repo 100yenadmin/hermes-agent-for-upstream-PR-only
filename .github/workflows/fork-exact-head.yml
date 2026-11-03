@@ -9,7 +9,7 @@ on:
         required: true
         type: string
       only:
-        description: Run one job only (python-tests, windows-tests, nix-check, focused or check); empty runs the three suites
+        description: Run one job only (python-tests, windows-tests, nix-check, focused, check or regen); empty runs the three suites
         required: false
         type: string
         default: ''
@@ -20,6 +20,16 @@ on:
         default: ''
       base_sha:
         description: Upstream base commit for scripts/check (health gate); empty skips the check job
+        required: false
+        type: string
+        default: ''
+      regen_cmd:
+        description: For only=regen, a bash command run in the checkout after setup (e.g. a snapshot regenerator)
+        required: false
+        type: string
+        default: ''
+      regen_paths:
+        description: For only=regen, space-separated paths whose changes go into the regen.patch artifact
         required: false
         type: string
         default: ''
@@ -319,3 +329,54 @@ jobs:
 
       - name: Run Nix flake check
         run: nix flake check --print-build-logs
+
+  regen:
+    name: Regenerate fixtures (portable runner)
+    if: inputs.only == 'regen' && inputs.regen_cmd != '' && inputs.regen_paths != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      EXPECTED_SHA: ${{ inputs.target_sha }}
+      REGEN_CMD: ${{ inputs.regen_cmd }}
+      REGEN_PATHS: ${{ inputs.regen_paths }}
+      OPENROUTER_API_KEY: ""
+      OPENAI_API_KEY: ""
+      NOUS_API_KEY: ""
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.target_sha }}
+
+      - name: Verify exact candidate
+        shell: bash
+        run: |
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            exit 2
+          fi
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Set up locked Python and test dependencies
+        uses: ./.github/actions/setup-pm
+        with:
+          extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web", "keychain"]'
+          test-environment: 'true'
+          prune-python-cache: true
+
+      - name: Run the regenerator and capture the change as a patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -c "$REGEN_CMD"
+          read -r -a paths <<< "$REGEN_PATHS"
+          git add -A -- "${paths[@]}"
+          git diff --cached --binary -- "${paths[@]}" > "$RUNNER_TEMP/regen.patch"
+          git diff --cached --stat -- "${paths[@]}"
+          echo "patch bytes: $(wc -c < "$RUNNER_TEMP/regen.patch")"
+
+      - name: Upload the patch
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: regen-${{ inputs.target_sha }}
+          path: ${{ runner.temp }}/regen.patch
+          if-no-files-found: error
