@@ -89,7 +89,9 @@ def test_excluded_responses_stay_unencoded(dashboard, kind):
     response = client.get(f"/api/_gzip/{kind}", headers={"Accept-Encoding": "gzip"})
     assert response.status_code == identity.status_code
     assert "content-encoding" not in response.headers
-    assert "vary" not in identity.headers and "vary" not in response.headers
+    # CORS may add Vary: Origin; these responses must not claim to vary on Accept-Encoding.
+    assert "Accept-Encoding" not in identity.headers.get("vary", "")
+    assert "Accept-Encoding" not in response.headers.get("vary", "")
     assert bytes(raw) == expected
 
 
@@ -116,8 +118,10 @@ def test_large_text_is_compressed(dashboard):
     assert gzip.decompress(bytes(raw)) == PLAIN
 
 
-def test_cors_preflight_preserves_existing_status_and_headers(dashboard):
+def test_cors_preflight_preserves_existing_status_and_headers(dashboard, monkeypatch):
     client, _raw = dashboard
+    # CORS trusts only this backend's own loopback origins; the desktop dev renderer is one.
+    monkeypatch.setenv("HERMES_DESKTOP_DEV_SERVER", "http://localhost:5174")
     response = client.options("/api/_gzip/large", headers={
         "Origin": "http://localhost:5174",
         "Access-Control-Request-Method": "GET",

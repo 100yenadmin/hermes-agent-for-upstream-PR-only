@@ -22,12 +22,17 @@ def _compressible(message: Message, minimum_size: int) -> bool:
 
 
 class _DashboardGZipResponder(GZipResponder):
+    _passthrough = False
+
     async def send_with_compression(self, message: Message) -> None:
-        await super().send_with_compression(message)
+        # Decide from the start message, before Starlette's responder buffers it: a response
+        # that is not compressible passes through untouched, whatever the Starlette version.
         if message["type"] == "http.response.start":
-            self.content_type_is_excluded = (
-                self.content_type_is_excluded or not _compressible(message, self.minimum_size)
-            )
+            self._passthrough = not _compressible(message, self.minimum_size)
+        if self._passthrough:
+            await self.send(message)
+            return
+        await super().send_with_compression(message)
 
 
 def _accepts_gzip(accept_encoding: str) -> bool:
