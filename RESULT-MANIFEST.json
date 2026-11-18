@@ -1,0 +1,87 @@
+{
+  "schema": "result-manifest/1",
+  "run_id": "hermes-ux-system-2026-11-18",
+  "project": "hermes-ux-system",
+  "kind": "eval",
+  "status": "settled",
+  "owner_lane": "hermes-ux-system",
+  "claim_class": "advisory",
+  "created": "2026-11-18T11:43:55Z",
+  "settled": "2026-11-18T11:44:19Z",
+  "code": {
+    "repo": "NousResearch/hermes-agent",
+    "sha": "069ca611b383b65ea3b44876756ae423f33a2e4f",
+    "dirty": false,
+    "diff_sha256": null
+  },
+  "env": {
+    "command": "python3 recount.py",
+    "models": {},
+    "dataset": {},
+    "seed": null
+  },
+  "headline": [
+    {
+      "benchmark": "hermes-first-wave",
+      "metric": "open_report_clusters",
+      "value": 10.0,
+      "n": 19,
+      "source": "counts.json"
+    },
+    {
+      "benchmark": "hermes-first-wave",
+      "metric": "qualifying_merged_clusters",
+      "value": 7.0,
+      "n": 19,
+      "source": "counts.json"
+    },
+    {
+      "benchmark": "hermes-first-wave",
+      "metric": "qualifying_product_fix_prs",
+      "value": 8.0,
+      "n": 7,
+      "source": "counts.json"
+    }
+  ],
+  "results": [
+    {
+      "path": "hermes-first-wave.json",
+      "role": "per-item",
+      "sha256": "f88b511eb269c1273ea377e1b5906e90965c248562729e5dd7c8223678efb592",
+      "bytes": 56024
+    },
+    {
+      "path": "counts.json",
+      "role": "per-item",
+      "sha256": "ee177efbedaa264ec1a5cca8af16c68b0694018eb36452c2c79a74af9b5370c1",
+      "bytes": 112
+    },
+    {
+      "path": "recount.py",
+      "role": "per-item",
+      "sha256": "bd1667348163a3c1b8733d34d2aae17c5c568f5dbd7cc85142a5ae01b63a1781",
+      "bytes": 757
+    },
+    {
+      "path": "RESULT.md",
+      "role": "headline",
+      "sha256": "bba817f33da68e17f24cc7538404f1d4d983f8fb5b5e8bd358b1631b83bd111d",
+      "bytes": 3146
+    }
+  ],
+  "rescore": {
+    "command": "python3 recount.py",
+    "inputs": [],
+    "external_inputs": []
+  },
+  "bulk": [],
+  "published": [],
+  "links": [],
+  "keep": [
+    "RESULT.md",
+    "counts.json",
+    "hermes-first-wave.json",
+    "recount.py"
+  ],
+  "local_raw": "Public GitHub metadata snapshot only; no raw customer material."
+}
