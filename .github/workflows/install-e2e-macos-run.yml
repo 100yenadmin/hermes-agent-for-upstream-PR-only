@@ -149,10 +149,12 @@ jobs:
       - name: Stage serve repo (main -> ${{ inputs.install-ref }})
         run: |
           set -euo pipefail
+          git fetch --no-tags https://github.com/NousResearch/hermes-agent.git \
+            refs/tags/v0.23.1:refs/tags/v0.23.1 refs/tags/v0.23.2:refs/tags/v0.23.2
           tests/install/macos-desktop-e2e.sh --phase stage \
             --update-method '${{ inputs.update-method }}' \
             --install-ref '${{ inputs.install-ref }}' \
-            --update-ref '${{ inputs.update-ref }}' \
+            --update-ref v0.23.2 \
             --dmg-url '${{ inputs.dmg-url }}'
         env:
           HERMES_E2E_LOG_DIR: ${{ runner.temp }}/e2e-logs
