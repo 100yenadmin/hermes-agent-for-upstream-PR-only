@@ -1,0 +1,78 @@
+tag,channel,published_at_utc,tagged_commit,first_linked_fix_prs_in_channel,linked_fix_prs_in_tag,release_url,date_basis
+v2026.7.1-beta.2,preview,2026-07-05T09:10:09Z,a580a7fe3fbd1b3329c978d58ca2f70e8ca37aee,0,0,https://github.com/openclaw/openclaw/releases/tag/v2026.7.1-beta.2,GitHub release published_at
+v2026.7.1-beta.5,preview,2026-07-11T10:36:02Z,b6387afd6d2e0f43c2ae98d2d124dbc277f03cca,9,9,https://github.com/openclaw/openclaw/releases/tag/v2026.7.1-beta.5,GitHub release published_at
+v2026.7.1-beta.6,preview,2026-07-13T01:38:43Z,a783a2b283d1eacd91ba65a891a38c89b1e6f790,0,9,https://github.com/openclaw/openclaw/releases/tag/v2026.7.1-beta.6,GitHub release published_at
+v2026.7.1,stable,2026-07-13T22:33:14Z,2d2ddc43d0dcf71f31283d780f9fe9ff4cc04fe4,9,9,https://github.com/openclaw/openclaw/releases/tag/v2026.7.1,GitHub release published_at
+v2026.7.2-beta.1,preview,2026-07-15T18:48:24Z,a911e58a57268b1daf30a1d29d70aedccf736832,14,23,https://github.com/openclaw/openclaw/releases/tag/v2026.7.2-beta.1,GitHub release published_at
+v2026.7.2-beta.2,preview,2026-07-17T08:38:04Z,54d98a47251d3216443f9446830dec1a0aaddc43,18,41,https://github.com/openclaw/openclaw/releases/tag/v2026.7.2-beta.2,GitHub release published_at
+v2026.7.2-beta.3,preview,2026-07-18T23:16:53Z,d111bef0eed5aefb1e7c5ac59801c1f0924495f1,7,48,https://github.com/openclaw/openclaw/releases/tag/v2026.7.2-beta.3,GitHub release published_at
+v2026.7.2-beta.5,preview,2026-07-28T03:23:12Z,ee929dbb857c717a60f3b2b502db5a6dd31b5c11,4,52,https://github.com/openclaw/openclaw/releases/tag/v2026.7.2-beta.5,GitHub release published_at
+v2026.7.2-beta.6,preview,2026-08-01T05:34:32Z,4d6bdbdbf33fe3ece3c53853fab9931882ff3f3c,6,58,https://github.com/openclaw/openclaw/releases/tag/v2026.7.2-beta.6,GitHub release published_at
+v2026.7.2-beta.7,preview,2026-08-02T08:11:31Z,dabe1915362e20c25704af91612a32a8f4c96e83,0,58,https://github.com/openclaw/openclaw/releases/tag/v2026.7.2-beta.7,GitHub release published_at
+v2026.7.1-1,stable,2026-08-04T00:41:25Z,81ac4f3bddc8b7a9a68ae908dd3d60d819c024f2,0,9,https://github.com/openclaw/openclaw/releases/tag/v2026.7.1-1,GitHub release published_at
+v2026.7.1-2,stable,2026-08-04T00:41:26Z,0790d9f593ad30c940ed93b5872a8cf6d6f3cf8c,0,9,https://github.com/openclaw/openclaw/releases/tag/v2026.7.1-2,GitHub release published_at
+v2026.6.33,stable,2026-08-08T07:16:21Z,7af0cfc9c5488e03c4e2f528bdc7ac9f7778b35e,0,0,https://github.com/openclaw/openclaw/releases/tag/v2026.6.33,GitHub release published_at
+v2026.6.34,stable,2026-08-08T07:22:14Z,5c38f996d4059ebd9080cf74dc611ec3a17f4d50,0,0,https://github.com/openclaw/openclaw/releases/tag/v2026.6.34,GitHub release published_at
+v2026.8.1-beta.2,preview,2026-08-15T05:36:23Z,8f382a202ff1e15833394b481615dcdda99b04d7,13,71,https://github.com/openclaw/openclaw/releases/tag/v2026.8.1-beta.2,GitHub release published_at
+v2026.8.1-beta.3,preview,2026-08-24T04:40:41Z,5831b80721f802072b0ec1893b30a16cf42d538c,0,71,https://github.com/openclaw/openclaw/releases/tag/v2026.8.1-beta.3,GitHub release published_at
+v2026.9.1-beta.1,preview,2026-08-28T20:43:46Z,1d96e5aee2d49cde999ed055eda113e2523a7b5c,1,72,https://github.com/openclaw/openclaw/releases/tag/v2026.9.1-beta.1,GitHub release published_at
+v2026.8.1,stable,2026-08-31T03:30:51Z,ea806575e6450e4d1efdfc72c19f04be982a1b9b,64,73,https://github.com/openclaw/openclaw/releases/tag/v2026.8.1,GitHub release published_at
+v2026.8.2,stable,2026-09-01T16:00:56Z,0965053fe6b9341776df147a6934b7485c60b5ca,5,78,https://github.com/openclaw/openclaw/releases/tag/v2026.8.2,GitHub release published_at
+v2026.9.1,stable,2026-09-03T18:31:33Z,ad6fe23aecb9b833d68139b0ddc9f239b894d2f1,3,81,https://github.com/openclaw/openclaw/releases/tag/v2026.9.1,GitHub release published_at
+v2026.9.2,stable,2026-09-05T20:00:07Z,3928bad9badfcb6c7d140530435e806fb8092190,5,86,https://github.com/openclaw/openclaw/releases/tag/v2026.9.2,GitHub release published_at
+v2026.9.3,stable,2026-09-08T14:15:53Z,1391f7cd2d40ab5bbcf2f5f831d3a64f520e72d7,8,94,https://github.com/openclaw/openclaw/releases/tag/v2026.9.3,GitHub release published_at
+v2026.6.35,stable,2026-09-10T06:39:30Z,c283867d7cdd1a93cfc58f829c849834c4426d3b,0,0,https://github.com/openclaw/openclaw/releases/tag/v2026.6.35,GitHub release published_at
+v2026.9.4,stable,2026-09-11T03:46:22Z,3a9d69db306cd7f081e06254cb89c4bcc14a7107,9,103,https://github.com/openclaw/openclaw/releases/tag/v2026.9.4,GitHub release published_at
+v2026.9.5,stable,2026-09-19T01:55:23Z,ec9c1a13db8938e5a3eaa51fca2e981cde2395a9,38,141,https://github.com/openclaw/openclaw/releases/tag/v2026.9.5,GitHub release published_at
+linux-stable,special,2026-09-19T05:00:44Z,ec9c1a13db8938e5a3eaa51fca2e981cde2395a9,,,https://github.com/openclaw/openclaw/releases/tag/linux-stable,GitHub release published_at
+v2026.7.35,stable,2026-09-21T13:14:04Z,aa94808cb05668cdf1c10bc8f034a8176deba483,0,9,https://github.com/openclaw/openclaw/releases/tag/v2026.7.35,GitHub release published_at
+v2026.9.6,stable,2026-09-23T23:21:10Z,eb377ac59e6c9fd6c7705028034812becf00271b,28,169,https://github.com/openclaw/openclaw/releases/tag/v2026.9.6,GitHub release published_at
+v2026.8.33,stable,2026-09-29T03:12:00Z,f773aa06a1a93b36b050f1a3f4b57d3d91311541,0,78,https://github.com/openclaw/openclaw/releases/tag/v2026.8.33,GitHub release published_at
+v2026.9.7,stable,2026-09-30T04:44:14Z,c074824a27c96d3983043f9eeb33823cd1772d8c,26,195,https://github.com/openclaw/openclaw/releases/tag/v2026.9.7,GitHub release published_at
+v2026.8.34,stable,2026-10-02T00:12:39Z,d21cb744af45bc4d29352750c5e1e7f1cf7f066a,0,78,https://github.com/openclaw/openclaw/releases/tag/v2026.8.34,GitHub release published_at
+v2026.8.35,stable,2026-10-02T14:06:34Z,713ba5785d72d6ed1cec971e21307f16cc4234a6,0,78,https://github.com/openclaw/openclaw/releases/tag/v2026.8.35,GitHub release published_at
+v2026.9.8,stable,2026-10-03T03:21:47Z,fc23bc864e4553c2d215e479eeec47b67a0bf943,0,195,https://github.com/openclaw/openclaw/releases/tag/v2026.9.8,GitHub release published_at
+v2026.10.1-beta.1,preview,2026-10-05T19:47:49Z,6830fe76b3db05ad59e8ff7f0f872d4e2639a1fe,152,224,https://github.com/openclaw/openclaw/releases/tag/v2026.10.1-beta.1,GitHub release published_at
+v2026.10.1-beta.2,preview,2026-10-08T00:41:22Z,c58cf3afa0793257a8127ae868d5e159da6d9d0a,0,224,https://github.com/openclaw/openclaw/releases/tag/v2026.10.1-beta.2,GitHub release published_at
+v2026.9.9,stable,2026-10-08T10:23:23Z,bcfc88812a35243893585dbeca87ca41b48272ca,0,195,https://github.com/openclaw/openclaw/releases/tag/v2026.9.9,GitHub release published_at
+v2026.10.1,stable,2026-10-10T23:54:03Z,e178c39e9aae3fa440735217f9aef9574f286677,29,224,https://github.com/openclaw/openclaw/releases/tag/v2026.10.1,GitHub release published_at
+v2026.10.5-beta.1,preview,2026-10-11T13:08:24Z,f283c3c71226c2e1d9ca06b11972f8bdb3969bd8,33,257,https://github.com/openclaw/openclaw/releases/tag/v2026.10.5-beta.1,GitHub release published_at
+v2026.10.2,stable,2026-10-12T05:34:44Z,b8952d477f0c932d8ddc6da5c89cab5a169b6ff1,0,224,https://github.com/openclaw/openclaw/releases/tag/v2026.10.2,GitHub release published_at
+v2026.10.5-beta.2,preview,2026-10-12T12:10:48Z,467e83dea27c0d9ade8e999d688de2ed656b2225,0,257,https://github.com/openclaw/openclaw/releases/tag/v2026.10.5-beta.2,GitHub release published_at
+v2026.10.5-beta.3,preview,2026-10-13T10:00:37Z,1808b57b75f056fe4ae247d6cbc1ba68f1717858,0,257,https://github.com/openclaw/openclaw/releases/tag/v2026.10.5-beta.3,GitHub release published_at
+v2026.10.3,stable,2026-10-13T13:49:25Z,59cb44796b0f1f0daa0e37af8b1495abb45d9bc1,0,224,https://github.com/openclaw/openclaw/releases/tag/v2026.10.3,GitHub release published_at
+v2026.10.5-beta.4,preview,2026-10-15T06:10:42Z,6b4b2a945d5ff157920efa663d1c6192a9a1e717,0,257,https://github.com/openclaw/openclaw/releases/tag/v2026.10.5-beta.4,GitHub release published_at
+v2026.9.33,stable,2026-10-15T10:39:22Z,5873f8174e0b2866a2b8bc0dbf4c4c8164d8dc82,0,195,https://github.com/openclaw/openclaw/releases/tag/v2026.9.33,GitHub release published_at
+v2026.10.10-beta.1,preview,2026-10-15T18:03:07Z,87175a8e989c7b7197d085d155c9e7b04c001da8,18,275,https://github.com/openclaw/openclaw/releases/tag/v2026.10.10-beta.1,GitHub release published_at
+v2026.10.4,stable,2026-10-16T00:36:19Z,383c124cc32ffee3f8e56f549b88da94d269a4af,0,224,https://github.com/openclaw/openclaw/releases/tag/v2026.10.4,GitHub release published_at
+v2026.10.5,stable,2026-10-18T21:47:25Z,1b58cb9a1b4f4353e1add63c8506db4d890962e8,33,257,https://github.com/openclaw/openclaw/releases/tag/v2026.10.5,GitHub release published_at
+v2026.10.10-beta.2,preview,2026-10-19T12:23:09Z,2b85c4c25ea98d72ca1d3e93fb0fd9cac8f0ddab,0,275,https://github.com/openclaw/openclaw/releases/tag/v2026.10.10-beta.2,GitHub release published_at
+v2026.10.10-beta.3,preview,2026-10-21T07:00:49Z,15dffe5258a93c3d9c5dfd0a2b2de9989ebe7e14,0,275,https://github.com/openclaw/openclaw/releases/tag/v2026.10.10-beta.3,GitHub release published_at
+v2026.10.6,stable,2026-10-22T12:53:10Z,fe06181dc5ecc01cf8904abbfc26925925efefbc,0,257,https://github.com/openclaw/openclaw/releases/tag/v2026.10.6,GitHub release published_at
+v2026.10.7,stable,2026-10-24T09:53:46Z,157d8c2bc3ea2fa183afdc11088e69690bf8e64e,0,257,https://github.com/openclaw/openclaw/releases/tag/v2026.10.7,GitHub release published_at
+v2026.9.34,stable,2026-10-24T11:38:56Z,f123d430a7dea78c9d78e05606c4cad621c0e2c8,0,195,https://github.com/openclaw/openclaw/releases/tag/v2026.9.34,GitHub release published_at
+v2026.9.35,stable,2026-10-27T02:20:41Z,2ff91b9c5ed26aff603c6d5466fc642ae9d50e72,0,195,https://github.com/openclaw/openclaw/releases/tag/v2026.9.35,GitHub release published_at
+v2026.10.10-beta.4,preview,2026-10-27T05:39:34Z,5a94eab2146e558b3ebcd41cb174fc5adc469c2a,0,275,https://github.com/openclaw/openclaw/releases/tag/v2026.10.10-beta.4,GitHub release published_at
+v2026.10.8,stable,2026-10-27T11:56:59Z,dc2523e5a5c7a309517fd7fa834add938231d526,0,257,https://github.com/openclaw/openclaw/releases/tag/v2026.10.8,GitHub release published_at
+v2026.10.9,stable,2026-10-29T15:54:35Z,8b18b5578f66eab1501cba4cef2310d88bfb9a41,0,257,https://github.com/openclaw/openclaw/releases/tag/v2026.10.9,GitHub release published_at
+v2026.9.36,stable,2026-10-29T20:19:38Z,70c40e4bdcbc4e9952d30121e8de86eeb0781618,0,195,https://github.com/openclaw/openclaw/releases/tag/v2026.9.36,GitHub release published_at
+v2026.10.10-beta.5,preview,2026-10-30T03:57:14Z,7e15622f37bd0ced194a3b0fccacb4ad6bc78d85,0,275,https://github.com/openclaw/openclaw/releases/tag/v2026.10.10-beta.5,GitHub release published_at
+v2026.10.10,stable,2026-11-03T03:22:35Z,7dc3350cb9f08fcf9a0af5c4845a20d5b2f1a8be,18,275,https://github.com/openclaw/openclaw/releases/tag/v2026.10.10,GitHub release published_at
+v2026.11.5-beta.1,preview,2026-11-04T04:51:56Z,bc061f935bfd79ad09e3e98c6df9f2e8f1e28bea,33,308,https://github.com/openclaw/openclaw/releases/tag/v2026.11.5-beta.1,GitHub release published_at
+v2026.11.1,stable,2026-11-05T09:48:37Z,4ffdd2047d192dd65554de3c8c46c0e0197c6e2a,0,275,https://github.com/openclaw/openclaw/releases/tag/v2026.11.1,GitHub release published_at
+v2026.11.2,stable,2026-11-08T19:31:04Z,b556fdf457b026574bf0f1e7b4914b15f3f179ce,0,275,https://github.com/openclaw/openclaw/releases/tag/v2026.11.2,GitHub release published_at
+v2026.11.3,stable,2026-11-10T18:53:07Z,847611dcaa3bf0e2783335f961dd1fd0580e4d9f,0,275,https://github.com/openclaw/openclaw/releases/tag/v2026.11.3,GitHub release published_at
+v2026.9.37,stable,2026-11-10T20:42:54Z,81da850122080b7187816ab70f145f3bc9e5efff,0,195,https://github.com/openclaw/openclaw/releases/tag/v2026.9.37,GitHub release published_at
+v2026.11.5-beta.2,preview,2026-11-12T00:43:25Z,c0f42f648144b25b8945b9c56329eb13eb6d7754,0,308,https://github.com/openclaw/openclaw/releases/tag/v2026.11.5-beta.2,GitHub release published_at
+v2026.11.5-beta.3,preview,2026-11-15T00:31:00Z,c2f4dde2638502fe506e234fb43ac65d8c391072,0,308,https://github.com/openclaw/openclaw/releases/tag/v2026.11.5-beta.3,GitHub release published_at
+v2026.11.5-beta.4,preview,2026-11-16T03:12:26Z,2c173a37a48f850246ae2133aa5c02df2ae35953,0,308,https://github.com/openclaw/openclaw/releases/tag/v2026.11.5-beta.4,GitHub release published_at
+v2026.11.4,stable,2026-11-16T04:17:42Z,d843d6af39a42cd3c30084edbeabeece732fd93a,0,275,https://github.com/openclaw/openclaw/releases/tag/v2026.11.4,GitHub release published_at
+v2026.11.5,stable,2026-11-17T10:47:56Z,e13cf15ece9bbd969b7362927c315362c90c97ff,33,308,https://github.com/openclaw/openclaw/releases/tag/v2026.11.5,GitHub release published_at
+v2026.10.33,stable,2026-11-18T04:15:53Z,5196fbbf89838939b0c2e29c09b8829afbc0d415,0,275,https://github.com/openclaw/openclaw/releases/tag/v2026.10.33,GitHub release published_at
+v2026.7.1-beta.1,git-only observed,,4eb1d333cfeca440b796b6a3f70d3c2bef996243,,,,annotated tag timestamp: 2026-07-02T06:16:52Z
+v2026.7.1-beta.3,git-only observed,,619a8728905f9d751e86b655efaa8c6129c42b52,,,,annotated tag timestamp: 2026-07-10T03:29:53Z
+v2026.7.1-beta.4,git-only observed,,7d2a86c65ed2396dae51573f17c7c620ae798a5a,,,,annotated tag timestamp: 2026-07-11T08:56:00Z
+v2026.7.2-beta.4,git-only observed,,5e63b365d4d3e62ef600b783fad7c5043b6f4738,,,,annotated tag timestamp: 2026-07-24T05:26:40Z
+v2026.7.33,git-only observed,,b60a4e9fa97cddf1869a1866d879b3051783cf12,,,,annotated tag timestamp: 2026-09-18T04:03:23Z
+v2026.7.34,git-only observed,,0847c47f4451569148e5ef1789be771416ff7b11,,,,target commit timestamp only: 2026-09-19T22:00:18Z
+v2026.8.1-beta.1,git-only observed,,ff8a3fe9d03eff4a70f5464714c3a389b06bfec8,,,,annotated tag timestamp: 2026-08-10T14:59:59Z
