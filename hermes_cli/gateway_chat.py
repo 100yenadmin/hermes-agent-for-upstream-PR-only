@@ -14,14 +14,13 @@ from hermes_cli.gateway_connection import RESUME_REFUSALS
 
 # These options change execution or require frontend facilities not yet exposed by
 # the authority. Reject them, rather than mutate process-wide gateway settings.
-# (--run-budget is accepted: it folds into the session.create policy via
-# _classic_only_policy, #143735.)
+# --run-budget is a session.create policy, subject to capability and resume checks.
 _UNSUPPORTED = (
     "image", "worktree", "w",
     "no_restore_cwd",
     "verbose", "compact",
 )
-_POLICY = ("model", "provider", "reasoning", "toolsets", "max_turns", "base_url", "ignore_rules", "api_key",
+_POLICY = ("model", "provider", "reasoning", "toolsets", "max_turns", "run_budget", "base_url", "ignore_rules", "api_key",
            "yolo", "safe_mode", "ignore_user_config", "skills", "checkpoints", "accept_hooks", "pass_session_id")
 # Where each refused option lives now; the refusal names it so the user is not left guessing.
 _RELOCATED = {
